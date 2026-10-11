@@ -10,6 +10,7 @@ import argparse
 import bisect
 import collections
 import json
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -23,6 +24,36 @@ SI = Path(__file__).resolve().parent.parent / "target" / "release" / "si.exe"
 def si_lines(cmd, index):
     out = subprocess.run([str(SI), cmd, str(index)], capture_output=True, check=True).stdout
     return [line.split("\t") for line in out.decode("utf-8", "replace").splitlines()]
+
+
+def si_index(index):
+    """(files, function definitions, call rows) of an si index."""
+    files, defs = set(), collections.defaultdict(list)
+    for file, line, kind, decl, name in si_lines("symbols", index):
+        files.add(file)
+        if kind == "function" and decl == "def":
+            defs[file, name].append(int(line))
+    calls = ((sf, int(sl), cn, cf, en, ef, how, decl) for sf, sl, cn, cf, _cl, en, ef, _el, how, decl, _via
+             in si_lines("calls", index))
+    return files, defs, calls
+
+
+def cbm_index(db_path, project=None):
+    """The same from a codebase-memory-mcp database, opened read-only."""
+    db = sqlite3.connect(f"file:{Path(db_path).as_posix()}?mode=ro", uri=True)
+    if project is None:
+        project = db.execute("select project from file_hashes group by 1 order by count(*) desc").fetchone()[0]
+    files = {r[0] for r in db.execute("select rel_path from file_hashes where project = ?", (project,))}
+    defs = collections.defaultdict(list)
+    for file, name, line in db.execute(
+            "select file_path, name, start_line from nodes where project = ? and label = 'Function'", (project,)):
+        defs[file, name].append(line)
+    rows = db.execute("""select s.file_path, json_extract(e.properties, '$.line'), s.name, s.file_path, t.name, t.file_path
+                         from edges e join nodes s on s.id = e.source_id join nodes t on t.id = e.target_id
+                         where e.project = ? and e.type = 'CALLS' and s.label = 'Function' and t.label = 'Function'""",
+                      (project,))
+    calls = ((sf, line or 0, cn, cf, en, ef, "certain", "def") for sf, line, cn, cf, en, ef in rows)
+    return files, defs, calls
 
 
 class Truth:
@@ -46,15 +77,11 @@ class Truth:
         return i < 0 or line > info["inactive"][i][1]
 
 
-def score(truth_path, index, corpus):
+def score(truth_path, index, corpus, cbm=False):
     t = Truth(truth_path)
     corpus = Path(corpus)
-    si_defs = collections.defaultdict(list)  # (file, name) -> lines
-    si_files = set()
-    for file, line, kind, decl, name in si_lines("symbols", index):
-        si_files.add(file)
-        if kind == "function" and decl == "def":
-            si_defs[file, name].append(int(line))
+    # files, (file, name) -> lines, call rows
+    si_files, si_defs, call_rows = cbm_index(index) if cbm else si_index(index)
 
     # --- definitions -------------------------------------------------------
     text = {}
@@ -108,7 +135,7 @@ def score(truth_path, index, corpus):
 
     certain, any_, to_decl = set(), set(), set()
     judged = []  # certain si edges on compiled lines from functions clang knows
-    for site_file, site_line, cn, cf, _cl, en, ef, _el, how, decl, via in si_lines("calls", index):
+    for site_file, site_line, cn, cf, en, ef, how, decl in call_rows:
         key = (cf, cn, ef, en)
         if decl == "decl":
             to_decl.add(key)
@@ -117,8 +144,8 @@ def score(truth_path, index, corpus):
         if how == "certain":
             certain.add(key)
             if (cf, cn) in names_called and (cf, cn, en) not in per_program and t.active(site_file, int(site_line)):
-                judged.append((key, via))
-    judged_keys = {k for k, _ in judged}
+                judged.append(key)
+    judged_keys = set(judged)
     right = judged_keys & want_calls
     # The caller does call that name, but clang bound it elsewhere: to another
     # definition in the corpus, or to nothing the build defines (libc).
@@ -149,9 +176,10 @@ def main():
     ap.add_argument("truth")
     ap.add_argument("index")
     ap.add_argument("corpus")
+    ap.add_argument("--cbm", action="store_true", help="INDEX is a codebase-memory-mcp database")
     ap.add_argument("--show", type=int, default=0, help="print this many examples of each kind of error")
     args = ap.parse_args()
-    res, detail = score(args.truth, args.index, args.corpus)
+    res, detail = score(args.truth, args.index, args.corpus, args.cbm)
     print(json.dumps(res, indent=2))
     if args.show:
         for k in ("missed_defs", "extra_defs", "generated_defs", "missed_calls", "wrong_file", "undefined", "phantom"):
