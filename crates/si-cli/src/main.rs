@@ -77,6 +77,8 @@ enum Cmd {
     },
     /// Line-delimited JSON query server on stdin/stdout.
     Serve { dir: PathBuf },
+    /// Every symbol as `file<TAB>line<TAB>kind<TAB>decl|def<TAB>name` (for accuracy checks).
+    Symbols { dir: PathBuf },
 }
 
 fn ms(t: Instant) -> f64 {
@@ -117,7 +119,8 @@ fn is_call(e: &&EdgeHalf) -> bool {
 
 fn sym_json(g: &Graph, id: u32) -> Value {
     let s = &g.syms[id as usize];
-    json!({ "name": g.sym_name(id), "kind": kind::name(s.kind), "file": g.file_path(s.file), "line": s.line })
+    json!({ "name": g.sym_name(id), "kind": kind::name(s.kind), "file": g.file_path(s.file), "line": s.line,
+            "decl": s.flags & flag::DECL != 0 })
 }
 
 fn index(root: &Path, out: &Path, stores: &str, stride: usize) -> Value {
@@ -127,7 +130,11 @@ fn index(root: &Path, out: &Path, stores: &str, stride: usize) -> Value {
     let scan_ms = ms(t);
 
     let t = Instant::now();
-    let facts = si_core::extract_all(root, &files);
+    let transparent = si_core::prescan(&files);
+    let prescan_ms = ms(t);
+
+    let t = Instant::now();
+    let facts = si_core::extract_all(root, &files, &transparent);
     let extract_ms = ms(t);
     let facts_bytes: usize = facts.iter().map(FileFacts::heap_bytes).sum();
 
@@ -169,15 +176,18 @@ fn index(root: &Path, out: &Path, stores: &str, stride: usize) -> Value {
         "lines": facts.iter().map(|f| f.defs[0].end_line as u64).sum::<u64>(),
         "files_with_parse_errors": facts.iter().filter(|f| f.has_error).count(),
         "threads": rayon::current_num_threads(),
+        "transparent_macros": transparent.len(),
         "names": g.n_names(),
         "symbols": g.syms.len(),
         "edges": ls.edges,
         "refs": { "total": ls.refs, "resolved": ls.resolved, "ambiguous": ls.ambiguous,
                   "unresolved": ls.unresolved, "capped": ls.capped,
                   "indirect_calls": facts.iter().map(|f| f.indirect_calls as u64).sum::<u64>() },
-        "ms": { "scan": scan_ms, "extract": extract_ms, "link": link_ms,
-                "link_intern": ls.intern_ms, "link_syms": ls.syms_ms, "link_resolve": ls.resolve_ms, "link_csr": ls.csr_ms,
+        "includes": { "found": ls.includes_found, "missing": ls.includes_missing },
+        "ms": { "scan": scan_ms, "prescan": prescan_ms, "extract": extract_ms, "link": link_ms,
+                "link_intern": ls.intern_ms, "link_includes": ls.include_ms, "link_syms": ls.syms_ms, "link_resolve": ls.resolve_ms, "link_csr": ls.csr_ms,
                 "total": ms(total),
+                "cpu_mask": facts.iter().map(|f| f.mask_ns).sum::<u64>() as f64 / 1e6,
                 "cpu_parse": facts.iter().map(|f| f.parse_ns).sum::<u64>() as f64 / 1e6,
                 "cpu_walk": facts.iter().map(|f| f.walk_ns).sum::<u64>() as f64 / 1e6,
                 "slowest_file": (slowest.parse_ns + slowest.walk_ns) as f64 / 1e6 },
@@ -196,11 +206,25 @@ fn run_query(g: &Graph, op: &str, name: &str, depth: u32) -> Value {
     let syms = g.find(name);
     match op {
         "find" => json!({ "results": syms.iter().map(|&s| sym_json(g, s)).collect::<Vec<_>>() }),
-        "callers" | "callees" | "refs" => {
+        "callers" => {
+            let mut results = Vec::new();
+            for &s in syms {
+                for c in si_core::callers_through_macros(g, s) {
+                    let mut v = sym_json(g, c.caller);
+                    v["at_line"] = json!(c.line);
+                    v["certain"] = json!(!c.ambiguous);
+                    if let Some(m) = c.via {
+                        v["via_macro"] = json!(g.sym_name(m));
+                    }
+                    results.push(v);
+                }
+            }
+            json!({ "count": results.len(), "results": results })
+        }
+        "callees" | "refs" => {
             let mut results = Vec::new();
             for &s in syms {
                 let edges: Vec<&EdgeHalf> = match op {
-                    "callers" => g.refs_to(s).iter().filter(is_call).collect(),
                     "callees" => g.refs_from(s).iter().filter(is_call).collect(),
                     _ => g.refs_to(s).iter().collect(),
                 };
@@ -328,7 +352,8 @@ fn bench_query(dir: &Path, n: usize, seed: u64) -> Value {
 
 fn bench_incr(root: &Path, n: usize, seed: u64) -> Value {
     let files = si_core::scan(root);
-    let mut facts = si_core::extract_all(root, &files);
+    let transparent = si_core::prescan(&files);
+    let mut facts = si_core::extract_all(root, &files, &transparent);
     let (g, _) = si_core::link::link(&facts);
     let edges = g.out.len();
     drop(g);
@@ -339,7 +364,7 @@ fn bench_incr(root: &Path, n: usize, seed: u64) -> Value {
     for _ in 0..n {
         let i = rng.below(files.len());
         let t0 = Instant::now();
-        facts[i] = si_core::extract_file(&mut ex, root, &files[i]);
+        facts[i] = si_core::extract_file(&mut ex, root, &files[i], &transparent);
         let t1 = Instant::now();
         let (g, _) = si_core::link::link(&facts);
         let t2 = Instant::now();
@@ -371,6 +396,16 @@ fn serve(dir: &Path) {
     }
 }
 
+fn symbols(dir: &Path) {
+    let g = Graph::load(&dir.join("graph.si")).expect("load graph.si");
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    for (id, s) in g.syms.iter().enumerate().filter(|(_, s)| s.kind != kind::FILE) {
+        let decl = if s.flags & flag::DECL != 0 { "decl" } else { "def" };
+        writeln!(out, "{}	{}	{}	{decl}	{}", g.file_path(s.file), s.line, kind::name(s.kind), g.sym_name(id as u32))
+            .expect("write symbols");
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     if cli.threads > 0 {
@@ -386,6 +421,7 @@ fn main() {
         Cmd::BenchIncr { root, n, seed } => bench_incr(root, *n, *seed),
         Cmd::Sample { dir, n, seed } => sample(dir, *n, *seed),
         Cmd::Serve { dir } => return serve(dir),
+        Cmd::Symbols { dir } => return symbols(dir),
     };
     println!("{}", serde_json::to_string_pretty(&result).unwrap());
 }

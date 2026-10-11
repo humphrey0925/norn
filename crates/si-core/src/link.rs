@@ -1,4 +1,5 @@
-//! Global link: per-file facts -> one graph. O(names log names + defs + refs).
+//! Global link: per-file facts -> one graph. O(names log names + defs + refs),
+//! plus the include closures, O(sum of closure sizes).
 
 use crate::graph::Graph;
 use crate::model::{flag, kind, pack_meta, refkind, EdgeHalf, FileFacts, FileRec, Sym};
@@ -17,6 +18,11 @@ pub struct LinkStats {
     pub unresolved: u64,
     pub capped: u64,
     pub edges: u64,
+    /// `#include` operands that named a file in the index, and that did not
+    /// (system headers, generated files).
+    pub includes_found: u64,
+    pub includes_missing: u64,
+    pub include_ms: f64,
     pub intern_ms: f64,
     pub syms_ms: f64,
     pub resolve_ms: f64,
@@ -44,6 +50,103 @@ fn csr(n: usize, edges: &[[u32; 3]], key: usize, other: usize) -> (Vec<u32>, Vec
         *slot += 1;
     }
     (off, adj)
+}
+
+fn dir_of(path: &str) -> &str {
+    path.rfind('/').map_or("", |i| &path[..i])
+}
+
+/// `dir` joined with `rel`, with `.` and `..` components folded away.
+fn join(dir: &str, rel: &str) -> String {
+    let mut parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
+    for p in rel.split('/') {
+        match p {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(p),
+        }
+    }
+    parts.join("/")
+}
+
+/// For each file, the files it includes directly. Without the build's `-I`
+/// list an operand is matched by path suffix: the includer's own directory
+/// wins, then the candidates sharing the longest directory prefix with it.
+fn include_edges(files: &[FileFacts], stats: &mut LinkStats) -> Vec<Vec<u32>> {
+    let by_path: FxHashMap<&str, u32> = files.iter().enumerate().map(|(i, f)| (f.path.as_str(), i as u32)).collect();
+    let mut by_base: FxHashMap<&str, Vec<u32>> = FxHashMap::default();
+    for (i, f) in files.iter().enumerate() {
+        by_base.entry(f.path.rsplit('/').next().unwrap_or(&f.path)).or_default().push(i as u32);
+    }
+    let edges: Vec<(Vec<u32>, u64)> = files
+        .par_iter()
+        .map(|f| {
+            let dir = dir_of(&f.path);
+            let (mut out, mut missing) = (Vec::new(), 0);
+            for &inc in &f.includes {
+                let operand = f.name(inc as usize);
+                if let Some(&id) = by_path.get(join(dir, operand).as_str()) {
+                    out.push(id);
+                    continue;
+                }
+                let tail = join("", operand);
+                let base = tail.rsplit('/').next().unwrap_or(&tail);
+                let matches = |id: &&u32| {
+                    let p = files[**id as usize].path.as_str();
+                    p == tail || p.ends_with(&tail) && p.as_bytes()[p.len() - tail.len() - 1] == b'/'
+                };
+                let cands: Vec<u32> = by_base.get(base).into_iter().flatten().filter(matches).copied().collect();
+                let shared = |id: u32| {
+                    let other = dir_of(&files[id as usize].path);
+                    dir.split('/').zip(other.split('/')).take_while(|(a, b)| a == b).count()
+                };
+                match cands.iter().map(|&c| shared(c)).max() {
+                    Some(best) => out.extend(cands.iter().copied().filter(|&c| shared(c) == best)),
+                    None => missing += 1,
+                }
+            }
+            out.sort_unstable();
+            out.dedup();
+            (out, missing)
+        })
+        .collect();
+    stats.includes_found = edges.iter().map(|e| e.0.len() as u64).sum();
+    stats.includes_missing = edges.iter().map(|e| e.1).sum();
+    edges.into_iter().map(|e| e.0).collect()
+}
+
+/// Per-thread scratch for one file's include closure: membership in O(1),
+/// reset in O(closure).
+struct Closure {
+    member: Vec<bool>,
+    list: Vec<u32>,
+}
+
+impl Closure {
+    fn new(n: usize) -> Self {
+        Closure { member: vec![false; n], list: Vec::new() }
+    }
+
+    /// Everything `file` includes, directly or not (itself excluded).
+    fn fill(&mut self, file: u32, edges: &[Vec<u32>]) {
+        for &f in &self.list {
+            self.member[f as usize] = false;
+        }
+        self.list.clear();
+        self.member[file as usize] = true;
+        let mut stack = vec![file];
+        while let Some(f) = stack.pop() {
+            for &to in &edges[f as usize] {
+                if !std::mem::replace(&mut self.member[to as usize], true) {
+                    self.list.push(to);
+                    stack.push(to);
+                }
+            }
+        }
+        self.member[file as usize] = false;
+    }
 }
 
 pub fn link(files: &[FileFacts]) -> (Graph, LinkStats) {
@@ -118,13 +221,20 @@ pub fn link(files: &[FileFacts]) -> (Graph, LinkStats) {
     }
     stats.syms_ms = ms(t);
 
+    let t = Instant::now();
+    let includes = include_edges(files, &mut stats);
+    stats.include_ms = ms(t);
+
     // 3. Resolve references. Each file is independent given the symbol table.
+    //    A name means, in order: a definition in this file; one in a file it
+    //    includes; anything with external visibility.
     let t = Instant::now();
     let syms = &g.syms;
     let per_file: Vec<(Vec<[u32; 3]>, [u64; 4])> = files
         .par_iter()
         .enumerate()
-        .map(|(fi, f)| {
+        .map_init(|| Closure::new(files.len()), |closure, (fi, f)| {
+            closure.fill(fi as u32, &includes);
             let base = g.files[fi].sym_start;
             let end = base + f.defs.len() as u32;
             let mut edges = Vec::with_capacity(f.refs.len());
@@ -135,11 +245,28 @@ pub fn link(files: &[FileFacts]) -> (Graph, LinkStats) {
                 tmp.clear();
                 // A definition in the same file shadows everything else (covers `static`).
                 tmp.extend(cands.iter().filter(|&&c| c >= base && c < end && syms[c as usize].kind != kind::FILE));
+                let external = |c: &&u32| {
+                    let s = &syms[**c as usize];
+                    s.kind != kind::FILE && (s.flags & flag::STATIC == 0 || s.flags & flag::HEADER != 0)
+                };
                 if tmp.is_empty() {
+                    // Included text is part of this translation unit, `static` or not.
                     tmp.extend(cands.iter().filter(|&&c| {
                         let s = &syms[c as usize];
-                        s.kind != kind::FILE && (s.flags & flag::STATIC == 0 || s.flags & flag::HEADER != 0)
+                        s.kind != kind::FILE && closure.member[s.file as usize]
                     }));
+                    // Only a prototype or `extern` in sight: the definition is
+                    // in another translation unit.
+                    if !tmp.is_empty() && tmp.iter().all(|&c| syms[c as usize].flags & flag::DECL != 0) {
+                        let n = tmp.len();
+                        tmp.extend(cands.iter().filter(external).filter(|&&c| syms[c as usize].flags & flag::DECL == 0));
+                        if tmp.len() > n {
+                            tmp.drain(..n);
+                        }
+                    }
+                }
+                if tmp.is_empty() {
+                    tmp.extend(cands.iter().filter(external));
                 }
                 if tmp.is_empty() {
                     counts[2] += 1;
@@ -188,4 +315,83 @@ pub fn link(files: &[FileFacts]) -> (Graph, LinkStats) {
     stats.csr_ms = ms(t);
 
     (g, stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extract::Extractor;
+    use crate::mask::Transparent;
+
+    fn graph(files: &[(&str, &str)]) -> Graph {
+        let mut ex = Extractor::new();
+        let t = Transparent::default();
+        let facts: Vec<FileFacts> = files.iter().map(|(path, src)| ex.extract(path, src.as_bytes(), &t)).collect();
+        link(&facts).0
+    }
+
+    /// Files defining the symbols that `caller` references under `name`.
+    fn targets(g: &Graph, caller: &str, name: &str) -> Vec<String> {
+        let mut out: Vec<String> = g
+            .find(caller)
+            .iter()
+            .flat_map(|&s| g.refs_from(s))
+            .filter(|e| g.sym_name(e.other) == name)
+            .map(|e| g.file_path(g.syms[e.other as usize].file).to_string())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn a_static_function_is_visible_to_a_file_that_includes_it() {
+        let g = graph(&[
+            ("gas/a.c", "#include \"impl.c\"\nvoid f (void) { helper (); }\n"),
+            ("gas/impl.c", "static void helper (void) { }\n"),
+            ("ld/other.c", "void g (void) { helper (); }\n"),
+        ]);
+        assert_eq!(targets(&g, "f", "helper"), ["gas/impl.c"]);
+        assert!(targets(&g, "g", "helper").is_empty());
+    }
+
+    #[test]
+    fn an_included_header_decides_between_same_named_macros() {
+        let g = graph(&[
+            ("a/conf.h", "#define SIZE 4\n"),
+            ("b/conf.h", "#define SIZE 8\n"),
+            ("a/x.c", "#include \"conf.h\"\nint f (void) { return SIZE; }\n"),
+            ("c/y.c", "int g (void) { return SIZE; }\n"),
+        ]);
+        assert_eq!(targets(&g, "f", "SIZE"), ["a/conf.h"]);
+        assert_eq!(targets(&g, "g", "SIZE"), ["a/conf.h", "b/conf.h"]);
+    }
+
+    #[test]
+    fn a_prototype_in_a_header_leads_to_the_definition() {
+        let g = graph(&[
+            ("inc/api.h", "extern int api (int);\n"),
+            ("lib/api.c", "#include \"api.h\"\nint api (int x) { return x; }\n"),
+            ("app/main.c", "#include \"../inc/api.h\"\nint main (void) { return api (1); }\n"),
+        ]);
+        assert_eq!(targets(&g, "main", "api"), ["lib/api.c"]);
+    }
+
+    #[test]
+    fn macro_bodies_and_macro_blocks_are_indexed() {
+        let g = graph(&[(
+            "m.c",
+            "#define CHECK(x) validate (x)\n#define EACH(i) for (i = 0; i < 3; i++)\n\
+             int validate (int);\nint last (int);\n\
+             int f (int a)\n{\n  int i;\n  EACH (i)\n    {\n      CHECK (a);\n    }\n  return last (a);\n}\n",
+        )]);
+        assert_eq!(targets(&g, "CHECK", "validate"), ["m.c"]);
+        // `EACH (i) { ... }` must not end `f` early or become a function itself.
+        assert_eq!(targets(&g, "f", "last"), ["m.c"]);
+        assert_eq!(targets(&g, "f", "EACH"), ["m.c"]);
+        assert!(g.find("EACH").iter().all(|&s| g.syms[s as usize].kind == kind::MACRO));
+        let through: Vec<&str> =
+            crate::callers_through_macros(&g, g.find("validate")[0]).iter().map(|c| g.sym_name(c.caller)).collect();
+        assert!(through.contains(&"CHECK") && through.contains(&"f"), "{through:?}");
+    }
 }

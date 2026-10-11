@@ -3,10 +3,12 @@
 pub mod extract;
 pub mod graph;
 pub mod link;
+pub mod mask;
 pub mod model;
 pub mod packed;
 pub mod sqlite;
 
+use mask::Transparent;
 use model::FileFacts;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -29,14 +31,21 @@ pub fn rel_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/")
 }
 
-pub fn extract_file(ex: &mut extract::Extractor, root: &Path, path: &Path) -> FileFacts {
+/// Corpus-wide pre-pass: which macros can be dropped before parsing.
+pub fn prescan(files: &[PathBuf]) -> Transparent {
+    let defines: Vec<Vec<mask::Define>> =
+        files.par_iter().map(|p| mask::defines(&std::fs::read(p).unwrap_or_default())).collect();
+    Transparent::from_defines(defines.into_iter().flatten())
+}
+
+pub fn extract_file(ex: &mut extract::Extractor, root: &Path, path: &Path, transparent: &Transparent) -> FileFacts {
     let src = std::fs::read(path).unwrap_or_default();
-    ex.extract(&rel_path(root, path), &src)
+    ex.extract(&rel_path(root, path), &src, transparent)
 }
 
 /// Extract all files on the current rayon pool; output order matches `files`.
-pub fn extract_all(root: &Path, files: &[PathBuf]) -> Vec<FileFacts> {
-    files.par_iter().map_init(extract::Extractor::new, |ex, p| extract_file(ex, root, p)).collect()
+pub fn extract_all(root: &Path, files: &[PathBuf], transparent: &Transparent) -> Vec<FileFacts> {
+    files.par_iter().map_init(extract::Extractor::new, |ex, p| extract_file(ex, root, p, transparent)).collect()
 }
 
 /// Route tree-sitter's C allocations through mimalloc. The platform heap
@@ -44,6 +53,41 @@ pub fn extract_all(root: &Path, files: &[PathBuf]) -> Vec<FileFacts> {
 pub fn use_mimalloc_for_parser() {
     use libmimalloc_sys::{mi_calloc, mi_free, mi_malloc, mi_realloc};
     unsafe { tree_sitter::set_allocator(Some(mi_malloc), Some(mi_calloc), Some(mi_realloc), Some(mi_free)) }
+}
+
+/// One caller of a function: directly, or by using a macro whose expansion
+/// makes the call.
+#[derive(Clone, Copy, Debug)]
+pub struct Caller {
+    pub caller: u32,
+    pub line: u32,
+    pub ambiguous: bool,
+    /// The macro used at `line`, when the call is not written there itself.
+    pub via: Option<u32>,
+}
+
+/// Callers of `sym`, looking through macros: if macro `M` calls `sym`, every
+/// user of `M` calls it too (and so on through macros that use `M`). The
+/// macros themselves are reported as well, since the call is written there.
+pub fn callers_through_macros(g: &graph::Graph, sym: u32) -> Vec<Caller> {
+    use model::{kind, refkind};
+    let mut out = Vec::new();
+    let mut seen_macros = rustc_hash::FxHashSet::default();
+    let mut work = vec![(sym, None, false)];
+    while let Some((target, via, via_ambiguous)) = work.pop() {
+        for e in g.refs_to(target) {
+            // A call must be written as one; a macro is "called" by any use.
+            if via.is_none() && e.kind() != refkind::CALL {
+                continue;
+            }
+            let ambiguous = via_ambiguous || e.ambiguous();
+            out.push(Caller { caller: e.other, line: e.line(), ambiguous, via });
+            if g.syms[e.other as usize].kind == kind::MACRO && seen_macros.insert(e.other) {
+                work.push((e.other, Some(e.other), ambiguous));
+            }
+        }
+    }
+    out
 }
 
 /// Bounded BFS over references, the shape of a call-tree / reference-tree view.

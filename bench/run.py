@@ -22,6 +22,8 @@ from pathlib import Path
 
 import psutil
 
+import check_defs
+
 ROOT = Path(__file__).resolve().parent.parent
 SI = ROOT / "target" / "release" / ("si.exe" if os.name == "nt" else "si")
 CBM = ROOT / "tools" / "cbm" / ("codebase-memory-mcp.exe" if os.name == "nt" else "codebase-memory-mcp")
@@ -282,7 +284,7 @@ def bench_roundtrip(index_dir, project, n, with_cbm):
             r = srv.ask("tree" if op == "tree3" else op, name)
             t[op].append(time.perf_counter() - t0)
             if op == "find":
-                unique_def[name] = sum(x["kind"] == "function" for x in r["results"]) == 1
+                unique_def[name] = sum(x["kind"] == "function" and not x["decl"] for x in r["results"]) == 1
             if op == "callers":
                 fns = [x for x in r["results"] if x["kind"] == "function"]
                 si_callers[name] = ({x["name"] for x in fns if x["certain"]}, {x["name"] for x in fns})
@@ -304,6 +306,7 @@ def bench_roundtrip(index_dir, project, n, with_cbm):
         # definition, so both tools are answering about the same symbol.
         agree = {"certain": [0, 0, 0], "all": [0, 0, 0]}  # both, only_si, only_cbm
         compared = 0
+        disagreements = []
         for name in names:
             for op, q in queries.items():
                 t0 = time.perf_counter()
@@ -316,9 +319,14 @@ def bench_roundtrip(index_dir, project, n, with_cbm):
                         agree[key][0] += len(ours & theirs)
                         agree[key][1] += len(ours - theirs)
                         agree[key][2] += len(theirs - ours)
+                    ours = si_callers[name][1]
+                    if ours != theirs:
+                        disagreements.append({"function": name, "only_si": sorted(ours - theirs),
+                                              "only_cbm": sorted(theirs - ours)})
         mcp.close()
         res["cbm"] = {k: latency(v) for k, v in t.items()}
         res["cbm_server_side"] = latency(cbm_logged_durations(len(names) * len(queries)))
+        res["caller_disagreements"] = disagreements
         res["caller_agreement"] = {"functions_compared": compared,
                                    **{k: dict(zip(("both", "only_si", "only_cbm"), v)) for k, v in agree.items()}}
     return res
@@ -355,6 +363,10 @@ def main():
     index_dir = OUT / "si"
     si("index", corpus, "--out", index_dir, "--stores", "csr,csr-packed,sqlite-naive,sqlite-tuned")
     res["si_query"] = si("bench-query", index_dir, "--n", 2000)[2]
+    expected, found, missing = check_defs.recall(corpus, index_dir)
+    res["si_accuracy"] = {"function_defs_expected": expected, "function_defs_found": found,
+                          "function_def_recall": found / expected, "files_with_missing_defs": len(missing)}
+    print(f"  function definitions: {found}/{expected} = {found / expected:.2%} (regex estimate)", flush=True)
     wall, peak, js = si("bench-incr", corpus, "--n", 30)
     res["si_incremental"] = js
 

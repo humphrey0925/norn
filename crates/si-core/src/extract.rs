@@ -1,5 +1,6 @@
-//! Single-file extraction: tree-sitter parse + one preorder walk, O(tokens).
+//! Single-file extraction: lexical mask, tree-sitter parse, one preorder walk. O(tokens).
 
+use crate::mask::{self, Event, Tok, Transparent};
 use crate::model::{flag, kind, refkind, Def, FileFacts, Ref};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::num::NonZeroU16;
@@ -16,8 +17,6 @@ struct Ids {
     union_specifier: u16,
     enum_specifier: u16,
     enumerator: u16,
-    preproc_def: u16,
-    preproc_function_def: u16,
     call_expression: u16,
     function_declarator: u16,
     storage_class_specifier: u16,
@@ -42,8 +41,6 @@ impl Ids {
             union_specifier: k("union_specifier"),
             enum_specifier: k("enum_specifier"),
             enumerator: k("enumerator"),
-            preproc_def: k("preproc_def"),
-            preproc_function_def: k("preproc_function_def"),
             call_expression: k("call_expression"),
             function_declarator: k("function_declarator"),
             storage_class_specifier: k("storage_class_specifier"),
@@ -69,7 +66,13 @@ struct Scope {
 }
 
 struct Walk<'a> {
+    /// Masked text: what the parser saw. Same offsets as the original.
     src: &'a [u8],
+    orig: &'a [u8],
+    /// What the mask hid, still to be merged in at its source position.
+    events: std::slice::Iter<'a, Event>,
+    next_event: Option<&'a Event>,
+    blocks: &'a [(u32, u32, u32)],
     ids: &'a Ids,
     out: FileFacts,
     names: FxHashMap<&'a [u8], u32>,
@@ -93,7 +96,8 @@ impl Extractor {
         Extractor { parser, ids: Ids::new(&lang) }
     }
 
-    pub fn extract(&mut self, path: &str, src: &[u8]) -> FileFacts {
+    /// The facts depend on the file's content and on `transparent`.
+    pub fn extract(&mut self, path: &str, src: &[u8], transparent: &Transparent) -> FileFacts {
         let mut out = FileFacts::new(path.to_string());
         out.hash = xxhash_rust::xxh3::xxh3_64(src);
         out.bytes = src.len() as u32;
@@ -101,7 +105,14 @@ impl Extractor {
         out.defs.push(Def { name: file_name, line: 1, end_line: 0, kind: kind::FILE, flags: 0 });
 
         let t = std::time::Instant::now();
-        let Some(tree) = self.parser.parse(src, None) else {
+        let lexed = mask::lex(src, transparent);
+        for &(a, e) in &lexed.includes {
+            let id = out.push_name(&String::from_utf8_lossy(&src[a as usize..e as usize]));
+            out.includes.push(id);
+        }
+        out.mask_ns = t.elapsed().as_nanos() as u64;
+        let t = std::time::Instant::now();
+        let Some(tree) = self.parser.parse(&lexed.masked, None) else {
             out.has_error = true;
             return out;
         };
@@ -111,8 +122,13 @@ impl Extractor {
         out.has_error = root.has_error();
         out.defs[0].end_line = root.end_position().row as u32 + 1;
 
+        let mut events = lexed.events.iter();
         let mut w = Walk {
-            src,
+            src: &lexed.masked,
+            orig: src,
+            next_event: events.next(),
+            events,
+            blocks: &lexed.blocks,
             ids: &self.ids,
             out,
             names: FxHashMap::default(),
@@ -134,6 +150,7 @@ impl Extractor {
                 }
             }
         }
+        w.flush_events(usize::MAX);
         w.out.walk_ns = t.elapsed().as_nanos() as u64;
         w.out
     }
@@ -164,6 +181,46 @@ impl<'a> Walk<'a> {
             flags,
         });
         (self.out.defs.len() - 1) as u32
+    }
+
+    fn leave_scope(&mut self, pos: usize) {
+        if self.scope.is_some_and(|s| pos >= s.end) {
+            self.scope = None;
+            self.locals.clear();
+        }
+    }
+
+    /// Merge in everything the mask hid before byte `pos`.
+    fn flush_events(&mut self, pos: usize) {
+        while let Some(ev) = self.next_event.filter(|e| e.pos() < pos) {
+            self.next_event = self.events.next();
+            self.leave_scope(ev.pos());
+            match ev {
+                Event::Macro(m) => {
+                    let name = self.intern(self.tok_text(&m.name));
+                    self.out.defs.push(Def { name, line: m.name.line, end_line: m.end_line, kind: kind::MACRO, flags: 0 });
+                    let scope = (self.out.defs.len() - 1) as u32;
+                    for t in &m.refs {
+                        self.push_tok_ref(t, scope);
+                    }
+                }
+                Event::Ref(t) => {
+                    if !(self.in_fn() && self.locals.contains(self.tok_text(t))) {
+                        self.push_tok_ref(t, self.scope.map_or(0, |s| s.def));
+                    }
+                }
+            }
+        }
+    }
+
+    fn tok_text(&self, t: &Tok) -> &'a [u8] {
+        &self.orig[t.start as usize..t.end as usize]
+    }
+
+    fn push_tok_ref(&mut self, t: &Tok, scope: u32) {
+        let name = self.intern(self.tok_text(t));
+        let kind = if t.call { refkind::CALL } else { refkind::USE };
+        self.out.refs.push(Ref { name, line: t.line, scope, kind });
     }
 
     fn push_ref(&mut self, n: Node, kind: u8) {
@@ -217,12 +274,8 @@ impl<'a> Walk<'a> {
 
     /// Returns whether to descend into the node's children.
     fn visit(&mut self, node: Node<'a>) -> bool {
-        if let Some(s) = self.scope {
-            if node.start_byte() >= s.end {
-                self.scope = None;
-                self.locals.clear();
-            }
-        }
+        self.flush_events(node.start_byte());
+        self.leave_scope(node.start_byte());
         let k = node.kind_id();
         let ids = self.ids;
 
@@ -255,10 +308,29 @@ impl<'a> Walk<'a> {
         if k == ids.function_definition {
             let named = node.child_by_field_id(ids.f_declarator.get()).and_then(|d| self.decl_name(d));
             if let Some((name, _)) = named {
+                if self.in_fn() {
+                    // C has no nested functions: `FOR_EACH (x) { ... }` inside a
+                    // body is a macro followed by a block.
+                    self.skip.insert(name.start_byte());
+                    self.push_ref(name, refkind::CALL);
+                    return true;
+                }
                 let flags = self.storage_flags(node);
                 let def = self.push_def(name, node, kind::FUNCTION, flags);
                 self.locals.clear();
-                self.scope = Some(Scope { def, end: node.end_byte(), is_fn: true });
+                // Error recovery can end the node early; the body's matching
+                // brace is where the function really ends.
+                let mut end = node.end_byte();
+                if let Some(body) = node.child_by_field_id(ids.f_body) {
+                    let at = self.blocks.partition_point(|b| (b.0 as usize) < body.start_byte());
+                    if let Some(&(start, block_end, last_line)) = self.blocks.get(at) {
+                        if start as usize == body.start_byte() && block_end as usize > end {
+                            end = block_end as usize;
+                            self.out.defs[def as usize].end_line = last_line;
+                        }
+                    }
+                }
+                self.scope = Some(Scope { def, end, is_fn: true });
             }
             return true;
         }
@@ -325,14 +397,6 @@ impl<'a> Walk<'a> {
                 self.push_def(name, node, kind::ENUM_CONST, 0);
             }
             return true;
-        }
-        if k == ids.preproc_def || k == ids.preproc_function_def {
-            if let Some(name) = node.child_by_field_id(ids.f_name) {
-                self.push_def(name, node, kind::MACRO, 0);
-                self.skip.remove(&name.start_byte());
-            }
-            // The macro body is an opaque token run to tree-sitter; nothing to walk.
-            return false;
         }
         true
     }

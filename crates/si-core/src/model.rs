@@ -64,7 +64,8 @@ pub struct Ref {
 }
 
 /// Everything extracted from a single file. Depends only on that file's
-/// content, so it can be produced in parallel and cached by content hash.
+/// content and the transparent-macro set, so it can be produced in parallel
+/// and cached by (content hash, set digest).
 #[derive(Clone, Debug, Default)]
 pub struct FileFacts {
     pub path: String,
@@ -72,13 +73,16 @@ pub struct FileFacts {
     pub bytes: u32,
     pub has_error: bool,
     pub indirect_calls: u32,
-    /// Wall time spent in the tree-sitter parse and in the tree walk.
+    /// Wall time spent in the lexical mask, the tree-sitter parse and the tree walk.
+    pub mask_ns: u64,
     pub parse_ns: u64,
     pub walk_ns: u64,
     name_buf: String,
     name_off: Vec<u32>,
     pub defs: Vec<Def>,
     pub refs: Vec<Ref>,
+    /// `#include` operands as written, as file-local name ids.
+    pub includes: Vec<u32>,
 }
 
 impl FileFacts {
@@ -106,6 +110,7 @@ impl FileFacts {
             + self.name_off.capacity() * 4
             + self.defs.capacity() * std::mem::size_of::<Def>()
             + self.refs.capacity() * std::mem::size_of::<Ref>()
+            + self.includes.capacity() * 4
     }
 }
 
