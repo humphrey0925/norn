@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Score an si index against clang's ground truth (bench/gt_extract.py).
+
+The truth covers one build configuration, so:
+  recall     is over everything clang saw in corpus files;
+  precision  is over what si reports in files clang read, on lines that some
+             translation unit actually compiled.
+"""
+import argparse
+import bisect
+import collections
+import json
+import subprocess
+from pathlib import Path
+
+# Generated at configure time from a file the corpus does have, with the same
+# definitions; clang reads the generated copy.
+GENERATED = {"<build>/bfd/bfd.h": "bfd/bfd-in2.h", "<build>/bfd/bfd_stdint.h": "bfd/bfd_stdint.h"}
+
+SI = Path(__file__).resolve().parent.parent / "target" / "release" / "si.exe"
+
+
+def si_lines(cmd, index):
+    out = subprocess.run([str(SI), cmd, str(index)], capture_output=True, check=True).stdout
+    return [line.split("\t") for line in out.decode("utf-8", "replace").splitlines()]
+
+
+class Truth:
+    def __init__(self, path):
+        t = json.load(open(path, encoding="utf-8"))
+        self.raw = t
+        self.files = {GENERATED.get(f, f): v for f, v in t["files"].items()}
+        self.defs = [(name, GENERATED.get(file, file), line) for _, name, file, line, _ in t["defs"]]
+        self.homes = collections.defaultdict(set)  # usr -> files defining it
+        for usr, _, file, _, _ in t["defs"]:
+            self.homes[usr].add(GENERATED.get(file, file))
+        self.calls = t["calls"]
+        self._starts = {f: [r[0] for r in v["inactive"]] for f, v in self.files.items()}
+
+    def active(self, file, line):
+        """Did any translation unit compile this line?"""
+        info = self.files.get(file)
+        if info is None:
+            return False
+        i = bisect.bisect_right(self._starts[file], line) - 1
+        return i < 0 or line > info["inactive"][i][1]
+
+
+def score(truth_path, index, corpus):
+    t = Truth(truth_path)
+    corpus = Path(corpus)
+    si_defs = collections.defaultdict(list)  # (file, name) -> lines
+    si_files = set()
+    for file, line, kind, decl, name in si_lines("symbols", index):
+        si_files.add(file)
+        if kind == "function" and decl == "def":
+            si_defs[file, name].append(int(line))
+
+    # --- definitions -------------------------------------------------------
+    text = {}
+
+    def written(file, line, name):
+        """Is the name spelled on that line (not produced by a macro)?"""
+        if file not in text:
+            text[file] = (corpus / file).read_bytes().decode("latin-1").split("\n")  # not splitlines: ^L is not a line break
+        return line <= len(text[file]) and name in text[file][line - 1]
+
+    want = {(file, name, line) for name, file, line in t.defs if file in si_files}
+    outside = len({d for d in t.defs if d[1] not in si_files})
+    hit, generated, missed = 0, [], []
+    for file, name, line in want:
+        if (file, name) in si_defs:
+            hit += 1
+        elif not written(file, line, name):
+            generated.append((file, line, name))
+        else:
+            missed.append((file, line, name))
+    truth_names = {(file, name) for file, name, _ in want}
+    extra, checked = [], 0
+    for (file, name), lines in si_defs.items():
+        for line in lines:
+            if t.active(file, line):
+                checked += 1
+                if (file, name) not in truth_names:
+                    extra.append((file, line, name))
+    defs = {"truth": len(want), "truth_outside_corpus": outside, "found": hit, "recall": hit / len(want),
+            "missed_written": len(missed), "missed_macro_generated": len(generated),
+            "si_in_compiled_lines": checked, "si_not_in_truth": len(extra), "precision": 1 - len(extra) / checked}
+
+    # --- calls -------------------------------------------------------------
+    want_calls = set()       # (caller file, caller name, callee file, callee name)
+    names_called = collections.defaultdict(set)  # (caller file, caller name) -> callee names, defined or not
+    per_program = set()      # (caller file, caller name, callee name): which definition depends on the link
+    external = 0
+    for cf, cn, _cl, usr, callee_name, home, _site_file, _site_line in t.calls:
+        cf = GENERATED.get(cf, cf)
+        if cf not in si_files:
+            continue
+        names_called[cf, cn].add(callee_name)
+        homes = {GENERATED.get(home, home)} if home else t.homes.get(usr, set())
+        if len(homes) > 1:
+            per_program.add((cf, cn, callee_name))
+        elif not homes or not homes <= si_files:
+            external += 1
+        else:
+            want_calls.add((cf, cn, *homes, callee_name))
+    want_calls = {k for k in want_calls if (k[0], k[1], k[3]) not in per_program}
+
+    certain, any_, to_decl = set(), set(), set()
+    judged = []  # certain si edges on compiled lines from functions clang knows
+    for site_file, site_line, cn, cf, _cl, en, ef, _el, how, decl, via in si_lines("calls", index):
+        key = (cf, cn, ef, en)
+        if decl == "decl":
+            to_decl.add(key)
+            continue
+        any_.add(key)
+        if how == "certain":
+            certain.add(key)
+            if (cf, cn) in names_called and (cf, cn, en) not in per_program and t.active(site_file, int(site_line)):
+                judged.append((key, via))
+    judged_keys = {k for k, _ in judged}
+    right = judged_keys & want_calls
+    # The caller does call that name, but clang bound it elsewhere: to another
+    # definition in the corpus, or to nothing the build defines (libc).
+    elsewhere = {(k[0], k[1], k[3]) for k in want_calls}
+    wrong_file = {k for k in judged_keys - want_calls if (k[0], k[1], k[3]) in elsewhere}
+    undefined = {k for k in judged_keys - want_calls - wrong_file if k[3] in names_called[k[0], k[1]]}
+    phantom = judged_keys - want_calls - wrong_file - undefined
+    missed_calls = want_calls - any_
+    calls = {"truth_edges": len(want_calls), "truth_call_sites_to_undefined": external,
+             "truth_edges_decided_by_link": len(per_program),
+             "found_certain": len(want_calls & certain), "found_any": len(want_calls & any_),
+             "recall_certain": len(want_calls & certain) / len(want_calls),
+             "recall_any": len(want_calls & any_) / len(want_calls),
+             "si_certain_judged": len(judged_keys), "right": len(right),
+             "wrong_definition_chosen": len(wrong_file), "callee_undefined_in_build": len(undefined),
+             "no_such_call": len(phantom),
+             "precision_certain": len(right) / (len(judged_keys) - len(undefined)),
+             "si_edges_to_prototypes": len(to_decl)}
+    detail = {"missed_defs": sorted(missed), "generated_defs": sorted(generated), "extra_defs": sorted(extra),
+              "missed_calls": sorted(missed_calls), "wrong_file": sorted(wrong_file), "undefined": sorted(undefined), "phantom": sorted(phantom),
+              "names_called": names_called, "want_calls": want_calls, "any": any_, "certain": certain}
+    return {"translation_units": t.raw["translation_units"], "indirect_calls": t.raw["indirect_calls"],
+            "definitions": defs, "calls": calls}, detail
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("truth")
+    ap.add_argument("index")
+    ap.add_argument("corpus")
+    ap.add_argument("--show", type=int, default=0, help="print this many examples of each kind of error")
+    args = ap.parse_args()
+    res, detail = score(args.truth, args.index, args.corpus)
+    print(json.dumps(res, indent=2))
+    if args.show:
+        for k in ("missed_defs", "extra_defs", "generated_defs", "missed_calls", "wrong_file", "undefined", "phantom"):
+            by_file = collections.Counter(x[0] for x in detail[k])
+            print(f"\n{k}: {len(detail[k])}; top files {by_file.most_common(6)}")
+            step = max(1, len(detail[k]) // args.show)
+            for x in detail[k][::step][:args.show]:
+                print("   ", *x)
+
+
+if __name__ == "__main__":
+    main()

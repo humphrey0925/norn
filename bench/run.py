@@ -23,6 +23,7 @@ from pathlib import Path
 import psutil
 
 import check_defs
+import check_truth
 
 ROOT = Path(__file__).resolve().parent.parent
 SI = ROOT / "target" / "release" / ("si.exe" if os.name == "nt" else "si")
@@ -367,6 +368,13 @@ def main():
     res["si_accuracy"] = {"function_defs_expected": expected, "function_defs_found": found,
                           "function_def_recall": found / expected, "files_with_missing_defs": len(missing)}
     print(f"  function definitions: {found}/{expected} = {found / expected:.2%} (regex estimate)", flush=True)
+    truth = ROOT / "out" / "gt" / "truth.json"  # from bench/gt_extract.py, if the corpus was built
+    if truth.exists():
+        res["si_truth"] = check_truth.score(truth, index_dir, corpus)[0]
+        d, c = res["si_truth"]["definitions"], res["si_truth"]["calls"]
+        print(f"  against clang: definitions recall {d['recall']:.2%} precision {d['precision']:.2%}; "
+              f"calls recall {c['recall_any']:.2%} ({c['recall_certain']:.2%} certain) "
+              f"precision {c['precision_certain']:.2%}", flush=True)
     wall, peak, js = si("bench-incr", corpus, "--n", 30)
     res["si_incremental"] = js
 

@@ -69,21 +69,29 @@ pub struct Caller {
 /// Callers of `sym`, looking through macros: if macro `M` calls `sym`, every
 /// user of `M` calls it too (and so on through macros that use `M`). The
 /// macros themselves are reported as well, since the call is written there.
+/// A macro that only names the function (`#define emit emit_le`) calls it
+/// where the macro itself is called.
 pub fn callers_through_macros(g: &graph::Graph, sym: u32) -> Vec<Caller> {
     use model::{kind, refkind};
     let mut out = Vec::new();
     let mut seen_macros = rustc_hash::FxHashSet::default();
-    let mut work = vec![(sym, None, false)];
-    while let Some((target, via, via_ambiguous)) = work.pop() {
+    // (target, macro it was reached through, ambiguous so far, whether the
+    // call is still to be written by whoever uses the target)
+    let mut work = vec![(sym, None, false, true)];
+    while let Some((target, via, via_ambiguous, call_pending)) = work.pop() {
         for e in g.refs_to(target) {
-            // A call must be written as one; a macro is "called" by any use.
-            if via.is_none() && e.kind() != refkind::CALL {
+            let from_macro = g.syms[e.other as usize].kind == kind::MACRO;
+            let called = e.kind() == refkind::CALL;
+            if call_pending && !called && !from_macro {
                 continue;
             }
             let ambiguous = via_ambiguous || e.ambiguous();
-            out.push(Caller { caller: e.other, line: e.line(), ambiguous, via });
-            if g.syms[e.other as usize].kind == kind::MACRO && seen_macros.insert(e.other) {
-                work.push((e.other, Some(e.other), ambiguous));
+            let pending = call_pending && !called;
+            if !pending {
+                out.push(Caller { caller: e.other, line: e.line(), ambiguous, via });
+            }
+            if from_macro && seen_macros.insert((e.other, pending)) {
+                work.push((e.other, Some(e.other), ambiguous, pending));
             }
         }
     }

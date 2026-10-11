@@ -255,14 +255,14 @@ pub fn link(files: &[FileFacts]) -> (Graph, LinkStats) {
                         let s = &syms[c as usize];
                         s.kind != kind::FILE && closure.member[s.file as usize]
                     }));
-                    // Only a prototype or `extern` in sight: the definition is
-                    // in another translation unit.
-                    if !tmp.is_empty() && tmp.iter().all(|&c| syms[c as usize].flags & flag::DECL != 0) {
-                        let n = tmp.len();
-                        tmp.extend(cands.iter().filter(external).filter(|&&c| syms[c as usize].flags & flag::DECL == 0));
-                        if tmp.len() > n {
-                            tmp.drain(..n);
-                        }
+                }
+                // Only a prototype or `extern` in sight: the definition is in
+                // another translation unit.
+                if !tmp.is_empty() && tmp.iter().all(|&c| syms[c as usize].flags & flag::DECL != 0) {
+                    let n = tmp.len();
+                    tmp.extend(cands.iter().filter(external).filter(|&&c| syms[c as usize].flags & flag::DECL == 0));
+                    if tmp.len() > n {
+                        tmp.drain(..n);
                     }
                 }
                 if tmp.is_empty() {

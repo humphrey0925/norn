@@ -367,6 +367,14 @@ fn blank(buf: &mut [u8], start: usize, end: usize) {
     }
 }
 
+/// One open `#if` group.
+struct Cond {
+    nest: Nest,
+    /// Its directives so far, to hide them all once one has to be.
+    spans: Vec<(usize, usize)>,
+    hidden: bool,
+}
+
 struct Lexer<'a> {
     c: Cur<'a>,
     transparent: &'a Transparent,
@@ -375,7 +383,7 @@ struct Lexer<'a> {
     nest: Nest,
     /// Nesting at each open `#if`, restored at `#else` so that alternative
     /// branches do not both count their brackets.
-    conds: Vec<Nest>,
+    conds: Vec<Cond>,
     /// Last significant byte, to tell `= {` from a block.
     prev: u8,
     line_start: bool,
@@ -638,20 +646,40 @@ impl<'a> Lexer<'a> {
                     self.out.includes.push((open as u32 + 1, (open + 1 + len) as u32));
                 }
             }
-            b"if" | b"ifdef" | b"ifndef" => self.conds.push(self.nest.clone()),
-            b"elif" | b"else" | b"elifdef" | b"elifndef" => {
-                if let Some(n) = self.conds.last() {
-                    self.nest = n.clone();
-                }
-            }
-            b"endif" => {
-                self.conds.pop();
-            }
             _ => {}
         }
         self.c.skip_directive();
+        let span = (start, self.c.i);
+        // A group that cuts a statement in two (`if (x)` / `#endif` / `y;`)
+        // is not a statement itself: hide all of it and read every branch.
+        let in_block = self.nest.braces.last().is_some_and(|b| b.0 == Brace::Block);
+        let cuts = hide || in_block && !matches!(self.prev, b';' | b'{' | b'}' | b':');
+        match word {
+            b"if" | b"ifdef" | b"ifndef" => {
+                self.conds.push(Cond { nest: self.nest.clone(), spans: vec![span], hidden: cuts });
+                hide = cuts;
+            }
+            b"elif" | b"else" | b"elifdef" | b"elifndef" | b"endif" => {
+                if let Some(c) = self.conds.last_mut() {
+                    if cuts && !c.hidden {
+                        c.hidden = true;
+                        for &(a, e) in &c.spans {
+                            blank(&mut self.out.masked, a, e);
+                        }
+                    }
+                    hide = c.hidden;
+                    c.spans.push(span);
+                    if word == b"endif" {
+                        self.conds.pop();
+                    } else {
+                        self.nest = c.nest.clone();
+                    }
+                }
+            }
+            _ => {}
+        }
         if hide {
-            blank(&mut self.out.masked, start, self.c.i);
+            blank(&mut self.out.masked, span.0, span.1);
         }
     }
 
@@ -818,6 +846,24 @@ mod tests {
         let kept: Vec<&str> = m.lines().filter(|l| l.starts_with('#')).collect();
         assert_eq!(kept, ["#ifdef A", "#endif", "#ifdef A", "#endif"]);
         assert_eq!(m.len(), src.len());
+    }
+
+    #[test]
+    fn a_group_that_cuts_a_statement_is_hidden_whole() {
+        let src = "void f ()
+{
+#ifdef A
+  if (!a)
+#endif
+    a = 1;
+#ifdef B
+  b ();
+#endif
+}
+";
+        let m = masked(src, &Transparent::default());
+        let kept: Vec<&str> = m.lines().filter(|l| l.starts_with('#')).collect();
+        assert_eq!(kept, ["#ifdef B", "#endif"], "{m}");
     }
 
     #[test]

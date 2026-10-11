@@ -79,6 +79,8 @@ enum Cmd {
     Serve { dir: PathBuf },
     /// Every symbol as `file<TAB>line<TAB>kind<TAB>decl|def<TAB>name` (for accuracy checks).
     Symbols { dir: PathBuf },
+    /// Every call edge, tab-separated (for accuracy checks).
+    Calls { dir: PathBuf },
 }
 
 fn ms(t: Instant) -> f64 {
@@ -406,6 +408,30 @@ fn symbols(dir: &Path) {
     }
 }
 
+/// Every call the index knows, one per line: call site file and line, then
+/// the calling and the called function as `name`, `file`, `line`, then
+/// `certain|ambiguous`, `decl|def` for the callee, and the macro the call
+/// was made through (or `-`).
+fn calls(dir: &Path) {
+    let g = Graph::load(&dir.join("graph.si")).expect("load graph.si");
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    for (id, s) in g.syms.iter().enumerate().filter(|(_, s)| s.kind == kind::FUNCTION) {
+        let decl = if s.flags & flag::DECL != 0 { "decl" } else { "def" };
+        for c in si_core::callers_through_macros(&g, id as u32) {
+            let from = &g.syms[c.caller as usize];
+            if from.kind != kind::FUNCTION {
+                continue;
+            }
+            let certain = if c.ambiguous { "ambiguous" } else { "certain" };
+            let via = c.via.map_or("-", |m| g.sym_name(m));
+            writeln!(out, "{}	{}	{}	{}	{}	{}	{}	{}	{certain}	{decl}	{via}",
+                     g.file_path(from.file), c.line, g.sym_name(c.caller), g.file_path(from.file), from.line,
+                     g.sym_name(id as u32), g.file_path(s.file), s.line)
+                .expect("write calls");
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     if cli.threads > 0 {
@@ -422,6 +448,7 @@ fn main() {
         Cmd::Sample { dir, n, seed } => sample(dir, *n, *seed),
         Cmd::Serve { dir } => return serve(dir),
         Cmd::Symbols { dir } => return symbols(dir),
+        Cmd::Calls { dir } => return calls(dir),
     };
     println!("{}", serde_json::to_string_pretty(&result).unwrap());
 }
