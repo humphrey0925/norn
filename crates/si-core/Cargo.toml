@@ -1,0 +1,15 @@
+[package]
+name = "si-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tree-sitter = "0.25"
+tree-sitter-c = "0.24"
+rayon = "1"
+rustc-hash = "2"
+bytemuck = { version = "1", features = ["derive"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+walkdir = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
