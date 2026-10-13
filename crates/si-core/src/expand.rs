@@ -742,9 +742,18 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str) -> Found {
             // A member the expansion names. One written at the use, operator
             // and all, the parser has seen.
             if t.origin != Origin::Site || p.origin != Origin::Site {
-                // `(*(p)->member) (args)`: closing parentheses, then the call.
-                let after = toks[i + 1..].iter().find(|x| !x.is(")"));
-                if after.is_some_and(|x| x.is("(")) {
+                // `(*(p)->member) (args)` or `(p->member[i]) (args)`:
+                // subscripts and closing parentheses, then the call.
+                let mut k = i + 1;
+                let mut depth = 0;
+                while let Some(x) = toks.get(k) {
+                    depth += x.is("[") as i32 - x.is("]") as i32;
+                    if depth == 0 && !x.is(")") && !x.is("]") {
+                        break;
+                    }
+                    k += 1;
+                }
+                if toks.get(k).is_some_and(|x| x.is("(")) {
                     found.refs.push((name(), refkind::ICALL));
                 } else if t.origin == Origin::Pasted {
                     found.refs.push((name(), refkind::MEMBER));
