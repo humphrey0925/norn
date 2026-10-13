@@ -301,6 +301,97 @@ impl Server {
         json!(out)
     }
 
+    /// `si/search`: fuzzy symbol search with scores, for the search view
+    /// (an editor filters `workspace/symbol` results again by its own rules).
+    fn search(&mut self, params: &Value) -> Value {
+        let limit = params["limit"].as_u64().unwrap_or(100) as usize;
+        let hits = si_core::search::search(self.g(), params["query"].as_str().unwrap_or(""), limit);
+        json!(hits.into_iter().map(|(score, s)| { let mut v = self.entry(s); v["score"] = json!(score); v }).collect::<Vec<_>>())
+    }
+
+    /// A symbol for the extension's own views.
+    fn entry(&mut self, sym: u32) -> Value {
+        let loc = self.sym_location(sym);
+        let g = self.g();
+        let s = &g.syms[sym as usize];
+        json!({ "name": g.sym_name(sym), "kind": kind::name(s.kind), "file": g.file_path(s.file), "line": s.line,
+                "endLine": s.end_line, "declaration": s.flags & flag::DECL != 0, "uri": loc["uri"], "range": loc["range"],
+                "data": { "file": g.file_path(s.file), "line": s.line, "name": g.sym_name(sym) } })
+    }
+
+    /// `si/context`: what the name under the cursor is defined as.
+    fn context(&mut self, params: &Value) -> Value {
+        let mut found = self.targets(params);
+        if found.iter().any(|&s| self.g().syms[s as usize].flags & flag::DECL == 0) {
+            found.retain(|&s| self.g().syms[s as usize].flags & flag::DECL == 0);
+        }
+        let all = found.len();
+        match found.first() {
+            Some(&s) => {
+                let mut v = self.entry(s);
+                v["candidates"] = json!(all);
+                v
+            }
+            None => Value::Null,
+        }
+    }
+
+    /// `si/relation`: the callers or callees of the function under the
+    /// cursor (or the function the cursor is in, or `item`), each saying how
+    /// the call comes about: by name, through a macro, through a member or
+    /// variable holding the function, through a pointer; certain or not.
+    fn relation(&mut self, params: &Value) -> Value {
+        let incoming = params["direction"].as_str() != Some("callees");
+        let root = if params["item"].is_object() {
+            self.item_symbol(&json!({ "data": params["item"] }))
+        } else {
+            let callable = |s: &Server, x: u32| matches!(s.g().syms[x as usize].kind, kind::FUNCTION | kind::MACRO);
+            let mut under: Vec<u32> = self.targets(params).into_iter().filter(|&x| callable(self, x)).collect();
+            under.sort_by_key(|&x| self.g().syms[x as usize].flags & flag::DECL != 0);
+            under.first().copied().or_else(|| {
+                // Not on a function's name: the function the cursor is in.
+                let file = self.relative(&uri_to_path(params["textDocument"]["uri"].as_str()?))?;
+                let line = params["position"]["line"].as_u64()? as u32 + 1;
+                let g = self.g();
+                let f = (0..g.files.len() as u32).find(|&f| g.file_path(f) == file)?;
+                g.symbol_at(f, line).filter(|&x| g.syms[x as usize].kind == kind::FUNCTION)
+            })
+        };
+        let Some(root) = root else { return json!({ "root": null, "entries": [] }) };
+        let g = self.g();
+        let edges = if incoming { si_core::callers_through_macros(g, root) } else { si_core::callees_through_slots(g, root) };
+        // (other end, macro, member or variable, pointer) -> (lines, certain)
+        let mut groups: Vec<((u32, Option<u32>, Option<u32>, bool), Vec<u32>, bool)> = Vec::new();
+        for c in edges {
+            if !matches!(g.syms[c.caller as usize].kind, kind::FUNCTION | kind::MACRO | kind::GLOBAL) {
+                continue;
+            }
+            let key = (c.caller, c.via.filter(|v| Some(*v) != c.slot), c.slot, c.pointer);
+            match groups.iter_mut().find(|x| x.0 == key) {
+                Some(x) => {
+                    x.1.push(c.line);
+                    x.2 &= !c.ambiguous;
+                }
+                None => groups.push((key, vec![c.line], !c.ambiguous)),
+            }
+        }
+        groups.truncate(LIMIT);
+        let mut entries = Vec::new();
+        for ((other, via, slot, pointer), mut lines, certain) in groups {
+            lines.sort_unstable();
+            lines.dedup();
+            let names = { let g = self.g(); (via.map(|m| g.sym_name(m).to_string()), slot.map(|m| g.sym_name(m).to_string())) };
+            let mut v = self.entry(other);
+            v["lines"] = json!(lines);
+            v["viaMacro"] = json!(names.0);
+            v["through"] = json!(names.1);
+            v["pointer"] = json!(pointer);
+            v["certain"] = json!(certain);
+            entries.push(v);
+        }
+        json!({ "root": self.entry(root), "entries": entries })
+    }
+
     fn update(&mut self, paths: Vec<PathBuf>) {
         if !paths.is_empty() {
             self.session.update(&paths);
@@ -317,6 +408,10 @@ impl Server {
             "textDocument/prepareCallHierarchy" => self.prepare_hierarchy(params),
             "callHierarchy/incomingCalls" => self.calls(params, true),
             "callHierarchy/outgoingCalls" => self.calls(params, false),
+            "si/search" => self.search(params),
+            "si/context" => self.context(params),
+            "si/relation" => self.relation(params),
+            "si/status" => json!({ "files": self.session.files(), "symbols": self.g().syms.len(), "edges": self.g().out.len() }),
             "shutdown" => Value::Null,
             _ => return None,
         })

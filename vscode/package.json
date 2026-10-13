@@ -1,0 +1,215 @@
+{
+  "name": "si-code-index",
+  "displayName": "SI Code Index",
+  "description": "Source-Insight-style symbol search, context and relation views for C, backed by the si index.",
+  "version": "0.1.0",
+  "publisher": "humphrey0925",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/humphrey0925/si.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:c",
+    "onLanguage:cpp",
+    "workspaceContains:**/*.c"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "si",
+          "title": "SI",
+          "icon": "media/si.svg"
+        }
+      ],
+      "panel": [
+        {
+          "id": "siPanel",
+          "title": "SI",
+          "icon": "media/si.svg"
+        }
+      ]
+    },
+    "views": {
+      "si": [
+        {
+          "type": "webview",
+          "id": "si.search",
+          "name": "專案符號"
+        },
+        {
+          "id": "si.fileSymbols",
+          "name": "本檔符號"
+        }
+      ],
+      "siPanel": [
+        {
+          "id": "si.relation",
+          "name": "Relation"
+        },
+        {
+          "type": "webview",
+          "id": "si.context",
+          "name": "Context"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "si.relation.callers",
+        "title": "SI: 顯示呼叫者",
+        "icon": "$(call-incoming)"
+      },
+      {
+        "command": "si.relation.callees",
+        "title": "SI: 顯示被呼叫者",
+        "icon": "$(call-outgoing)"
+      },
+      {
+        "command": "si.relation.references",
+        "title": "SI: 顯示參照",
+        "icon": "$(references)"
+      },
+      {
+        "command": "si.relation.lock",
+        "title": "SI: 鎖定 Relation（不跟隨游標）",
+        "icon": "$(unlock)"
+      },
+      {
+        "command": "si.relation.unlock",
+        "title": "SI: 解除鎖定 Relation",
+        "icon": "$(lock)"
+      },
+      {
+        "command": "si.context.lock",
+        "title": "SI: 鎖定 Context（不跟隨游標）",
+        "icon": "$(unlock)"
+      },
+      {
+        "command": "si.context.unlock",
+        "title": "SI: 解除鎖定 Context",
+        "icon": "$(lock)"
+      },
+      {
+        "command": "si.openToSide",
+        "title": "在旁邊開啟",
+        "icon": "$(split-horizontal)"
+      },
+      {
+        "command": "si.openDefinition",
+        "title": "跳到定義",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "si.restart",
+        "title": "SI: 重新建立索引"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "si.relation.callees",
+          "when": "view == si.relation",
+          "group": "navigation@1"
+        },
+        {
+          "command": "si.relation.callers",
+          "when": "view == si.relation",
+          "group": "navigation@2"
+        },
+        {
+          "command": "si.relation.references",
+          "when": "view == si.relation",
+          "group": "navigation@3"
+        },
+        {
+          "command": "si.relation.lock",
+          "when": "view == si.relation && !si.relationLocked",
+          "group": "navigation@4"
+        },
+        {
+          "command": "si.relation.unlock",
+          "when": "view == si.relation && si.relationLocked",
+          "group": "navigation@4"
+        },
+        {
+          "command": "si.context.lock",
+          "when": "view == si.context && !si.contextLocked",
+          "group": "navigation@1"
+        },
+        {
+          "command": "si.context.unlock",
+          "when": "view == si.context && si.contextLocked",
+          "group": "navigation@1"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "si.openToSide",
+          "when": "view == si.relation || view == si.fileSymbols",
+          "group": "inline@1"
+        },
+        {
+          "command": "si.openDefinition",
+          "when": "view == si.relation && viewItem == call",
+          "group": "inline@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "si.openToSide",
+          "when": "false"
+        },
+        {
+          "command": "si.openDefinition",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "SI",
+      "properties": {
+        "si.serverPath": {
+          "type": "string",
+          "default": "si",
+          "description": "si 執行檔的路徑（預設從 PATH 尋找）。"
+        },
+        "si.includeAliases": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "由樣板產生的標頭對應，格式 FROM=TO，例如 bfd.h=bfd-in2.h。"
+        },
+        "si.codeLens.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "在函式定義上方顯示呼叫者與被呼叫者數量。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --allow-missing-repository --skip-license -o ../out/si-code-index.vsix",
+    "test": "tsc -p ./ && node ./out/test/runTest.js"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0",
+    "@vscode/test-electron": "^2.4.0"
+  }
+}

@@ -117,6 +117,17 @@ def main():
         outgoing = c.request("callHierarchy/outgoingCalls", {"item": items[0]})
         assert any(x["to"]["name"] == "cache_bread_1" for x in outgoing), [x["to"]["name"] for x in outgoing]
 
+        # The extension's own requests.
+        at = c.at("bfd/bfdio.c", "bfd_read (void *ptr")
+        rel = c.request("si/relation", {**at, "direction": "callees"})
+        through = {e["name"]: e["through"] for e in rel["entries"]}
+        assert rel["root"]["name"] == "bfd_read" and through.get("cache_bread") == "bread", through
+        ctx = c.request("si/context", c.at("bfd/bfdio.c", "bread (abfd, ptr"))
+        assert ctx["name"] == "bread" and ctx["kind"] == "field", ctx
+        hits = c.request("si/search", {"query": "init cache"})
+        assert hits[0]["score"] >= hits[-1]["score"] and any(h["name"] == "bfd_cache_init" for h in hits), hits[:3]
+        print("si/relation, si/context, si/search answer as the views expect")
+
         # Save an edit: a new function calling an existing one.
         path = work / "bfd/cache.c"
         path.write_bytes(path.read_bytes() + b"\nint si_probe (void) { return bfd_cache_init (0); }\n")

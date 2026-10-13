@@ -1,0 +1,89 @@
+// What the extension has to do inside the editor, checked there.
+import * as assert from "assert";
+import * as path from "path";
+import * as vscode from "vscode";
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function until<T>(what: string, f: () => Promise<T | undefined | false>): Promise<T> {
+  for (let i = 0; i < 100; i++) {
+    const v = await f();
+    if (v) {
+      return v;
+    }
+    await sleep(200);
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
+function find(doc: vscode.TextDocument, needle: string): vscode.Position {
+  const i = doc.getText().indexOf(needle);
+  assert.ok(i >= 0, needle);
+  return doc.positionAt(i + 1);
+}
+
+export async function run(): Promise<void> {
+  const folder = vscode.workspace.workspaceFolders![0].uri.fsPath;
+  const doc = await vscode.workspace.openTextDocument(path.join(folder, "bfd", "bfdio.c"));
+  const editor = await vscode.window.showTextDocument(doc);
+  const ext = vscode.extensions.all.find((e) => e.packageJSON.name === "si-code-index")!;
+  await ext.activate();
+
+  // The server is up and has indexed the folder.
+  const symbols = await until("workspace symbols", async () => {
+    const s = await vscode.commands.executeCommand<vscode.SymbolInformation[]>("vscode.executeWorkspaceSymbolProvider", "bfd_cache_init");
+    return s?.length ? s : undefined;
+  });
+  assert.ok(symbols.some((s) => s.name === "bfd_cache_init"));
+
+  // Go to definition across files.
+  const call = find(doc, "bfd_set_error (bfd_error_invalid_operation)");
+  const defs = await vscode.commands.executeCommand<vscode.Location[]>("vscode.executeDefinitionProvider", doc.uri, call);
+  assert.ok(defs.length >= 1 && defs[0].uri.fsPath.endsWith("bfd-in2.h"), JSON.stringify(defs));
+
+  // Call hierarchy through a function pointer: bfd_read calls iovec->bread.
+  const read = find(doc, "bfd_read (void *ptr");
+  const items = await vscode.commands.executeCommand<vscode.CallHierarchyItem[]>("vscode.prepareCallHierarchy", doc.uri, read);
+  assert.strictEqual(items[0].name, "bfd_read");
+  const out = await vscode.commands.executeCommand<vscode.CallHierarchyOutgoingCall[]>("vscode.provideOutgoingCalls", items[0]);
+  const names = out.map((c) => c.to.name);
+  assert.ok(names.includes("cache_bread"), names.join(","));
+
+  // CodeLens over function definitions, with resolved counts.
+  const lenses = await vscode.commands.executeCommand<vscode.CodeLens[]>("vscode.executeCodeLensProvider", doc.uri, 400);
+  const resolved = lenses.filter((l) => l.command);
+  assert.ok(resolved.length > 5, `only ${resolved.length} of ${lenses.length} lenses resolved`);
+  assert.ok(resolved.some((l) => /呼叫者/.test(l.command!.title)));
+  assert.ok(resolved.some((l) => /經函式指標/.test(l.command!.title)), resolved.map((l) => l.command!.title).slice(0, 8).join(" | "));
+
+  // The views and their commands exist and run.
+  editor.selection = new vscode.Selection(read, read);
+  for (const view of ["si.relation.focus", "si.context.focus", "si.search.focus", "si.fileSymbols.focus"]) {
+    await vscode.commands.executeCommand(view);
+  }
+  for (const command of ["si.relation.callers", "si.relation.references", "si.relation.callees", "si.relation.lock", "si.relation.unlock", "si.context.lock", "si.context.unlock"]) {
+    await vscode.commands.executeCommand(command);
+  }
+
+  // Split: a result opened "beside" lands in another group, and one opened
+  // normally stays in the group of the editor the views follow.
+  await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
+  const target = { uri: vscode.Uri.file(path.join(folder, "bfd", "cache.c")).toString(), line: 373, character: 0 };
+  await vscode.commands.executeCommand("si.open", target, true);
+  assert.strictEqual(vscode.window.activeTextEditor!.viewColumn, vscode.ViewColumn.Two);
+  assert.ok(vscode.window.activeTextEditor!.document.fileName.endsWith("cache.c"));
+  assert.strictEqual(vscode.window.activeTextEditor!.selection.active.line, 373);
+  await sleep(400); // the views now follow the editor in group two
+  await vscode.commands.executeCommand("si.open", { uri: doc.uri.toString(), line: 10, character: 0 }, false);
+  assert.strictEqual(vscode.window.activeTextEditor!.viewColumn, vscode.ViewColumn.Two, "opens where the focus was");
+
+  // Saving an edit re-indexes it.
+  const edit = new vscode.WorkspaceEdit();
+  edit.insert(doc.uri, new vscode.Position(doc.lineCount, 0), "\nint si_probe (void) { return 0; }\n");
+  await vscode.workspace.applyEdit(edit);
+  await doc.save();
+  await until("the saved function", async () => {
+    const s = await vscode.commands.executeCommand<vscode.SymbolInformation[]>("vscode.executeWorkspaceSymbolProvider", "si_probe");
+    return s?.some((x) => x.name === "si_probe");
+  });
+}

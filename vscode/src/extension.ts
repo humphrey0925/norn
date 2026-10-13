@@ -1,0 +1,564 @@
+// SI for VS Code: fuzzy project symbol search, file symbols, a Context view
+// that follows the cursor and a Relation view of callers and callees. All of
+// it asks the `si lsp` server; nothing is indexed here.
+//
+// With the editor split, the views follow the editor that last had focus,
+// results open in that editor's group (or beside it, on request), and each
+// view can be locked so it stops following.
+
+import * as path from "path";
+import * as vscode from "vscode";
+import { LanguageClient, LanguageClientOptions, ServerOptions } from "vscode-languageclient/node";
+
+/** A symbol as the server's `si/*` requests describe it. */
+interface Entry {
+  name: string;
+  kind: string;
+  file: string;
+  line: number;
+  endLine: number;
+  declaration: boolean;
+  uri: string;
+  range: { start: { line: number; character: number }; end: { line: number; character: number } };
+  data: { file: string; line: number; name: string };
+  score?: number;
+  candidates?: number;
+  // `si/relation` only:
+  lines?: number[];
+  viaMacro?: string | null;
+  through?: string | null;
+  pointer?: boolean;
+  certain?: boolean;
+}
+
+type Mode = "callees" | "callers" | "references";
+
+let client: LanguageClient | undefined;
+/** The text editor that last had focus: what the views are about. */
+let current: vscode.TextEditor | undefined;
+
+const ICONS: Record<string, string> = {
+  function: "symbol-function", macro: "symbol-constant", struct: "symbol-struct", union: "symbol-struct",
+  enum: "symbol-enum", enum_const: "symbol-enum-member", typedef: "symbol-class", global: "symbol-variable",
+  field: "symbol-field", file: "symbol-file",
+};
+const KIND_NAMES: Record<string, string> = {
+  function: "函式", macro: "巨集", struct: "結構", union: "聯合", enum: "列舉", enum_const: "列舉常數",
+  typedef: "型別別名", global: "全域變數", field: "結構成員",
+};
+
+function isSource(doc: vscode.TextDocument): boolean {
+  return doc.uri.scheme === "file" && /\.[ch]$/i.test(doc.fileName);
+}
+
+function positionParams(editor: vscode.TextEditor) {
+  const p = editor.selection.active;
+  return { textDocument: { uri: editor.document.uri.toString() }, position: { line: p.line, character: p.character } };
+}
+
+async function ask<T>(method: string, params: unknown): Promise<T | undefined> {
+  if (!client || !client.isRunning()) {
+    return undefined;
+  }
+  try {
+    return await client.sendRequest<T>(method, params);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Show a place: in the group of the editor the views follow, or beside it. */
+async function open(uri: string, line: number, character = 0, beside = false) {
+  const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(uri));
+  const at = new vscode.Position(Math.max(0, line), character);
+  const viewColumn = beside ? vscode.ViewColumn.Beside : current?.viewColumn ?? vscode.ViewColumn.Active;
+  await vscode.window.showTextDocument(doc, { viewColumn, selection: new vscode.Range(at, at), preview: true });
+}
+
+// ---------------------------------------------------------------- Relation
+
+class Node {
+  constructor(
+    readonly label: string,
+    readonly entry?: Entry,
+    /** Where a click goes: the call site when there is one. */
+    readonly target?: { uri: string; line: number; character: number },
+    readonly children?: Node[],
+    readonly detail?: string,
+  ) {}
+}
+
+class Relation implements vscode.TreeDataProvider<Node> {
+  private readonly changed = new vscode.EventEmitter<Node | undefined>();
+  readonly onDidChangeTreeData = this.changed.event;
+  mode: Mode = "callees";
+  locked = false;
+  private roots: Node[] = [];
+  private at: ReturnType<typeof positionParams> | undefined;
+  message = "";
+
+  setMode(mode: Mode) {
+    this.mode = mode;
+    void this.load(this.at);
+  }
+
+  /** Follow the cursor, unless locked. */
+  follow(editor: vscode.TextEditor) {
+    if (!this.locked) {
+      void this.load(positionParams(editor));
+    }
+  }
+
+  private async load(at: ReturnType<typeof positionParams> | undefined) {
+    this.at = at;
+    this.roots = [];
+    this.message = "";
+    if (at && this.mode === "references") {
+      this.roots = await this.references(at);
+    } else if (at) {
+      const r = await ask<{ root: Entry | null; entries: Entry[] }>("si/relation", { ...at, direction: this.mode });
+      if (r?.root) {
+        const root = new Node(r.root.name, r.root, { uri: r.root.uri, line: r.root.range.start.line, character: r.root.range.start.character });
+        this.roots = [root];
+        this.message = `${r.root.name} 的${this.mode === "callers" ? "呼叫者" : "被呼叫者"}：${r.entries.length}`;
+      } else {
+        this.message = "游標不在函式上";
+      }
+    }
+    this.changed.fire(undefined);
+  }
+
+  private async references(at: ReturnType<typeof positionParams>): Promise<Node[]> {
+    const uri = vscode.Uri.parse(at.textDocument.uri);
+    const pos = new vscode.Position(at.position.line, at.position.character);
+    const found = (await vscode.commands.executeCommand<vscode.Location[]>("vscode.executeReferenceProvider", uri, pos)) ?? [];
+    const byFile = new Map<string, vscode.Location[]>();
+    for (const loc of found) {
+      const k = loc.uri.toString();
+      byFile.set(k, [...(byFile.get(k) ?? []), loc]);
+    }
+    this.message = `參照：${found.length} 處，${byFile.size} 個檔案`;
+    const nodes: Node[] = [];
+    for (const [file, locs] of byFile) {
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(file));
+      const kids = locs.map((l) => {
+        const text = l.range.start.line < doc.lineCount ? doc.lineAt(l.range.start.line).text.trim() : "";
+        return new Node(text, undefined, { uri: file, line: l.range.start.line, character: l.range.start.character }, undefined, String(l.range.start.line + 1));
+      });
+      nodes.push(new Node(vscode.workspace.asRelativePath(doc.uri), undefined, undefined, kids, `${locs.length} 處`));
+    }
+    return nodes;
+  }
+
+  getTreeItem(node: Node): vscode.TreeItem {
+    const e = node.entry;
+    const expandable = node.children ? true : !!e && this.mode !== "references";
+    const item = new vscode.TreeItem(
+      node.label,
+      expandable ? (this.roots.includes(node) || node.children ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed) : vscode.TreeItemCollapsibleState.None,
+    );
+    if (e) {
+      // How the call comes about, then where the function is.
+      const how = [
+        e.through ? `經 ${e.through}（函式指標）` : "",
+        e.pointer ? "經指標變數" : "",
+        e.viaMacro ? `經巨集 ${e.viaMacro}` : "",
+        e.certain === false ? "不確定" : "",
+      ].filter(Boolean);
+      item.description = [...how, `${e.file}:${e.line}`].join(" · ");
+      item.iconPath = new vscode.ThemeIcon(e.through || e.pointer ? "symbol-event" : ICONS[e.kind] ?? "symbol-misc");
+      item.tooltip = `${KIND_NAMES[e.kind] ?? e.kind} ${e.name}\n${e.file}:${e.line}` + (e.lines?.length ? `\n呼叫於第 ${e.lines.join("、")} 行` : "");
+      item.contextValue = "call";
+    } else {
+      item.description = node.detail;
+    }
+    if (node.target) {
+      item.command = { command: "si.open", title: "開啟", arguments: [node.target, false] };
+    }
+    return item;
+  }
+
+  async getChildren(node?: Node): Promise<Node[]> {
+    if (!node) {
+      return this.roots;
+    }
+    if (node.children) {
+      return node.children;
+    }
+    if (!node.entry || this.mode === "references") {
+      return [];
+    }
+    const parent = node.entry;
+    const r = await ask<{ root: Entry | null; entries: Entry[] }>("si/relation", { item: parent.data, direction: this.mode });
+    return (r?.entries ?? []).map((e) => {
+      // A caller's call is in the caller's file; a callee's is in ours.
+      const line = (e.lines?.[0] ?? e.line) - 1;
+      const target = this.mode === "callers" ? { uri: e.uri, line, character: 0 } : { uri: parent.uri, line, character: 0 };
+      return new Node(e.name, e, target);
+    });
+  }
+}
+
+// ---------------------------------------------------------------- File symbols
+
+class FileSymbols implements vscode.TreeDataProvider<Node> {
+  private readonly changed = new vscode.EventEmitter<Node | undefined>();
+  readonly onDidChangeTreeData = this.changed.event;
+  private groups: Node[] = [];
+  private shown = "";
+
+  async show(editor: vscode.TextEditor) {
+    const uri = editor.document.uri.toString();
+    if (uri === this.shown) {
+      return;
+    }
+    this.shown = uri;
+    const symbols = (await ask<{ name: string; kind: number; location: { range: Entry["range"] } }[]>("textDocument/documentSymbol", { textDocument: { uri } })) ?? [];
+    const order: [number, string, string][] = [
+      [14, "巨集", "symbol-constant"], [12, "函式", "symbol-function"], [23, "結構", "symbol-struct"], [10, "列舉", "symbol-enum"],
+      [22, "列舉常數", "symbol-enum-member"], [5, "型別別名", "symbol-class"], [13, "全域變數", "symbol-variable"], [8, "結構成員", "symbol-field"],
+    ];
+    this.groups = [];
+    for (const [kind, title] of order) {
+      const kids = symbols
+        .filter((s) => s.kind === kind)
+        .map((s) => new Node(s.name, undefined, { uri, line: s.location.range.start.line, character: s.location.range.start.character }, undefined, String(s.location.range.start.line + 1)));
+      if (kids.length) {
+        this.groups.push(new Node(title, undefined, undefined, kids, String(kids.length)));
+      }
+    }
+    this.changed.fire(undefined);
+  }
+
+  refresh() {
+    this.shown = "";
+    if (current) {
+      void this.show(current);
+    }
+  }
+
+  getTreeItem(node: Node): vscode.TreeItem {
+    const item = new vscode.TreeItem(node.label, node.children ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
+    item.description = node.detail;
+    if (node.target) {
+      item.command = { command: "si.open", title: "開啟", arguments: [node.target, false] };
+    }
+    return item;
+  }
+
+  getChildren(node?: Node): Node[] {
+    return node ? node.children ?? [] : this.groups;
+  }
+}
+
+// ---------------------------------------------------------------- webviews
+
+const STYLE = `
+  body { padding: 0; color: var(--vscode-foreground); font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); }
+  input { width: 100%; box-sizing: border-box; margin: 6px 0; padding: 4px 6px; color: var(--vscode-input-foreground);
+          background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, transparent); outline-offset: -1px; }
+  input:focus { outline: 1px solid var(--vscode-focusBorder); }
+  .wrap { padding: 0 8px; }
+  .row { display: flex; gap: 8px; padding: 2px 8px; cursor: pointer; white-space: nowrap; align-items: baseline; }
+  .row:hover, .row:focus { background: var(--vscode-list-hoverBackground); outline: none; }
+  .name { font-family: var(--vscode-editor-font-family); overflow: hidden; text-overflow: ellipsis; }
+  .name b { color: var(--vscode-list-highlightForeground); font-weight: 600; }
+  .dim { color: var(--vscode-descriptionForeground); font-size: 0.9em; margin-left: auto; overflow: hidden; text-overflow: ellipsis; }
+  .kind { color: var(--vscode-descriptionForeground); font-size: 0.85em; flex: none; width: 4.5em; }
+  .head { padding: 4px 8px; border-bottom: 1px solid var(--vscode-panel-border); cursor: pointer; display: flex; gap: 10px; flex-wrap: wrap; }
+  .head strong { font-family: var(--vscode-editor-font-family); }
+  pre { margin: 0; padding: 4px 0; font-family: var(--vscode-editor-font-family); font-size: var(--vscode-editor-font-size); line-height: 1.5; }
+  pre div { padding: 0 8px; white-space: pre; }
+  pre span.n { display: inline-block; width: 4.5em; padding-right: 1em; text-align: right; color: var(--vscode-editorLineNumber-foreground); }
+  pre div.at { background: var(--vscode-editor-lineHighlightBackground, var(--vscode-list-hoverBackground)); }
+  .empty { padding: 8px; color: var(--vscode-descriptionForeground); }
+`;
+
+function page(body: string, script: string): string {
+  const nonce = Math.random().toString(36).slice(2);
+  return `<!doctype html><html><head><meta charset="utf-8">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+    <style>${STYLE}</style></head><body>${body}<script nonce="${nonce}">const vscode = acquireVsCodeApi();${script}</script></body></html>`;
+}
+
+/** Fuzzy project symbol search: fragments in any order, initials. */
+class Search implements vscode.WebviewViewProvider {
+  resolveWebviewView(view: vscode.WebviewView) {
+    view.webview.options = { enableScripts: true };
+    view.webview.html = page(
+      `<div class="wrap"><input id="q" placeholder="片段或縮寫，例如 init cache、bci" spellcheck="false"></div><div id="list"></div>`,
+      `
+      const q = document.getElementById("q"), list = document.getElementById("list");
+      let timer, results = [];
+      const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+      // Mark what matched: each word as a substring, else its letters in order.
+      function mark(name, words) {
+        const on = new Array(name.length).fill(false), lower = name.toLowerCase();
+        for (const w of words) {
+          const i = lower.indexOf(w);
+          if (i >= 0) { for (let k = 0; k < w.length; k++) on[i + k] = true; continue; }
+          let k = 0;
+          for (let j = 0; j < lower.length && k < w.length; j++) if (lower[j] === w[k]) { on[j] = true; k++; }
+        }
+        let out = "";
+        for (let i = 0; i < name.length; i++) out += on[i] ? "<b>" + esc(name[i]) + "</b>" : esc(name[i]);
+        return out;
+      }
+      q.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(() => vscode.postMessage({ query: q.value }), 60); });
+      q.addEventListener("keydown", (e) => { if (e.key === "Enter" && results[0]) vscode.postMessage({ open: results[0], beside: e.ctrlKey || e.metaKey }); });
+      list.addEventListener("click", (e) => {
+        const row = e.target.closest(".row");
+        if (row) vscode.postMessage({ open: results[+row.dataset.i], beside: e.ctrlKey || e.metaKey });
+      });
+      window.addEventListener("message", (e) => {
+        results = e.data.results;
+        const words = e.data.query.toLowerCase().split(/\\s+/).filter(Boolean);
+        list.innerHTML = results.length
+          ? results.map((r, i) => '<div class="row" tabindex="0" data-i="' + i + '"><span class="kind">' + esc(r.kindName) + '</span><span class="name">' + mark(r.name, words) + '</span><span class="dim">' + esc(r.file) + ":" + r.line + "</span></div>").join("")
+          : (words.length ? '<div class="empty">沒有符合的符號</div>' : "");
+      });
+      q.focus();`,
+    );
+    view.webview.onDidReceiveMessage(async (m: { query?: string; open?: Entry; beside?: boolean }) => {
+      if (m.open) {
+        await open(m.open.uri, m.open.range.start.line, m.open.range.start.character, !!m.beside);
+      } else if (m.query !== undefined) {
+        const query = m.query;
+        const found = query.trim() ? (await ask<Entry[]>("si/search", { query, limit: 100 })) ?? [] : [];
+        void view.webview.postMessage({ query, results: found.map((e) => ({ ...e, kindName: KIND_NAMES[e.kind] ?? e.kind })) });
+      }
+    });
+  }
+}
+
+/** The definition of whatever the cursor is on, without going there. */
+class Context implements vscode.WebviewViewProvider {
+  private view: vscode.WebviewView | undefined;
+  locked = false;
+  private last = "";
+
+  resolveWebviewView(view: vscode.WebviewView) {
+    this.view = view;
+    view.webview.options = { enableScripts: true };
+    view.webview.html = page(
+      `<div id="root"><div class="empty">把游標停在一個名稱上，這裡會顯示它的定義。</div></div>`,
+      `
+      const root = document.getElementById("root");
+      let shown;
+      const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+      root.addEventListener("click", (e) => { if (shown) vscode.postMessage({ open: shown, beside: e.ctrlKey || e.metaKey }); });
+      window.addEventListener("message", (e) => {
+        const d = e.data;
+        shown = d.entry;
+        if (!d.entry) { root.innerHTML = '<div class="empty">' + esc(d.message) + "</div>"; return; }
+        const more = d.entry.candidates > 1 ? '<span class="dim">共 ' + d.entry.candidates + " 個候選</span>" : "";
+        root.innerHTML = '<div class="head"><strong>' + esc(d.entry.name) + "</strong><span>" + esc(d.kindName) + "</span><span>" + esc(d.entry.file) + ":" + d.entry.line + "</span>" + more + "</div><pre>"
+          + d.lines.map((t, i) => '<div class="' + (d.first + i === d.entry.line ? "at" : "") + '"><span class="n">' + (d.first + i) + "</span>" + esc(t) + "</div>").join("") + "</pre>";
+      });`,
+    );
+    view.webview.onDidReceiveMessage(async (m: { open: Entry; beside?: boolean }) => {
+      await open(m.open.uri, m.open.range.start.line, m.open.range.start.character, !!m.beside);
+    });
+    if (current) {
+      void this.follow(current);
+    }
+  }
+
+  async follow(editor: vscode.TextEditor) {
+    if (this.locked || !this.view?.visible) {
+      return;
+    }
+    const at = positionParams(editor);
+    const key = JSON.stringify(at);
+    if (key === this.last) {
+      return;
+    }
+    this.last = key;
+    const entry = await ask<Entry | null>("si/context", at);
+    if (key !== this.last) {
+      return; // the cursor has moved on
+    }
+    if (!entry) {
+      void this.view.webview.postMessage({ entry: null, message: "這裡沒有索引認得的名稱。" });
+      return;
+    }
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(entry.uri));
+    const first = Math.max(1, entry.line - 2);
+    const last = Math.min(doc.lineCount, Math.max(entry.endLine, entry.line) + 1, first + 40);
+    const lines: string[] = [];
+    for (let l = first; l <= last; l++) {
+      lines.push(doc.lineAt(l - 1).text);
+    }
+    void this.view.webview.postMessage({ entry, kindName: KIND_NAMES[entry.kind] ?? entry.kind, first, lines });
+  }
+}
+
+// ---------------------------------------------------------------- CodeLens
+
+class Lenses implements vscode.CodeLensProvider {
+  private readonly changed = new vscode.EventEmitter<void>();
+  readonly onDidChangeCodeLenses = this.changed.event;
+
+  refresh() {
+    this.changed.fire();
+  }
+
+  async provideCodeLenses(doc: vscode.TextDocument): Promise<vscode.CodeLens[]> {
+    if (!vscode.workspace.getConfiguration("si").get<boolean>("codeLens.enabled", true) || !isSource(doc)) {
+      return [];
+    }
+    const symbols = (await ask<{ name: string; kind: number; location: { range: Entry["range"] } }[]>("textDocument/documentSymbol", { textDocument: { uri: doc.uri.toString() } })) ?? [];
+    // Definitions only: a function symbol whose line opens a body further down.
+    return symbols
+      .filter((s) => s.kind === 12)
+      .map((s) => {
+        const r = s.location.range;
+        const lens = new vscode.CodeLens(new vscode.Range(r.start.line, r.start.character, r.end.line, r.end.character));
+        (lens as vscode.CodeLens & { si: unknown }).si = { textDocument: { uri: doc.uri.toString() }, position: r.start };
+        return lens;
+      });
+  }
+
+  async resolveCodeLens(lens: vscode.CodeLens): Promise<vscode.CodeLens> {
+    const at = (lens as vscode.CodeLens & { si: ReturnType<typeof positionParams> }).si;
+    const [callers, callees] = await Promise.all([
+      ask<{ entries: Entry[] }>("si/relation", { ...at, direction: "callers" }),
+      ask<{ entries: Entry[] }>("si/relation", { ...at, direction: "callees" }),
+    ]);
+    const indirect = (callees?.entries ?? []).filter((e) => e.through || e.pointer).length;
+    const parts = [`${callers?.entries.length ?? 0} 個呼叫者`, `${callees?.entries.length ?? 0} 個被呼叫者`];
+    if (indirect) {
+      parts.push(`其中 ${indirect} 個經函式指標`);
+    }
+    lens.command = { title: parts.join(" · "), command: "si.showRelationAt", arguments: [at] };
+    return lens;
+  }
+}
+
+// ---------------------------------------------------------------- activation
+
+function serverCommand(): { command: string; args: string[] } {
+  const config = vscode.workspace.getConfiguration("si");
+  const aliases = config.get<string[]>("includeAliases", []);
+  return { command: config.get<string>("serverPath", "si"), args: ["lsp", ...aliases.flatMap((a) => ["--include-alias", a])] };
+}
+
+export async function activate(context: vscode.ExtensionContext) {
+  const relation = new Relation();
+  const fileSymbols = new FileSymbols();
+  const contextView = new Context();
+  const lenses = new Lenses();
+  const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 10);
+  status.text = "$(sync~spin) SI 建立索引中";
+  status.show();
+
+  const relationTree = vscode.window.createTreeView("si.relation", { treeDataProvider: relation, showCollapseAll: true });
+  relation.onDidChangeTreeData(() => (relationTree.message = relation.message || undefined));
+  const selector: vscode.DocumentSelector = [{ scheme: "file", pattern: "**/*.{c,h}" }];
+
+  async function refreshStatus() {
+    const s = await ask<{ files: number; symbols: number }>("si/status", {});
+    status.text = s ? `$(symbol-namespace) SI ${s.files.toLocaleString()} 檔 · ${s.symbols.toLocaleString()} 符號` : "$(warning) SI 未啟動";
+  }
+
+  let timer: NodeJS.Timeout | undefined;
+  function follow(editor: vscode.TextEditor | undefined, now = false) {
+    // Only a C source editor changes what the views are about: clicking into
+    // a terminal or a settings page leaves them as they are.
+    if (!editor || !isSource(editor.document)) {
+      return;
+    }
+    current = editor;
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      void fileSymbols.show(editor);
+      void contextView.follow(editor);
+      relation.follow(editor);
+    }, now ? 0 : 150);
+  }
+
+  async function start() {
+    const { command, args } = serverCommand();
+    const serverOptions: ServerOptions = { command, args, options: { cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath } };
+    const clientOptions: LanguageClientOptions = {
+      documentSelector: selector as LanguageClientOptions["documentSelector"],
+      synchronize: { fileEvents: vscode.workspace.createFileSystemWatcher("**/*.{c,h}") },
+    };
+    client = new LanguageClient("si", "SI", serverOptions, clientOptions);
+    try {
+      await client.start();
+    } catch (e) {
+      status.text = "$(warning) SI 未啟動";
+      void vscode.window.showErrorMessage(`無法啟動 si（${command}）。請在設定 si.serverPath 指定 si 執行檔的路徑。${e instanceof Error ? e.message : ""}`);
+      return;
+    }
+    await refreshStatus();
+    follow(vscode.window.activeTextEditor, true);
+  }
+
+  const lock = (key: string, view: { locked: boolean }, on: boolean) => {
+    view.locked = on;
+    void vscode.commands.executeCommand("setContext", key, on);
+    if (!on) {
+      follow(current, true);
+    }
+  };
+
+  context.subscriptions.push(
+    status,
+    relationTree,
+    vscode.window.registerTreeDataProvider("si.fileSymbols", fileSymbols),
+    vscode.window.registerWebviewViewProvider("si.search", new Search(), { webviewOptions: { retainContextWhenHidden: true } }),
+    vscode.window.registerWebviewViewProvider("si.context", contextView),
+    vscode.languages.registerCodeLensProvider(selector, lenses),
+    vscode.window.onDidChangeActiveTextEditor((e) => follow(e, true)),
+    vscode.window.onDidChangeTextEditorSelection((e) => {
+      // The same file may be open in two groups; only the focused one counts.
+      if (e.textEditor === vscode.window.activeTextEditor) {
+        follow(e.textEditor);
+      }
+    }),
+    vscode.workspace.onDidSaveTextDocument(async (doc) => {
+      if (isSource(doc)) {
+        // The server re-indexes on the save notification; ask after it has.
+        await refreshStatus();
+        fileSymbols.refresh();
+        lenses.refresh();
+      }
+    }),
+    vscode.commands.registerCommand("si.open", (t: { uri: string; line: number; character: number }, beside: boolean) => open(t.uri, t.line, t.character, beside)),
+    vscode.commands.registerCommand("si.openToSide", (n: Node) => n?.target && open(n.target.uri, n.target.line, n.target.character, true)),
+    vscode.commands.registerCommand("si.openDefinition", (n: Node) => n?.entry && open(n.entry.uri, n.entry.range.start.line, n.entry.range.start.character, false)),
+    vscode.commands.registerCommand("si.relation.callers", () => relation.setMode("callers")),
+    vscode.commands.registerCommand("si.relation.callees", () => relation.setMode("callees")),
+    vscode.commands.registerCommand("si.relation.references", () => relation.setMode("references")),
+    vscode.commands.registerCommand("si.relation.lock", () => lock("si.relationLocked", relation, true)),
+    vscode.commands.registerCommand("si.relation.unlock", () => lock("si.relationLocked", relation, false)),
+    vscode.commands.registerCommand("si.context.lock", () => lock("si.contextLocked", contextView, true)),
+    vscode.commands.registerCommand("si.context.unlock", () => lock("si.contextLocked", contextView, false)),
+    vscode.commands.registerCommand("si.showRelationAt", async (at: ReturnType<typeof positionParams>) => {
+      await vscode.commands.executeCommand("si.relation.focus");
+      const uri = vscode.Uri.parse(at.textDocument.uri);
+      const editor = vscode.window.visibleTextEditors.find((e) => e.document.uri.toString() === uri.toString());
+      if (editor) {
+        const p = new vscode.Position(at.position.line, at.position.character);
+        editor.selection = new vscode.Selection(p, p);
+        relation.locked = false;
+        void vscode.commands.executeCommand("setContext", "si.relationLocked", false);
+        follow(editor, true);
+      }
+    }),
+    vscode.commands.registerCommand("si.restart", async () => {
+      status.text = "$(sync~spin) SI 建立索引中";
+      await client?.stop();
+      await start();
+    }),
+    { dispose: () => void client?.stop() },
+  );
+  void path;
+  await start();
+}
+
+export async function deactivate() {
+  await client?.stop();
+}
