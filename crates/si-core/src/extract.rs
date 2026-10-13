@@ -2,7 +2,8 @@
 
 use crate::mask::{self, Event, Tok, MacroSets};
 use crate::model::{
-    flag, kind, refkind, site, ArgPass, Bind, Def, FileFacts, InitSite, MacroBody, ParamCall, Record, Ref, Site, NONE,
+    flag, kind, refkind, root, site, ArgPass, Bind, Def, FileFacts, InitSite, MacroBody, MemberHint, ParamCall, Record,
+    Ref, Site, NONE,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::num::NonZeroU16;
@@ -145,10 +146,17 @@ struct Walk<'a> {
     /// In the function being read: what each local variable is assigned
     /// that a call could go through (a member, or a name that is not
     /// local), and the calls made through locals.
-    local_sources: FxHashMap<&'a [u8], Vec<(bool, u32)>>,
+    local_sources: FxHashMap<&'a [u8], Vec<(bool, u32, u32)>>,
     local_calls: Vec<(&'a [u8], u32)>,
     /// The parameters of the function being read, by position.
     params: FxHashMap<&'a [u8], u32>,
+    /// The struct, union or typedef type of each local of that function.
+    local_types: FxHashMap<&'a [u8], u32>,
+    /// Hints worked out at a member access, for the reference its member
+    /// name is about to become (by the name's position).
+    pending_hints: FxHashMap<usize, u32>,
+    /// Struct bodies being read: (end, index in `out.records`).
+    open_records: Vec<(usize, usize)>,
 }
 
 impl Default for Extractor {
@@ -217,6 +225,9 @@ impl Extractor {
             local_sources: FxHashMap::default(),
             local_calls: Vec::new(),
             params: FxHashMap::default(),
+            local_types: FxHashMap::default(),
+            pending_hints: FxHashMap::default(),
+            open_records: Vec::new(),
         };
         w.site_starts = w.site_defs.keys().copied().collect();
         w.site_starts.sort_unstable();
@@ -287,13 +298,106 @@ impl<'a> Walk<'a> {
             if let Some(&index) = self.params.get(local) {
                 self.out.param_calls.push(ParamCall { scope, index, line });
             }
-            for &(member, name) in self.local_sources.get(local).into_iter().flatten() {
+            for &(member, name, hint) in self.local_sources.get(local).into_iter().flatten() {
                 let kind = if member { refkind::ICALL } else { refkind::PCALL };
                 self.out.refs.push(Ref { name, line, scope, kind });
+                if hint != NONE {
+                    self.out.ref_hints.push((self.out.refs.len() as u32 - 1, hint));
+                }
             }
         }
         self.local_sources.clear();
         self.params.clear();
+        self.local_types.clear();
+    }
+
+    /// The name of a declaration's type when it is a struct, a union or a
+    /// typedef: what a member access on the declared thing is looked up in.
+    fn type_name_of(&mut self, decl: Node<'a>) -> u32 {
+        match decl.child_by_field_id(self.ids.f_type) {
+            Some(t) => self.type_name(t),
+            None => NONE,
+        }
+    }
+
+    fn type_name(&mut self, t: Node<'a>) -> u32 {
+        let ids = self.ids;
+        let k = t.kind_id();
+        if k == ids.type_identifier {
+            self.intern(self.text(t))
+        } else if k == ids.struct_specifier || k == ids.union_specifier {
+            match t.child_by_field_id(ids.f_name) {
+                Some(n) => self.intern(self.text(n)),
+                None if t.child_by_field_id(ids.f_body).is_some() => self.unnamed(t),
+                None => NONE,
+            }
+        } else {
+            NONE
+        }
+    }
+
+    /// A name for a struct or union that has none, the same wherever it is
+    /// asked for: by where it is written.
+    fn unnamed(&mut self, t: Node<'a>) -> u32 {
+        let name = format!("@{}:{}", self.out.name(0), t.start_byte());
+        self.out.push_name(&name)
+    }
+
+    /// What `object` in `object.member` is: its root (a type, a variable or
+    /// a call) and the members followed from there, appended to `path`.
+    fn object_root(&mut self, mut n: Node<'a>, path: &mut Vec<u32>) -> Option<(u8, u32)> {
+        let ids = self.ids;
+        for _ in 0..32 {
+            let k = n.kind_id();
+            if k == ids.parenthesized_expression {
+                n = n.named_child(0)?;
+            } else if k == ids.pointer_expression || k == ids.subscript_expression {
+                n = n.child_by_field_id(ids.f_argument)?;
+            } else {
+                break;
+            }
+        }
+        let k = n.kind_id();
+        if k == ids.identifier {
+            let text = self.text(n);
+            if self.in_fn() && self.locals.contains(text) {
+                return self.local_types.get(text).map(|&t| (root::TYPE, t));
+            }
+            return Some((root::VAR, self.intern(text)));
+        }
+        if k == ids.field_expression {
+            let r = self.object_root(n.child_by_field_id(ids.f_argument)?, path)?;
+            let member = n.child_by_field_id(ids.f_field)?;
+            path.push(self.intern(self.text(member)));
+            return Some(r);
+        }
+        if k == ids.call_expression {
+            let f = n.child_by_field_id(ids.f_function).filter(|f| f.kind_id() == ids.identifier)?;
+            return Some((root::FUNC, self.intern(self.text(f))));
+        }
+        if k == ids.cast_expression {
+            let t = n.child_by_field_id(ids.f_type).and_then(|d| d.child_by_field_id(ids.f_type))?;
+            let name = self.type_name(t);
+            return (name != NONE).then_some((root::TYPE, name));
+        }
+        None
+    }
+
+    /// The hint for the member of a member access, or `NONE`.
+    fn member_hint(&mut self, access: Node<'a>) -> u32 {
+        let mut path = Vec::new();
+        let Some(object) = access.child_by_field_id(self.ids.f_argument) else { return NONE };
+        match self.object_root(object, &mut path) {
+            Some((root_kind, root)) => self.push_hint(root_kind, root, &path),
+            None => NONE,
+        }
+    }
+
+    fn push_hint(&mut self, root_kind: u8, root: u32, path: &[u32]) -> u32 {
+        let start = self.out.hint_path.len() as u32;
+        self.out.hint_path.extend_from_slice(path);
+        self.out.hints.push(MemberHint { root_kind, root, path: start, len: path.len() as u32 });
+        self.out.hints.len() as u32 - 1
     }
 
     /// The names of a function's own parameters, in order.
@@ -315,6 +419,10 @@ impl<'a> Walk<'a> {
         for (i, p) in params.into_iter().enumerate() {
             if let Some((name, _)) = p.child_by_field_id(ids.f_declarator.get()).and_then(|d| self.decl_name(d)) {
                 self.params.insert(self.text(name), i as u32);
+                let t = self.type_name_of(p);
+                if t != NONE {
+                    self.local_types.insert(self.text(name), t);
+                }
             }
         }
     }
@@ -326,12 +434,13 @@ impl<'a> Walk<'a> {
         if k == self.ids.field_expression {
             if let Some(member) = value.child_by_field_id(self.ids.f_field) {
                 let name = self.intern(self.text(member));
-                self.local_sources.entry(local).or_default().push((true, name));
+                let hint = self.member_hint(value);
+                self.local_sources.entry(local).or_default().push((true, name, hint));
             }
         } else if k == self.ids.identifier {
             if !self.locals.contains(self.text(value)) {
                 let name = self.intern(self.text(value));
-                self.local_sources.entry(local).or_default().push((false, name));
+                self.local_sources.entry(local).or_default().push((false, name, NONE));
             }
         } else if k == self.ids.conditional_expression {
             for f in [self.ids.f_consequence, self.ids.f_alternative] {
@@ -518,33 +627,56 @@ impl<'a> Walk<'a> {
         }
     }
 
-    fn bind(&mut self, value: Node<'a>, slot: u32, index: u32, var: bool, scope: u32) {
+    fn bind(&mut self, value: Node<'a>, slot: u32, index: u32, var: bool, scope: u32, hint: u32) {
         let mut fns = Vec::new();
         self.function_names(value, &mut fns);
         for f in fns {
             let func = self.intern(self.text(f));
-            self.out.binds.push(Bind { slot, index, func, line: f.start_position().row as u32 + 1, scope, var, unit: NONE });
+            let line = f.start_position().row as u32 + 1;
+            self.out.binds.push(Bind { slot, index, func, line, scope, var, unit: NONE, hint });
         }
     }
 
-    /// The name of the member a field declaration, member access or
-    /// designator is about.
-    fn member_names(&mut self, body: Node<'a>) -> Vec<u32> {
-        let mut fields = Vec::new();
+    /// The members of a struct body in order, each with its type's name
+    /// (see `type_name_of`). The members of an unnamed struct or union
+    /// member are members of this one.
+    fn member_names(&mut self, body: Node<'a>, names: &mut Vec<u32>, types: &mut Vec<u32>) {
+        let ids = self.ids;
         let mut c = body.walk();
-        for decl in body.named_children(&mut c).filter(|d| d.kind_id() == self.ids.field_declaration) {
+        let decls: Vec<Node<'a>> = body.named_children(&mut c).filter(|d| d.kind_id() == ids.field_declaration).collect();
+        for decl in decls {
             let ds = self.declarators(decl);
             if ds.is_empty() {
-                fields.push(NONE);
-            }
-            for d in ds {
-                match self.decl_name(d) {
-                    Some((name, _)) => fields.push(self.intern(self.text(name))),
-                    None => fields.push(NONE),
+                let inner = decl.child_by_field_id(ids.f_type).and_then(|t| t.child_by_field_id(ids.f_body));
+                match inner {
+                    Some(inner) => self.member_names(inner, names, types),
+                    None => {
+                        names.push(NONE);
+                        types.push(NONE);
+                    }
                 }
+                continue;
+            }
+            let t = self.type_name_of(decl);
+            for d in ds {
+                // A member that is a function pointer has no struct type,
+                // whatever its return type is.
+                let (name, t) = match self.decl_name(d) {
+                    Some((name, _)) => (self.intern(self.text(name)), if self.declares_function(d) { NONE } else { t }),
+                    None => (NONE, NONE),
+                };
+                names.push(name);
+                types.push(t);
             }
         }
-        fields
+    }
+
+    fn push_record(&mut self, name: u32, node: Node<'a>, body: Node<'a>) {
+        let (mut fields, mut types) = (Vec::new(), Vec::new());
+        self.member_names(body, &mut fields, &mut types);
+        let defs = vec![NONE; fields.len()];
+        self.open_records.push((node.end_byte(), self.out.records.len()));
+        self.out.records.push(Record { name, fields, types, defs });
     }
 
     /// A braced initializer of an object of struct type `type_name` (or of
@@ -568,22 +700,24 @@ impl<'a> Walk<'a> {
                 match field {
                     Some(f) => {
                         let slot = self.intern(self.text(f));
-                        self.bind(value, slot, NONE, false, scope);
+                        // The initialized object's type says whose member it is.
+                        let hint = if type_name == NONE { NONE } else { self.push_hint(root::TYPE, type_name, &[]) };
+                        self.bind(value, slot, NONE, false, scope, hint);
                     }
                     // `[i] = { ... }`: one element of the array.
                     None if value.kind_id() == ids.initializer_list => self.init_list(value, type_name, false, var, scope),
-                    None => self.bind(value, var, NONE, true, scope),
+                    None => self.bind(value, var, NONE, true, scope, NONE),
                 }
             } else if array {
                 if k == ids.initializer_list {
                     self.init_list(el, type_name, false, var, scope);
                 } else if var != NONE {
                     // An array of function pointers.
-                    self.bind(el, var, NONE, true, scope);
+                    self.bind(el, var, NONE, true, scope, NONE);
                 }
             } else if !el.is_extra() {
                 if type_name != NONE {
-                    self.bind(el, type_name, index, false, scope);
+                    self.bind(el, type_name, index, false, scope, NONE);
                 }
                 index += 1;
             }
@@ -615,7 +749,7 @@ impl<'a> Walk<'a> {
             };
             if value.kind_id() != ids.initializer_list {
                 if var != NONE {
-                    self.bind(value, var, NONE, true, scope);
+                    self.bind(value, var, NONE, true, scope, NONE);
                 }
                 continue;
             }
@@ -662,10 +796,24 @@ impl<'a> Walk<'a> {
             return false;
         }
         if k == ids.field_identifier {
+            let hint = self.pending_hints.remove(&node.start_byte());
             if !self.skip.remove(&node.start_byte()) {
                 self.push_ref(node, refkind::MEMBER);
+                if let Some(h) = hint.filter(|&h| h != NONE) {
+                    self.out.ref_hints.push((self.out.refs.len() as u32 - 1, h));
+                }
             }
             return false;
+        }
+        if k == ids.field_expression {
+            // Whose member it is, for when the walk reaches the name.
+            if let Some(member) = node.child_by_field_id(ids.f_field) {
+                if !self.skip.contains(&member.start_byte()) {
+                    let hint = self.member_hint(node);
+                    self.pending_hints.insert(member.start_byte(), hint);
+                }
+            }
+            return true;
         }
         if k == ids.call_expression {
             match node.child_by_field_id(ids.f_function) {
@@ -700,6 +848,10 @@ impl<'a> Walk<'a> {
                         if let Some(member) = target.child_by_field_id(ids.f_field) {
                             self.skip.insert(member.start_byte());
                             self.push_ref(member, refkind::ICALL);
+                            let hint = self.member_hint(target);
+                            if hint != NONE {
+                                self.out.ref_hints.push((self.out.refs.len() as u32 - 1, hint));
+                            }
                         }
                     } else if tk == ids.identifier && !(self.in_fn() && self.locals.contains(self.text(target))) {
                         // `(*hook) (...)` through a variable that is not local.
@@ -721,11 +873,12 @@ impl<'a> Walk<'a> {
                 if left.kind_id() == ids.field_expression {
                     if let Some(member) = left.child_by_field_id(ids.f_field) {
                         let slot = self.intern(self.text(member));
-                        self.bind(right, slot, NONE, false, scope);
+                        let hint = self.member_hint(left);
+                        self.bind(right, slot, NONE, false, scope, hint);
                     }
                 } else if left.kind_id() == ids.identifier && !(self.in_fn() && self.locals.contains(self.text(left))) {
                     let slot = self.intern(self.text(left));
-                    self.bind(right, slot, NONE, true, scope);
+                    self.bind(right, slot, NONE, true, scope, NONE);
                 } else if left.kind_id() == ids.identifier {
                     self.local_source(self.text(left), right);
                 }
@@ -734,15 +887,27 @@ impl<'a> Walk<'a> {
         }
         if k == ids.field_declaration {
             let typedef_name = node.child_by_field_id(ids.f_type).filter(|t| t.kind_id() == ids.type_identifier);
+            while self.open_records.last().is_some_and(|r| node.start_byte() >= r.0) {
+                self.open_records.pop();
+            }
             for d in self.declarators(node) {
                 if let Some((name, _)) = self.decl_name(d) {
-                    if self.declares_function(d) {
-                        self.push_def(name, node, kind::FIELD, flag::CALLABLE);
+                    let def = if self.declares_function(d) {
+                        self.push_def(name, node, kind::FIELD, flag::CALLABLE)
                     } else {
                         let def = self.push_def(name, node, kind::FIELD, 0);
                         if let Some(t) = typedef_name {
                             let t = self.intern(self.text(t));
                             self.out.field_types.push((def, t));
+                        }
+                        def
+                    };
+                    // Its place in the struct being read.
+                    if let Some(&(_, r)) = self.open_records.last() {
+                        let id = self.out.defs[def as usize].name;
+                        let record = &mut self.out.records[r];
+                        if let Some(at) = (0..record.fields.len()).find(|&i| record.fields[i] == id && record.defs[i] == NONE) {
+                            record.defs[at] = def;
                         }
                     }
                 }
@@ -761,6 +926,10 @@ impl<'a> Walk<'a> {
                 }
                 let flags = self.storage_flags(node);
                 let def = self.push_def(name, node, kind::FUNCTION, flags);
+                let returns = self.type_name_of(node);
+                if returns != NONE {
+                    self.out.typed.push((def, returns));
+                }
                 self.locals.clear();
                 if let Some(d) = node.child_by_field_id(ids.f_declarator.get()) {
                     self.note_params(d);
@@ -783,10 +952,16 @@ impl<'a> Walk<'a> {
         }
         if k == ids.declaration {
             if self.in_fn() {
+                let declared = self.type_name_of(node);
                 for d in self.declarators(node) {
                     if let Some((name, _)) = self.decl_name(d) {
                         self.skip.insert(name.start_byte());
                         self.locals.insert(self.text(name));
+                        if declared != NONE && !self.declares_function(d) {
+                            self.local_types.insert(self.text(name), declared);
+                        } else {
+                            self.local_types.remove(self.text(name));
+                        }
                         if let Some(value) = d.child_by_field_id(ids.f_value).filter(|_| d.kind_id() == ids.init_declarator) {
                             self.local_source(self.text(name), value);
                         }
@@ -795,12 +970,18 @@ impl<'a> Walk<'a> {
                 self.initializers(node, self.scope.map_or(0, |s| s.def));
             } else {
                 let storage = self.storage_flags(node);
+                let declared = self.type_name_of(node);
                 let mut first = None;
                 for d in self.declarators(node) {
                     if let Some((name, is_fn)) = self.decl_name(d) {
                         let (kind, flags) =
                             if is_fn { (kind::FUNCTION, storage | flag::DECL) } else { (kind::GLOBAL, storage) };
                         let def = self.push_def(name, node, kind, flags);
+                        // A function's return type, or a variable's own
+                        // (a pointer to a function has neither to offer).
+                        if declared != NONE && (is_fn || !self.declares_function(d)) {
+                            self.out.typed.push((def, declared));
+                        }
                         first.get_or_insert(def);
                     }
                 }
@@ -829,19 +1010,13 @@ impl<'a> Walk<'a> {
                 if let Some((name, _)) = self.decl_name(d) {
                     let callable = if self.declares_function(d) { flag::CALLABLE } else { 0 };
                     self.push_def(name, node, kind::TYPEDEF, callable);
-                    // `typedef struct tag name;` and `typedef struct { ... } name;`
-                    let Some(r) = record.filter(|_| d.kind_id() == ids.type_identifier) else { continue };
+                    // `typedef struct tag name;`, `typedef struct { ... } name;`
+                    // and pointers to them: the name stands for the struct.
+                    let Some(r) = record.filter(|_| !self.declares_function(d)) else { continue };
                     let alias = self.intern(self.text(name));
-                    match (r.child_by_field_id(ids.f_name), r.child_by_field_id(ids.f_body)) {
-                        (Some(tag), _) => {
-                            let tag = self.intern(self.text(tag));
-                            self.out.aliases.push((alias, tag));
-                        }
-                        (None, Some(body)) => {
-                            let fields = self.member_names(body);
-                            self.out.records.push(Record { name: alias, fields });
-                        }
-                        (None, None) => {}
+                    let tag = self.type_name(r);
+                    if tag != NONE {
+                        self.out.aliases.push((alias, tag));
                     }
                 }
             }
@@ -860,9 +1035,11 @@ impl<'a> Walk<'a> {
                     self.push_def(name, node, kind, 0);
                     if k != ids.enum_specifier {
                         let record = self.intern(self.text(name));
-                        let fields = self.member_names(node.child_by_field_id(ids.f_body).unwrap());
-                        self.out.records.push(Record { name: record, fields });
+                        self.push_record(record, node, node.child_by_field_id(ids.f_body).unwrap());
                     }
+                } else if k != ids.enum_specifier {
+                    let record = self.unnamed(node);
+                    self.push_record(record, node, node.child_by_field_id(ids.f_body).unwrap());
                 }
             }
             return true;

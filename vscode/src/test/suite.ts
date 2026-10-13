@@ -53,8 +53,8 @@ export async function run(): Promise<void> {
   const lenses = await vscode.commands.executeCommand<vscode.CodeLens[]>("vscode.executeCodeLensProvider", doc.uri, 400);
   const resolved = lenses.filter((l) => l.command);
   assert.ok(resolved.length > 5, `only ${resolved.length} of ${lenses.length} lenses resolved`);
-  assert.ok(resolved.some((l) => /呼叫者/.test(l.command!.title)));
-  assert.ok(resolved.some((l) => /經函式指標/.test(l.command!.title)), resolved.map((l) => l.command!.title).slice(0, 8).join(" | "));
+  assert.ok(resolved.some((l) => /callers/.test(l.command!.title)));
+  assert.ok(resolved.some((l) => /through function pointers/.test(l.command!.title)), resolved.map((l) => l.command!.title).slice(0, 8).join(" | "));
 
   // The views and their commands exist and run.
   editor.selection = new vscode.Selection(read, read);

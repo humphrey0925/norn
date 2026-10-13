@@ -69,12 +69,12 @@
 
   function badges(n) {
     const e = n.entry;
-    if (n.slot) return '<span class="badge ptr">函式指標</span>';
+    if (n.slot) return '<span class="badge ptr">function pointer</span>';
     let b = "";
-    if (e.through && mode === "callers") b += '<span class="badge ptr">經 ' + esc(e.through) + "</span>";
-    if (e.pointer) b += '<span class="badge ptr">經指標變數</span>';
-    if (e.viaMacro) b += '<span class="badge mac">經巨集 ' + esc(e.viaMacro) + "</span>";
-    if (e.certain === false) b += '<span class="badge amb">不確定</span>';
+    if (e.through && mode === "callers") b += '<span class="badge ptr">through ' + esc(e.through) + "</span>";
+    if (e.pointer) b += '<span class="badge ptr">through a pointer</span>';
+    if (e.viaMacro) b += '<span class="badge mac">via macro ' + esc(e.viaMacro) + "</span>";
+    if (e.certain === false) b += '<span class="badge amb">uncertain</span>';
     return b;
   }
 
@@ -98,14 +98,14 @@
     const leaf = n.children && n.children.length === 0;
     const twisty = leaf ? "" : n.open ? "▾" : "▸";
     const e = n.entry;
-    const where = n.slot ? (n.lines?.length ? "第 " + n.lines.join("、") + " 行" : "") : e.file + ":" + e.line;
-    const calls = !n.slot && n.parent && e.lines?.length ? ' <span class="at">· 第 ' + e.lines.slice(0, 4).join("、") + (e.lines.length > 4 ? "…" : "") + " 行</span>" : "";
+    const where = n.slot ? (n.lines?.length ? "line " + n.lines.join(", ") : "") : e.file + ":" + e.line;
+    const calls = !n.slot && n.parent && e.lines?.length ? ' <span class="at">· line ' + e.lines.slice(0, 4).join(", ") + (e.lines.length > 4 ? "…" : "") + "</span>" : "";
     out.push(
       '<div class="row' + (n.parent ? "" : " top") + '" data-id="' + n.id + '" style="padding-left:' + (8 + depth * 16) + 'px" tabindex="0">' +
         '<span class="tw" data-act="toggle">' + (n.loading ? "…" : twisty) + "</span>" +
         '<span class="k k-' + (n.slot ? "field" : e.kind) + '">' + (n.slot ? "·" : KIND[e.kind] ?? "?") + "</span>" +
-        '<span class="name" data-act="name" title="' + (n.slot ? "到呼叫處" : "跳到這個函式") + '">' + esc(n.slot ?? e.name) + "</span>" + badges(n) +
-        '<span class="loc" title="到呼叫處">' + esc(where) + calls + "</span>" +
+        '<span class="name" data-act="name" title="' + (n.slot ? "Go to the call" : "Go to this function") + '">' + esc(n.slot ?? e.name) + "</span>" + badges(n) +
+        '<span class="loc" title="Go to the call">' + esc(where) + calls + "</span>" +
         "</div>",
     );
     if (n.open && n.children) for (const c of n.children) treeRows(c, depth + 1, out);
@@ -114,12 +114,12 @@
   function renderRefs() {
     const out = [];
     refs.forEach((g, gi) => {
-      out.push('<div class="row top" style="padding-left:8px"><span class="tw">▾</span><span class="name">' + esc(g.file) + '</span><span class="loc">' + g.items.length + " 處</span></div>");
+      out.push('<div class="row top" style="padding-left:8px"><span class="tw">▾</span><span class="name">' + esc(g.file) + '</span><span class="loc">' + g.items.length + "</span></div>");
       g.items.forEach((it, ii) => {
         out.push('<div class="row" data-ref="' + gi + "," + ii + '" style="padding-left:28px" tabindex="0"><span class="ln">' + (it.line + 1) + '</span><span class="name text">' + esc(it.text) + "</span></div>");
       });
     });
-    root.innerHTML = out.join("") || '<div class="empty">沒有參照</div>';
+    root.innerHTML = out.join("") || '<div class="empty">No references</div>';
   }
 
   // ---------------------------------------------------------------- graph
@@ -165,10 +165,10 @@
       const leaf = n.children && n.children.length === 0;
       const kx = mode === "callers" ? nx - 11 : nx + w + 11, ky = ny + H / 2;
       const more = leaf ? "" :
-        '<g class="knob" data-act="toggle"><title>' + (n.open ? "收合" : "展開") + '</title><circle cx="' + kx + '" cy="' + ky + '" r="7"></circle>' +
+        '<g class="knob" data-act="toggle"><title>' + (n.open ? "Collapse" : "Expand") + '</title><circle cx="' + kx + '" cy="' + ky + '" r="7"></circle>' +
         '<text x="' + kx + '" y="' + (ky + 4) + '" text-anchor="middle">' + (n.loading ? "…" : n.open ? "−" : "+") + "</text></g>";
       shapes.push(
-        '<g class="gn ' + cls + (e && e.certain === false ? " amb" : "") + '" data-id="' + n.id + '"><title>' + esc(n.slot ? "結構成員（函式指標）" : e.file + ":" + e.line) + "</title>" +
+        '<g class="gn ' + cls + (e && e.certain === false ? " amb" : "") + '" data-id="' + n.id + '"><title>' + esc(n.slot ? "struct member (function pointer)" : e.file + ":" + e.line) + "</title>" +
           '<rect x="' + nx + '" y="' + ny + '" width="' + w + '" height="' + H + '" rx="' + (n.slot ? 12 : 3) + '"></rect>' +
           '<text x="' + (nx + 10) + '" y="' + (ny + 16) + '">' + esc(n.slot ?? e.name) + "</text>" + more + "</g>",
       );
@@ -185,7 +185,7 @@
     })(top);
     root.innerHTML =
       '<div class="graph"><svg width="' + Math.max(total, 200) + '" height="' + (row * ROW + 12) + '">' + edges.join("") + shapes.join("") + "</svg></div>" +
-      '<div class="hint">點函式名稱跳到該函式（Ctrl＋點開在旁邊）；點旁邊的 ＋／− 展開或收合。</div>';
+      '<div class="hint">Click a name to go to the function (Ctrl+click opens beside); the knob beside it expands or collapses.</div>';
   }
 
   // ---------------------------------------------------------------- common
@@ -196,7 +196,7 @@
     document.getElementById("views").hidden = mode === "references";
     if (mode === "references") return refs ? renderRefs() : (root.innerHTML = "");
     if (!top) {
-      root.innerHTML = '<div class="empty">把游標放在函式上，這裡會顯示它的呼叫關係。</div>';
+      root.innerHTML = '<div class="empty">Put the cursor on a function to see what it calls and what calls it.</div>';
       return;
     }
     if (view === "graph") return renderGraph();

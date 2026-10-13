@@ -1117,9 +1117,15 @@ fn expand_file(
     }
 
     // 2. Each of those has the whole body.
-    for r in &f.refs {
+    let hinted: FxHashMap<u32, u32> = f.ref_hints.iter().copied().collect();
+    for (i, r) in f.refs.iter().enumerate() {
         if let Some(v) = variants.get(&r.scope) {
-            out.refs.extend(v[1..].iter().map(|&(scope, _)| Ref { scope, ..*r }));
+            for &(scope, _) in &v[1..] {
+                out.refs.push(Ref { scope, ..*r });
+                if let Some(&h) = hinted.get(&(i as u32)) {
+                    out.ref_hints.push((out.refs.len() as u32 - 1, h));
+                }
+            }
         }
     }
 
@@ -1208,7 +1214,7 @@ fn expand_file(
                     Place::Member(m) => (names.id(&mut out, &m), NONE),
                     Place::Index(i) => (type_name, i),
                 };
-                let bind = Bind { slot, index, func, line: m.line, scope: m.scope, var: false, unit: NONE };
+                let bind = Bind { slot, index, func, line: m.line, scope: m.scope, var: false, unit: NONE, hint: NONE };
                 if seen_binds.insert(bind) {
                     out.binds.push(bind);
                 }
@@ -1257,7 +1263,7 @@ fn expand_file(
                 Place::Index(_) if init.type_name == NONE => continue,
                 Place::Index(i) => (init.type_name, i),
             };
-            let bind = Bind { slot, index, func, line: init.line, scope: init.scope, var: false, unit };
+            let bind = Bind { slot, index, func, line: init.line, scope: init.scope, var: false, unit, hint: NONE };
             if seen_binds.insert(bind) {
                 out.binds.push(bind);
             }
@@ -1285,6 +1291,12 @@ fn expand_file(
     }
     for c in &mut out.param_calls {
         c.scope = new_index[c.scope as usize];
+    }
+    for t in &mut out.typed {
+        t.0 = new_index[t.0 as usize];
+    }
+    for d in out.records.iter_mut().flat_map(|r| r.defs.iter_mut()).filter(|d| **d != NONE) {
+        *d = new_index[*d as usize];
     }
     out.sites.clear();
     let added = ((out.defs.len() - n_defs) as u64, (out.refs.len() - n_refs) as u64);

@@ -45,8 +45,8 @@ const ICONS: Record<string, string> = {
   field: "symbol-field", file: "symbol-file",
 };
 const KIND_NAMES: Record<string, string> = {
-  function: "函式", macro: "巨集", struct: "結構", union: "聯合", enum: "列舉", enum_const: "列舉常數",
-  typedef: "型別別名", global: "全域變數", field: "結構成員",
+  function: "function", macro: "macro", struct: "struct", union: "union", enum: "enum", enum_const: "enumerator",
+  typedef: "typedef", global: "variable", field: "member",
 };
 
 function isSource(doc: vscode.TextDocument): boolean {
@@ -111,10 +111,10 @@ class Relation implements vscode.WebviewViewProvider {
       <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${w.cspSource} 'unsafe-inline'; script-src ${w.cspSource};">
       <link rel="stylesheet" href="${file("relation.css")}"></head><body>
       <div id="bar" role="tablist">
-        <button role="tab" data-mode="callees">被呼叫者</button>
-        <button role="tab" data-mode="callers">呼叫者</button>
-        <button role="tab" data-mode="references">參照</button>
-        <span id="views"><button data-view="tree">樹狀</button><button data-view="graph">圖形</button></span>
+        <button role="tab" data-mode="callees">Calls</button>
+        <button role="tab" data-mode="callers">Called by</button>
+        <button role="tab" data-mode="references">References</button>
+        <span id="views"><button data-view="tree">Tree</button><button data-view="graph">Graph</button></span>
       </div>
       <div id="message"></div><div id="root"></div>
       <script src="${file("relation.js")}"></script></body></html>`;
@@ -162,8 +162,8 @@ class Relation implements vscode.WebviewViewProvider {
     if (at !== this.at) {
       return; // the cursor has moved on
     }
-    const what = this.mode === "callers" ? "呼叫者" : "被呼叫者";
-    const message = r?.root ? `${r.root.name} 的${what}：${r.entries.length}` : "游標不在函式上";
+    const what = this.mode === "callers" ? "called by" : "calls";
+    const message = r?.root ? `${r.root.name} ${what} ${r.entries.length}` : "The cursor is not on a function";
     void w.postMessage({ type: "root", mode: this.mode, root: r?.root ?? null, entries: r?.entries ?? [], message });
   }
 
@@ -186,7 +186,7 @@ class Relation implements vscode.WebviewViewProvider {
       }));
       groups.push({ file: vscode.workspace.asRelativePath(doc.uri), uri: file, items });
     }
-    return { groups, message: `參照：${found.length} 處，${byFile.size} 個檔案` };
+    return { groups, message: `${found.length} references in ${byFile.size} files` };
   }
 }
 
@@ -206,8 +206,8 @@ class FileSymbols implements vscode.TreeDataProvider<Node> {
     this.shown = uri;
     const symbols = (await ask<{ name: string; kind: number; location: { range: Entry["range"] } }[]>("textDocument/documentSymbol", { textDocument: { uri } })) ?? [];
     const order: [number, string, string][] = [
-      [14, "巨集", "symbol-constant"], [12, "函式", "symbol-function"], [23, "結構", "symbol-struct"], [10, "列舉", "symbol-enum"],
-      [22, "列舉常數", "symbol-enum-member"], [5, "型別別名", "symbol-class"], [13, "全域變數", "symbol-variable"], [8, "結構成員", "symbol-field"],
+      [14, "Macros", "symbol-constant"], [12, "Functions", "symbol-function"], [23, "Structs", "symbol-struct"], [10, "Enums", "symbol-enum"],
+      [22, "Enumerators", "symbol-enum-member"], [5, "Typedefs", "symbol-class"], [13, "Variables", "symbol-variable"], [8, "Members", "symbol-field"],
     ];
     this.groups = [];
     for (const [kind, title] of order) {
@@ -232,7 +232,7 @@ class FileSymbols implements vscode.TreeDataProvider<Node> {
     const item = new vscode.TreeItem(node.label, node.children ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
     item.description = node.detail;
     if (node.target) {
-      item.command = { command: "si.open", title: "開啟", arguments: [node.target, false] };
+      item.command = { command: "si.open", title: "Open", arguments: [node.target, false] };
     }
     return item;
   }
@@ -277,7 +277,7 @@ class Search implements vscode.WebviewViewProvider {
   resolveWebviewView(view: vscode.WebviewView) {
     view.webview.options = { enableScripts: true };
     view.webview.html = page(
-      `<div class="wrap"><input id="q" placeholder="片段或縮寫，例如 init cache、bci" spellcheck="false"></div><div id="list"></div>`,
+      `<div class="wrap"><input id="q" placeholder="Fragments or initials: init cache, bci" spellcheck="false"></div><div id="list"></div>`,
       `
       const q = document.getElementById("q"), list = document.getElementById("list");
       let timer, results = [];
@@ -306,7 +306,7 @@ class Search implements vscode.WebviewViewProvider {
         const words = e.data.query.toLowerCase().split(/\\s+/).filter(Boolean);
         list.innerHTML = results.length
           ? results.map((r, i) => '<div class="row" tabindex="0" data-i="' + i + '"><span class="kind">' + esc(r.kindName) + '</span><span class="name">' + mark(r.name, words) + '</span><span class="dim">' + esc(r.file) + ":" + r.line + "</span></div>").join("")
-          : (words.length ? '<div class="empty">沒有符合的符號</div>' : "");
+          : (words.length ? '<div class="empty">No matching symbols</div>' : "");
       });
       q.focus();`,
     );
@@ -332,7 +332,7 @@ class Context implements vscode.WebviewViewProvider {
     this.view = view;
     view.webview.options = { enableScripts: true };
     view.webview.html = page(
-      `<div id="root"><div class="empty">把游標停在一個名稱上，這裡會顯示它的定義。</div></div>`,
+      `<div id="root"><div class="empty">Put the cursor on a name to see its definition here.</div></div>`,
       `
       const root = document.getElementById("root");
       let shown;
@@ -342,7 +342,7 @@ class Context implements vscode.WebviewViewProvider {
         const d = e.data;
         shown = d.entry;
         if (!d.entry) { root.innerHTML = '<div class="empty">' + esc(d.message) + "</div>"; return; }
-        const more = d.entry.candidates > 1 ? '<span class="dim">共 ' + d.entry.candidates + " 個候選</span>" : "";
+        const more = d.entry.candidates > 1 ? '<span class="dim">' + d.entry.candidates + " candidates</span>" : "";
         root.innerHTML = '<div class="head"><strong>' + esc(d.entry.name) + "</strong><span>" + esc(d.kindName) + "</span><span>" + esc(d.entry.file) + ":" + d.entry.line + "</span>" + more + "</div><pre>"
           + d.lines.map((t, i) => '<div class="' + (d.first + i === d.entry.line ? "at" : "") + '"><span class="n">' + (d.first + i) + "</span>" + esc(t) + "</div>").join("") + "</pre>";
       });`,
@@ -370,7 +370,7 @@ class Context implements vscode.WebviewViewProvider {
       return; // the cursor has moved on
     }
     if (!entry) {
-      void this.view.webview.postMessage({ entry: null, message: "這裡沒有索引認得的名稱。" });
+      void this.view.webview.postMessage({ entry: null, message: "Nothing the index knows here." });
       return;
     }
     const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(entry.uri));
@@ -417,9 +417,9 @@ class Lenses implements vscode.CodeLensProvider {
       ask<{ entries: Entry[] }>("si/relation", { ...at, direction: "callees" }),
     ]);
     const indirect = (callees?.entries ?? []).filter((e) => e.through || e.pointer).length;
-    const parts = [`${callers?.entries.length ?? 0} 個呼叫者`, `${callees?.entries.length ?? 0} 個被呼叫者`];
+    const parts = [`${callers?.entries.length ?? 0} callers`, `${callees?.entries.length ?? 0} calls`];
     if (indirect) {
-      parts.push(`其中 ${indirect} 個經函式指標`);
+      parts.push(`${indirect} through function pointers`);
     }
     lens.command = { title: parts.join(" · "), command: "si.showRelationAt", arguments: [at] };
     return lens;
@@ -462,17 +462,17 @@ export async function activate(context: vscode.ExtensionContext) {
   const contextView = new Context();
   const lenses = new Lenses();
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 10);
-  status.text = "$(sync~spin) SI 建立索引中";
+  status.text = "$(sync~spin) SI indexing";
   status.show();
 
   const selector: vscode.DocumentSelector = [{ scheme: "file", pattern: "**/*.{c,h}" }];
 
   async function refreshStatus() {
     const s = await ask<{ files: number; symbols: number; loaded: number; parsed: number; cache: string | null }>("si/status", {});
-    status.text = s ? `$(symbol-namespace) SI ${s.files.toLocaleString()} 檔 · ${s.symbols.toLocaleString()} 符號` : "$(warning) SI 未啟動";
+    status.text = s ? `$(symbol-namespace) SI ${s.files.toLocaleString()} files · ${s.symbols.toLocaleString()} symbols` : "$(warning) SI not running";
     status.tooltip = s
-      ? `啟動時從上次保存讀回 ${s.loaded.toLocaleString()} 檔，重新解析 ${s.parsed.toLocaleString()} 檔
-` + (s.cache ? `索引保存於 ${s.cache}` : "索引未保存（si.cache.enabled 已關閉）")
+      ? `At start: ${s.loaded.toLocaleString()} files read from the saved index, ${s.parsed.toLocaleString()} parsed
+` + (s.cache ? `Index kept in ${s.cache}` : "Index not kept (si.cache.enabled is off)")
       : undefined;
   }
 
@@ -500,8 +500,8 @@ export async function activate(context: vscode.ExtensionContext) {
     // A path that is not there is the usual reason for not starting: say so
     // plainly instead of leaving a spawn error in the log.
     if (/[\/]/.test(command) && !fs.existsSync(command)) {
-      status.text = "$(warning) SI 未啟動";
-      const pick = await vscode.window.showErrorMessage(`找不到 si 執行檔：${command}`, "開啟設定");
+      status.text = "$(warning) SI not running";
+      const pick = await vscode.window.showErrorMessage(`si executable not found: ${command}`, "Open Settings");
       if (pick) {
         void vscode.commands.executeCommand("workbench.action.openSettings", "si.serverPath");
       }
@@ -516,8 +516,8 @@ export async function activate(context: vscode.ExtensionContext) {
     try {
       await client.start();
     } catch (e) {
-      status.text = "$(warning) SI 未啟動";
-      void vscode.window.showErrorMessage(`無法啟動 si（${command}）。請在設定 si.serverPath 指定 si 執行檔的路徑。${e instanceof Error ? e.message : ""}`);
+      status.text = "$(warning) SI not running";
+      void vscode.window.showErrorMessage(`Could not start si (${command}). Set si.serverPath to the si executable. ${e instanceof Error ? e.message : ""}`);
       return;
     }
     await refreshStatus();
@@ -578,14 +578,14 @@ export async function activate(context: vscode.ExtensionContext) {
       }
     }),
     vscode.commands.registerCommand("si.restart", async () => {
-      status.text = "$(sync~spin) SI 建立索引中";
+      status.text = "$(sync~spin) SI indexing";
       if (client?.isRunning()) {
         await client.stop();
       }
       await start();
     }),
     vscode.commands.registerCommand("si.rebuild", async () => {
-      status.text = "$(sync~spin) SI 完整重建索引中";
+      status.text = "$(sync~spin) SI rebuilding";
       if (client?.isRunning()) {
         await client.stop();
       }

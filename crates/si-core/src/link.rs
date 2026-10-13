@@ -2,7 +2,7 @@
 //! plus the include closures, O(sum of closure sizes).
 
 use crate::graph::Graph;
-use crate::model::{flag, kind, pack_meta, refkind, EdgeHalf, FileFacts, FileRec, Sym, NONE};
+use crate::model::{flag, kind, pack_meta, refkind, root, EdgeHalf, FileFacts, FileRec, MemberHint, Sym, NONE};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::time::Instant;
@@ -220,8 +220,28 @@ fn in_sight(
     }
 }
 
-/// The members of the struct called `name` (a tag or a typedef) as seen
-/// from `file`: which file lays it out, and the member names there.
+/// The struct called `name` (a tag or a typedef) as seen from `file`: which
+/// file lays it out, and which of that file's records it is.
+fn record_of(
+    name: u32,
+    file: u32,
+    closure: &Closure,
+    records: &FxHashMap<u32, Vec<(u32, u32)>>,
+    aliases: &FxHashMap<u32, Vec<u32>>,
+) -> Option<(u32, u32)> {
+    let direct = records.get(&name).into_iter().flatten();
+    let through = aliases.get(&name).into_iter().flatten().filter_map(|tag| records.get(tag)).flatten();
+    let mut all: Vec<(u32, u32)> = direct.chain(through).copied().collect();
+    all.sort_unstable();
+    all.dedup();
+    all.iter()
+        .find(|r| r.0 == file)
+        .or_else(|| all.iter().find(|r| closure.member[r.0 as usize]))
+        .or(if all.len() == 1 { all.first() } else { None })
+        .copied()
+}
+
+/// The members of the struct called `name` as seen from `file`.
 fn layout<'a>(
     name: u32,
     file: u32,
@@ -230,17 +250,63 @@ fn layout<'a>(
     aliases: &FxHashMap<u32, Vec<u32>>,
     files: &[&'a FileFacts],
 ) -> Option<(u32, &'a [u32])> {
-    let direct = records.get(&name).into_iter().flatten();
-    let through = aliases.get(&name).into_iter().flatten().filter_map(|tag| records.get(tag)).flatten();
-    let mut all: Vec<(u32, u32)> = direct.chain(through).copied().collect();
-    all.sort_unstable();
-    all.dedup();
-    let pick = all
-        .iter()
-        .find(|r| r.0 == file)
-        .or_else(|| all.iter().find(|r| closure.member[r.0 as usize]))
-        .or(if all.len() == 1 { all.first() } else { None })?;
-    Some((pick.0, &files[pick.0 as usize].records[pick.1 as usize].fields))
+    let (rf, ri) = record_of(name, file, closure, records, aliases)?;
+    Some((rf, &files[rf as usize].records[ri as usize].fields))
+}
+
+/// What the link knows about types: enough to say which struct a member
+/// access is on.
+struct Types<'a> {
+    files: &'a [&'a FileFacts],
+    remap: &'a [Vec<u32>],
+    records: &'a FxHashMap<u32, Vec<(u32, u32)>>,
+    aliases: &'a FxHashMap<u32, Vec<u32>>,
+    /// Type name of a variable, or of what a function returns, by symbol.
+    of_symbol: &'a FxHashMap<u32, u32>,
+}
+
+impl Types<'_> {
+    /// The symbol of member `member` (a global name) of the struct that
+    /// `hint`, written in file `fi`, leads to.
+    #[allow(clippy::too_many_arguments)]
+    fn member(
+        &self,
+        hint: &MemberHint,
+        member: u32,
+        fi: usize,
+        g: &Graph,
+        own: std::ops::Range<u32>,
+        closure: &Closure,
+        scratch: &mut Vec<u32>,
+    ) -> Option<u32> {
+        let f = self.files[fi];
+        let name = self.remap[fi][hint.root as usize];
+        let type_name = match hint.root_kind {
+            root::TYPE => name,
+            kind_of_root => {
+                // The variable or function the name means here, then its type.
+                let wanted = if kind_of_root == root::VAR { kind::GLOBAL } else { kind::FUNCTION };
+                in_sight(g.syms_named(name), &g.syms, own, closure, |s| s.kind == wanted, scratch);
+                *scratch.iter().find_map(|s| self.of_symbol.get(s))?
+            }
+        };
+        let (mut rf, mut ri) = record_of(type_name, fi as u32, closure, self.records, self.aliases)?;
+        let position = |rf: u32, ri: u32, wanted: u32| {
+            let r = &self.files[rf as usize].records[ri as usize];
+            (0..r.fields.len()).find(|&i| r.fields[i] != NONE && self.remap[rf as usize][r.fields[i] as usize] == wanted)
+        };
+        for &m in &f.hint_path[hint.path as usize..(hint.path + hint.len) as usize] {
+            let at = position(rf, ri, self.remap[fi][m as usize])?;
+            let t = self.files[rf as usize].records[ri as usize].types[at];
+            if t == NONE {
+                return None;
+            }
+            (rf, ri) = record_of(self.remap[rf as usize][t as usize], rf, closure, self.records, self.aliases)?;
+        }
+        let at = position(rf, ri, member)?;
+        let def = self.files[rf as usize].records[ri as usize].defs[at];
+        (def != NONE).then(|| g.files[rf as usize].sym_start + def)
+    }
 }
 
 pub fn link(files: &[FileFacts]) -> (Graph, LinkStats) {
@@ -366,6 +432,14 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
         }
     }
 
+    let mut of_symbol: FxHashMap<u32, u32> = FxHashMap::default();
+    for (fi, f) in files.iter().enumerate() {
+        for &(def, t) in &f.typed {
+            of_symbol.insert(g.files[fi].sym_start + def, remap[fi][t as usize]);
+        }
+    }
+    let types = Types { files, remap: &remap, records: &records, aliases: &aliases, of_symbol: &of_symbol };
+
     // Functions that call through a parameter: symbol -> (position, line).
     let mut through_param: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
     for (fi, f) in files.iter().enumerate() {
@@ -391,7 +465,12 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
             let mut edges = Vec::with_capacity(f.refs.len());
             let mut counts = [0u64; 4]; // resolved, ambiguous, unresolved, capped
             let mut tmp: Vec<u32> = Vec::new();
-            for r in &f.refs {
+            let mut scratch: Vec<u32> = Vec::new();
+            let mut hint_of = vec![NONE; f.refs.len()];
+            for &(r, h) in &f.ref_hints {
+                hint_of[r as usize] = h;
+            }
+            for (ri, r) in f.refs.iter().enumerate() {
                 let (kind, maybe) = (r.kind & !refkind::MAYBE, r.kind & refkind::MAYBE != 0);
                 let cands = g.syms_named(remap[fi][r.name as usize]);
                 // A member name can only mean a member, and nothing else can.
@@ -409,7 +488,18 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
                         s.kind != kind::FILE && s.kind != kind::FIELD && !(own_name && s.kind == kind::MACRO)
                     }
                 };
-                in_sight(cands, syms, base..end, closure, want, &mut tmp);
+                // With the type of what the member is taken from, the member
+                // is one symbol and no guess.
+                let typed = (member && hint_of[ri] != NONE)
+                    .then(|| types.member(&f.hints[hint_of[ri] as usize], remap[fi][r.name as usize], fi, &g, base..end, closure, &mut scratch))
+                    .flatten();
+                match typed {
+                    Some(sym) => {
+                        tmp.clear();
+                        tmp.push(sym);
+                    }
+                    None => in_sight(cands, syms, base..end, closure, want, &mut tmp),
+                }
                 if tmp.is_empty() {
                     counts[2] += 1;
                     continue;
@@ -449,7 +539,13 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
             let mut bound: Vec<[u32; 3]> = Vec::new();
             let mut slots: Vec<u32> = Vec::new();
             for b in &f.binds {
-                if b.var {
+                let typed = (!b.var && b.index == NONE && b.hint != NONE)
+                    .then(|| types.member(&f.hints[b.hint as usize], remap[fi][b.slot as usize], fi, &g, base..end, closure, &mut scratch))
+                    .flatten();
+                if let Some(sym) = typed {
+                    slots.clear();
+                    slots.push(sym);
+                } else if b.var {
                     in_sight(g.syms_named(remap[fi][b.slot as usize]), syms, base..end, closure, |s| s.kind == kind::GLOBAL, &mut slots);
                 } else {
                     // Positional: the member is the struct's `index`-th.
@@ -465,7 +561,19 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
                     let cands = g.syms_named(name);
                     let holds = |s: &Sym| s.kind == kind::FIELD && s.flags & flag::CALLABLE != 0;
                     in_sight(cands, syms, base..end, closure, holds, &mut slots);
-                    if let Some(rf) = home {
+                    // The very member at that position, when the struct's
+                    // layout says which definition it is.
+                    let exact = (b.index != NONE)
+                        .then(|| record_of(remap[fi][b.slot as usize], fi as u32, closure, &records, &aliases))
+                        .flatten()
+                        .and_then(|(rf, ri)| {
+                            let def = *files[rf as usize].records[ri as usize].defs.get(b.index as usize)?;
+                            (def != NONE).then(|| g.files[rf as usize].sym_start + def)
+                        });
+                    if let Some(sym) = exact {
+                        slots.clear();
+                        slots.push(sym);
+                    } else if let Some(rf) = home {
                         let there = |c: &&u32| holds(&syms[**c as usize]) && syms[**c as usize].file == rf;
                         if cands.iter().any(|c| there(&c)) {
                             slots.clear();
@@ -710,6 +818,46 @@ int c (int x) { return x; }
         let through_pointer: Vec<&str> =
             crate::callers_through_macros(&g, g.find("a")[0]).iter().filter(|c| c.pointer).map(|c| g.sym_name(c.caller)).collect();
         assert_eq!(through_pointer, ["go"]);
+    }
+
+    #[test]
+    fn members_of_the_same_name_in_different_structs_are_told_apart() {
+        let g = graph(&[
+            ("t.h", "struct reader { int (*run) (int); };
+struct writer { int (*run) (int); };
+typedef struct writer writer_t;
+struct box { struct reader *rd; writer_t *wr; };
+struct box *the_box (void);
+"),
+            (
+                "u.c",
+                "#include \"t.h\"
+static int do_read (int x) { return x; }
+static int do_write (int x) { return x; }
+                 struct reader r = { do_read };
+struct writer w = { .run = do_write };
+                 int by_param (struct reader *p) { return p->run (1); }
+                 int by_global (void) { return w.run (2); }
+                 int by_cast (void *p) { return ((struct writer *) p)->run (3); }
+                 int by_member (struct box *b) { return b->rd->run (4) + b->wr->run (5); }
+                 int by_call (void) { return the_box ()->wr->run (6); }
+                 int by_local (void) { writer_t *q = &w; int (*f) (int) = q->run; return f (7); }
+                 void set (struct reader *p) { p->run = do_read; }
+",
+            ),
+        ]);
+        let run = |f: &str| (f.to_string(), "run".to_string());
+        assert_eq!(callees(&g, "by_param"), [run("do_read")]);
+        assert_eq!(callees(&g, "by_global"), [run("do_write")]);
+        assert_eq!(callees(&g, "by_cast"), [run("do_write")]);
+        assert_eq!(callees(&g, "by_member"), [run("do_read"), run("do_write")]);
+        assert_eq!(callees(&g, "by_call"), [run("do_write"), ("the_box".to_string(), String::new())]);
+        assert_eq!(callees(&g, "by_local"), [run("do_write")]);
+        // Each function is stored in one of the two members, not in "run".
+        for (f, line) in [("do_read", 1), ("do_write", 2)] {
+            let slots: Vec<u32> = g.find(f).iter().flat_map(|&s| g.refs_to(s)).filter(|e| e.kind() == refkind::BIND).map(|e| g.syms[e.other as usize].line).collect();
+            assert_eq!(slots, [line], "{f}");
+        }
     }
 
     #[test]

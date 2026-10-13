@@ -2,7 +2,7 @@
   "name": "si-code-index",
   "displayName": "SI Code Index",
   "description": "Source-Insight-style symbol search, context and relation views for C, backed by the si index.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publisher": "humphrey0925",
   "repository": {
     "type": "git",
@@ -42,11 +42,11 @@
         {
           "type": "webview",
           "id": "si.search",
-          "name": "專案符號"
+          "name": "Project Symbols"
         },
         {
           "id": "si.fileSymbols",
-          "name": "本檔符號"
+          "name": "File Symbols"
         }
       ],
       "siPanel": [
@@ -65,59 +65,59 @@
     "commands": [
       {
         "command": "si.relation.callers",
-        "title": "SI: 顯示呼叫者",
+        "title": "SI: Show Callers",
         "icon": "$(call-incoming)"
       },
       {
         "command": "si.relation.callees",
-        "title": "SI: 顯示被呼叫者",
+        "title": "SI: Show Calls",
         "icon": "$(call-outgoing)"
       },
       {
         "command": "si.relation.references",
-        "title": "SI: 顯示參照",
+        "title": "SI: Show References",
         "icon": "$(references)"
       },
       {
         "command": "si.relation.lock",
-        "title": "SI: 鎖定 Relation（不跟隨游標）",
+        "title": "SI: Lock Relation (stop following the cursor)",
         "icon": "$(unlock)"
       },
       {
         "command": "si.relation.unlock",
-        "title": "SI: 解除鎖定 Relation",
+        "title": "SI: Unlock Relation",
         "icon": "$(lock)"
       },
       {
         "command": "si.context.lock",
-        "title": "SI: 鎖定 Context（不跟隨游標）",
+        "title": "SI: Lock Context (stop following the cursor)",
         "icon": "$(unlock)"
       },
       {
         "command": "si.context.unlock",
-        "title": "SI: 解除鎖定 Context",
+        "title": "SI: Unlock Context",
         "icon": "$(lock)"
       },
       {
         "command": "si.openToSide",
-        "title": "在旁邊開啟",
+        "title": "Open to the Side",
         "icon": "$(split-horizontal)"
       },
       {
         "command": "si.restart",
-        "title": "SI: 重新啟動索引（只重新解析有變動的檔案）"
+        "title": "SI: Restart Index (parse only what changed)"
       },
       {
         "command": "si.relation.tree",
-        "title": "SI: Relation 以樹狀顯示"
+        "title": "SI: Show Relation as a Tree"
       },
       {
         "command": "si.relation.graph",
-        "title": "SI: Relation 以圖形顯示"
+        "title": "SI: Show Relation as a Graph"
       },
       {
         "command": "si.rebuild",
-        "title": "SI: 捨棄保存的索引並完整重建"
+        "title": "SI: Discard the Saved Index and Rebuild"
       }
     ],
     "menus": {
@@ -163,7 +163,7 @@
         "si.serverPath": {
           "type": "string",
           "default": "si",
-          "description": "si 執行檔的完整路徑，例如 D:\\tools\\si-windows-x64.exe（不需要引號；預設從 PATH 尋找 si）。"
+          "description": "Full path of the si executable, for example D:\\tools\\si-windows-x64.exe (no quotes needed). By default si is looked up on PATH."
         },
         "si.includeAliases": {
           "type": "array",
@@ -171,22 +171,22 @@
             "type": "string"
           },
           "default": [],
-          "description": "由樣板產生的標頭對應，格式 FROM=TO，例如 bfd.h=bfd-in2.h。"
+          "description": "Which template a generated header comes from, as FROM=TO, for example bfd.h=bfd-in2.h."
         },
         "si.codeLens.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "在函式定義上方顯示呼叫者與被呼叫者數量。"
+          "description": "Show the number of callers and calls above each function definition."
         },
         "si.cache.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "把索引保存在磁碟上，下次開啟時只重新解析有變動的檔案。"
+          "description": "Keep the index on disk, so that the next start parses only the files that changed."
         },
         "si.cache.directory": {
           "type": "string",
           "default": "",
-          "description": "索引保存的位置（留空則放在使用者的快取目錄，依專案路徑區分）。"
+          "description": "Where the index is kept. Empty: the user's cache directory, by the project's path."
         }
       }
     }

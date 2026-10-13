@@ -129,6 +129,8 @@ pub struct Bind {
     pub scope: u32,
     /// The slot is a variable, not a member.
     pub var: bool,
+    /// For a member: what it is a member of (an index into `hints`), or `NONE`.
+    pub hint: u32,
     /// The translation unit (a file index, set at link time) in which the
     /// store reads this way, when macros decide that; else `NONE`.
     pub unit: u32,
@@ -171,6 +173,30 @@ pub struct InitSite {
 pub struct Record {
     pub name: u32,
     pub fields: Vec<u32>,
+    /// For each member, the name of its type when that is a struct, a union
+    /// or a typedef (else `NONE`), and its definition in this file.
+    pub types: Vec<u32>,
+    pub defs: Vec<u32>,
+}
+
+/// What a member access is made on, as far as the text says: something of a
+/// known type, a variable or a call, then members followed from there. From
+/// this the link finds the struct the member belongs to, so that two structs
+/// with a member of the same name are not confused.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct MemberHint {
+    pub root_kind: u8,
+    /// A type name, a variable's name or a function's, by `root_kind`.
+    pub root: u32,
+    /// The members followed from the root: `len` names in `hint_path`.
+    pub path: u32,
+    pub len: u32,
+}
+
+pub mod root {
+    pub const TYPE: u8 = 0;
+    pub const VAR: u8 = 1;
+    pub const FUNC: u8 = 2;
 }
 
 /// A definition found in one file. `name` indexes the file-local name table.
@@ -228,6 +254,13 @@ pub struct FileFacts {
     pub field_types: Vec<(u32, u32)>,
     pub param_calls: Vec<ParamCall>,
     pub arg_passes: Vec<ArgPass>,
+    pub hints: Vec<MemberHint>,
+    pub hint_path: Vec<u32>,
+    /// (reference, hint): which member references have one.
+    pub ref_hints: Vec<(u32, u32)>,
+    /// (definition, type name) of variables and functions at file scope
+    /// whose type, or return type, is a struct, union or typedef.
+    pub typed: Vec<(u32, u32)>,
 }
 
 impl FileFacts {
