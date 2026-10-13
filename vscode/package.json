@@ -2,7 +2,7 @@
   "name": "si-code-index",
   "displayName": "SI Code Index",
   "description": "Source-Insight-style symbol search, context and relation views for C, backed by the si index.",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "publisher": "humphrey0925",
   "repository": {
     "type": "git",
@@ -232,6 +232,20 @@
       {
         "command": "si.conditions.delete",
         "title": "Delete Configuration"
+      },
+      {
+        "command": "si.relation.sync",
+        "title": "SI: Show Relation of the Symbol under the Cursor",
+        "icon": "$(target)"
+      },
+      {
+        "command": "si.context.sync",
+        "title": "SI: Show Context of the Symbol under the Cursor",
+        "icon": "$(target)"
+      },
+      {
+        "command": "si.relation.target",
+        "title": "SI: Relation target"
       }
     ],
     "menus": {
@@ -315,6 +329,16 @@
           "command": "si.scope.openConfig",
           "when": "view == si.conditions",
           "group": "1_si@1"
+        },
+        {
+          "command": "si.relation.sync",
+          "when": "view == si.relation",
+          "group": "navigation@3"
+        },
+        {
+          "command": "si.context.sync",
+          "when": "view == si.context",
+          "group": "navigation@0"
         }
       ],
       "view/item/context": [
@@ -387,6 +411,10 @@
         {
           "command": "si.conditions.delete",
           "when": "false"
+        },
+        {
+          "command": "si.relation.target",
+          "when": "false"
         }
       ],
       "explorer/context": [
@@ -439,7 +467,8 @@
           "description": "Where the index is kept. Empty: .si/cache in the workspace."
         }
       }
-    }
+    },
+    "keybindings": []
   },
   "scripts": {
     "compile": "tsc -p ./",

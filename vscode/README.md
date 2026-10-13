@@ -19,6 +19,9 @@ Source-Insight-style views for C in VS Code, backed by the `si` index.
   the workspace and is there the next time. The sync button brings the
   index in line with the disk whenever you want it.
 
+- **Lock and sync**: Relation and Context follow the cursor until locked.
+  A locked view stays on its symbol while you read elsewhere; its target
+  button moves it to what the cursor is on now, still locked.
 - **Compile Conditions**: what the build defines, so that `#if` branches
   it does not compile are left out. A project can have several sets, as a
   build has configurations (Debug, Release, one per board), with one in

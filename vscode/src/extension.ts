@@ -163,6 +163,17 @@ class Relation implements vscode.WebviewViewProvider {
     }
   }
 
+  /** Show what the cursor is on now, locked or not: a locked view moves
+   *  only when asked to. */
+  sync(editor: vscode.TextEditor) {
+    return this.load(positionParams(editor));
+  }
+
+  /** Where what is shown was asked for. */
+  get target(): At | undefined {
+    return this.at;
+  }
+
   private async load(at: At | undefined) {
     this.at = at;
     const w = this.view?.webview;
@@ -862,8 +873,8 @@ class Context implements vscode.WebviewViewProvider {
     }
   }
 
-  async follow(editor: vscode.TextEditor) {
-    if (this.locked || !this.view?.visible) {
+  async follow(editor: vscode.TextEditor, asked = false) {
+    if ((this.locked && !asked) || !this.view?.visible) {
       return;
     }
     const at = positionParams(editor);
@@ -1199,6 +1210,15 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("si.relation.callees", () => relation.setMode("callees")),
     vscode.commands.registerCommand("si.relation.references", () => relation.setMode("references")),
     vscode.commands.registerCommand("si.relation.assignments", () => relation.setMode("assignments")),
+    vscode.commands.registerCommand("si.relation.sync", () => {
+      const editor = vscode.window.activeTextEditor && isSource(vscode.window.activeTextEditor.document) ? vscode.window.activeTextEditor : current;
+      return editor ? relation.sync(editor) : undefined;
+    }),
+    vscode.commands.registerCommand("si.relation.target", () => relation.target),
+    vscode.commands.registerCommand("si.context.sync", () => {
+      const editor = vscode.window.activeTextEditor && isSource(vscode.window.activeTextEditor.document) ? vscode.window.activeTextEditor : current;
+      return editor ? contextView.follow(editor, true) : undefined;
+    }),
     vscode.commands.registerCommand("si.relation.lock", () => lock("si.relationLocked", relation, true)),
     vscode.commands.registerCommand("si.relation.unlock", () => lock("si.relationLocked", relation, false)),
     vscode.commands.registerCommand("si.context.lock", () => lock("si.contextLocked", contextView, true)),

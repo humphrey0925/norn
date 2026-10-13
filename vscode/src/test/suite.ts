@@ -66,6 +66,24 @@ export async function run(): Promise<void> {
     await vscode.commands.executeCommand(command);
   }
 
+  // A locked Relation stays where it is when the cursor moves, and moves
+  // when asked to.
+  type Target = { position: { line: number } } | undefined;
+  const shownAt = async () => (await vscode.commands.executeCommand<Target>("si.relation.target"))?.position.line;
+  await vscode.commands.executeCommand("si.relation.sync");
+  const before = await shownAt();
+  assert.strictEqual(before, read.line);
+  await vscode.commands.executeCommand("si.relation.lock");
+  const elsewhere = new vscode.Position(read.line + 40, 2);
+  editor.selection = new vscode.Selection(elsewhere, elsewhere);
+  await new Promise((r) => setTimeout(r, 500));
+  assert.strictEqual(await shownAt(), before, "locked: the cursor moved, the view did not");
+  await vscode.commands.executeCommand("si.relation.sync");
+  assert.strictEqual(await shownAt(), elsewhere.line, "asked: the locked view shows the cursor's place");
+  await vscode.commands.executeCommand("si.context.sync");
+  await vscode.commands.executeCommand("si.relation.unlock");
+  editor.selection = new vscode.Selection(read, read);
+
   // Split: a result opened "beside" lands in another group, and one opened
   // normally stays in the group of the editor the views follow.
   await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
