@@ -17,7 +17,6 @@ use crate::mask::is_keyword;
 use crate::model::{flag, kind, refkind, site, Bind, Def, FileFacts, Ref, Site, NONE};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::sync::Arc;
 
 /// Where expansion spends its time, in nanoseconds (`SI_EXPAND_PROFILE`).
 static SPENT: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
@@ -66,10 +65,116 @@ enum Origin {
     Pasted,
 }
 
-#[derive(Clone, Debug)]
+/// The text of a token: one copy of each distinct text for the life of the
+/// process, and a token holds a pointer to it.
+///
+/// Tokens are copied far more often than they are made: every expansion
+/// copies its macro's body and its arguments, and the kernel's are
+/// expanded ten million times. Counting references on shared text made
+/// every core wait on the others for the same few counters, and a copy of
+/// its own for each engine made an allocation per token. A pointer costs
+/// nothing to copy. What is kept is small: identifiers, numbers and
+/// punctuation, which recur; string literals, which do not, are all the
+/// one empty string (nothing here reads what a string says).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Text(&'static str);
+
+const SHARDS: usize = 64;
+/// Every text in use, by shard of its hash. The set owns the strings; a
+/// `Text` points into one of them.
+static POOL: [std::sync::Mutex<Option<FxHashSet<Box<str>>>>; SHARDS] = [const { std::sync::Mutex::new(None) }; SHARDS];
+
+impl Text {
+    fn of(s: &str) -> Text {
+        let shard = xxhash_rust::xxh3::xxh3_64(s.as_bytes()) as usize % SHARDS;
+        let mut pool = POOL[shard].lock().unwrap_or_else(|e| e.into_inner());
+        let set = pool.get_or_insert_with(FxHashSet::default);
+        if !set.contains(s) {
+            set.insert(s.into());
+        }
+        let kept: &str = set.get(s).unwrap();
+        // SAFETY: the string is on the heap and stays where it is while the
+        // set holds it, whatever the set does with its own table; it is
+        // only let go by `release`, which is called when no `Text` is left.
+        Text(unsafe { &*(kept as *const str) })
+    }
+
+    /// Let go of every text. Only when no token made so far is still held:
+    /// at the end of an expansion of the corpus, whose tokens, macro table
+    /// and engines are all gone by then. In a tree the size of the kernel
+    /// this is several hundred megabytes of identifiers and numbers.
+    fn release() {
+        for shard in &POOL {
+            *shard.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+}
+
+/// Held by whoever makes or holds tokens: the texts are let go when the
+/// last holder is done. (Not under test, where tokens are made freely by
+/// tests running side by side.)
+struct Holding;
+
+static HOLDERS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
+impl Holding {
+    fn new() -> Holding {
+        *HOLDERS.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        Holding
+    }
+}
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        let mut holders = HOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+        *holders -= 1;
+        // Under the lock: nobody starts holding while the texts go.
+        if *holders == 0 && !cfg!(test) {
+            Text::release();
+        }
+    }
+}
+
+impl std::ops::Deref for Text {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.0
+    }
+}
+
+impl From<&str> for Text {
+    fn from(s: &str) -> Text {
+        Text::of(s)
+    }
+}
+
+impl From<String> for Text {
+    fn from(s: String) -> Text {
+        Text::of(&s)
+    }
+}
+
+impl From<std::borrow::Cow<'_, str>> for Text {
+    fn from(s: std::borrow::Cow<'_, str>) -> Text {
+        Text::of(&s)
+    }
+}
+
+impl std::fmt::Debug for Text {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::fmt::Display for Text {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct T {
-    /// Shared: tokens are copied far more often than they are made.
-    text: Arc<str>,
+    text: Text,
     k: K,
     origin: Origin,
     /// A macro name met inside its own expansion: never expanded again.
@@ -150,6 +255,11 @@ fn tokenize(s: &[u8], origin: Origin) -> Vec<T> {
                     i += 1 + (s[i] == b'\\' && i + 1 < n) as usize;
                 }
                 i = (i + 1).min(n);
+                if b == b'"' {
+                    // What a string says is nothing an expansion is read for.
+                    out.push(T { text: "\"\"".into(), k: K::Other, origin, noexpand: false });
+                    continue;
+                }
                 K::Other
             }
             _ => {
@@ -189,6 +299,10 @@ fn is_tag(t: &T) -> bool {
 /// written at its uses? True when it pastes tokens, calls one of its
 /// parameters (which may then be such a macro), declares one, or is just
 /// another name (`#define pe_dll_build pep_dll_build`).
+/// (Its tokens are gone when it returns. It is called for every `#define`
+/// of the corpus while files are read, which is over before any expansion
+/// begins: it does not register as a holder, which would be a lock taken
+/// by every thread for every definition.)
 pub fn hides_names(body: &[u8], params: &[&[u8]]) -> bool {
     hides(&tokenize(body, Origin::Body), |t| params.contains(&t.text.as_bytes()))
 }
@@ -246,14 +360,14 @@ fn hides(toks: &[T], is_param: impl Fn(&T) -> bool) -> bool {
 }
 
 struct Parsed {
-    params: Vec<Arc<str>>,
+    params: Vec<Text>,
     variadic: bool,
     function_like: bool,
     body: Vec<T>,
     /// See [`hides_names`].
     hides: bool,
     /// `#if NAME == value` (or, with true, its `#else`) around the definition.
-    guards: Vec<(Arc<str>, i64, bool)>,
+    guards: Vec<(Text, i64, bool)>,
     /// Defined only under some `#if`.
     conditional: bool,
     /// Defined under `#ifndef` of its own name.
@@ -275,7 +389,7 @@ fn parse(text: &str, function_like: bool, guard: &str) -> Parsed {
         })
         .collect();
     let mut toks = tokenize(text.as_bytes(), Origin::Body);
-    let mut params: Vec<Arc<str>> = Vec::new();
+    let mut params: Vec<Text> = Vec::new();
     let mut variadic = false;
     if function_like {
         let close = toks.iter().position(|t| t.is(")")).unwrap_or(toks.len());
@@ -328,15 +442,9 @@ struct Engine<'a> {
     choice: Choice,
     /// Names with several definitions met in this run, with how many.
     met: Vec<(Box<str>, usize)>,
-    active: Vec<Arc<str>>,
+    active: Vec<Text>,
     steps: u32,
     hiding: FxHashMap<Box<str>, bool>,
-    /// This engine's own copy of each macro body it has used. The tokens
-    /// of the bodies in the table are shared by every thread, and copying
-    /// one counts a reference on it: with every core expanding the same
-    /// few macros (`BIT`, `GENMASK`), they spend their time taking the
-    /// counter from each other. A copy made once is this thread's alone.
-    bodies: FxHashMap<usize, std::rc::Rc<Vec<T>>>,
     /// Set when the engine stands for all the translation units of this
     /// file together.
     merged: Option<u32>,
@@ -381,7 +489,6 @@ impl<'a> Engine<'a> {
             active: Vec::new(),
             steps: 0,
             hiding: FxHashMap::default(),
-            bodies: FxHashMap::default(),
             merged: None,
             max_variants: MAX_VARIANTS,
             sure: Vec::new(),
@@ -459,7 +566,7 @@ impl<'a> Engine<'a> {
 
     /// Can the guard hold in some translation unit with this file? It cannot
     /// when every value the name is given there says otherwise.
-    fn feasible(&mut self, guard: &(Arc<str>, i64, bool)) -> bool {
+    fn feasible(&mut self, guard: &(Text, i64, bool)) -> bool {
         let (name, value, negated) = guard;
         let values: Option<Vec<i64>> = self
             .candidates(name)
@@ -595,15 +702,10 @@ impl<'a> Engine<'a> {
         args.resize(np, Vec::new());
         let mut expanded: Vec<Option<Vec<T>>> = vec![None; np];
         let empty = || T { text: "".into(), k: K::Other, origin: Origin::Body, noexpand: false };
-        let own = self
-            .bodies
-            .entry(m as *const Parsed as usize)
-            .or_insert_with(|| std::rc::Rc::new(m.body.iter().map(|t| T { text: Arc::from(&*t.text), k: t.k, origin: t.origin, noexpand: t.noexpand }).collect()))
-            .clone();
         let mut res: Vec<T> = Vec::with_capacity(m.body.len());
         let mut i = 0;
         while i < m.body.len() {
-            let t = &own[i];
+            let t = &m.body[i];
             let p = m.param_at[i];
             if t.is("#") && m.function_like && m.param_at.get(i + 1).is_some_and(|&p| p != NONE) {
                 res.push(T { text: "\"\"".into(), k: K::Other, origin: Origin::Body, noexpand: false });
@@ -1605,6 +1707,8 @@ fn environment(files: &[FileFacts], includes: &[Vec<u32>]) -> u64 {
 /// replacement for each file that had any. Returns (uses, definitions added,
 /// references added).
 pub fn expand(files: &[FileFacts], includes: &[Vec<u32>], sure_includes: &[Vec<u32>], cache: &mut Cache) -> (u64, u64, u64) {
+    // Dropped last, after the macro table and the engines below.
+    let _holding = Holding::new();
     let sites: u64 = files.iter().map(|f| (f.sites.len() + f.inits.len()) as u64).sum();
     let environment = environment(files, includes) ^ environment(&[], sure_includes).rotate_left(17) ^ sure_digest(sure_includes);
     if cache.environment != environment || cache.hashes.len() != files.len() {
@@ -1748,8 +1852,9 @@ mod tests {
             ("NAME (elf)", "elf32"),
             ("XCAT (elf, SIZE)", "elfSIZE"),
             ("STR (a b)", "\"\""),
-            ("LOG (\"x\")", "printf ( \"x\" )"),
-            ("LOG (\"x\", 1, 2)", "printf ( \"x\" , 1 , 2 )"),
+            // (What a string says is not kept: every string is the empty one.)
+            ("LOG (\"x\")", "printf ( \"\" )"),
+            ("LOG (\"x\", 1, 2)", "printf ( \"\" , 1 , 2 )"),
             ("SELF", "SELF + 1"),
             ("CAT", "CAT"),
         ] {
