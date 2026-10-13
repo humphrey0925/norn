@@ -2,15 +2,18 @@
 //! plus the include closures, O(sum of closure sizes).
 
 use crate::graph::Graph;
-use crate::model::{flag, kind, pack_meta, refkind, EdgeHalf, FileFacts, FileRec, Sym};
+use crate::model::{flag, kind, pack_meta, refkind, EdgeHalf, FileFacts, FileRec, Sym, NONE};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::time::Instant;
 
 /// Upper bound on targets emitted for one ambiguous reference.
+/// Structs that may share a member name before a use of the name is left
+/// unresolved.
+const MAX_MEMBER_CANDIDATES: usize = 8;
 const MAX_CANDIDATES: usize = 32;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct LinkStats {
     pub refs: u64,
     pub resolved: u64,
@@ -28,6 +31,9 @@ pub struct LinkStats {
     pub expanded_defs: u64,
     pub expanded_refs: u64,
     pub expand_ms: f64,
+    /// Where a function is stored in a member or variable: file and line of
+    /// the store, the member or variable, the function.
+    pub bind_sites: Vec<[u32; 4]>,
     pub intern_ms: f64,
     pub syms_ms: f64,
     pub resolve_ms: f64,
@@ -79,7 +85,16 @@ fn join(dir: &str, rel: &str) -> String {
 /// For each file, the files it includes directly. Without the build's `-I`
 /// list an operand is matched by path suffix: the includer's own directory
 /// wins, then the candidates sharing the longest directory prefix with it.
-fn include_edges(files: &[FileFacts], stats: &mut LinkStats) -> Vec<Vec<u32>> {
+/// What the build knows and the sources do not say.
+#[derive(Clone, Debug, Default)]
+pub struct Options {
+    /// `(from, to)`: an `#include` of a file named `from` reads `to`
+    /// instead, for headers the build generates from a template
+    /// (`bfd.h` from `bfd-in2.h`).
+    pub include_aliases: Vec<(String, String)>,
+}
+
+fn include_edges(files: &[FileFacts], aliases: &[(String, String)], stats: &mut LinkStats) -> Vec<Vec<u32>> {
     let by_path: FxHashMap<&str, u32> = files.iter().enumerate().map(|(i, f)| (f.path.as_str(), i as u32)).collect();
     let mut by_base: FxHashMap<&str, Vec<u32>> = FxHashMap::default();
     for (i, f) in files.iter().enumerate() {
@@ -91,7 +106,12 @@ fn include_edges(files: &[FileFacts], stats: &mut LinkStats) -> Vec<Vec<u32>> {
             let dir = dir_of(&f.path);
             let (mut out, mut missing) = (Vec::new(), 0);
             for &inc in &f.includes {
-                let operand = f.name(inc as usize);
+                let written = f.name(inc as usize);
+                let renamed = aliases.iter().find_map(|(from, to)| {
+                    let dir = written.strip_suffix(from.as_str())?;
+                    (dir.is_empty() || dir.ends_with('/')).then(|| format!("{dir}{to}"))
+                });
+                let operand = renamed.as_deref().unwrap_or(written);
                 if let Some(&id) = by_path.get(join(dir, operand).as_str()) {
                     out.push(id);
                     continue;
@@ -154,13 +174,75 @@ impl Closure {
     }
 }
 
+/// The symbols a name can mean from one file, among `cands` that `want`
+/// accepts: those in the file itself (`own`); else those in files it
+/// includes; else anything with external visibility. A prototype or `extern`
+/// alone stands for the definition elsewhere.
+fn in_sight(
+    cands: &[u32],
+    syms: &[Sym],
+    own: std::ops::Range<u32>,
+    closure: &Closure,
+    want: impl Fn(&Sym) -> bool,
+    out: &mut Vec<u32>,
+) {
+    out.clear();
+    // A definition in the same file shadows everything else (covers `static`).
+    out.extend(cands.iter().filter(|&&c| own.contains(&c) && want(&syms[c as usize])));
+    let external = |c: &&u32| {
+        let s = &syms[**c as usize];
+        want(s) && (s.flags & flag::STATIC == 0 || s.flags & flag::HEADER != 0)
+    };
+    if out.is_empty() {
+        // Included text is part of this translation unit, `static` or not.
+        out.extend(cands.iter().filter(|&&c| want(&syms[c as usize]) && closure.member[syms[c as usize].file as usize]));
+    }
+    if !out.is_empty() && out.iter().all(|&c| syms[c as usize].flags & flag::DECL != 0) {
+        let n = out.len();
+        out.extend(cands.iter().filter(external).filter(|&&c| syms[c as usize].flags & flag::DECL == 0));
+        if out.len() > n {
+            out.drain(..n);
+        }
+    }
+    if out.is_empty() {
+        out.extend(cands.iter().filter(external));
+    }
+}
+
+/// The members of the struct called `name` (a tag or a typedef) as seen
+/// from `file`: which file lays it out, and the member names there.
+fn layout<'a>(
+    name: u32,
+    file: u32,
+    closure: &Closure,
+    records: &FxHashMap<u32, Vec<(u32, u32)>>,
+    aliases: &FxHashMap<u32, Vec<u32>>,
+    files: &[&'a FileFacts],
+) -> Option<(u32, &'a [u32])> {
+    let direct = records.get(&name).into_iter().flatten();
+    let through = aliases.get(&name).into_iter().flatten().filter_map(|tag| records.get(tag)).flatten();
+    let mut all: Vec<(u32, u32)> = direct.chain(through).copied().collect();
+    all.sort_unstable();
+    all.dedup();
+    let pick = all
+        .iter()
+        .find(|r| r.0 == file)
+        .or_else(|| all.iter().find(|r| closure.member[r.0 as usize]))
+        .or(if all.len() == 1 { all.first() } else { None })?;
+    Some((pick.0, &files[pick.0 as usize].records[pick.1 as usize].fields))
+}
+
 pub fn link(files: &[FileFacts]) -> (Graph, LinkStats) {
+    link_with(files, &Options::default())
+}
+
+pub fn link_with(files: &[FileFacts], options: &Options) -> (Graph, LinkStats) {
     let mut stats = LinkStats::default();
 
     // 0. Which file includes which, then macro expansion: it needs the
     //    definitions other files give, and adds definitions and references.
     let t = Instant::now();
-    let includes = include_edges(files, &mut stats);
+    let includes = include_edges(files, &options.include_aliases, &mut stats);
     stats.include_ms = ms(t);
     let t = Instant::now();
     let (expanded, counts) = crate::expand::expand(files, &includes);
@@ -238,12 +320,42 @@ pub fn link(files: &[FileFacts]) -> (Graph, LinkStats) {
     }
     stats.syms_ms = ms(t);
 
+    // Which members can hold a function: those declared as function
+    // pointers, and those of a typedef type that is one (or that is not
+    // defined anywhere here, so cannot be ruled out).
+    let callable: Vec<u32> = files
+        .iter()
+        .enumerate()
+        .flat_map(|(fi, f)| {
+            let (g, remap) = (&g, &remap);
+            f.field_types.iter().filter_map(move |&(def, type_name)| {
+                let typedefs = || g.syms_named(remap[fi][type_name as usize]).iter().map(|&t| &g.syms[t as usize]).filter(|t| t.kind == kind::TYPEDEF);
+                (typedefs().next().is_none() || typedefs().any(|t| t.flags & flag::CALLABLE != 0)).then_some(g.files[fi].sym_start + def)
+            })
+        })
+        .collect();
+    for id in callable {
+        g.syms[id as usize].flags |= flag::CALLABLE;
+    }
+
+    // Struct layouts by name, and typedef names for struct tags.
+    let mut records: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+    let mut aliases: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (fi, f) in files.iter().enumerate() {
+        for (i, r) in f.records.iter().enumerate() {
+            records.entry(remap[fi][r.name as usize]).or_default().push((fi as u32, i as u32));
+        }
+        for &(alias, tag) in &f.aliases {
+            aliases.entry(remap[fi][alias as usize]).or_default().push(remap[fi][tag as usize]);
+        }
+    }
+
     // 3. Resolve references. Each file is independent given the symbol table.
     //    A name means, in order: a definition in this file; one in a file it
     //    includes; anything with external visibility.
     let t = Instant::now();
     let syms = &g.syms;
-    let per_file: Vec<(Vec<[u32; 3]>, [u64; 4])> = files
+    let per_file: Vec<(Vec<[u32; 3]>, [u64; 4], Vec<[u32; 4]>)> = files
         .par_iter()
         .enumerate()
         .map_init(|| Closure::new(files.len()), |closure, (fi, f)| {
@@ -255,32 +367,17 @@ pub fn link(files: &[FileFacts]) -> (Graph, LinkStats) {
             let mut tmp: Vec<u32> = Vec::new();
             for r in &f.refs {
                 let cands = g.syms_named(remap[fi][r.name as usize]);
-                tmp.clear();
-                // A definition in the same file shadows everything else (covers `static`).
-                tmp.extend(cands.iter().filter(|&&c| c >= base && c < end && syms[c as usize].kind != kind::FILE));
-                let external = |c: &&u32| {
-                    let s = &syms[**c as usize];
-                    s.kind != kind::FILE && (s.flags & flag::STATIC == 0 || s.flags & flag::HEADER != 0)
-                };
-                if tmp.is_empty() {
-                    // Included text is part of this translation unit, `static` or not.
-                    tmp.extend(cands.iter().filter(|&&c| {
-                        let s = &syms[c as usize];
-                        s.kind != kind::FILE && closure.member[s.file as usize]
-                    }));
-                }
-                // Only a prototype or `extern` in sight: the definition is in
-                // another translation unit.
-                if !tmp.is_empty() && tmp.iter().all(|&c| syms[c as usize].flags & flag::DECL != 0) {
-                    let n = tmp.len();
-                    tmp.extend(cands.iter().filter(external).filter(|&&c| syms[c as usize].flags & flag::DECL == 0));
-                    if tmp.len() > n {
-                        tmp.drain(..n);
+                // A member name can only mean a member, and nothing else can.
+                let member = matches!(r.kind, refkind::MEMBER | refkind::ICALL);
+                let through = r.kind == refkind::ICALL;
+                let want = |s: &Sym| {
+                    if member {
+                        s.kind == kind::FIELD && (!through || s.flags & flag::CALLABLE != 0)
+                    } else {
+                        s.kind != kind::FILE && s.kind != kind::FIELD
                     }
-                }
-                if tmp.is_empty() {
-                    tmp.extend(cands.iter().filter(external));
-                }
+                };
+                in_sight(cands, syms, base..end, closure, want, &mut tmp);
                 if tmp.is_empty() {
                     counts[2] += 1;
                     continue;
@@ -293,6 +390,12 @@ pub fn link(files: &[FileFacts]) -> (Graph, LinkStats) {
                 if tmp.iter().any(is_def) {
                     tmp.retain(is_def);
                 }
+                // Without types, a member name shared by many structs says
+                // nothing about which one is meant.
+                if r.kind == refkind::MEMBER && tmp.len() > MAX_MEMBER_CANDIDATES {
+                    counts[2] += 1;
+                    continue;
+                }
                 if tmp.len() > MAX_CANDIDATES {
                     tmp.truncate(MAX_CANDIDATES);
                     counts[3] += 1;
@@ -302,11 +405,68 @@ pub fn link(files: &[FileFacts]) -> (Graph, LinkStats) {
                 let meta = pack_meta(r.line, ambiguous, r.kind);
                 edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta]));
             }
-            (edges, counts)
+
+            // Functions stored in members and variables: an edge from the
+            // member or variable to the function.
+            let mut bound: Vec<[u32; 3]> = Vec::new();
+            let mut slots: Vec<u32> = Vec::new();
+            for b in &f.binds {
+                if b.var {
+                    in_sight(g.syms_named(remap[fi][b.slot as usize]), syms, base..end, closure, |s| s.kind == kind::GLOBAL, &mut slots);
+                } else {
+                    // Positional: the member is the struct's `index`-th.
+                    let (name, home) = if b.index == NONE {
+                        (remap[fi][b.slot as usize], None)
+                    } else {
+                        let layout = layout(remap[fi][b.slot as usize], fi as u32, closure, &records, &aliases, files);
+                        match layout.and_then(|(rf, fields)| Some((rf, *fields.get(b.index as usize)?))) {
+                            Some((rf, field)) if field != NONE => (remap[rf as usize][field as usize], Some(rf)),
+                            _ => continue,
+                        }
+                    };
+                    let cands = g.syms_named(name);
+                    let holds = |s: &Sym| s.kind == kind::FIELD && s.flags & flag::CALLABLE != 0;
+                    in_sight(cands, syms, base..end, closure, holds, &mut slots);
+                    if let Some(rf) = home {
+                        let there = |c: &&u32| holds(&syms[**c as usize]) && syms[**c as usize].file == rf;
+                        if cands.iter().any(|c| there(&c)) {
+                            slots.clear();
+                            slots.extend(cands.iter().filter(there));
+                        }
+                    }
+                }
+                if slots.is_empty() || slots.len() > MAX_MEMBER_CANDIDATES {
+                    continue;
+                }
+                let named = g.syms_named(remap[fi][b.func as usize]);
+                in_sight(named, syms, base..end, closure, |s| s.kind == kind::FUNCTION, &mut tmp);
+                // Read in another translation unit, the name is first of all
+                // that unit's own function.
+                let own = |c: &&u32| syms[**c as usize].kind == kind::FUNCTION && syms[**c as usize].file == b.unit;
+                if b.unit != NONE && named.iter().any(|c| own(&c)) {
+                    tmp.clear();
+                    tmp.extend(named.iter().filter(own));
+                }
+                let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
+                if tmp.iter().any(is_def) {
+                    tmp.retain(is_def);
+                }
+                tmp.truncate(MAX_CANDIDATES);
+                let meta = pack_meta(b.line, slots.len() > 1 || tmp.len() > 1, refkind::BIND);
+                for &slot in &slots {
+                    bound.extend(tmp.iter().map(|&to| [slot, to, meta]));
+                }
+            }
+            bound.sort_unstable();
+            bound.dedup_by_key(|e| (e[0], e[1]));
+            let sites = bound.iter().map(|e| [fi as u32, e[2] >> 4, e[0], e[1]]).collect();
+            edges.extend(bound);
+            (edges, counts, sites)
         })
         .collect();
     let mut edges: Vec<[u32; 3]> = Vec::with_capacity(per_file.iter().map(|p| p.0.len()).sum());
-    for (e, c) in &per_file {
+    for (e, c, sites) in &per_file {
+        stats.bind_sites.extend_from_slice(sites);
         edges.extend_from_slice(e);
         stats.resolved += c[0];
         stats.ambiguous += c[1];

@@ -28,6 +28,8 @@ pub struct Tok {
     pub line: u32,
     /// Directly followed by `(`.
     pub call: bool,
+    /// A member name (`.x`, `->x`); `call` then allows for `(*p->x) (...)`.
+    pub member: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +47,9 @@ pub struct Macro {
     pub guard: String,
     /// Inside an `#if` group other than the file's include guard.
     pub conditional: bool,
+    /// Directly under `#ifndef` of its own name: a default, in force only
+    /// where nothing else defines the name.
+    pub fallback: bool,
 }
 
 /// A use of an *expanding* macro: one whose expansion holds names that are
@@ -56,6 +61,11 @@ pub struct SiteTok {
     pub args_end: u32,
     /// `model::site` bits known lexically.
     pub flags: u8,
+    /// `type NAME (args) = { ... }` at file scope: the braces (0, 0 if
+    /// none), the word before the name, and whether `[]` follows the name.
+    pub init: (u32, u32),
+    pub init_type: (u32, u32),
+    pub init_array: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -353,6 +363,32 @@ impl<'a> Cur<'a> {
         }
     }
 
+    /// At `open`: advance past the matching `close`. False if there is none.
+    fn skip_group(&mut self, open: u8, close: u8) -> bool {
+        let mut depth = 0u32;
+        while self.i < self.s.len() {
+            match self.s[self.i] {
+                b if b == open => {
+                    depth += 1;
+                    self.i += 1;
+                }
+                b if b == close => {
+                    depth -= 1;
+                    self.i += 1;
+                    if depth == 0 {
+                        return true;
+                    }
+                }
+                b'"' | b'\'' => self.skip_literal(),
+                b'/' if matches!(self.peek(1), b'*' | b'/') => {
+                    self.skip_comment();
+                }
+                _ => self.bump(),
+            }
+        }
+        false
+    }
+
     /// At `(`: advance past the matching `)`. False if there is none.
     fn skip_parens(&mut self) -> bool {
         let mut depth = 0u32;
@@ -381,8 +417,8 @@ impl<'a> Cur<'a> {
 }
 
 /// Identifier references in `s[start..end]`, as a macro body or macro
-/// arguments would contain them. Skips member names, pasted and stringified
-/// tokens, keywords and `params`.
+/// arguments would contain them. Skips pasted and stringified tokens,
+/// keywords and `params`.
 fn scan_refs(s: &[u8], start: usize, end: usize, line: u32, params: &[&[u8]], out: &mut Vec<Tok>) {
     let mut c = Cur { s: &s[..end], i: start, line };
     // The previous significant bytes decide whether an identifier is a member
@@ -401,8 +437,17 @@ fn scan_refs(s: &[u8], start: usize, end: usize, line: u32, params: &[&[u8]], ou
             c.skip_space(true);
             let pasted = c.peek(0) == b'#' && c.peek(1) == b'#';
             let member = prev[1] == b'.' || prev == *b"->";
-            if !(member || prev[1] == b'#' || pasted || is_keyword(text) || params.contains(&text)) {
-                out.push(Tok { start: a as u32, end: e as u32, line, call: c.peek(0) == b'(' });
+            if !(prev[1] == b'#' || pasted || is_keyword(text) || params.contains(&text)) {
+                let mut call = c.peek(0) == b'(';
+                if member {
+                    // `(*(p)->x) (args)`: closing parentheses, then the call.
+                    let mut k = c.i;
+                    while matches!(s.get(k), Some(b')' | b' ' | b'\t' | b'\n' | b'\r' | b'\\')) && k < end {
+                        k += 1;
+                    }
+                    call = k < end && s[k] == b'(';
+                }
+                out.push(Tok { start: a as u32, end: e as u32, line, call, member });
             }
             prev = [0, b'a'];
         } else if b.is_ascii_digit() {
@@ -482,6 +527,8 @@ struct Lexer<'a> {
     arg: Option<OperatorArg>,
     /// Start of the top-level block being read.
     block: Option<usize>,
+    /// The identifier before the one being read.
+    last_ident: (u32, u32),
 }
 
 #[derive(Clone, Copy)]
@@ -687,11 +734,12 @@ impl<'a> Lexer<'a> {
         let line = self.c.line;
         let (a, e) = self.c.ident();
         self.prev = b'a';
+        let before = std::mem::replace(&mut self.last_ident, (a as u32, e as u32));
         if let Some(&function_like) = self.transparent.expanding.get(&s[a..e]) {
-            self.site(Tok { start: a as u32, end: e as u32, line, call: false }, function_like);
+            self.site(Tok { start: a as u32, end: e as u32, line, call: false, member: false }, function_like, before);
         }
         let Some(&function_like) = self.transparent.transparent.get(&s[a..e]) else { return };
-        let mut tok = Tok { start: a as u32, end: e as u32, line, call: false };
+        let mut tok = Tok { start: a as u32, end: e as u32, line, call: false, member: false };
         let mut end = e;
         if function_like {
             let save = (self.c.i, self.c.line);
@@ -716,7 +764,7 @@ impl<'a> Lexer<'a> {
     /// Just past the name of an expanding macro: note the use and its
     /// arguments. The cursor does not move, so the arguments are still read
     /// as ordinary code.
-    fn site(&mut self, name: Tok, function_like: bool) {
+    fn site(&mut self, name: Tok, function_like: bool, before: (u32, u32)) {
         use crate::model::site;
         let save = (self.c.i, self.c.line);
         let mut args_end = 0;
@@ -734,14 +782,32 @@ impl<'a> Lexer<'a> {
             b'{' => site::BRACE_FOLLOWS,
             _ => 0,
         };
+        let top = self.nest.braces.is_empty() && self.nest.parens == 0;
+        // `const bfd_target MY (vec) = { ... }`: the parser cannot make a
+        // declaration of this, so the initializer is taken here.
+        let (mut init, mut init_array) = ((0, 0), false);
+        if top && before.1 > before.0 && !is_keyword(&self.c.s[before.0 as usize..before.1 as usize]) {
+            if self.c.peek(0) == b'[' && self.c.skip_group(b'[', b']') {
+                init_array = true;
+                self.c.skip_space(true);
+            }
+            if self.c.peek(0) == b'=' && self.c.peek(1) != b'=' {
+                self.c.i += 1;
+                self.c.skip_space(true);
+                let open = self.c.i;
+                if self.c.peek(0) == b'{' && self.c.skip_group(b'{', b'}') {
+                    init = (open as u32, self.c.i as u32);
+                }
+            }
+        }
         (self.c.i, self.c.line) = save;
-        if self.nest.braces.is_empty() && self.nest.parens == 0 {
+        if top {
             flags |= site::TOP;
         }
         if self.nest.braces.last().is_some_and(|b| b.0 == Brace::Init) {
             flags |= site::INIT;
         }
-        self.out.events.push(Event::Site(SiteTok { name, args_end, flags }));
+        self.out.events.push(Event::Site(SiteTok { name, args_end, flags, init, init_type: before, init_array }));
     }
 
     fn directive(&mut self) {
@@ -869,16 +935,20 @@ impl<'a> Lexer<'a> {
                 function_like,
                 deps: transparent_deps(s, body, end, &refs),
                 hides: crate::expand::hides_names(&s[body..end], &params),
-                refs: refs.iter().map(|t| s[t.start as usize..t.end as usize].to_vec()).collect(),
+                refs: refs.iter().filter(|t| !t.member).map(|t| s[t.start as usize..t.end as usize].to_vec()).collect(),
             });
         }
-        let name = Tok { start: a as u32, end: e as u32, line, call: function_like };
-        if let Some(c) = self.conds.first_mut() {
-            if c.ifndef.as_deref() == Some(&s[a..e]) {
-                c.include_guard = true;
+        let name = Tok { start: a as u32, end: e as u32, line, call: function_like, member: false };
+        // `#ifndef FOO_H` / `#define FOO_H` with nothing or `1` after it,
+        // around the whole file.
+        if self.conds.len() == 1 && self.conds[0].ifndef.as_deref() == Some(&s[a..e]) {
+            let body = s[body..end].iter().filter(|b| !b.is_ascii_whitespace()).count();
+            if !function_like && body <= 1 {
+                self.conds[0].include_guard = true;
             }
         }
         let conditional = self.conds.iter().any(|c| !c.include_guard);
+        let fallback = self.conds.last().is_some_and(|c| !c.include_guard && c.ifndef.as_deref() == Some(&s[a..e]));
         let keep = self.transparent.kept.contains(&s[a..e]);
         let mut guard = String::new();
         if keep {
@@ -887,7 +957,7 @@ impl<'a> Lexer<'a> {
                 guard += &format!("{sep}{n} {op} {v}");
             }
         }
-        self.out.events.push(Event::Macro(Macro { name, end_line, refs, end: end as u32, keep, guard, conditional }));
+        self.out.events.push(Event::Macro(Macro { name, end_line, refs, end: end as u32, keep, guard, conditional, fallback }));
     }
 }
 
@@ -944,6 +1014,7 @@ fn lexer<'a>(src: &'a [u8], transparent: &'a MacroSets, mask: bool) -> Lexer<'a>
         line_start: true,
         arg: None,
         block: None,
+        last_ident: (0, 0),
     }
 }
 
@@ -1012,7 +1083,8 @@ mod tests {
         let Event::Macro(m) = &l.events[0] else { panic!() };
         assert_eq!((m.name.line, m.end_line, m.name.call), (1, 2, true));
         let refs: Vec<(&str, bool)> = m.refs.iter().map(|t| (&src[t.start as usize..t.end as usize], t.call)).collect();
-        assert_eq!(refs, [("do_it", true), ("helper", false)]);
+        assert_eq!(refs, [("do_it", true), ("field", false), ("helper", false)]);
+        assert!(m.refs[1].member && !m.refs[0].member);
     }
 
     #[test]

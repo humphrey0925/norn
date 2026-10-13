@@ -16,7 +16,8 @@ from pathlib import Path
 
 # Generated at configure time from a file the corpus does have, with the same
 # definitions; clang reads the generated copy.
-GENERATED = {"<build>/bfd/bfd.h": "bfd/bfd-in2.h", "<build>/bfd/bfd_stdint.h": "bfd/bfd_stdint.h"}
+GENERATED = {"<build>/bfd/bfd.h": "bfd/bfd-in2.h", "<build>/bfd/bfd_stdint.h": "bfd/bfd_stdint.h",
+             "<build>/bfd/elf32-target.h": "bfd/elfxx-target.h", "<build>/bfd/elf64-target.h": "bfd/elfxx-target.h"}
 
 SI = Path(__file__).resolve().parent.parent / "target" / "release" / "si.exe"
 
@@ -33,9 +34,13 @@ def si_index(index):
         files.add(file)
         if kind == "function" and decl == "def":
             defs[file, name].append(int(line))
-    calls = ((sf, int(sl), cn, cf, en, ef, how, decl) for sf, sl, cn, cf, _cl, en, ef, _el, how, decl, _via
-             in si_lines("calls", index))
-    return files, defs, calls
+    calls, indirect = [], []
+    for sf, sl, cn, cf, _cl, en, ef, _el, how, decl, via, path in si_lines("calls", index):
+        if path == "indirect":
+            indirect.append((sf, int(sl), cn, cf, en, ef, via, decl))
+        else:
+            calls.append((sf, int(sl), cn, cf, en, ef, how, decl))
+    return files, defs, calls, indirect
 
 
 def cbm_index(db_path, project=None):
@@ -52,8 +57,8 @@ def cbm_index(db_path, project=None):
                          from edges e join nodes s on s.id = e.source_id join nodes t on t.id = e.target_id
                          where e.project = ? and e.type = 'CALLS' and s.label = 'Function' and t.label = 'Function'""",
                       (project,))
-    calls = ((sf, line or 0, cn, cf, en, ef, "certain", "def") for sf, line, cn, cf, en, ef in rows)
-    return files, defs, calls
+    calls = [(sf, line or 0, cn, cf, en, ef, "certain", "def") for sf, line, cn, cf, en, ef in rows]
+    return files, defs, calls, []
 
 
 class Truth:
@@ -81,7 +86,7 @@ def score(truth_path, index, corpus, cbm=False):
     t = Truth(truth_path)
     corpus = Path(corpus)
     # files, (file, name) -> lines, call rows
-    si_files, si_defs, call_rows = cbm_index(index) if cbm else si_index(index)
+    si_files, si_defs, call_rows, indirect_rows = cbm_index(index) if cbm else si_index(index)
 
     # --- definitions -------------------------------------------------------
     text = {}
@@ -164,11 +169,60 @@ def score(truth_path, index, corpus, cbm=False):
              "no_such_call": len(phantom),
              "precision_certain": len(right) / (len(judged_keys) - len(undefined)),
              "si_edges_to_prototypes": len(to_decl)}
-    detail = {"missed_defs": sorted(missed), "generated_defs": sorted(generated), "extra_defs": sorted(extra),
+    # --- calls through struct members -----------------------------------------
+    # What clang's types say: a call through member M of struct S may reach
+    # any function stored in S.M anywhere. An upper bound, not a trace.
+    stored = collections.defaultdict(set)  # (record, member) -> (callee file, callee name)
+    for record, member, usr, fn_name, home, _sf, _sl in t.raw.get("binds", []):
+        homes = {GENERATED.get(home, home)} if home else t.homes.get(usr, set())
+        if len(homes) == 1 and homes <= si_files:
+            stored[record, member].add((*homes, fn_name))
+    want_ind, callers_ind, sites = set(), set(), collections.Counter()
+    for cf, cn, _cl, how, record, member, _sf, _sl in t.raw.get("icalls", []):
+        cf = GENERATED.get(cf, cf)
+        if cf not in si_files:
+            continue
+        sites[how if how != "field" or stored.get((record, member)) else "field, nothing stored"] += 1
+        if how == "field":
+            callers_ind.add((cf, cn))
+            want_ind.update((cf, cn, ef, en) for ef, en in stored.get((record, member), ()))
+    # Where si says a function is stored. A store in a file clang did not
+    # compile cannot be judged, nor can the calls that only it explains.
+    compiled_stores, stores = None, {}
+    binds_file = Path(index) / "binds.tsv"
+    if not cbm and binds_file.exists():
+        compiled_stores, pairs, right_pairs = set(), set(), set()
+        truth_pairs = {(member, fn_name) for _r, member, _u, fn_name, _h, _sf, _sl in t.raw.get("binds", [])}
+        for line in binds_file.read_text(encoding="utf-8").splitlines():
+            site_file, site_line, member, fn_name, fn_file, what = line.split("\t")
+            if t.active(site_file, int(site_line)) and (fn_file, fn_name) in truth_names:
+                compiled_stores.add((member, fn_file, fn_name))
+                if what == "field":  # the truth has no stores into variables
+                    pairs.add((member, fn_name))
+        right_pairs = pairs & truth_pairs
+        stores = {"si_stores_in_compiled_lines": len(pairs), "right": len(right_pairs),
+                  "precision": len(right_pairs) / max(1, len(pairs)),
+                  "truth_stores": len(truth_pairs), "recall": len(right_pairs) / max(1, len(truth_pairs))}
+    got_ind, judged_ind = set(), set()
+    for site_file, site_line, cn, cf, en, ef, via, decl in indirect_rows:
+        if decl == "decl":
+            continue
+        got_ind.add((cf, cn, ef, en))
+        # Only a callee clang compiled can be told right from wrong.
+        if (cf, cn) in callers_ind and (ef, en) in truth_names and t.active(site_file, site_line):
+            if compiled_stores is None or (via, ef, en) in compiled_stores:
+                judged_ind.add((cf, cn, ef, en))
+    indirect = {"truth_call_sites": dict(sites), "truth_edges": len(want_ind), "found": len(want_ind & got_ind),
+                "recall": len(want_ind & got_ind) / max(1, len(want_ind)),
+                "si_edges": len(got_ind), "si_judged": len(judged_ind), "right": len(judged_ind & want_ind),
+                "precision": len(judged_ind & want_ind) / max(1, len(judged_ind)), "stores": stores}
+
+    detail = {"missed_indirect": sorted(want_ind - got_ind), "wrong_indirect": sorted(judged_ind - want_ind),
+              "missed_defs": sorted(missed), "generated_defs": sorted(generated), "extra_defs": sorted(extra),
               "missed_calls": sorted(missed_calls), "wrong_file": sorted(wrong_file), "undefined": sorted(undefined), "phantom": sorted(phantom),
               "names_called": names_called, "want_calls": want_calls, "any": any_, "certain": certain}
     return {"translation_units": t.raw["translation_units"], "indirect_calls": t.raw["indirect_calls"],
-            "definitions": defs, "calls": calls}, detail
+            "definitions": defs, "calls": calls, "indirect_calls_by_member": indirect}, detail
 
 
 def main():
@@ -182,7 +236,8 @@ def main():
     res, detail = score(args.truth, args.index, args.corpus, args.cbm)
     print(json.dumps(res, indent=2))
     if args.show:
-        for k in ("missed_defs", "extra_defs", "generated_defs", "missed_calls", "wrong_file", "undefined", "phantom"):
+        for k in ("missed_defs", "extra_defs", "generated_defs", "missed_calls", "wrong_file", "undefined", "phantom",
+                  "missed_indirect", "wrong_indirect"):
             by_file = collections.Counter(x[0] for x in detail[k])
             print(f"\n{k}: {len(detail[k])}; top files {by_file.most_common(6)}")
             step = max(1, len(detail[k]) // args.show)

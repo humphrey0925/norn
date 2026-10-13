@@ -12,6 +12,8 @@ pub mod kind {
     pub const ENUM_CONST: u8 = 6;
     pub const TYPEDEF: u8 = 7;
     pub const GLOBAL: u8 = 8;
+    /// A member of a struct or union.
+    pub const FIELD: u8 = 9;
 
     pub fn name(k: u8) -> &'static str {
         match k {
@@ -24,6 +26,7 @@ pub mod kind {
             ENUM_CONST => "enum_const",
             TYPEDEF => "typedef",
             GLOBAL => "global",
+            FIELD => "field",
             _ => "?",
         }
     }
@@ -36,11 +39,21 @@ pub mod flag {
     pub const DECL: u8 = 2;
     /// Defined in a header file.
     pub const HEADER: u8 = 4;
+    /// A typedef of a function or function pointer type, or a member that
+    /// can hold a function.
+    pub const CALLABLE: u8 = 8;
 }
 
 pub mod refkind {
     pub const CALL: u8 = 0;
     pub const USE: u8 = 1;
+    /// A member access: `x.name`, `x->name`, or `.name =` in an initializer.
+    pub const MEMBER: u8 = 2;
+    /// A call through a member: `x->name (...)`.
+    pub const ICALL: u8 = 3;
+    /// Not a reference in the source: an edge from a field or variable to a
+    /// function stored in it.
+    pub const BIND: u8 = 4;
 }
 
 pub const NONE: u32 = u32::MAX;
@@ -71,6 +84,8 @@ pub struct MacroBody {
     pub guard: u32,
     /// Defined only under some `#if`.
     pub conditional: bool,
+    /// Defined under `#ifndef` of its own name.
+    pub fallback: bool,
 }
 
 /// A use of an expanding macro, to be expanded at link time, when the
@@ -85,6 +100,46 @@ pub struct Site {
     /// The definition this use names (`NAME (a, b) (void) { }`), or `NONE`.
     pub def: u32,
     pub flags: u8,
+}
+
+/// A function stored where a call can later find it: in a struct member or
+/// in a variable. `func` is only a name; whether it is a function is
+/// decided at link time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Bind {
+    /// The member or variable name; or, when `index` is not `NONE`, the name
+    /// of the struct type whose `index`-th member is meant (an initializer
+    /// without designators).
+    pub slot: u32,
+    pub index: u32,
+    pub func: u32,
+    pub line: u32,
+    pub scope: u32,
+    /// The slot is a variable, not a member.
+    pub var: bool,
+    /// The translation unit (a file index, set at link time) in which the
+    /// store reads this way, when macros decide that; else `NONE`.
+    pub unit: u32,
+}
+
+/// A braced initializer with macro uses in it, kept as text: which member
+/// each element initializes is only known once the macros are expanded.
+#[derive(Clone, Copy, Debug)]
+pub struct InitSite {
+    /// The struct type's name, or `NONE`.
+    pub type_name: u32,
+    pub text: u32,
+    pub line: u32,
+    pub scope: u32,
+    /// The initialized object is an array of the type.
+    pub array: bool,
+}
+
+/// The members of a struct or union, in order (`NONE` for an unnamed one).
+#[derive(Clone, Debug)]
+pub struct Record {
+    pub name: u32,
+    pub fields: Vec<u32>,
 }
 
 /// A definition found in one file. `name` indexes the file-local name table.
@@ -129,6 +184,14 @@ pub struct FileFacts {
     pub includes: Vec<u32>,
     pub macros: Vec<MacroBody>,
     pub sites: Vec<Site>,
+    pub binds: Vec<Bind>,
+    pub inits: Vec<InitSite>,
+    pub records: Vec<Record>,
+    /// `typedef struct tag name;` as (name, tag).
+    pub aliases: Vec<(u32, u32)>,
+    /// Members declared with a typedef name, as (definition, type name):
+    /// whether they can hold a function depends on the typedef.
+    pub field_types: Vec<(u32, u32)>,
 }
 
 impl FileFacts {

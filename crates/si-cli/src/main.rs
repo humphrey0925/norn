@@ -42,6 +42,14 @@ enum Cmd {
         /// Index only every k-th file (for scaling measurements).
         #[arg(long, default_value_t = 1)]
         stride: usize,
+        /// `FROM=TO`: an `#include` of a file named FROM reads TO instead,
+        /// for a header the build generates from a template. Repeatable.
+        #[arg(long, value_name = "FROM=TO")]
+        include_alias: Vec<String>,
+        /// Also write `binds.tsv`: where each function is stored in a member
+        /// or variable (for accuracy checks).
+        #[arg(long)]
+        dump_binds: bool,
     },
     /// One-shot query against a CSR index: find | callers | callees | refs | tree.
     Query {
@@ -125,7 +133,7 @@ fn sym_json(g: &Graph, id: u32) -> Value {
             "decl": s.flags & flag::DECL != 0 })
 }
 
-fn index(root: &Path, out: &Path, stores: &str, stride: usize) -> Value {
+fn index(root: &Path, out: &Path, stores: &str, stride: usize, options: &si_core::link::Options, dump_binds: bool) -> Value {
     let total = Instant::now();
     let t = Instant::now();
     let files: Vec<PathBuf> = si_core::scan(root).into_iter().step_by(stride.max(1)).collect();
@@ -141,10 +149,19 @@ fn index(root: &Path, out: &Path, stores: &str, stride: usize) -> Value {
     let facts_bytes: usize = facts.iter().map(FileFacts::heap_bytes).sum();
 
     let t = Instant::now();
-    let (g, ls) = si_core::link::link(&facts);
+    let (g, ls) = si_core::link::link_with(&facts, options);
     let link_ms = ms(t);
 
     std::fs::create_dir_all(out).expect("create output dir");
+    if dump_binds {
+        let mut w = std::io::BufWriter::new(std::fs::File::create(out.join("binds.tsv")).expect("create binds.tsv"));
+        for &[file, line, slot, func] in &ls.bind_sites {
+            let f = &g.syms[func as usize];
+            let what = kind::name(g.syms[slot as usize].kind);
+            writeln!(w, "{}\t{line}\t{}\t{}\t{}\t{what}", g.file_path(file), g.sym_name(slot), g.sym_name(func), g.file_path(f.file))
+                .expect("write binds.tsv");
+        }
+    }
     let mut store_stats = serde_json::Map::new();
     for store in stores.split(',').filter(|s| !s.is_empty() && *s != "none") {
         let t = Instant::now();
@@ -220,18 +237,33 @@ fn run_query(g: &Graph, op: &str, name: &str, depth: u32) -> Value {
                     if let Some(m) = c.via {
                         v["via_macro"] = json!(g.sym_name(m));
                     }
+                    if let Some(slot) = c.slot {
+                        v["through"] = json!(g.sym_name(slot));
+                    }
                     results.push(v);
                 }
             }
             json!({ "count": results.len(), "results": results })
         }
-        "callees" | "refs" => {
+        "callees" => {
             let mut results = Vec::new();
             for &s in syms {
-                let edges: Vec<&EdgeHalf> = match op {
-                    "callees" => g.refs_from(s).iter().filter(is_call).collect(),
-                    _ => g.refs_to(s).iter().collect(),
-                };
+                for c in si_core::callees_through_slots(g, s) {
+                    let mut v = sym_json(g, c.caller);
+                    v["at_line"] = json!(c.line);
+                    v["certain"] = json!(!c.ambiguous);
+                    if let Some(slot) = c.slot {
+                        v["through"] = json!(g.sym_name(slot));
+                    }
+                    results.push(v);
+                }
+            }
+            json!({ "count": results.len(), "results": results })
+        }
+        "refs" => {
+            let mut results = Vec::new();
+            for &s in syms {
+                let edges: Vec<&EdgeHalf> = g.refs_to(s).iter().collect();
                 for e in edges {
                     let mut v = sym_json(g, e.other);
                     v["at_line"] = json!(e.line());
@@ -412,8 +444,8 @@ fn symbols(dir: &Path) {
 
 /// Every call the index knows, one per line: call site file and line, then
 /// the calling and the called function as `name`, `file`, `line`, then
-/// `certain|ambiguous`, `decl|def` for the callee, and the macro the call
-/// was made through (or `-`).
+/// `certain|ambiguous`, `decl|def` for the callee, the macro, member or
+/// variable the call was made through (or `-`), and `direct|indirect`.
 fn calls(dir: &Path) {
     let g = Graph::load(&dir.join("graph.si")).expect("load graph.si");
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
@@ -425,8 +457,9 @@ fn calls(dir: &Path) {
                 continue;
             }
             let certain = if c.ambiguous { "ambiguous" } else { "certain" };
-            let via = c.via.map_or("-", |m| g.sym_name(m));
-            writeln!(out, "{}	{}	{}	{}	{}	{}	{}	{}	{certain}	{decl}	{via}",
+            let via = c.slot.or(c.via).map_or("-", |m| g.sym_name(m));
+            let how = if c.indirect() { "indirect" } else { "direct" };
+            writeln!(out, "{}	{}	{}	{}	{}	{}	{}	{}	{certain}	{decl}	{via}	{how}",
                      g.file_path(from.file), c.line, g.sym_name(c.caller), g.file_path(from.file), from.line,
                      g.sym_name(id as u32), g.file_path(s.file), s.line)
                 .expect("write calls");
@@ -443,7 +476,13 @@ fn main() {
         si_core::use_mimalloc_for_parser();
     }
     let result = match &cli.cmd {
-        Cmd::Index { root, out, stores, stride } => index(root, out, stores, *stride),
+        Cmd::Index { root, out, stores, stride, include_alias, dump_binds } => {
+            let include_aliases = include_alias
+                .iter()
+                .map(|a| a.split_once('=').map(|(from, to)| (from.to_string(), to.to_string())).expect("FROM=TO"))
+                .collect();
+            index(root, out, stores, *stride, &si_core::link::Options { include_aliases }, *dump_binds)
+        }
         Cmd::Query { dir, op, name, depth } => query(dir, op, name, *depth),
         Cmd::BenchQuery { dir, n, seed } => bench_query(dir, *n, *seed),
         Cmd::BenchIncr { root, n, seed } => bench_incr(root, *n, *seed),

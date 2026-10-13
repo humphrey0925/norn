@@ -11,7 +11,18 @@ every entry of compile_commands.json, and writes one JSON file:
 The callee's file is given when its definition is in the same translation
 unit. Otherwise it has to be found by USR, which names one function per
 program: `main` and other names that several programs define have several.
+  icalls    [caller file, caller name, caller line, kind, record, field,
+             site file, site line]
+  binds     [record, field, function usr, function name, function file or
+             null, site file, site line]
   files     {file: {"tus": n, "inactive": [[first, last], ...]}}
+
+An indirect call (`icalls`) goes through a struct field (`kind` "field",
+with the record and field names), a parameter, a variable, or something
+else. `binds` are the places a function is stored in a field: by an
+initializer, positional or designated, or by an assignment. Joining the two
+on (record, field) gives the calls a field-based, type-aware analysis finds;
+it is an upper bound on what runs, not a record of it.
 
 `file` is relative to the source root; generated files are `<build>/...`.
 A line is inactive when every translation unit that read the file skipped it
@@ -62,7 +73,112 @@ def flags(entry):
     return out
 
 
-def calls_in(fn, caller, out, stats):
+OTHER = ("other", "", "")
+WRAPPERS = {CursorKind.UNEXPOSED_EXPR, CursorKind.PAREN_EXPR, CursorKind.CSTYLE_CAST_EXPR, CursorKind.UNARY_OPERATOR,
+            CursorKind.ARRAY_SUBSCRIPT_EXPR}
+
+
+def site(loc):
+    return rel(loc.file.name) if loc.file else None
+
+
+def slot_of(field):
+    return (field.semantic_parent.spelling, field.spelling)
+
+
+def target_of(call):
+    """What an indirect call goes through: (kind, record, name)."""
+    kids = list(call.get_children())
+    c = kids[0] if kids else None
+    while c is not None:
+        if c.kind == CursorKind.MEMBER_REF_EXPR:
+            f = c.referenced
+            return ("field", *slot_of(f)) if f is not None and f.kind == CursorKind.FIELD_DECL else OTHER
+        if c.kind == CursorKind.DECL_REF_EXPR:
+            d = c.referenced
+            if d is not None and d.kind == CursorKind.PARM_DECL:
+                return ("param", "", d.spelling)
+            if d is not None and d.kind == CursorKind.VAR_DECL:
+                return ("var", "", d.spelling)
+            return OTHER
+        if c.kind not in WRAPPERS:
+            return OTHER
+        kids = list(c.get_children())
+        # A cast's operand is its last child; the others lead with theirs.
+        c = (kids[-1] if c.kind == CursorKind.CSTYLE_CAST_EXPR else kids[0]) if kids else None
+    return OTHER
+
+
+def functions_named_in(expr):
+    """Functions whose address the expression takes (not ones it calls)."""
+    stack = [expr]
+    while stack:
+        c = stack.pop()
+        if c.kind == CursorKind.CALL_EXPR:
+            continue
+        if c.kind == CursorKind.DECL_REF_EXPR:
+            d = c.referenced
+            if d is not None and d.kind == CursorKind.FUNCTION_DECL:
+                yield d
+            continue
+        stack.extend(c.get_children())
+
+
+def bind(slot, expr, out):
+    for fn in functions_named_in(expr):
+        d = fn.get_definition()
+        home = rel(d.location.file.name) if d is not None and d.location.file else None
+        out.add((*slot, fn.get_usr(), fn.spelling, home, site(expr.location), expr.location.line))
+
+
+def init_list(lst, owner, out):
+    """Bind what a braced initializer stores. `owner` is the field the list
+    itself initializes, which is what the elements of an array belong to."""
+    t = lst.type.get_canonical()
+    fields = list(t.get_fields()) if t.kind == cindex.TypeKind.RECORD else None
+    pos = 0
+    for ch in lst.get_children():
+        slot, value = owner, ch
+        kids = list(ch.get_children())
+        if ch.kind == CursorKind.UNEXPOSED_EXPR and kids and kids[0].kind == CursorKind.MEMBER_REF:
+            f, value = kids[0].referenced, kids[-1]
+            if f is not None and f.kind == CursorKind.FIELD_DECL:
+                slot = slot_of(f)
+                names = [x.spelling for x in fields or []]
+                if f.spelling in names:
+                    pos = names.index(f.spelling) + 1
+        elif fields is not None:
+            slot = slot_of(fields[pos]) if pos < len(fields) else None
+            pos += 1
+        elif ch.kind == CursorKind.UNEXPOSED_EXPR and kids and kids[-1].kind == CursorKind.INIT_LIST_EXPR:
+            value = kids[-1]  # `[i] = { ... }`
+        if value.kind == CursorKind.INIT_LIST_EXPR:
+            init_list(value, slot, out)
+        elif slot is not None:
+            bind(slot, value, out)
+
+
+def binds_in(root, out):
+    stack = [root]
+    while stack:
+        c = stack.pop()
+        if c.kind == CursorKind.INIT_LIST_EXPR:
+            init_list(c, None, out)
+            continue
+        if c.kind == CursorKind.BINARY_OPERATOR:
+            kids = list(c.get_children())
+            if len(kids) == 2:
+                lhs = kids[0]
+                while lhs.kind == CursorKind.PAREN_EXPR:
+                    lhs = next(lhs.get_children())
+                f = lhs.referenced if lhs.kind == CursorKind.MEMBER_REF_EXPR else None
+                # An assignment has the type of its left side; a comparison does not.
+                if f is not None and f.kind == CursorKind.FIELD_DECL and c.type.spelling == kids[0].type.spelling:
+                    bind(slot_of(f), kids[1], out)
+        stack.extend(c.get_children())
+
+
+def calls_in(fn, caller, out, icalls, stats):
     stack = list(fn.get_children())
     while stack:
         c = stack.pop()
@@ -70,12 +186,12 @@ def calls_in(fn, caller, out, stats):
             callee = c.referenced
             if callee is not None and callee.kind == CursorKind.FUNCTION_DECL:
                 loc = c.location
-                site = rel(loc.file.name) if loc.file else None
                 d = callee.get_definition()
                 home = rel(d.location.file.name) if d is not None and d.location.file else None
-                out.add((*caller, callee.get_usr(), callee.spelling, home, site, loc.line))
+                out.add((*caller, callee.get_usr(), callee.spelling, home, site(loc), loc.line))
             else:
                 stats["indirect"] += 1
+                icalls.add((*caller, *target_of(c), site(c.location), c.location.line))
         stack.extend(c.get_children())
 
 
@@ -87,15 +203,18 @@ def one(entry):
     except cindex.TranslationUnitLoadError:
         return {"file": entry["file"], "failed": True}
     errors = [d.spelling for d in tu.diagnostics if d.severity >= cindex.Diagnostic.Error]
-    defs, calls, stats = set(), set(), collections.Counter()
+    defs, calls, icalls, binds, stats = set(), set(), set(), set(), collections.Counter()
     for c in tu.cursor.get_children():
-        if c.kind != CursorKind.FUNCTION_DECL or not c.is_definition() or c.location.file is None:
+        if c.location.file is None or c.kind not in (CursorKind.FUNCTION_DECL, CursorKind.VAR_DECL):
             continue
         file = rel(c.location.file.name)
         if file is None:
             continue
+        binds_in(c, binds)
+        if c.kind != CursorKind.FUNCTION_DECL or not c.is_definition():
+            continue
         defs.add((c.get_usr(), c.spelling, file, c.location.line, c.storage_class == cindex.StorageClass.STATIC))
-        calls_in(c, (file, c.spelling, c.location.line), calls, stats)
+        calls_in(c, (file, c.spelling, c.location.line), calls, icalls, stats)
     read = {rel(path)} | {rel(i.include.name) for i in tu.get_includes()}
     read.discard(None)
     skipped = collections.defaultdict(list)
@@ -106,7 +225,8 @@ def one(entry):
         if file:
             skipped[file].append((r.start.line, r.end.line))
     LIB.clang_disposeSourceRangeList(ranges)
-    return {"file": entry["file"], "errors": errors[:3], "defs": list(defs), "calls": list(calls), "read": list(read),
+    return {"file": entry["file"], "errors": errors[:3], "defs": list(defs), "calls": list(calls), "icalls": list(icalls),
+            "binds": list(binds), "read": list(read),
             "skipped": skipped, "indirect": stats["indirect"]}
 
 
@@ -121,7 +241,7 @@ def main():
     entries = json.load(open(os.path.join(BUILD, "compile_commands.json")))
     entries = list({(e["directory"], e["file"]): e for e in entries}.values())
 
-    defs, calls, indirect, failed, with_errors = set(), set(), 0, [], []
+    defs, calls, icalls, binds, indirect, failed, with_errors = set(), set(), set(), set(), 0, [], []
     tus = collections.Counter()
     skips = collections.defaultdict(collections.Counter)
     with multiprocessing.Pool() as pool:
@@ -133,6 +253,8 @@ def main():
                 with_errors.append((r["file"], r["errors"]))
             defs.update(map(tuple, r["defs"]))
             calls.update(map(tuple, r["calls"]))
+            icalls.update(map(tuple, r["icalls"]))
+            binds.update(map(tuple, r["binds"]))
             indirect += r["indirect"]
             for f in r["read"]:
                 tus[f] += 1
@@ -155,10 +277,12 @@ def main():
                 runs.append([line, line])
         files[f] = {"tus": n, "inactive": runs}
     json.dump({"translation_units": len(entries), "failed": failed, "with_errors": with_errors, "indirect_calls": indirect,
-               "defs": sorted(defs), "calls": sorted(calls, key=str), "files": files},
+               "defs": sorted(defs), "calls": sorted(calls, key=str), "icalls": sorted(icalls, key=str),
+               "binds": sorted(binds, key=str), "files": files},
               open(args.out, "w"))
     print(f"{len(entries)} TUs, {len(failed)} failed, {len(with_errors)} with errors, "
-          f"{len(defs)} definitions, {len(calls)} call sites, {indirect} indirect calls")
+          f"{len(defs)} definitions, {len(calls)} call sites, {indirect} indirect calls "
+          f"({len(icalls)} distinct), {len(binds)} bindings")
 
 
 if __name__ == "__main__":

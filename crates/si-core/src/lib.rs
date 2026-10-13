@@ -57,44 +57,85 @@ pub fn use_mimalloc_for_parser() {
     unsafe { tree_sitter::set_allocator(Some(mi_malloc), Some(mi_calloc), Some(mi_realloc), Some(mi_free)) }
 }
 
-/// One caller of a function: directly, or by using a macro whose expansion
-/// makes the call.
+/// One caller of a function: directly, by using a macro whose expansion
+/// makes the call, or by calling through a member or variable the function
+/// is stored in.
 #[derive(Clone, Copy, Debug)]
 pub struct Caller {
     pub caller: u32,
     pub line: u32,
     pub ambiguous: bool,
-    /// The macro used at `line`, when the call is not written there itself.
+    /// The macro used at `line`, or the member or variable called through,
+    /// when the call is not written there by name.
     pub via: Option<u32>,
+    /// The member or variable the call goes through, when it does: it then
+    /// reaches this function only if that is what is stored there at the
+    /// time.
+    pub slot: Option<u32>,
 }
 
-/// Callers of `sym`, looking through macros: if macro `M` calls `sym`, every
-/// user of `M` calls it too (and so on through macros that use `M`). The
-/// macros themselves are reported as well, since the call is written there.
-/// A macro that only names the function (`#define emit emit_le`) calls it
-/// where the macro itself is called.
+impl Caller {
+    pub fn indirect(&self) -> bool {
+        self.slot.is_some()
+    }
+}
+
+/// Callers of `sym`, looking through macros and function pointers:
+///
+/// * if macro `M` calls `sym`, every user of `M` calls it too (and so on
+///   through macros that use `M`); the macros themselves are reported as
+///   well, since the call is written there;
+/// * a macro that only names the function (`#define emit emit_le`) calls it
+///   where the macro itself is called;
+/// * if `sym` is stored in a struct member or a variable, every call through
+///   that member or variable may call it.
 pub fn callers_through_macros(g: &graph::Graph, sym: u32) -> Vec<Caller> {
     use model::{kind, refkind};
     let mut out = Vec::new();
-    let mut seen_macros = rustc_hash::FxHashSet::default();
-    // (target, macro it was reached through, ambiguous so far, whether the
-    // call is still to be written by whoever uses the target)
-    let mut work = vec![(sym, None, false, true)];
-    while let Some((target, via, via_ambiguous, call_pending)) = work.pop() {
+    let mut seen = rustc_hash::FxHashSet::default();
+    // (target, what it was reached through, ambiguous so far, whether the
+    // call is still to be written by whoever uses the target, indirect)
+    let mut work = vec![(sym, None, false, true, None)];
+    while let Some((target, via, via_ambiguous, call_pending, slot)) = work.pop() {
         for e in g.refs_to(target) {
+            if e.kind() == refkind::BIND {
+                // `target` is stored in `e.other`.
+                if via.is_none() && seen.insert((e.other, true)) {
+                    work.push((e.other, Some(e.other), e.ambiguous(), true, Some(e.other)));
+                }
+                continue;
+            }
             let from_macro = g.syms[e.other as usize].kind == kind::MACRO;
-            let called = e.kind() == refkind::CALL;
+            let called = matches!(e.kind(), refkind::CALL | refkind::ICALL);
             if call_pending && !called && !from_macro {
                 continue;
             }
             let ambiguous = via_ambiguous || e.ambiguous();
             let pending = call_pending && !called;
             if !pending {
-                out.push(Caller { caller: e.other, line: e.line(), ambiguous, via });
+                out.push(Caller { caller: e.other, line: e.line(), ambiguous, via, slot });
             }
-            if from_macro && seen_macros.insert((e.other, pending)) {
-                work.push((e.other, Some(e.other), ambiguous, pending));
+            if from_macro && seen.insert((e.other, pending)) {
+                work.push((e.other, Some(e.other), ambiguous, pending, slot));
             }
+        }
+    }
+    out
+}
+
+/// What `sym` calls: by name, and through members and variables (`via`),
+/// each function stored there.
+pub fn callees_through_slots(g: &graph::Graph, sym: u32) -> Vec<Caller> {
+    use model::refkind;
+    let mut out = Vec::new();
+    for e in g.refs_from(sym).iter().filter(|e| matches!(e.kind(), refkind::CALL | refkind::ICALL)) {
+        let stored: Vec<_> = g.refs_from(e.other).iter().filter(|b| b.kind() == refkind::BIND).collect();
+        if e.kind() == refkind::CALL {
+            out.push(Caller { caller: e.other, line: e.line(), ambiguous: e.ambiguous(), via: None, slot: None });
+        }
+        for b in stored {
+            let ambiguous = e.ambiguous() || b.ambiguous();
+            out.push(Caller { caller: b.other, line: e.line(), ambiguous, via: Some(e.other), slot: Some(e.other) });
         }
     }
     out
