@@ -114,6 +114,9 @@ struct Server {
     open: HashMap<PathBuf, String>,
     /// Lines of files read to place results, until the next update.
     lines: HashMap<String, Vec<String>>,
+    /// Every symbol worth listing, by name without regard to case; made
+    /// when first asked for and dropped when the index changes.
+    listing: Option<Vec<u32>>,
 }
 
 impl Server {
@@ -436,6 +439,7 @@ impl Server {
 
     fn synced(&mut self, up: si_core::session::Update) -> Value {
         self.lines.clear();
+        self.listing = None;
         let mut v = self.scope();
         v["files"] = json!(self.session.files());
         v["symbols"] = json!(self.g().syms.len());
@@ -451,7 +455,47 @@ impl Server {
         if !paths.is_empty() {
             self.session.update(&paths);
             self.lines.clear();
+            self.listing = None;
         }
+    }
+
+    /// `si/symbols`: a stretch of the whole project's symbols in name order
+    /// (`offset`, `limit`), with how many there are. Prototypes are left to
+    /// their definitions; a list this long is fetched as it is scrolled.
+    fn symbols(&mut self, params: &Value) -> Value {
+        if self.listing.is_none() {
+            let g = self.g();
+            let mut all: Vec<u32> = (0..g.syms.len() as u32)
+                .filter(|&s| g.syms[s as usize].kind != kind::FILE && g.syms[s as usize].flags & flag::DECL == 0)
+                .collect();
+            // Without regard to case, as a person looks a name up; then by
+            // the name itself and by place, so the order is always the same.
+            all.sort_by_cached_key(|&s| {
+                let sym = &g.syms[s as usize];
+                (g.sym_name(s).to_ascii_lowercase(), g.sym_name(s).to_string(), sym.file, sym.line)
+            });
+            self.listing = Some(all);
+        }
+        let all = self.listing.as_ref().unwrap();
+        let offset = (params["offset"].as_u64().unwrap_or(0) as usize).min(all.len());
+        let limit = params["limit"].as_u64().unwrap_or(200).min(2000) as usize;
+        let g = self.g();
+        let items: Vec<Value> = all[offset..(offset + limit).min(all.len())]
+            .iter()
+            .map(|&s| {
+                let sym = &g.syms[s as usize];
+                json!({ "name": g.sym_name(s), "kind": kind::name(sym.kind), "file": g.file_path(sym.file), "line": sym.line })
+            })
+            .collect();
+        json!({ "total": all.len(), "offset": offset, "items": items })
+    }
+
+    /// `si/place`: where exactly the name of the symbol defined on `line`
+    /// of `file` is written (a listing does not carry columns).
+    fn place(&mut self, params: &Value) -> Value {
+        let (file, line, name) =
+            (params["file"].as_str().unwrap_or(""), params["line"].as_u64().unwrap_or(1) as u32, params["name"].as_str().unwrap_or(""));
+        self.location(file, line, name)
     }
 
     fn request(&mut self, method: &str, params: &Value) -> Option<Value> {
@@ -467,6 +511,8 @@ impl Server {
             "si/context" => self.context(params),
             "si/relation" => self.relation(params),
             "si/assignments" => self.assignments(params),
+            "si/symbols" => self.symbols(params),
+            "si/place" => self.place(params),
             "si/scope" => self.scope(),
             "si/setScope" => {
                 let list = |key: &str| -> Vec<String> {
@@ -534,7 +580,7 @@ pub fn run(root: Option<&Path>, open: &dyn Fn(&Path) -> (Session, si_core::sessi
             let dir = root.map(Path::to_path_buf).or(from_client).unwrap_or_else(|| PathBuf::from("."));
             let (session, opened) = open(&dir);
             let opened = (opened.loaded, opened.extracted);
-            server = Some(Server { session, opened, root: dir, open: HashMap::new(), lines: HashMap::new() });
+            server = Some(Server { session, opened, root: dir, open: HashMap::new(), lines: HashMap::new(), listing: None });
             let capabilities = json!({
                 "textDocumentSync": { "openClose": true, "change": 1, "save": true },
                 "definitionProvider": true, "declarationProvider": true, "referencesProvider": true,

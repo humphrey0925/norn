@@ -443,6 +443,12 @@ const STYLE = `
   input:focus { outline: 1px solid var(--vscode-focusBorder); }
   .wrap { padding: 0 8px; }
   .row { display: flex; gap: 8px; padding: 2px 8px; cursor: pointer; white-space: nowrap; align-items: baseline; }
+  html, body { height: 100%; }
+  body { display: flex; flex-direction: column; }
+  #count { color: var(--vscode-descriptionForeground); font-size: 0.85em; padding: 0 0 4px; }
+  #scroll { flex: 1; overflow-y: auto; position: relative; min-height: 0; }
+  #scroll #list .row { position: absolute; left: 0; right: 0; height: 22px; box-sizing: border-box; padding: 0 8px; align-items: center; }
+  #space { width: 1px; }
   .row:hover, .row:focus { background: var(--vscode-list-hoverBackground); outline: none; }
   .name { font-family: var(--vscode-editor-font-family); overflow: hidden; text-overflow: ellipsis; }
   .name b { color: var(--vscode-list-highlightForeground); font-weight: 600; }
@@ -474,16 +480,31 @@ function page(w: vscode.Webview, body: string, script: string): string {
 
 /** Fuzzy project symbol search: fragments in any order, initials. */
 class Search implements vscode.WebviewViewProvider {
+  private view: vscode.WebviewView | undefined;
+
+  /** The index changed: what is listed may have too. */
+  refresh() {
+    void this.view?.webview.postMessage({ type: "reset" });
+  }
+
   resolveWebviewView(view: vscode.WebviewView) {
+    this.view = view;
     view.webview.html = page(
       view.webview,
-      `<div class="wrap"><input id="q" placeholder="Fragments or initials: init cache, bci" spellcheck="false"></div><div id="list"></div>`,
+      `<div class="wrap"><input id="q" placeholder="Fragments or initials: init cache, bci" spellcheck="false"><div id="count"></div></div>
+       <div id="scroll"><div id="space"></div><div id="list"></div></div>`,
       `
-      const q = document.getElementById("q"), list = document.getElementById("list");
-      let timer, results = [];
-      const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+      const q = document.getElementById("q"), list = document.getElementById("list"), space = document.getElementById("space");
+      const scroll = document.getElementById("scroll"), count = document.getElementById("count");
+      const ROW = 22, PAGE = 200;
+      // With nothing typed: every symbol of the project in name order,
+      // fetched a page at a time as it scrolls into view. With something
+      // typed: the matches, best first.
+      let timer, query = "", results = [], total = 0, pages = new Map(), asked = new Set(), epoch = 0;
+      const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
       // Mark what matched: each word as a substring, else its letters in order.
       function mark(name, words) {
+        if (!words.length) return esc(name);
         const on = new Array(name.length).fill(false), lower = name.toLowerCase();
         for (const w of words) {
           const i = lower.indexOf(w);
@@ -495,28 +516,75 @@ class Search implements vscode.WebviewViewProvider {
         for (let i = 0; i < name.length; i++) out += on[i] ? "<b>" + esc(name[i]) + "</b>" : esc(name[i]);
         return out;
       }
-      q.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(() => vscode.postMessage({ query: q.value }), 60); });
-      q.addEventListener("keydown", (e) => { if (e.key === "Enter" && results[0]) vscode.postMessage({ open: results[0], beside: e.ctrlKey || e.metaKey }); });
+      const words = () => query.toLowerCase().split(/\\s+/).filter(Boolean);
+      const item = (i) => (query ? results[i] : pages.get(Math.floor(i / PAGE))?.[i % PAGE]);
+      function row(r, i, w) {
+        if (!r) return '<div class="row" style="top:' + i * ROW + 'px"><span class="dim">…</span></div>';
+        return '<div class="row" tabindex="0" data-i="' + i + '" style="top:' + i * ROW + 'px" title="' + esc(r.kindName + " " + r.name + "\\n" + r.file + ":" + r.line) + '"><span class="codicon codicon-' + r.icon + " k-" + r.kind + '"></span><span class="name">' + mark(r.name, w) + '</span><span class="dim">' + esc(r.file.split("/").pop()) + ":" + r.line + "</span></div>";
+      }
+      function render() {
+        const n = query ? results.length : total;
+        space.style.height = n * ROW + "px";
+        count.textContent = query ? (n ? n + " matches" : "No matching symbols") : (n ? n.toLocaleString() + " symbols, by name" : "");
+        const first = Math.max(0, Math.floor(scroll.scrollTop / ROW) - 10);
+        const last = Math.min(n, Math.ceil((scroll.scrollTop + scroll.clientHeight) / ROW) + 10);
+        const w = words();
+        let html = "";
+        for (let i = first; i < last; i++) html += row(item(i), i, w);
+        list.innerHTML = html;
+        if (!query) {
+          for (let p = Math.floor(first / PAGE); p <= Math.floor(Math.max(first, last - 1) / PAGE); p++) {
+            if (!pages.has(p) && !asked.has(p)) { asked.add(p); vscode.postMessage({ page: p, size: PAGE, epoch }); }
+          }
+        }
+      }
+      function reset() { epoch++; pages = new Map(); asked = new Set(); render(); }
+      scroll.addEventListener("scroll", render);
+      new ResizeObserver(render).observe(scroll);
+      q.addEventListener("input", () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          query = q.value.trim();
+          scroll.scrollTop = 0;
+          if (query) vscode.postMessage({ query }); else { results = []; render(); }
+        }, 60);
+      });
+      q.addEventListener("keydown", (e) => { const r = item(0); if (e.key === "Enter" && r) vscode.postMessage({ open: r, beside: e.ctrlKey || e.metaKey }); });
       list.addEventListener("click", (e) => {
-        const row = e.target.closest(".row");
-        if (row) vscode.postMessage({ open: results[+row.dataset.i], beside: e.ctrlKey || e.metaKey });
+        const el = e.target.closest("[data-i]");
+        const r = el && item(+el.dataset.i);
+        if (r) vscode.postMessage({ open: r, beside: e.ctrlKey || e.metaKey });
       });
       window.addEventListener("message", (e) => {
-        results = e.data.results;
-        const words = e.data.query.toLowerCase().split(/\\s+/).filter(Boolean);
-        list.innerHTML = results.length
-          ? results.map((r, i) => '<div class="row" tabindex="0" data-i="' + i + '" title="' + esc(r.kindName + " " + r.name + "\\n" + r.file + ":" + r.line) + '"><span class="codicon codicon-' + r.icon + " k-" + r.kind + '"></span><span class="name">' + mark(r.name, words) + '</span><span class="dim">' + esc(r.file.split("/").pop()) + ":" + r.line + "</span></div>").join("")
-          : (words.length ? '<div class="empty">No matching symbols</div>' : "");
+        const d = e.data;
+        if (d.type === "reset") return reset();
+        if (d.type === "page") {
+          if (d.epoch !== epoch) return;
+          total = d.total;
+          pages.set(d.page, d.items);
+        } else if (d.query === query) {
+          results = d.results;
+        }
+        render();
       });
+      reset();
       q.focus();`,
     );
-    view.webview.onDidReceiveMessage(async (m: { query?: string; open?: Entry; beside?: boolean }) => {
+    const decorate = <T extends { kind: string }>(e: T) => ({ ...e, kindName: KIND_NAMES[e.kind] ?? e.kind, icon: ICONS[e.kind] ?? "symbol-misc" });
+    view.webview.onDidReceiveMessage(async (m: { query?: string; page?: number; size?: number; epoch?: number; open?: { file: string; line: number; name: string }; beside?: boolean }) => {
       if (m.open) {
-        await open(m.open.uri, m.open.range.start.line, m.open.range.start.character, !!m.beside);
+        // A listing carries no columns: ask where the name is written.
+        const at = await ask<{ uri: string; range: Entry["range"] }>("si/place", { file: m.open.file, line: m.open.line, name: m.open.name });
+        if (at) {
+          await open(at.uri, at.range.start.line, at.range.start.character, !!m.beside);
+        }
+      } else if (m.page !== undefined) {
+        const size = m.size ?? 200;
+        const r = await ask<{ total: number; items: { name: string; kind: string; file: string; line: number }[] }>("si/symbols", { offset: m.page * size, limit: size });
+        void view.webview.postMessage({ type: "page", page: m.page, epoch: m.epoch, total: r?.total ?? 0, items: (r?.items ?? []).map(decorate) });
       } else if (m.query !== undefined) {
-        const query = m.query;
-        const found = query.trim() ? (await ask<Entry[]>("si/search", { query, limit: 100 })) ?? [] : [];
-        void view.webview.postMessage({ query, results: found.map((e) => ({ ...e, kindName: KIND_NAMES[e.kind] ?? e.kind, icon: ICONS[e.kind] ?? "symbol-misc" })) });
+        const found = (await ask<Entry[]>("si/search", { query: m.query, limit: 200 })) ?? [];
+        void view.webview.postMessage({ type: "results", query: m.query, results: found.map(decorate) });
       }
     });
   }
@@ -660,6 +728,7 @@ export async function activate(context: vscode.ExtensionContext) {
   home = context.extensionUri;
   const relation = new Relation(vscode.Uri.joinPath(context.extensionUri, "media"));
   const fileSymbols = new FileSymbols();
+  const search = new Search();
   const contextView = new Context();
   const lenses = new Lenses();
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 10);
@@ -680,6 +749,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
   function afterSync(r: Synced, what: string) {
     fileSymbols.refresh();
+    search.refresh();
     lenses.refresh();
     void refreshStatus();
     if (current) {
@@ -811,7 +881,7 @@ export async function activate(context: vscode.ExtensionContext) {
     status,
     vscode.window.registerWebviewViewProvider("si.relation", relation, { webviewOptions: { retainContextWhenHidden: true } }),
     vscode.window.registerTreeDataProvider("si.fileSymbols", fileSymbols),
-    vscode.window.registerWebviewViewProvider("si.search", new Search(), { webviewOptions: { retainContextWhenHidden: true } }),
+    vscode.window.registerWebviewViewProvider("si.search", search, { webviewOptions: { retainContextWhenHidden: true } }),
     vscode.window.registerWebviewViewProvider("si.context", contextView),
     vscode.languages.registerCodeLensProvider(selector, lenses),
     vscode.window.onDidChangeActiveTextEditor((e) => follow(e, true)),
@@ -831,6 +901,7 @@ export async function activate(context: vscode.ExtensionContext) {
         // The server re-indexes on the save notification; ask after it has.
         await refreshStatus();
         fileSymbols.refresh();
+        search.refresh();
         lenses.refresh();
       }
     }),

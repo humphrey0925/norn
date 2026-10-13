@@ -100,6 +100,17 @@ def main():
         found = c.request("workspace/symbol", {"query": "bfd_cache_"})
         assert any(s["name"] == "bfd_cache_init" for s in found), found
         print(f"workspace symbols bfd_cache_*: {len(found)}")
+        # The whole project's symbols, in name order whatever the case, a
+        # stretch at a time.
+        first = c.request("si/symbols", {"offset": 0, "limit": 50})
+        names = [x["name"] for x in first["items"]]
+        assert first["total"] > 3000 and len(names) == 50 and names == sorted(names, key=lambda n: (n.lower(), n)), names[:8]
+        later = c.request("si/symbols", {"offset": first["total"] - 5, "limit": 50})
+        assert len(later["items"]) == 5 and later["items"][0]["name"].lower() >= names[-1].lower()
+        spot = c.request("si/place", {k: first["items"][10][k] for k in ("file", "line", "name")})
+        assert spot["range"]["start"]["line"] == first["items"][10]["line"] - 1, spot
+        print(f"all symbols: {first['total']} in name order, fetched by the stretch")
+
         # Fragments in any order, and initials.
         for query, want in [("init cache", "bfd_cache_init"), ("bci", "bfd_cache_init"), ("mem bread", "memory_bread")]:
             names = [x["name"] for x in c.request("workspace/symbol", {"query": query})]
