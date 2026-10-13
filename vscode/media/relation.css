@@ -1,0 +1,51 @@
+body { padding: 0; margin: 0; color: var(--vscode-foreground); font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); }
+#bar { display: flex; align-items: center; gap: 2px; padding: 2px 8px 0; border-bottom: 1px solid var(--vscode-panel-border); flex-wrap: wrap; }
+#bar button { font: inherit; color: var(--vscode-descriptionForeground); background: none; border: 0; border-bottom: 2px solid transparent; padding: 3px 9px 5px; cursor: pointer; }
+#bar button[aria-selected="true"] { color: var(--vscode-foreground); border-bottom-color: var(--vscode-focusBorder); }
+#bar button:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+#views { margin-left: auto; display: flex; border: 1px solid var(--vscode-panel-border); border-radius: 3px; overflow: hidden; margin-bottom: 3px; }
+#views button { border: 0; padding: 1px 9px; font-size: 0.9em; }
+#views button[aria-pressed="true"] { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+#message { padding: 3px 10px; color: var(--vscode-descriptionForeground); font-size: 0.9em; }
+.empty, .hint { padding: 6px 10px; color: var(--vscode-descriptionForeground); }
+.hint { font-size: 0.85em; }
+
+.row { display: flex; align-items: baseline; gap: 6px; padding: 2px 8px; white-space: nowrap; cursor: pointer; }
+.row:hover { background: var(--vscode-list-hoverBackground); }
+.row:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.row.top .name { font-weight: 600; }
+.tw { width: 12px; flex: none; color: var(--vscode-descriptionForeground); text-align: center; }
+.k { width: 12px; flex: none; text-align: center; font-family: var(--vscode-editor-font-family); font-weight: 600; font-size: 0.9em; }
+.k-function { color: var(--vscode-symbolIcon-functionForeground, var(--vscode-charts-purple)); }
+.k-macro { color: var(--vscode-symbolIcon-constantForeground, var(--vscode-charts-orange)); }
+.k-field { color: var(--vscode-symbolIcon-fieldForeground, var(--vscode-charts-blue)); }
+.k-global { color: var(--vscode-symbolIcon-variableForeground, var(--vscode-charts-blue)); }
+.name { font-family: var(--vscode-editor-font-family); }
+.name.text { color: var(--vscode-foreground); overflow: hidden; text-overflow: ellipsis; }
+.ln { width: 4em; flex: none; text-align: right; color: var(--vscode-editorLineNumber-foreground); font-family: var(--vscode-editor-font-family); }
+.loc { color: var(--vscode-descriptionForeground); font-size: 0.9em; }
+.at { opacity: 0.85; }
+.go { margin-left: auto; padding: 0 4px; color: var(--vscode-descriptionForeground); visibility: hidden; }
+.row:hover .go { visibility: visible; }
+.go:hover { color: var(--vscode-foreground); }
+.badge { font-size: 0.82em; padding: 0 6px; border-radius: 9px; line-height: 1.5; }
+.badge.ptr { color: var(--vscode-charts-blue); background: color-mix(in srgb, var(--vscode-charts-blue) 16%, transparent); }
+.badge.mac { color: var(--vscode-charts-orange); background: color-mix(in srgb, var(--vscode-charts-orange) 16%, transparent); }
+.badge.amb { color: var(--vscode-charts-yellow); background: color-mix(in srgb, var(--vscode-charts-yellow) 16%, transparent); }
+
+.graph { overflow: auto; padding: 6px 4px; }
+.graph svg { display: block; }
+.gn { cursor: pointer; }
+.gn rect { fill: var(--vscode-editorWidget-background); stroke: var(--vscode-editorWidget-border, var(--vscode-panel-border)); }
+.gn text { fill: var(--vscode-foreground); font-family: var(--vscode-editor-font-family); font-size: 12px; }
+.gn .plus { fill: var(--vscode-descriptionForeground); }
+.gn:hover rect { stroke: var(--vscode-focusBorder); }
+.gn.rootnode rect { fill: var(--vscode-list-activeSelectionBackground); stroke: var(--vscode-focusBorder); }
+.gn.rootnode text { fill: var(--vscode-list-activeSelectionForeground); }
+.gn.slot rect { stroke: var(--vscode-charts-blue); fill: color-mix(in srgb, var(--vscode-charts-blue) 14%, transparent); }
+.gn.ptr rect { stroke: var(--vscode-charts-blue); }
+.gn.mac rect { stroke: var(--vscode-charts-orange); }
+.gn.amb rect { stroke-dasharray: 4 3; }
+.ge { fill: none; stroke: var(--vscode-descriptionForeground); stroke-width: 1.1; opacity: 0.8; }
+.ge.ptr { stroke: var(--vscode-charts-blue); stroke-dasharray: 4 3; }
+.ge.mac { stroke: var(--vscode-charts-orange); stroke-dasharray: 4 3; }

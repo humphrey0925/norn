@@ -19,7 +19,7 @@ async function main() {
   try {
     await runTests({
       extensionDevelopmentPath: path.resolve(__dirname, "../.."),
-      extensionTestsPath: path.resolve(__dirname, "./suite"),
+      extensionTestsPath: path.resolve(__dirname, process.argv[2] === "demo" ? "./demo" : "./suite"),
       launchArgs: [work, "--disable-extensions"],
     });
   } finally {

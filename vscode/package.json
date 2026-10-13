@@ -2,7 +2,7 @@
   "name": "si-code-index",
   "displayName": "SI Code Index",
   "description": "Source-Insight-style symbol search, context and relation views for C, backed by the si index.",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "publisher": "humphrey0925",
   "repository": {
     "type": "git",
@@ -52,7 +52,8 @@
       "siPanel": [
         {
           "id": "si.relation",
-          "name": "Relation"
+          "name": "Relation",
+          "type": "webview"
         },
         {
           "type": "webview",
@@ -103,32 +104,20 @@
         "icon": "$(split-horizontal)"
       },
       {
-        "command": "si.openDefinition",
-        "title": "跳到定義",
-        "icon": "$(go-to-file)"
-      },
-      {
         "command": "si.restart",
         "title": "SI: 重新建立索引"
+      },
+      {
+        "command": "si.relation.tree",
+        "title": "SI: Relation 以樹狀顯示"
+      },
+      {
+        "command": "si.relation.graph",
+        "title": "SI: Relation 以圖形顯示"
       }
     ],
     "menus": {
       "view/title": [
-        {
-          "command": "si.relation.callees",
-          "when": "view == si.relation",
-          "group": "navigation@1"
-        },
-        {
-          "command": "si.relation.callers",
-          "when": "view == si.relation",
-          "group": "navigation@2"
-        },
-        {
-          "command": "si.relation.references",
-          "when": "view == si.relation",
-          "group": "navigation@3"
-        },
         {
           "command": "si.relation.lock",
           "when": "view == si.relation && !si.relationLocked",
@@ -153,22 +142,13 @@
       "view/item/context": [
         {
           "command": "si.openToSide",
-          "when": "view == si.relation || view == si.fileSymbols",
+          "when": "view == si.fileSymbols",
           "group": "inline@1"
-        },
-        {
-          "command": "si.openDefinition",
-          "when": "view == si.relation && viewItem == call",
-          "group": "inline@2"
         }
       ],
       "commandPalette": [
         {
           "command": "si.openToSide",
-          "when": "false"
-        },
-        {
-          "command": "si.openDefinition",
           "when": "false"
         }
       ]

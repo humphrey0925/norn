@@ -79,29 +79,66 @@ async function open(uri: string, line: number, character = 0, beside = false) {
 
 // ---------------------------------------------------------------- Relation
 
+/** A row of a tree view. */
 class Node {
   constructor(
     readonly label: string,
     readonly entry?: Entry,
-    /** Where a click goes: the call site when there is one. */
     readonly target?: { uri: string; line: number; character: number },
     readonly children?: Node[],
     readonly detail?: string,
   ) {}
 }
 
-class Relation implements vscode.TreeDataProvider<Node> {
-  private readonly changed = new vscode.EventEmitter<Node | undefined>();
-  readonly onDidChangeTreeData = this.changed.event;
+type At = ReturnType<typeof positionParams>;
+
+/** Callers, callees or references of the function at the cursor, as a tree
+ *  or a graph (media/relation.js draws both). */
+class Relation implements vscode.WebviewViewProvider {
   mode: Mode = "callees";
   locked = false;
-  private roots: Node[] = [];
-  private at: ReturnType<typeof positionParams> | undefined;
-  message = "";
+  private view: vscode.WebviewView | undefined;
+  private at: At | undefined;
+
+  constructor(private readonly media: vscode.Uri) {}
+
+  resolveWebviewView(view: vscode.WebviewView) {
+    this.view = view;
+    const w = view.webview;
+    w.options = { enableScripts: true, localResourceRoots: [this.media] };
+    const file = (name: string) => w.asWebviewUri(vscode.Uri.joinPath(this.media, name));
+    w.html = `<!doctype html><html><head><meta charset="utf-8">
+      <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${w.cspSource} 'unsafe-inline'; script-src ${w.cspSource};">
+      <link rel="stylesheet" href="${file("relation.css")}"></head><body>
+      <div id="bar" role="tablist">
+        <button role="tab" data-mode="callees">被呼叫者</button>
+        <button role="tab" data-mode="callers">呼叫者</button>
+        <button role="tab" data-mode="references">參照</button>
+        <span id="views"><button data-view="tree">樹狀</button><button data-view="graph">圖形</button></span>
+      </div>
+      <div id="message"></div><div id="root"></div>
+      <script src="${file("relation.js")}"></script></body></html>`;
+    w.onDidReceiveMessage(async (m: { ready?: boolean; open?: { uri: string; line: number; character: number }; beside?: boolean; mode?: Mode; expand?: Entry["data"]; id?: number }) => {
+      if (m.ready) {
+        await this.load(this.at ?? (current ? positionParams(current) : undefined));
+      } else if (m.open) {
+        await open(m.open.uri, m.open.line, m.open.character, !!m.beside);
+      } else if (m.mode) {
+        this.setMode(m.mode);
+      } else if (m.expand) {
+        const r = await ask<{ entries: Entry[] }>("si/relation", { item: m.expand, direction: this.mode });
+        void w.postMessage({ type: "children", id: m.id, entries: r?.entries ?? [] });
+      }
+    });
+  }
 
   setMode(mode: Mode) {
     this.mode = mode;
     void this.load(this.at);
+  }
+
+  setView(view: "tree" | "graph") {
+    void this.view?.webview.postMessage({ type: "view", view });
   }
 
   /** Follow the cursor, unless locked. */
@@ -111,26 +148,26 @@ class Relation implements vscode.TreeDataProvider<Node> {
     }
   }
 
-  private async load(at: ReturnType<typeof positionParams> | undefined) {
+  private async load(at: At | undefined) {
     this.at = at;
-    this.roots = [];
-    this.message = "";
-    if (at && this.mode === "references") {
-      this.roots = await this.references(at);
-    } else if (at) {
-      const r = await ask<{ root: Entry | null; entries: Entry[] }>("si/relation", { ...at, direction: this.mode });
-      if (r?.root) {
-        const root = new Node(r.root.name, r.root, { uri: r.root.uri, line: r.root.range.start.line, character: r.root.range.start.character });
-        this.roots = [root];
-        this.message = `${r.root.name} 的${this.mode === "callers" ? "呼叫者" : "被呼叫者"}：${r.entries.length}`;
-      } else {
-        this.message = "游標不在函式上";
-      }
+    const w = this.view?.webview;
+    if (!w || !at) {
+      return;
     }
-    this.changed.fire(undefined);
+    if (this.mode === "references") {
+      void w.postMessage({ type: "refs", ...(await this.references(at)) });
+      return;
+    }
+    const r = await ask<{ root: Entry | null; entries: Entry[] }>("si/relation", { ...at, direction: this.mode });
+    if (at !== this.at) {
+      return; // the cursor has moved on
+    }
+    const what = this.mode === "callers" ? "呼叫者" : "被呼叫者";
+    const message = r?.root ? `${r.root.name} 的${what}：${r.entries.length}` : "游標不在函式上";
+    void w.postMessage({ type: "root", mode: this.mode, root: r?.root ?? null, entries: r?.entries ?? [], message });
   }
 
-  private async references(at: ReturnType<typeof positionParams>): Promise<Node[]> {
+  private async references(at: At) {
     const uri = vscode.Uri.parse(at.textDocument.uri);
     const pos = new vscode.Position(at.position.line, at.position.character);
     const found = (await vscode.commands.executeCommand<vscode.Location[]>("vscode.executeReferenceProvider", uri, pos)) ?? [];
@@ -139,65 +176,17 @@ class Relation implements vscode.TreeDataProvider<Node> {
       const k = loc.uri.toString();
       byFile.set(k, [...(byFile.get(k) ?? []), loc]);
     }
-    this.message = `參照：${found.length} 處，${byFile.size} 個檔案`;
-    const nodes: Node[] = [];
+    const groups = [];
     for (const [file, locs] of byFile) {
       const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(file));
-      const kids = locs.map((l) => {
-        const text = l.range.start.line < doc.lineCount ? doc.lineAt(l.range.start.line).text.trim() : "";
-        return new Node(text, undefined, { uri: file, line: l.range.start.line, character: l.range.start.character }, undefined, String(l.range.start.line + 1));
-      });
-      nodes.push(new Node(vscode.workspace.asRelativePath(doc.uri), undefined, undefined, kids, `${locs.length} 處`));
+      const items = locs.map((l) => ({
+        line: l.range.start.line,
+        character: l.range.start.character,
+        text: l.range.start.line < doc.lineCount ? doc.lineAt(l.range.start.line).text.trim() : "",
+      }));
+      groups.push({ file: vscode.workspace.asRelativePath(doc.uri), uri: file, items });
     }
-    return nodes;
-  }
-
-  getTreeItem(node: Node): vscode.TreeItem {
-    const e = node.entry;
-    const expandable = node.children ? true : !!e && this.mode !== "references";
-    const item = new vscode.TreeItem(
-      node.label,
-      expandable ? (this.roots.includes(node) || node.children ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed) : vscode.TreeItemCollapsibleState.None,
-    );
-    if (e) {
-      // How the call comes about, then where the function is.
-      const how = [
-        e.through ? `經 ${e.through}（函式指標）` : "",
-        e.pointer ? "經指標變數" : "",
-        e.viaMacro ? `經巨集 ${e.viaMacro}` : "",
-        e.certain === false ? "不確定" : "",
-      ].filter(Boolean);
-      item.description = [...how, `${e.file}:${e.line}`].join(" · ");
-      item.iconPath = new vscode.ThemeIcon(e.through || e.pointer ? "symbol-event" : ICONS[e.kind] ?? "symbol-misc");
-      item.tooltip = `${KIND_NAMES[e.kind] ?? e.kind} ${e.name}\n${e.file}:${e.line}` + (e.lines?.length ? `\n呼叫於第 ${e.lines.join("、")} 行` : "");
-      item.contextValue = "call";
-    } else {
-      item.description = node.detail;
-    }
-    if (node.target) {
-      item.command = { command: "si.open", title: "開啟", arguments: [node.target, false] };
-    }
-    return item;
-  }
-
-  async getChildren(node?: Node): Promise<Node[]> {
-    if (!node) {
-      return this.roots;
-    }
-    if (node.children) {
-      return node.children;
-    }
-    if (!node.entry || this.mode === "references") {
-      return [];
-    }
-    const parent = node.entry;
-    const r = await ask<{ root: Entry | null; entries: Entry[] }>("si/relation", { item: parent.data, direction: this.mode });
-    return (r?.entries ?? []).map((e) => {
-      // A caller's call is in the caller's file; a callee's is in ours.
-      const line = (e.lines?.[0] ?? e.line) - 1;
-      const target = this.mode === "callers" ? { uri: e.uri, line, character: 0 } : { uri: parent.uri, line, character: 0 };
-      return new Node(e.name, e, target);
-    });
+    return { groups, message: `參照：${found.length} 處，${byFile.size} 個檔案` };
   }
 }
 
@@ -460,7 +449,7 @@ function serverCommand(): { command: string; args: string[] } {
 }
 
 export async function activate(context: vscode.ExtensionContext) {
-  const relation = new Relation();
+  const relation = new Relation(vscode.Uri.joinPath(context.extensionUri, "media"));
   const fileSymbols = new FileSymbols();
   const contextView = new Context();
   const lenses = new Lenses();
@@ -468,8 +457,6 @@ export async function activate(context: vscode.ExtensionContext) {
   status.text = "$(sync~spin) SI 建立索引中";
   status.show();
 
-  const relationTree = vscode.window.createTreeView("si.relation", { treeDataProvider: relation, showCollapseAll: true });
-  relation.onDidChangeTreeData(() => (relationTree.message = relation.message || undefined));
   const selector: vscode.DocumentSelector = [{ scheme: "file", pattern: "**/*.{c,h}" }];
 
   async function refreshStatus() {
@@ -532,7 +519,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     status,
-    relationTree,
+    vscode.window.registerWebviewViewProvider("si.relation", relation, { webviewOptions: { retainContextWhenHidden: true } }),
     vscode.window.registerTreeDataProvider("si.fileSymbols", fileSymbols),
     vscode.window.registerWebviewViewProvider("si.search", new Search(), { webviewOptions: { retainContextWhenHidden: true } }),
     vscode.window.registerWebviewViewProvider("si.context", contextView),
@@ -554,7 +541,8 @@ export async function activate(context: vscode.ExtensionContext) {
     }),
     vscode.commands.registerCommand("si.open", (t: { uri: string; line: number; character: number }, beside: boolean) => open(t.uri, t.line, t.character, beside)),
     vscode.commands.registerCommand("si.openToSide", (n: Node) => n?.target && open(n.target.uri, n.target.line, n.target.character, true)),
-    vscode.commands.registerCommand("si.openDefinition", (n: Node) => n?.entry && open(n.entry.uri, n.entry.range.start.line, n.entry.range.start.character, false)),
+    vscode.commands.registerCommand("si.relation.tree", () => relation.setView("tree")),
+    vscode.commands.registerCommand("si.relation.graph", () => relation.setView("graph")),
     vscode.commands.registerCommand("si.relation.callers", () => relation.setMode("callers")),
     vscode.commands.registerCommand("si.relation.callees", () => relation.setMode("callees")),
     vscode.commands.registerCommand("si.relation.references", () => relation.setMode("references")),
