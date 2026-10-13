@@ -220,7 +220,8 @@ impl<'a> Walk<'a> {
                     if m.keep {
                         let text = String::from_utf8_lossy(&self.orig[m.name.end as usize..m.end as usize]);
                         let text = self.out.push_name(&text);
-                        self.out.macros.push(MacroBody { name, text, function_like: m.name.call });
+                        let guard = if m.guard.is_empty() { NONE } else { self.out.push_name(&m.guard) };
+                        self.out.macros.push(MacroBody { name, text, function_like: m.name.call, guard, conditional: m.conditional });
                     }
                 }
                 Event::Site(s) => {

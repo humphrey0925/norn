@@ -41,6 +41,10 @@ pub struct Macro {
     pub end: u32,
     /// Whether expansion may need this body (see [`MacroSets`]).
     pub keep: bool,
+    /// The `#if NAME == value` tests it is under: `NAME == 64;OTHER != 1`.
+    pub guard: String,
+    /// Inside an `#if` group other than the file's include guard.
+    pub conditional: bool,
 }
 
 /// A use of an *expanding* macro: one whose expansion holds names that are
@@ -453,6 +457,13 @@ struct Cond {
     /// Its directives so far, to hide them all once one has to be.
     spans: Vec<(usize, usize)>,
     hidden: bool,
+    /// The current branch holds exactly when this does: name, value, and
+    /// whether it is the negation.
+    test: Option<(String, i64, bool)>,
+    /// The name tested by `#ifndef`, until the group is seen to define it
+    /// (which makes it an include guard, and so no condition at all).
+    ifndef: Option<Vec<u8>>,
+    include_guard: bool,
 }
 
 struct Lexer<'a> {
@@ -770,7 +781,21 @@ impl<'a> Lexer<'a> {
         let cuts = hide || in_block && !matches!(self.prev, b';' | b'{' | b'}' | b':');
         match word {
             b"if" | b"ifdef" | b"ifndef" => {
-                self.conds.push(Cond { nest: self.nest.clone(), spans: vec![span], hidden: cuts });
+                let test = if word == b"if" { equality(&s[e..span.1]) } else { None };
+                let ifndef = (word == b"ifndef").then(|| {
+                    let mut c = Cur { s: &s[..span.1], i: e, line: 0 };
+                    c.skip_space(false);
+                    let (a, e) = c.ident();
+                    s[a..e].to_vec()
+                });
+                self.conds.push(Cond {
+                    nest: self.nest.clone(),
+                    spans: vec![span],
+                    hidden: cuts,
+                    test,
+                    ifndef,
+                    include_guard: false,
+                });
                 hide = cuts;
             }
             b"elif" | b"else" | b"elifdef" | b"elifndef" | b"endif" => {
@@ -782,6 +807,13 @@ impl<'a> Lexer<'a> {
                         }
                     }
                     hide = c.hidden;
+                    // `#else` of a lone `#if` is its negation; after an
+                    // `#elif` only the `#elif`'s own test is known.
+                    c.test = match word {
+                        b"else" if c.spans.len() == 1 => c.test.take().map(|(n, v, _)| (n, v, true)),
+                        b"elif" => equality(&s[e..span.1]),
+                        _ => None,
+                    };
                     c.spans.push(span);
                     if word == b"endif" {
                         self.conds.pop();
@@ -841,9 +873,33 @@ impl<'a> Lexer<'a> {
             });
         }
         let name = Tok { start: a as u32, end: e as u32, line, call: function_like };
+        if let Some(c) = self.conds.first_mut() {
+            if c.ifndef.as_deref() == Some(&s[a..e]) {
+                c.include_guard = true;
+            }
+        }
+        let conditional = self.conds.iter().any(|c| !c.include_guard);
         let keep = self.transparent.kept.contains(&s[a..e]);
-        self.out.events.push(Event::Macro(Macro { name, end_line, refs, end: end as u32, keep }));
+        let mut guard = String::new();
+        if keep {
+            for (n, v, negated) in self.conds.iter().filter_map(|c| c.test.as_ref()) {
+                let (sep, op) = (if guard.is_empty() { "" } else { ";" }, if *negated { "!=" } else { "==" });
+                guard += &format!("{sep}{n} {op} {v}");
+            }
+        }
+        self.out.events.push(Event::Macro(Macro { name, end_line, refs, end: end as u32, keep, guard, conditional }));
     }
+}
+
+/// The condition of an `#if`, when it is `NAME == integer` and no more.
+fn equality(cond: &[u8]) -> Option<(String, i64, bool)> {
+    let text = std::str::from_utf8(cond).ok()?;
+    let text = text.split("/*").next()?.split("//").next()?;
+    let (name, value) = text.split_once("==")?;
+    let name = name.trim();
+    let ident = !name.is_empty() && name.bytes().all(is_ident) && is_ident_start(name.as_bytes()[0]);
+    ident.then_some(())?;
+    Some((name.to_string(), value.trim().parse().ok()?, false))
 }
 
 /// `Some(macros it invokes)` if the body `s[start..end]` is only attributes

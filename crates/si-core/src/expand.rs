@@ -30,6 +30,10 @@ const BLIND_RUNS: usize = 3;
 /// Uses of one macro in one file that may come to nothing before the rest
 /// are skipped.
 const BARREN_USES: u32 = 16;
+/// Translation units a file may be in and still be expanded in each apart.
+const MAX_UNITS: usize = 32;
+/// Places remembered for one name of a definition.
+const MAX_CONTEXTS: usize = 8;
 const MAX_TOKENS: usize = 20_000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -63,6 +67,14 @@ struct T {
 impl T {
     fn is(&self, s: &str) -> bool {
         self.k == K::Punct && &*self.text == s
+    }
+}
+
+fn int(s: &str) -> Option<i64> {
+    let s = s.trim_end_matches(['u', 'U', 'l', 'L']);
+    match s.strip_prefix("0x").or(s.strip_prefix("0X")) {
+        Some(hex) => i64::from_str_radix(hex, 16).ok(),
+        None => s.parse().ok(),
     }
 }
 
@@ -157,13 +169,17 @@ fn is_tag(t: &T) -> bool {
 
 /// Does a macro with this body put names in its expansion that are not
 /// written at its uses? True when it pastes tokens, calls one of its
-/// parameters (which may then be such a macro), or declares one.
+/// parameters (which may then be such a macro), declares one, or is just
+/// another name (`#define pe_dll_build pep_dll_build`).
 pub fn hides_names(body: &[u8], params: &[&[u8]]) -> bool {
     hides(&tokenize(body, Origin::Body), |t| params.contains(&t.text.as_bytes()))
 }
 
 fn hides(toks: &[T], is_param: impl Fn(&T) -> bool) -> bool {
     let n = toks.len();
+    if n == 1 && toks[0].k == K::Ident && !is_param(&toks[0]) && !is_keyword(toks[0].text.as_bytes()) {
+        return true;
+    }
     let (mut paren, mut brace) = (0i32, 0i32);
     for i in 0..n {
         let t = &toks[i];
@@ -208,12 +224,24 @@ struct Parsed {
     body: Vec<T>,
     /// See [`hides_names`].
     hides: bool,
+    /// `#if NAME == value` (or, with true, its `#else`) around the definition.
+    guards: Vec<(Arc<str>, i64, bool)>,
+    /// Defined only under some `#if`.
+    conditional: bool,
     /// For each body token, the parameter it names, or `NONE`.
     param_at: Vec<u32>,
 }
 
 /// `text` is what follows the macro's name in its `#define`.
-fn parse(text: &str, function_like: bool) -> Parsed {
+fn parse(text: &str, function_like: bool, guard: &str) -> Parsed {
+    let guards = guard
+        .split(';')
+        .filter_map(|g| {
+            let (name, rest) = g.split_once(' ')?;
+            let (op, value) = rest.split_once(' ')?;
+            Some((name.into(), value.parse().ok()?, op == "!="))
+        })
+        .collect();
     let mut toks = tokenize(text.as_bytes(), Origin::Body);
     let mut params: Vec<Arc<str>> = Vec::new();
     let mut variadic = false;
@@ -235,7 +263,7 @@ fn parse(text: &str, function_like: bool) -> Parsed {
     let param_at =
         toks.iter().map(|t| params.iter().position(|p| t.k == K::Ident && *p == t.text).map_or(NONE, |i| i as u32)).collect();
     let hides = hides(&toks, |t| params.contains(&t.text));
-    Parsed { params, variadic, function_like, body: toks, hides, param_at }
+    Parsed { params, variadic, function_like, body: toks, hides, guards, conditional: false, param_at }
 }
 
 struct Table<'a> {
@@ -265,9 +293,38 @@ struct Engine<'a> {
     active: Vec<Arc<str>>,
     steps: u32,
     hiding: FxHashMap<Box<str>, bool>,
+    /// Set when the engine stands for all the translation units of this
+    /// file together.
+    merged: Option<u32>,
 }
 
 impl<'a> Engine<'a> {
+    fn new(table: &'a Table<'a>, visible: Vec<bool>) -> Self {
+        Engine {
+            table,
+            visible,
+            cands: FxHashMap::default(),
+            choice: Choice::default(),
+            met: Vec::new(),
+            active: Vec::new(),
+            steps: 0,
+            hiding: FxHashMap::default(),
+            merged: None,
+        }
+    }
+
+    /// Is there a translation unit here in which `name` is no macro?
+    fn maybe_undefined(&mut self, name: &str) -> bool {
+        match self.merged {
+            // Several units at once: sure only if the file itself always
+            // defines the name.
+            Some(file) => !self.table.by_name.get(name).is_some_and(|v| {
+                v.iter().any(|&(f, i)| f == file && !self.table.files[f as usize].macros[i as usize].conditional)
+            }),
+            None => self.candidates(name).iter().all(|p| p.conditional),
+        }
+    }
+
     fn candidates(&mut self, name: &str) -> &[&'a Parsed] {
         if !self.cands.contains_key(name) {
             let all = self.table.by_name.get(name).map_or(&[][..], |v| &v[..]);
@@ -277,22 +334,52 @@ impl<'a> Engine<'a> {
                 .map(|&(f, i)| (self.table.files[f as usize].name(self.table.files[f as usize].macros[i as usize].text as usize), f, i))
                 .collect();
             if seen.is_empty() {
-                seen = all
-                    .iter()
-                    .map(|&(f, i)| {
-                        (self.table.files[f as usize].name(self.table.files[f as usize].macros[i as usize].text as usize), f, i)
-                    })
-                    .collect();
+                // An `#include` that could not be followed (a generated
+                // header, say) may hide the definition. A header can reach
+                // any file, a source file only itself; and if several
+                // headers define the name there is no telling which is meant.
+                let headers = || all.iter().filter(|(f, _)| self.table.files[*f as usize].path.ends_with(".h"));
+                if headers().map(|x| x.0).collect::<FxHashSet<u32>>().len() == 1 {
+                    seen = headers()
+                        .map(|&(f, i)| {
+                            let file = &self.table.files[f as usize];
+                            (file.name(file.macros[i as usize].text as usize), f, i)
+                        })
+                        .collect();
+                }
             }
             // The same text is the same definition; the order must not depend
             // on which file was read first.
             seen.sort_unstable();
             seen.dedup_by(|a, b| a.0.split_whitespace().eq(b.0.split_whitespace()));
             seen.truncate(MAX_CANDIDATES);
-            let list = seen.iter().map(|&(_, f, i)| &self.table.parsed[f as usize][i as usize]).collect();
-            self.cands.insert(name.into(), list);
+            let list: Vec<&'a Parsed> = seen.iter().map(|&(_, f, i)| &self.table.parsed[f as usize][i as usize]).collect();
+            // In the cache first, so that a guard that leads back here ends.
+            self.cands.insert(name.into(), list.clone());
+            let open: Vec<&'a Parsed> = list.iter().copied().filter(|p| p.guards.iter().all(|g| self.feasible(g))).collect();
+            if !open.is_empty() && open.len() < list.len() {
+                self.cands.insert(name.into(), open);
+            }
         }
         &self.cands[name]
+    }
+
+    /// Can the guard hold in some translation unit with this file? It cannot
+    /// when every value the name is given there says otherwise.
+    fn feasible(&mut self, guard: &(Arc<str>, i64, bool)) -> bool {
+        let (name, value, negated) = guard;
+        let values: Option<Vec<i64>> = self
+            .candidates(name)
+            .iter()
+            .map(|p| match &p.body[..] {
+                [t] if !p.function_like => int(&t.text),
+                _ => None,
+            })
+            .collect();
+        match values {
+            Some(v) if !v.is_empty() => v.iter().any(|x| (x == value) != *negated),
+            _ => true,
+        }
     }
 
     /// Can a use of `name` here expand to names not written at the use? The
@@ -569,6 +656,19 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str) -> Found {
         }
         return found;
     }
+    // Another name for a function, followed by what followed the use:
+    // `re_search (bufp, ...)` with `#define re_search xre_search`.
+    let renamed = n >= 2
+        && toks[0].k == K::Ident
+        && toks[0].origin != Origin::Site
+        && toks[1].is("(")
+        && toks[1..].iter().all(|t| t.origin == Origin::Site)
+        && !is_keyword(toks[0].text.as_bytes());
+    if renamed {
+        found.single = Some(toks[0].text.to_string());
+        found.refs.push((toks[0].text.to_string(), refkind::CALL));
+        return found;
+    }
     let in_fn = s.flags & site::IN_FN != 0;
     let top = s.flags & site::TOP != 0;
     let init = s.flags & site::INIT != 0;
@@ -677,6 +777,14 @@ impl Names {
     }
 }
 
+fn guard_text<'a>(f: &'a FileFacts, m: &crate::model::MacroBody) -> &'a str {
+    if m.guard == NONE {
+        ""
+    } else {
+        f.name(m.guard as usize)
+    }
+}
+
 fn site_tokens(f: &FileFacts, s: &Site) -> Vec<T> {
     let mut toks = tokenize(f.name(s.name as usize).as_bytes(), Origin::Site);
     if s.args != NONE {
@@ -685,45 +793,89 @@ fn site_tokens(f: &FileFacts, s: &Site) -> Vec<T> {
     toks
 }
 
+/// The translation units `file` is part of: itself or whatever includes it,
+/// when that is a source file or is included by nothing.
+fn roots(file: u32, files: &[FileFacts], rev: &[Vec<u32>]) -> Vec<u32> {
+    let mut seen = vec![false; rev.len()];
+    seen[file as usize] = true;
+    let mut stack = vec![file];
+    let mut out = Vec::new();
+    while let Some(f) = stack.pop() {
+        if rev[f as usize].is_empty() || files[f as usize].path.ends_with(".c") {
+            out.push(f);
+        }
+        stack.extend(rev[f as usize].iter().copied().filter(|&r| !std::mem::replace(&mut seen[r as usize], true)));
+    }
+    out.sort_unstable();
+    out
+}
+
+/// `root` and everything it includes.
+fn closure(root: u32, fwd: &[Vec<u32>]) -> Vec<bool> {
+    let mut seen = vec![false; fwd.len()];
+    seen[root as usize] = true;
+    let mut stack = vec![root];
+    while let Some(f) = stack.pop() {
+        stack.extend(fwd[f as usize].iter().copied().filter(|&t| !std::mem::replace(&mut seen[t as usize], true)));
+    }
+    seen
+}
+
+/// Where an expansion holds: which translation unit (as an index into the
+/// file's engines) and which definitions were chosen there.
+type Contexts = Vec<(usize, Choice)>;
+
+fn add_name(named: &mut Vec<(String, Contexts)>, name: &str, context: (usize, Choice)) {
+    match named.iter_mut().find(|x| x.0 == name) {
+        Some(x) if x.1.len() < MAX_CONTEXTS => x.1.push(context),
+        Some(_) => {}
+        None => named.push((name.to_string(), vec![context])),
+    }
+}
+
 fn expand_file(fi: usize, f: &FileFacts, table: &Table, fwd: &[Vec<u32>], rev: &[Vec<u32>]) -> Option<(FileFacts, u64, u64)> {
     if f.sites.is_empty() {
         return None;
     }
-    let mut eng = Engine {
-        table,
-        visible: visible(fi as u32, fwd, rev),
-        cands: FxHashMap::default(),
-        choice: Choice::default(),
-        met: Vec::new(),
-        active: Vec::new(),
-        steps: 0,
-        hiding: FxHashMap::default(),
+    // One engine per translation unit the file is in, so that what one macro
+    // expands to agrees with what the others do there. A header in too many
+    // gets a single engine that sees them all at once.
+    let units = roots(fi as u32, table.files, rev);
+    let mut engines: Vec<Engine> = if units.len() <= MAX_UNITS {
+        units.iter().map(|&r| Engine::new(table, closure(r, fwd))).collect()
+    } else {
+        vec![Engine { merged: Some(fi as u32), ..Engine::new(table, visible(fi as u32, fwd, rev)) }]
     };
     let mut out = f.clone();
     let mut names = Names { ids: (0..f.n_names()).map(|i| (f.name(i).to_string(), i as u32)).collect() };
     let (n_defs, n_refs) = (f.defs.len(), f.refs.len());
+    let live: Vec<&Site> =
+        f.sites.iter().filter(|s| engines.iter_mut().any(|e| e.hides(f.name(s.name as usize)))).collect();
 
     // 1. Definitions written under a macro's name: one per expansion.
-    let mut variants: FxHashMap<u32, Vec<(u32, Choice)>> = FxHashMap::default();
-    let live: Vec<&Site> = f.sites.iter().filter(|s| eng.hides(f.name(s.name as usize))).collect();
-    // A macro whose first uses here all expand to nothing of interest (a
-    // table row, typically) is not tried again in this file.
-    let mut barren: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut variants: FxHashMap<u32, Vec<(u32, Contexts)>> = FxHashMap::default();
     for s in live.iter().filter(|s| s.def != NONE) {
         let toks = site_tokens(f, s);
-        let mut named: Vec<(String, Choice)> = Vec::new();
-        let mut known = FxHashSet::default();
-        let novel = |exp: &[T]| recognise(exp, s, f.name(s.name as usize)).novel(&mut known);
-        for (exp, choice) in eng.variants(&toks, &Choice::default(), novel) {
-            let found = recognise(&exp, s, f.name(s.name as usize));
-            if let Some(n) = found.def_name() {
-                if !named.iter().any(|x| x.0 == n) {
-                    named.push((n.to_string(), choice));
+        let macro_name = f.name(s.name as usize);
+        let mut named: Vec<(String, Contexts)> = Vec::new();
+        for (ei, eng) in engines.iter_mut().enumerate() {
+            // Where the name is not a macro, or may not be, it is the name.
+            if s.args == NONE && eng.maybe_undefined(macro_name) {
+                add_name(&mut named, macro_name, (ei, Choice::default()));
+            }
+            let mut known = FxHashSet::default();
+            let novel = |exp: &[T]| recognise(exp, s, macro_name).novel(&mut known);
+            for (exp, choice) in eng.variants(&toks, &Choice::default(), novel) {
+                if let Some(n) = recognise(&exp, s, macro_name).def_name() {
+                    add_name(&mut named, n, (ei, choice));
                 }
             }
         }
+        if named.iter().all(|x| x.0 == macro_name) {
+            continue;
+        }
         let base = out.defs[s.def as usize];
-        for (i, (n, choice)) in named.into_iter().enumerate() {
+        for (i, (n, contexts)) in named.into_iter().enumerate() {
             let name = names.id(&mut out, &n);
             let idx = if i == 0 {
                 out.defs[s.def as usize].name = name;
@@ -732,7 +884,7 @@ fn expand_file(fi: usize, f: &FileFacts, table: &Table, fwd: &[Vec<u32>], rev: &
                 out.defs.push(Def { name, ..base });
                 (out.defs.len() - 1) as u32
             };
-            variants.entry(s.def).or_default().push((idx, choice));
+            variants.entry(s.def).or_default().push((idx, contexts));
         }
     }
 
@@ -743,40 +895,46 @@ fn expand_file(fi: usize, f: &FileFacts, table: &Table, fwd: &[Vec<u32>], rev: &
         }
     }
 
-    // 3. Every other use: the names its expansions make.
+    // 3. Every other use: the names its expansions make. Inside one of the
+    //    definitions above, only where that definition has that name.
     // A prototype and the definition it announces are two things.
     let key = |d: &Def| (d.name, d.line, d.kind, d.flags & flag::DECL);
     let mut seen_defs: FxHashSet<(u32, u32, u8, u8)> = out.defs.iter().map(key).collect();
     let mut seen_refs: FxHashSet<(u32, u32, u32, u8)> = FxHashSet::default();
-    let here = [(0, Choice::default())];
+    let everywhere: Contexts = (0..engines.len()).map(|e| (e, Choice::default())).collect();
+    // A macro whose first uses here all expand to nothing of interest (a
+    // table row, typically) is not tried again in this file.
+    let mut barren: FxHashMap<u32, u32> = FxHashMap::default();
     for s in live.iter().filter(|s| s.def == NONE) {
         if barren.get(&s.name).is_some_and(|&n| n >= BARREN_USES) {
             continue;
         }
         let mut fruitful = false;
         let toks = site_tokens(f, s);
-        let scopes = match variants.get(&s.scope) {
-            Some(v) => &v[..],
-            None => &here[..],
+        let macro_name = f.name(s.name as usize);
+        let scopes: Vec<(u32, &Contexts)> = match variants.get(&s.scope) {
+            Some(v) => v.iter().map(|(scope, contexts)| (*scope, contexts)).collect(),
+            None => vec![(s.scope, &everywhere)],
         };
-        for (i, (scope, pinned)) in scopes.iter().enumerate() {
-            let scope = if variants.contains_key(&s.scope) { *scope } else { s.scope };
-            let mut known = FxHashSet::default();
-            let novel = |exp: &[T]| recognise(exp, s, f.name(s.name as usize)).novel(&mut known);
-            for (exp, _) in eng.variants(&toks, pinned, novel) {
-                let found = recognise(&exp, s, f.name(s.name as usize));
-                fruitful |= !found.is_empty();
-                for (n, kind) in found.refs {
-                    let name = names.id(&mut out, &n);
-                    if seen_refs.insert((name, s.line, scope, kind)) {
-                        out.refs.push(Ref { name, line: s.line, scope, kind });
+        for (i, (scope, contexts)) in scopes.into_iter().enumerate() {
+            for (ei, pinned) in contexts {
+                let mut known = FxHashSet::default();
+                let novel = |exp: &[T]| recognise(exp, s, macro_name).novel(&mut known);
+                for (exp, _) in engines[*ei].variants(&toks, pinned, novel) {
+                    let found = recognise(&exp, s, macro_name);
+                    fruitful |= !found.is_empty();
+                    for (n, kind) in found.refs {
+                        let name = names.id(&mut out, &n);
+                        if seen_refs.insert((name, s.line, scope, kind)) {
+                            out.refs.push(Ref { name, line: s.line, scope, kind });
+                        }
                     }
-                }
-                for (n, kind, flags) in found.decls {
-                    let name = names.id(&mut out, &n);
-                    let def = Def { name, line: s.line, end_line: s.line, kind, flags };
-                    if i == 0 && seen_defs.insert(key(&def)) {
-                        out.defs.push(def);
+                    for (n, kind, flags) in found.decls {
+                        let name = names.id(&mut out, &n);
+                        let def = Def { name, line: s.line, end_line: s.line, kind, flags };
+                        if i == 0 && seen_defs.insert(key(&def)) {
+                            out.defs.push(def);
+                        }
                     }
                 }
             }
@@ -818,7 +976,13 @@ pub fn expand(files: &[FileFacts], includes: &[Vec<u32>]) -> (Vec<Option<FileFac
     }
     let parsed: Vec<Vec<Parsed>> = files
         .par_iter()
-        .map(|f| f.macros.iter().map(|m| parse(f.name(m.text as usize), m.function_like)).collect())
+        .map(|f| {
+            let one = |m: &crate::model::MacroBody| Parsed {
+                conditional: m.conditional,
+                ..parse(f.name(m.text as usize), m.function_like, guard_text(f, m))
+            };
+            f.macros.iter().map(one).collect()
+        })
         .collect();
     let table = Table { files, by_name, parsed };
     let mut rev: Vec<Vec<u32>> = vec![Vec::new(); files.len()];
@@ -886,25 +1050,16 @@ mod tests {
         let mut f = FileFacts::new("a.c".into());
         for (name, text, function_like) in macros {
             let (name, text) = (f.push_name(name), f.push_name(text));
-            f.macros.push(crate::model::MacroBody { name, text, function_like });
+            f.macros.push(crate::model::MacroBody { name, text, function_like, guard: NONE, conditional: false });
         }
         let files = [f];
-        let parsed = vec![files[0].macros.iter().map(|m| parse(files[0].name(m.text as usize), m.function_like)).collect()];
+        let parsed = vec![files[0].macros.iter().map(|m| parse(files[0].name(m.text as usize), m.function_like, "")).collect()];
         let mut by_name: FxHashMap<&str, Vec<(u32, u32)>> = FxHashMap::default();
         for (i, m) in files[0].macros.iter().enumerate() {
             by_name.entry(files[0].name(m.name as usize)).or_default().push((0, i as u32));
         }
         let table = Table { files: &files, by_name, parsed };
-        let mut eng = Engine {
-            table: &table,
-            visible: vec![true],
-            cands: FxHashMap::default(),
-            choice: Choice::default(),
-            met: Vec::new(),
-            active: Vec::new(),
-            steps: 0,
-            hiding: FxHashMap::default(),
-        };
+        let mut eng = Engine::new(&table, vec![true]);
         for (src, want) in [
             ("NAME (elf)", "elf32"),
             ("XCAT (elf, SIZE)", "elfSIZE"),

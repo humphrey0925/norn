@@ -66,6 +66,11 @@ pub struct MacroBody {
     pub name: u32,
     pub text: u32,
     pub function_like: bool,
+    /// The `#if NAME == value` tests around it, as `NAME == 64;OTHER != 1`,
+    /// or `NONE`.
+    pub guard: u32,
+    /// Defined only under some `#if`.
+    pub conditional: bool,
 }
 
 /// A use of an expanding macro, to be expanded at link time, when the
