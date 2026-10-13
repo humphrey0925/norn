@@ -698,7 +698,7 @@ mod tests {
 
     /// Like `graph`, with the corpus-wide pre-pass, so macros are expanded.
     fn expanded(files: &[(&str, &str)]) -> Graph {
-        let sets = MacroSets::from_defines(files.iter().flat_map(|(_, src)| crate::mask::defines(src.as_bytes())));
+        let sets = MacroSets::from_defines(files.iter().flat_map(|(_, src)| crate::mask::defines(src.as_bytes(), &crate::cond::Conditions::default())));
         let mut ex = Extractor::new();
         let facts: Vec<FileFacts> = files.iter().map(|(path, src)| ex.extract(path, src.as_bytes(), &sets)).collect();
         link(&facts).0

@@ -19,6 +19,13 @@ Source-Insight-style views for C in VS Code, backed by the `si` index.
   the workspace and is there the next time. The sync button brings the
   index in line with the disk whenever you want it.
 
+- **Compile Conditions**: what the build defines, so that `#if` branches
+  it does not compile are left out. Macros can be listed as defined (with a
+  value) or not defined, read from a file (a header of `#define` lines, or
+  a Kconfig `.config`), and names with a prefix, or all names, can be
+  assumed not defined unless the build or the sources define them. Kept in
+  `.si/config.json` with the scope.
+
 Go to definition, find references, workspace symbols and call hierarchy use
 the same index.
 

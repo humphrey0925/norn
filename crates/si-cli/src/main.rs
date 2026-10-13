@@ -186,11 +186,15 @@ fn sym_json(g: &Graph, id: u32) -> Value {
 fn index(root: &Path, out: &Path, stores: &str, stride: usize, options: &si_core::link::Options, dump_binds: bool) -> Value {
     let total = Instant::now();
     let t = Instant::now();
-    let files: Vec<PathBuf> = si_core::scan(root).into_iter().step_by(stride.max(1)).collect();
+    // The project's own settings, if it has any: which folders, and what
+    // the build defines.
+    let scope = si_core::scope::Scope::load(root);
+    let files: Vec<PathBuf> = si_core::scan_scope(root, &scope).into_iter().step_by(stride.max(1)).collect();
+    let conditions = si_core::conditions_of(root, &files);
     let scan_ms = ms(t);
 
     let t = Instant::now();
-    let transparent = si_core::prescan(&files);
+    let transparent = si_core::prescan_under(&files, &conditions);
     let prescan_ms = ms(t);
 
     let t = Instant::now();
@@ -246,6 +250,7 @@ fn index(root: &Path, out: &Path, stores: &str, stride: usize, options: &si_core
         "files_with_parse_errors": facts.iter().filter(|f| f.has_error).count(),
         "threads": rayon::current_num_threads(),
         "transparent_macros": transparent.len(),
+        "conditions_known": conditions.len(),
         "expanding_macros": transparent.expanding_len(),
         "expansion": { "sites": ls.sites, "defs_added": ls.expanded_defs, "refs_added": ls.expanded_refs },
         "names": g.n_names(),

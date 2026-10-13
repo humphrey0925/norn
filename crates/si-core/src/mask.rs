@@ -18,6 +18,7 @@
 //! Blanking overwrites bytes with spaces and keeps newlines, so every byte
 //! offset and line number in the masked text matches the original.
 
+use crate::cond::{Conditions, Tri};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// An identifier occurrence found lexically.
@@ -130,6 +131,9 @@ pub struct MacroSets {
     transparent: FxHashMap<Vec<u8>, bool>,
     expanding: FxHashMap<Vec<u8>, bool>,
     kept: FxHashSet<Vec<u8>>,
+    /// What the build is known to define: branches it never compiles are
+    /// skipped (see `cond`).
+    conditions: Conditions,
 }
 
 /// What a macro may expand to and still be dropped: attributes, and
@@ -204,7 +208,16 @@ impl MacroSets {
                 }
             }
         }
-        MacroSets { transparent: set, expanding, kept }
+        MacroSets { transparent: set, expanding, kept, conditions: Conditions::default() }
+    }
+
+    pub fn with_conditions(mut self, conditions: Conditions) -> MacroSets {
+        self.conditions = conditions;
+        self
+    }
+
+    pub fn conditions(&self) -> &Conditions {
+        &self.conditions
     }
 
     /// Number of transparent macros.
@@ -248,6 +261,7 @@ impl MacroSets {
         self.transparent.iter().fold(0, |acc, (k, v)| acc ^ h(k, *v as u64))
             ^ self.expanding.iter().fold(0, |acc, (k, v)| acc ^ h(k, 2 + *v as u64))
             ^ self.kept.iter().fold(0, |acc, k| acc ^ h(k, 4))
+            ^ self.conditions.digest()
     }
 }
 
@@ -535,11 +549,18 @@ struct Cond {
     /// (which makes it an include guard, and so no condition at all).
     ifndef: Option<Vec<u8>>,
     include_guard: bool,
+    /// Whether one of the group's branches so far is known to be the one
+    /// compiled (true), known none is (false), or it is not known.
+    taken: Tri,
+    /// Whether the branch being read is compiled: yes, or not known. (One
+    /// that is not is never read.)
+    compiled: Tri,
 }
 
 struct Lexer<'a> {
     c: Cur<'a>,
     transparent: &'a MacroSets,
+    conditions: &'a Conditions,
     out: Lexed,
     defines: Option<Vec<Define>>,
     nest: Nest,
@@ -916,7 +937,7 @@ impl<'a> Lexer<'a> {
                     _ => 0,
                 };
                 if let Some(len) = text.iter().skip(1).position(|&b| b == close) {
-                    let conditional = self.conds.iter().any(|c| !c.include_guard);
+                    let conditional = self.conds.iter().any(|c| !c.include_guard && c.compiled != Tri::True);
                     self.out.includes.push((open as u32 + 1, (open + 1 + len) as u32, conditional));
                 }
             }
@@ -924,6 +945,9 @@ impl<'a> Lexer<'a> {
         }
         self.c.skip_directive();
         let span = (start, self.c.i);
+        // Set when the branch this directive opens is one the build never
+        // compiles: its text is then passed over.
+        let mut skip = false;
         // A group that cuts a statement in two (`if (x)` / `#endif` / `y;`)
         // is not a statement itself: hide all of it and read every branch.
         let in_block = self.nest.braces.last().is_some_and(|b| b.0 == Brace::Block);
@@ -937,6 +961,18 @@ impl<'a> Lexer<'a> {
                     let (a, e) = c.ident();
                     s[a..e].to_vec()
                 });
+                // Does the build compile this branch?
+                let named = || {
+                    let mut c = Cur { s: &s[..span.1], i: e, line: 0 };
+                    c.skip_space(false);
+                    let (a, e) = c.ident();
+                    self.conditions.defined(&s[a..e])
+                };
+                let holds = match word {
+                    b"ifdef" => named(),
+                    b"ifndef" => named().not(),
+                    _ => self.conditions.eval(&s[e..span.1]),
+                };
                 self.conds.push(Cond {
                     nest: self.nest.clone(),
                     spans: vec![span],
@@ -944,8 +980,11 @@ impl<'a> Lexer<'a> {
                     test,
                     ifndef,
                     include_guard: false,
+                    taken: holds,
+                    compiled: holds,
                 });
                 hide = cuts;
+                skip = holds == Tri::False;
             }
             b"elif" | b"else" | b"elifdef" | b"elifndef" | b"endif" => {
                 if let Some(c) = self.conds.last_mut() {
@@ -956,6 +995,14 @@ impl<'a> Lexer<'a> {
                         }
                     }
                     hide = c.hidden;
+                    // This branch is compiled only if none before it was,
+                    // and (for `#elif`) its own condition holds.
+                    if word != b"endif" {
+                        let own = if word == b"elif" { self.conditions.eval(&s[e..span.1]) } else if word == b"else" { Tri::True } else { Tri::Unknown };
+                        c.compiled = c.taken.not().and(own);
+                        skip = c.compiled == Tri::False;
+                        c.taken = c.taken.or(own);
+                    }
                     // `#else` of a lone `#if` is its negation; after an
                     // `#elif` only the `#elif`'s own test is known.
                     c.test = match word {
@@ -976,6 +1023,58 @@ impl<'a> Lexer<'a> {
         if hide {
             blank(&mut self.out.masked, span.0, span.1);
         }
+        if skip {
+            self.skip_branch();
+        }
+    }
+
+    /// Past a branch the build does not compile, to the `#elif`, `#else` or
+    /// `#endif` that ends it. Nothing in it is read: no definitions, no
+    /// references, and the parser sees blanks.
+    fn skip_branch(&mut self) {
+        let s = self.c.s;
+        let from = self.c.i;
+        let mut depth = 0u32;
+        let mut line_start = false;
+        while self.c.i < s.len() {
+            match s[self.c.i] {
+                b'\n' => {
+                    self.c.bump();
+                    line_start = true;
+                }
+                b' ' | b'\t' | b'\r' | 0x0c => self.c.i += 1,
+                b'/' if matches!(self.c.peek(1), b'*' | b'/') => {
+                    self.c.skip_comment();
+                }
+                b'"' | b'\'' => {
+                    self.c.skip_literal();
+                    line_start = false;
+                }
+                b'#' if line_start => {
+                    let at = (self.c.i, self.c.line);
+                    self.c.i += 1;
+                    self.c.skip_space(false);
+                    let (a, e) = self.c.ident();
+                    match &s[a..e] {
+                        b"if" | b"ifdef" | b"ifndef" => depth += 1,
+                        b"endif" if depth > 0 => depth -= 1,
+                        b"endif" | b"elif" | b"else" | b"elifdef" | b"elifndef" if depth == 0 => {
+                            (self.c.i, self.c.line) = at;
+                            break;
+                        }
+                        _ => {}
+                    }
+                    self.c.skip_directive();
+                    line_start = false;
+                }
+                _ => {
+                    self.c.i += 1;
+                    line_start = false;
+                }
+            }
+        }
+        blank(&mut self.out.masked, from, self.c.i);
+        self.line_start = true;
     }
 
     /// After the word `define`. Leaves the cursor inside the directive.
@@ -1030,8 +1129,8 @@ impl<'a> Lexer<'a> {
                 self.conds[0].include_guard = true;
             }
         }
-        let conditional = self.conds.iter().any(|c| !c.include_guard);
-        let fallback = self.conds.last().is_some_and(|c| !c.include_guard && c.ifndef.as_deref() == Some(&s[a..e]));
+        let conditional = self.conds.iter().any(|c| !c.include_guard && c.compiled != Tri::True);
+        let fallback = self.conds.last().is_some_and(|c| !c.include_guard && c.compiled != Tri::True && c.ifndef.as_deref() == Some(&s[a..e]));
         let keep = self.transparent.kept.contains(&s[a..e]);
         let mut guard = String::new();
         if keep {
@@ -1085,10 +1184,11 @@ fn transparent_deps(s: &[u8], start: usize, end: usize, refs: &[Tok]) -> Option<
     }
 }
 
-fn lexer<'a>(src: &'a [u8], transparent: &'a MacroSets, mask: bool) -> Lexer<'a> {
+fn lexer<'a>(src: &'a [u8], transparent: &'a MacroSets, conditions: &'a Conditions, mask: bool) -> Lexer<'a> {
     Lexer {
         c: Cur { s: src, i: 0, line: 1 },
         transparent,
+        conditions,
         out: Lexed { masked: if mask { src.to_vec() } else { Vec::new() }, ..Default::default() },
         defines: None,
         nest: Nest::default(),
@@ -1104,15 +1204,36 @@ fn lexer<'a>(src: &'a [u8], transparent: &'a MacroSets, mask: bool) -> Lexer<'a>
 
 /// Mask `src` for parsing and report what was hidden.
 pub fn lex(src: &[u8], transparent: &MacroSets) -> Lexed {
-    let mut l = lexer(src, transparent, true);
+    let mut l = lexer(src, transparent, &transparent.conditions, true);
     l.run();
     l.out
 }
 
-/// The `#define`s of one file, for building the [`MacroSets`] set.
-pub fn defines(src: &[u8]) -> Vec<Define> {
+/// Every name the file `#define`s, in whatever branch: a plain scan of its
+/// lines, for knowing which names the sources define at all.
+pub fn defined_names(src: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    for line in src.split(|&b| b == b'\n') {
+        let line = line.trim_ascii_start();
+        let Some(rest) = line.strip_prefix(b"#") else { continue };
+        let Some(rest) = rest.trim_ascii_start().strip_prefix(b"define") else { continue };
+        if !rest.first().is_some_and(|b| matches!(b, b' ' | b'\t')) {
+            continue;
+        }
+        let rest = rest.trim_ascii_start();
+        let end = rest.iter().position(|&b| !is_ident(b)).unwrap_or(rest.len());
+        if end > 0 {
+            out.push(&rest[..end]);
+        }
+    }
+    out
+}
+
+/// The `#define`s of one file, for building the [`MacroSets`] set: those
+/// in branches the build compiles, as far as `conditions` say.
+pub fn defines(src: &[u8], conditions: &Conditions) -> Vec<Define> {
     static NONE: std::sync::OnceLock<MacroSets> = std::sync::OnceLock::new();
-    let mut l = lexer(src, NONE.get_or_init(MacroSets::default), false);
+    let mut l = lexer(src, NONE.get_or_init(MacroSets::default), conditions, false);
     l.defines = Some(Vec::new());
     l.run();
     l.defines.unwrap_or_default()
@@ -1123,7 +1244,7 @@ mod tests {
     use super::*;
 
     fn transparent(src: &str) -> MacroSets {
-        MacroSets::from_defines(defines(src.as_bytes()))
+        MacroSets::from_defines(defines(src.as_bytes(), &Conditions::default()))
     }
 
     fn masked(src: &str, t: &MacroSets) -> String {
@@ -1179,6 +1300,32 @@ mod tests {
         let kept: Vec<&str> = m.lines().filter(|l| l.starts_with('#')).collect();
         assert_eq!(kept, ["#ifdef A", "#endif", "#ifdef A", "#endif"]);
         assert_eq!(m.len(), src.len());
+    }
+
+    #[test]
+    fn branches_the_build_does_not_compile_are_passed_over() {
+        let src = "#if WIDTH == 64\nint wide (void);\n#define W 64\n#elif WIDTH == 32\nint narrow (void);\n#define W 32\n#else\nint none (void);\n#endif\n\
+                   #ifdef WINDOWS\nint win (void);\n# if 1\nint nested (void);\n# endif\n#else\nint unix_ (void);\n#endif\n\
+                   #ifdef UNKNOWN\nint maybe (void);\n#endif\n#if 0\nint dead (void);  /* don't */\n#endif\nint always (void);\n";
+        let mut c = Conditions::default();
+        c.define("WIDTH", "32");
+        c.undefine("WINDOWS");
+        let sets = MacroSets::default().with_conditions(c.clone());
+        let l = lex(src.as_bytes(), &sets);
+        let m = String::from_utf8(l.masked).unwrap();
+        assert_eq!(m.len(), src.len());
+        assert_eq!(m.matches('\n').count(), src.matches('\n').count(), "lines stay where they are");
+        for (name, there) in [("wide", false), ("narrow", true), ("none", false), ("win", false), ("nested", false), ("unix_", true), ("maybe", true), ("dead", false), ("always", true)] {
+            assert_eq!(m.contains(name), there, "{name}");
+        }
+        // Only the definition in the compiled branch counts.
+        let names: Vec<String> = defines(src.as_bytes(), &c).iter().map(|d| String::from_utf8(d.name.clone()).unwrap()).collect();
+        assert_eq!(names, ["W"]);
+        let macros = l.events.iter().filter(|e| matches!(e, Event::Macro(_))).count();
+        assert_eq!(macros, 1);
+        // With nothing configured only `#if 0` is passed over.
+        let plain = masked(src, &MacroSets::default());
+        assert!(plain.contains("wide") && plain.contains("win") && !plain.contains("dead"));
     }
 
     #[test]

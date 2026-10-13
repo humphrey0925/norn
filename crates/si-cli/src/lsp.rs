@@ -116,7 +116,7 @@ struct Server {
     lines: HashMap<String, Vec<String>>,
     /// Every symbol worth listing, by name without regard to case; made
     /// when first asked for and dropped when the index changes.
-    listing: Option<Vec<u32>>,
+    listing: [Option<Vec<u32>>; 2],
 }
 
 impl Server {
@@ -430,6 +430,15 @@ impl Server {
         json!({ "target": target.map(|t| self.entry(t)), "by": if by_slot { "member" } else { "function" }, "rows": rows })
     }
 
+    /// `si/conditions`: what the build is said to define (the settings as
+    /// written), and how many macros that settles once the files they name
+    /// are read.
+    fn conditions(&self) -> Value {
+        let s = self.session.condition_settings();
+        json!({ "defines": s.defines, "undefines": s.undefines, "assumeUndefined": s.assume_undefined,
+                "conditionFiles": s.condition_files, "known": self.session.conditions_known() })
+    }
+
     /// `si/scope`: which folders are indexed, and where that is written.
     fn scope(&self) -> Value {
         let s = self.session.scope();
@@ -439,7 +448,7 @@ impl Server {
 
     fn synced(&mut self, up: si_core::session::Update) -> Value {
         self.lines.clear();
-        self.listing = None;
+        self.listing = [None, None];
         let mut v = self.scope();
         v["files"] = json!(self.session.files());
         v["symbols"] = json!(self.g().syms.len());
@@ -455,7 +464,7 @@ impl Server {
         if !paths.is_empty() {
             self.session.update(&paths);
             self.lines.clear();
-            self.listing = None;
+            self.listing = [None, None];
         }
     }
 
@@ -463,20 +472,34 @@ impl Server {
     /// (`offset`, `limit`), with how many there are. Prototypes are left to
     /// their definitions; a list this long is fetched as it is scrolled.
     fn symbols(&mut self, params: &Value) -> Value {
-        if self.listing.is_none() {
+        // `order`: "name", or "kind" (functions together, then macros, and
+        // so on, each kind by name).
+        let by_kind = params["order"].as_str() == Some("kind");
+        if self.listing[by_kind as usize].is_none() {
             let g = self.g();
             let mut all: Vec<u32> = (0..g.syms.len() as u32)
                 .filter(|&s| g.syms[s as usize].kind != kind::FILE && g.syms[s as usize].flags & flag::DECL == 0)
                 .collect();
+            let rank = |k: u8| match k {
+                kind::FUNCTION => 0,
+                kind::MACRO => 1,
+                kind::STRUCT => 2,
+                kind::UNION => 3,
+                kind::ENUM => 4,
+                kind::ENUM_CONST => 5,
+                kind::TYPEDEF => 6,
+                kind::GLOBAL => 7,
+                _ => 8,
+            };
             // Without regard to case, as a person looks a name up; then by
             // the name itself and by place, so the order is always the same.
             all.sort_by_cached_key(|&s| {
                 let sym = &g.syms[s as usize];
-                (g.sym_name(s).to_ascii_lowercase(), g.sym_name(s).to_string(), sym.file, sym.line)
+                (if by_kind { rank(sym.kind) } else { 0 }, g.sym_name(s).to_ascii_lowercase(), g.sym_name(s).to_string(), sym.file, sym.line)
             });
-            self.listing = Some(all);
+            self.listing[by_kind as usize] = Some(all);
         }
-        let all = self.listing.as_ref().unwrap();
+        let all = self.listing[by_kind as usize].as_ref().unwrap();
         let offset = (params["offset"].as_u64().unwrap_or(0) as usize).min(all.len());
         let limit = params["limit"].as_u64().unwrap_or(200).min(2000) as usize;
         let g = self.g();
@@ -513,6 +536,18 @@ impl Server {
             "si/assignments" => self.assignments(params),
             "si/symbols" => self.symbols(params),
             "si/place" => self.place(params),
+            "si/conditions" => self.conditions(),
+            "si/setConditions" => {
+                let settings: si_core::cond::Settings = serde_json::from_value(params.clone()).unwrap_or_default();
+                match self.session.set_conditions(&settings) {
+                    Ok(up) => {
+                        let mut v = self.synced(up);
+                        v["conditions"] = self.conditions();
+                        v
+                    }
+                    Err(e) => json!({ "error": format!("could not save the conditions: {e}") }),
+                }
+            }
             "si/scope" => self.scope(),
             "si/setScope" => {
                 let list = |key: &str| -> Vec<String> {
@@ -580,7 +615,7 @@ pub fn run(root: Option<&Path>, open: &dyn Fn(&Path) -> (Session, si_core::sessi
             let dir = root.map(Path::to_path_buf).or(from_client).unwrap_or_else(|| PathBuf::from("."));
             let (session, opened) = open(&dir);
             let opened = (opened.loaded, opened.extracted);
-            server = Some(Server { session, opened, root: dir, open: HashMap::new(), lines: HashMap::new(), listing: None });
+            server = Some(Server { session, opened, root: dir, open: HashMap::new(), lines: HashMap::new(), listing: [None, None] });
             let capabilities = json!({
                 "textDocumentSync": { "openClose": true, "change": 1, "save": true },
                 "definitionProvider": true, "declarationProvider": true, "referencesProvider": true,

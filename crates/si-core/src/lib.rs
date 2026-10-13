@@ -1,5 +1,6 @@
 //! Code-intelligence core: per-file extraction, global link, pluggable stores.
 
+pub mod cond;
 pub mod expand;
 pub mod extract;
 pub mod graph;
@@ -55,9 +56,29 @@ pub fn rel_path(root: &Path, path: &Path) -> String {
 /// Corpus-wide pre-pass: which macros can be dropped before parsing, and
 /// which have to be expanded.
 pub fn prescan(files: &[PathBuf]) -> MacroSets {
+    prescan_under(files, &cond::Conditions::default())
+}
+
+/// The compile conditions the tree's settings give, told (when they assume
+/// anything) which names the files `#define` themselves.
+pub fn conditions_of(root: &Path, files: &[PathBuf]) -> cond::Conditions {
+    let mut conditions = cond::Conditions::load(root);
+    if conditions.assumes() {
+        let names: Vec<Vec<Vec<u8>>> = files
+            .par_iter()
+            .map(|p| mask::defined_names(&std::fs::read(p).unwrap_or_default()).into_iter().map(<[u8]>::to_vec).collect())
+            .collect();
+        conditions.set_in_source(names.into_iter().flatten().collect());
+    }
+    conditions
+}
+
+/// The same, with what the build is known to define: `#define`s in branches
+/// it never compiles do not count, and extraction skips those branches.
+pub fn prescan_under(files: &[PathBuf], conditions: &cond::Conditions) -> MacroSets {
     let defines: Vec<Vec<mask::Define>> =
-        files.par_iter().map(|p| mask::defines(&std::fs::read(p).unwrap_or_default())).collect();
-    MacroSets::from_defines(defines.into_iter().flatten())
+        files.par_iter().map(|p| mask::defines(&std::fs::read(p).unwrap_or_default(), conditions)).collect();
+    MacroSets::from_defines(defines.into_iter().flatten()).with_conditions(conditions.clone())
 }
 
 pub fn extract_file(ex: &mut extract::Extractor, root: &Path, path: &Path, transparent: &MacroSets) -> FileFacts {

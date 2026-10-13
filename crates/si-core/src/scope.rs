@@ -24,6 +24,19 @@ pub struct Scope {
     pub exclude: Vec<String>,
 }
 
+/// Write these settings into `.si/config.json`, leaving the others in the
+/// file as they are: the scope and the compile conditions share it.
+pub fn write_settings(root: &Path, settings: serde_json::Value) -> std::io::Result<()> {
+    let path = Scope::config_path(root);
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let existing = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let mut all = existing.filter(|v| v.is_object()).unwrap_or_else(|| serde_json::json!({}));
+    for (key, value) in settings.as_object().into_iter().flatten() {
+        all[key] = value.clone();
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&all).unwrap() + "\n")
+}
+
 /// Folders that are never part of a project: ours, and version control's.
 const NEVER: [&str; 4] = [".si", ".git", ".svn", ".hg"];
 
@@ -51,14 +64,12 @@ impl Scope {
     }
 
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
-        let path = Scope::config_path(root);
-        std::fs::create_dir_all(path.parent().unwrap())?;
         // The root is written as `.`, which reads better than an empty name.
         let mut written = self.clone().normalized();
         for list in [&mut written.include, &mut written.exclude] {
             list.iter_mut().filter(|f| f.is_empty()).for_each(|f| *f = ".".into());
         }
-        std::fs::write(path, serde_json::to_string_pretty(&written).unwrap() + "\n")
+        write_settings(root, serde_json::to_value(&written).unwrap())
     }
 
     pub fn normalized(mut self) -> Scope {

@@ -261,6 +261,8 @@ pub struct FileFacts {
     /// (definition, type name) of variables and functions at file scope
     /// whose type, or return type, is a struct, union or typedef.
     pub typed: Vec<(u32, u32)>,
+    /// Every name the file `#define`s, in whatever branch.
+    pub defined_names: Vec<u32>,
 }
 
 impl FileFacts {

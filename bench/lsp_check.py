@@ -109,6 +109,12 @@ def main():
         assert len(later["items"]) == 5 and later["items"][0]["name"].lower() >= names[-1].lower()
         spot = c.request("si/place", {k: first["items"][10][k] for k in ("file", "line", "name")})
         assert spot["range"]["start"]["line"] == first["items"][10]["line"] - 1, spot
+        grouped = c.request("si/symbols", {"offset": 0, "limit": 2000, "order": "kind"})["items"]
+        kinds = [x["kind"] for x in grouped]
+        runs = [k for i, k in enumerate(kinds) if i == 0 or kinds[i - 1] != k]
+        assert runs[:2] == ["function", "macro"] and len(runs) == len(set(runs)), runs
+        fn_names = [x["name"] for x in grouped if x["kind"] == "function"]
+        assert fn_names == sorted(fn_names, key=lambda n: (n.lower(), n))
         print(f"all symbols: {first['total']} in name order, fetched by the stretch")
 
         # Fragments in any order, and initials.
@@ -168,6 +174,18 @@ def main():
         r = c.request("si/setScope", {"include": [], "exclude": []})
         assert r["added"] == 1 and c.request("workspace/symbol", {"query": "ATTRIBUTE_UNUSED"}), r
         print("scope: folders leave and return, saved in .si/config.json; sync picks up new files")
+        # Compile conditions: bfdio.c has `#ifndef FD_CLOEXEC` / `#define
+        # FD_CLOEXEC 1`; told the build defines it, that branch is skipped.
+        has = lambda name: any(x["name"] == name for x in c.request("workspace/symbol", {"query": name}))
+        assert has("FD_CLOEXEC")
+        r = c.request("si/setConditions", {"defines": {"FD_CLOEXEC": "1"}})
+        assert r["conditions"]["known"] == 1 and r["parsed"] >= 7, r
+        assert not has("FD_CLOEXEC") and has("bfd_read")
+        saved = json.loads((work / ".si" / "config.json").read_text())
+        assert saved["defines"] == {"FD_CLOEXEC": "1"} and "exclude" in saved, saved
+        c.request("si/setConditions", {})
+        assert has("FD_CLOEXEC")
+        print("conditions: a branch the build does not compile leaves the index, and comes back")
         c.close()
     print("ok")
 

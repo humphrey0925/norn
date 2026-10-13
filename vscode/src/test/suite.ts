@@ -113,6 +113,17 @@ export async function run(): Promise<void> {
   await vscode.commands.executeCommand("si.scope.apply");
   assert.ok(await has("ATTRIBUTE_UNUSED"));
 
+  // Compile conditions: bfdio.c defines FD_CLOEXEC under `#ifndef
+  // FD_CLOEXEC`. Told the build defines it, that branch is not indexed.
+  assert.ok(await has("FD_CLOEXEC"));
+  await vscode.commands.executeCommand("si.conditions.define", "FD_CLOEXEC=1");
+  assert.ok(!(await has("FD_CLOEXEC")) && (await has("bfd_read")), "the skipped branch left the index");
+  const conditions = await vscode.commands.executeCommand<{ defines: Record<string, string> }>("si.conditions.get");
+  assert.deepStrictEqual(conditions.defines, { FD_CLOEXEC: "1" });
+  await vscode.commands.executeCommand("si.conditions.remove", { group: "defines", key: "FD_CLOEXEC" });
+  assert.ok(await has("FD_CLOEXEC"));
+  await vscode.commands.executeCommand("si.conditions.focus");
+
   // The index is kept in the workspace, and git is told to leave it alone.
   assert.ok((await vscode.workspace.fs.stat(vscode.Uri.file(path.join(folder, ".si", "cache", "manifest")))).size > 0);
   const ignore = Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(folder, ".si", ".gitignore")))).toString();

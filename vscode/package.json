@@ -2,7 +2,7 @@
   "name": "si-code-index",
   "displayName": "SI Code Index",
   "description": "Source-Insight-style symbol search, context and relation views for C, backed by the si index.",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "publisher": "humphrey0925",
   "repository": {
     "type": "git",
@@ -54,6 +54,12 @@
           "id": "si.scope",
           "name": "Index Scope",
           "contextualTitle": "SI Index Scope"
+        },
+        {
+          "id": "si.conditions",
+          "name": "Compile Conditions",
+          "contextualTitle": "SI Compile Conditions",
+          "visibility": "collapsed"
         }
       ],
       "siPanel": [
@@ -182,6 +188,31 @@
       {
         "command": "si.relation.assignments",
         "title": "SI: Show Function Pointer Assignments"
+      },
+      {
+        "command": "si.conditions.define",
+        "title": "SI: Define a Macro for Conditions…",
+        "icon": "$(add)"
+      },
+      {
+        "command": "si.conditions.undefine",
+        "title": "SI: Mark a Macro as Not Defined…",
+        "icon": "$(circle-slash)"
+      },
+      {
+        "command": "si.conditions.addFile",
+        "title": "SI: Read Conditions from a File (.config, header)…",
+        "icon": "$(file-add)"
+      },
+      {
+        "command": "si.conditions.assume",
+        "title": "SI: Assume Names Are Not Defined (prefix or *)…",
+        "icon": "$(question)"
+      },
+      {
+        "command": "si.conditions.remove",
+        "title": "Remove",
+        "icon": "$(trash)"
       }
     ],
     "menus": {
@@ -250,6 +281,31 @@
           "command": "si.resetLayout",
           "when": "view =~ /^si\\\\./",
           "group": "9_si@1"
+        },
+        {
+          "command": "si.conditions.define",
+          "when": "view == si.conditions",
+          "group": "navigation@1"
+        },
+        {
+          "command": "si.conditions.undefine",
+          "when": "view == si.conditions",
+          "group": "navigation@2"
+        },
+        {
+          "command": "si.conditions.addFile",
+          "when": "view == si.conditions",
+          "group": "navigation@3"
+        },
+        {
+          "command": "si.conditions.assume",
+          "when": "view == si.conditions",
+          "group": "navigation@4"
+        },
+        {
+          "command": "si.scope.openConfig",
+          "when": "view == si.conditions",
+          "group": "1_si@1"
         }
       ],
       "view/item/context": [
@@ -272,6 +328,31 @@
           "command": "si.scope.exclude",
           "when": "view == si.scope && viewItem == folder",
           "group": "si@3"
+        },
+        {
+          "command": "si.conditions.remove",
+          "when": "view == si.conditions && viewItem == condition",
+          "group": "inline@1"
+        },
+        {
+          "command": "si.conditions.define",
+          "when": "view == si.conditions && viewItem == group.defines",
+          "group": "inline@1"
+        },
+        {
+          "command": "si.conditions.undefine",
+          "when": "view == si.conditions && viewItem == group.undefines",
+          "group": "inline@1"
+        },
+        {
+          "command": "si.conditions.addFile",
+          "when": "view == si.conditions && viewItem == group.conditionFiles",
+          "group": "inline@1"
+        },
+        {
+          "command": "si.conditions.assume",
+          "when": "view == si.conditions && viewItem == group.assumeUndefined",
+          "group": "inline@1"
         }
       ],
       "commandPalette": [
@@ -289,6 +370,10 @@
         },
         {
           "command": "si.scope.only",
+          "when": "false"
+        },
+        {
+          "command": "si.conditions.remove",
           "when": "false"
         }
       ],

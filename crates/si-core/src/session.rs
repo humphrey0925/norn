@@ -11,6 +11,7 @@
 //! * the edit changes a macro body or an `#include`: expansions elsewhere
 //!   depend on it, and the expansion cache notices by itself.
 
+use crate::cond::{Conditions, Settings};
 use crate::expand::Cache;
 use crate::extract::Extractor;
 use crate::graph::Graph;
@@ -39,6 +40,11 @@ pub struct Session {
     stamps: Vec<Stamp>,
     /// Which part of the tree is the project (`.si/config.json`).
     scope: Scope,
+    /// What the build defines, from the same file: branches it does not
+    /// compile are not indexed.
+    conditions: Conditions,
+    /// Set when the conditions changed: every file is then read again.
+    all_stale: bool,
     pub graph: Graph,
     pub stats: LinkStats,
 }
@@ -72,14 +78,58 @@ impl Session {
     pub fn open(root: &Path, options: Options) -> Session {
         let scope = Scope::load(root);
         let files = crate::scan_scope(root, &scope);
+        let conditions = crate::conditions_of(root, &files);
         let defines: Vec<Vec<Define>> =
-            files.par_iter().map(|p| mask::defines(&std::fs::read(p).unwrap_or_default())).collect();
-        let sets = MacroSets::from_defines(defines.iter().flatten().cloned());
+            files.par_iter().map(|p| mask::defines(&std::fs::read(p).unwrap_or_default(), &conditions)).collect();
+        let sets = MacroSets::from_defines(defines.iter().flatten().cloned()).with_conditions(conditions.clone());
         let facts = crate::extract_all(root, &files, &sets);
         let mut cache = Cache::default();
         let (graph, stats) = link_cached(&facts, &options, &mut cache);
         let stamps = files.par_iter().map(|p| stamp(p)).collect();
-        Session { root: root.to_path_buf(), files, defines, facts, sets, cache, options, store: None, stamps, scope, graph, stats }
+        Session {
+            root: root.to_path_buf(),
+            files,
+            defines,
+            facts,
+            sets,
+            cache,
+            options,
+            store: None,
+            stamps,
+            scope,
+            conditions,
+            all_stale: false,
+            graph,
+            stats,
+        }
+    }
+
+    /// The conditions the tree's settings give now, with the names the
+    /// indexed files define (as the facts have them).
+    fn conditions_now(root: &Path, facts: &[FileFacts]) -> Conditions {
+        let mut conditions = Conditions::load(root);
+        if conditions.assumes() {
+            let names = facts.iter().flat_map(|f| f.defined_names.iter().map(|&n| f.name(n as usize).as_bytes().to_vec()));
+            conditions.set_in_source(names.collect());
+        }
+        conditions
+    }
+
+    /// The compile conditions as written in the tree.
+    pub fn condition_settings(&self) -> Settings {
+        Settings::load(&self.root)
+    }
+
+    /// How many macros the conditions settle, one way or the other.
+    pub fn conditions_known(&self) -> usize {
+        self.conditions.len()
+    }
+
+    /// Make these the project's compile conditions, save them in the tree,
+    /// and index again under them.
+    pub fn set_conditions(&mut self, settings: &Settings) -> std::io::Result<Update> {
+        settings.save(&self.root)?;
+        Ok(self.sync())
     }
 
     pub fn scope(&self) -> &Scope {
@@ -99,6 +149,12 @@ impl Session {
     pub fn sync(&mut self) -> Update {
         let t = Instant::now();
         self.scope = Scope::load(&self.root);
+        // Other conditions make other facts of every file.
+        let conditions = Session::conditions_now(&self.root, &self.facts);
+        if conditions != self.conditions {
+            self.conditions = conditions;
+            self.all_stale = true;
+        }
         let paths = self.out_of_date();
         let mut up = self.update(&paths);
         up.extract_ms = ms(t) - up.link_ms;
@@ -190,7 +246,10 @@ impl Session {
         }
         // The facts were all extracted under these sets, or the save was
         // interrupted and cannot be trusted.
-        let sets = MacroSets::from_defines(defines.iter().flatten().cloned());
+        // (The conditions are part of the sets: a save made under other
+        // conditions does not match and is rebuilt.)
+        let conditions = Session::conditions_now(root, &facts);
+        let sets = MacroSets::from_defines(defines.iter().flatten().cloned()).with_conditions(conditions.clone());
         if sets.digest() != manifest.sets {
             return None;
         }
@@ -205,6 +264,8 @@ impl Session {
             store: None,
             stamps,
             scope: Scope::load(root),
+            conditions,
+            all_stale: false,
             graph: Graph::default(),
             stats: LinkStats::default(),
         })
@@ -243,7 +304,7 @@ impl Session {
             let there = path.is_file() && self.scope.contains(&crate::rel_path(&self.root, &path));
             match (self.files.binary_search(&path), there) {
                 (Ok(i), true) => {
-                    let defines = mask::defines(&std::fs::read(&path).unwrap_or_default());
+                    let defines = mask::defines(&std::fs::read(&path).unwrap_or_default(), &self.conditions);
                     defines_changed |= defines != self.defines[i];
                     self.defines[i] = defines;
                     up.changed += 1;
@@ -262,7 +323,7 @@ impl Session {
                 }
                 (Err(i), true) => {
                     self.files.insert(i, path.clone());
-                    self.defines.insert(i, mask::defines(&std::fs::read(&path).unwrap_or_default()));
+                    self.defines.insert(i, mask::defines(&std::fs::read(&path).unwrap_or_default(), &self.conditions));
                     self.facts.insert(i, FileFacts::new(String::new()));
                     self.stamps.insert(i, (0, 0));
                     defines_changed = true;
@@ -274,10 +335,18 @@ impl Session {
             }
         }
 
+        // New conditions: which `#define`s count has to be seen again, and
+        // every file read under them.
+        let all_stale = std::mem::take(&mut self.all_stale);
+        if all_stale {
+            let (files, conditions) = (&self.files, &self.conditions);
+            self.defines = files.par_iter().map(|p| mask::defines(&std::fs::read(p).unwrap_or_default(), conditions)).collect();
+            defines_changed = true;
+        }
         // Did any macro change character? Then whoever mentions it is stale.
         let mut reclassified = FxHashSet::default();
         if defines_changed {
-            let sets = MacroSets::from_defines(self.defines.iter().flatten().cloned());
+            let sets = MacroSets::from_defines(self.defines.iter().flatten().cloned()).with_conditions(self.conditions.clone());
             reclassified = self.sets.reclassified(&sets);
             self.sets = sets;
         }
@@ -286,7 +355,8 @@ impl Session {
             .into_par_iter()
             .filter(|&i| {
                 let f = &self.facts[i];
-                touched.contains(&self.files[i])
+                all_stale
+                    || touched.contains(&self.files[i])
                     || !reclassified.is_empty() && (0..f.n_names()).any(|n| reclassified.contains(f.name(n).as_bytes()))
             })
             .collect();
@@ -456,6 +526,42 @@ mod tests {
         std::fs::remove_file(d.0.join("main.c")).unwrap();
         let up = s.sync();
         assert_eq!((up.added, up.removed, functions(&s, "b"), functions(&s, "main")), (1, 1, 1, 0));
+    }
+
+    #[test]
+    fn compile_conditions_decide_which_branches_are_indexed() {
+        let d = Dir::new("conditions");
+        d.write("a.c", "#ifdef CONFIG_NET\nint net_init (void) { return helper (); }\n#else\nint net_stub (void) { return 0; }\n#endif\nint helper (void) { return 1; }\n");
+        d.write("dot-config", "CONFIG_NET=y\n# CONFIG_USB is not set\n");
+        let cache = d.0.join("cache-outside-scan");
+        let open = |d: &Dir| Session::open_cached(&d.0, Options::default(), cache.clone());
+
+        // Nothing configured: both branches, as before.
+        let (mut s, _) = open(&d);
+        assert_eq!((functions(&s, "net_init"), functions(&s, "net_stub")), (1, 1));
+        // Configured from a file: only the branch that is compiled.
+        let settings = Settings { condition_files: vec!["dot-config".into()], ..Settings::default() };
+        let up = s.set_conditions(&settings).unwrap();
+        assert_eq!((up.extracted, s.conditions_known()), (1, 3));
+        assert_eq!((functions(&s, "net_init"), functions(&s, "net_stub"), functions(&s, "helper")), (1, 0, 1));
+        // The scope, written to the same file, leaves the conditions alone.
+        s.set_scope(Scope::default()).unwrap();
+        assert_eq!(s.condition_settings(), settings);
+        drop(s);
+
+        // The next start is under the same conditions, from the save.
+        let (mut s, up) = open(&d);
+        assert_eq!((up.loaded, up.extracted, functions(&s, "net_stub")), (1, 0, 0));
+        // Turned the other way by hand in the settings.
+        let mut other = settings.clone();
+        other.undefines.push("CONFIG_NET".into());
+        s.set_conditions(&other).unwrap();
+        assert_eq!((functions(&s, "net_init"), functions(&s, "net_stub")), (0, 1));
+        drop(s);
+        // Conditions changed while nothing was running: the save is rebuilt.
+        Settings::default().save(&d.0).unwrap();
+        let (s, up) = open(&d);
+        assert_eq!((up.loaded, functions(&s, "net_init"), functions(&s, "net_stub")), (0, 1, 1));
     }
 
     #[test]

@@ -181,6 +181,13 @@ impl Extractor {
         let file_name = out.push_name(path);
         out.defs.push(Def { name: file_name, line: 1, end_line: 0, kind: kind::FILE, flags: 0 });
 
+        let mut names = mask::defined_names(src);
+        names.sort_unstable();
+        names.dedup();
+        for name in names {
+            let id = out.push_name(&String::from_utf8_lossy(name));
+            out.defined_names.push(id);
+        }
         let t = std::time::Instant::now();
         let lexed = mask::lex(src, transparent);
         for &(a, e, conditional) in &lexed.includes {

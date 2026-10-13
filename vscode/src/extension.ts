@@ -434,6 +434,135 @@ class ScopeTree implements vscode.TreeDataProvider<string> {
   }
 }
 
+// ---------------------------------------------------------------- Compile conditions
+
+interface ConditionSettings {
+  defines: Record<string, string>;
+  undefines: string[];
+  assumeUndefined: string[];
+  conditionFiles: string[];
+  known?: number;
+}
+
+/** One row of the Conditions view: a group, or a setting in it. */
+interface ConditionRow {
+  group: "defines" | "undefines" | "conditionFiles" | "assumeUndefined";
+  key?: string;
+}
+
+/** What the build defines, so that `#if` branches it does not compile are
+ *  left out of the index. Kept in `.si/config.json` with the scope. */
+class ConditionsTree implements vscode.TreeDataProvider<ConditionRow> {
+  private readonly changed = new vscode.EventEmitter<ConditionRow | undefined>();
+  readonly onDidChangeTreeData = this.changed.event;
+  settings: ConditionSettings = { defines: {}, undefines: [], assumeUndefined: [], conditionFiles: [] };
+
+  constructor(private readonly afterSync: (r: Synced, what: string) => void) {}
+
+  async load() {
+    const s = await ask<ConditionSettings>("si/conditions", {});
+    if (s) {
+      this.settings = s;
+      this.changed.fire(undefined);
+    }
+  }
+
+  getChildren(row?: ConditionRow): ConditionRow[] {
+    const s = this.settings;
+    if (!row) {
+      return [{ group: "defines" }, { group: "undefines" }, { group: "conditionFiles" }, { group: "assumeUndefined" }];
+    }
+    if (row.key !== undefined) {
+      return [];
+    }
+    const keys = row.group === "defines" ? Object.keys(s.defines).sort() : [...s[row.group]].sort();
+    return keys.map((key) => ({ group: row.group, key }));
+  }
+
+  getTreeItem(row: ConditionRow): vscode.TreeItem {
+    const s = this.settings;
+    if (row.key === undefined) {
+      const titles = {
+        defines: ["Defined", "Macros the build defines", "symbol-constant"],
+        undefines: ["Not defined", "Macros the build does not define", "circle-slash"],
+        conditionFiles: ["From files", "Files read for more: a header of #define lines, or a Kconfig .config", "file"],
+        assumeUndefined: ["Assume not defined", "Prefixes (or * for everything) whose names are not defined unless listed or defined in the sources", "question"],
+      } as const;
+      const [label, tip, icon] = titles[row.group];
+      const count = row.group === "defines" ? Object.keys(s.defines).length : s[row.group].length;
+      const item = new vscode.TreeItem(label, count ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
+      item.description = count ? String(count) : "none";
+      item.tooltip = tip;
+      item.iconPath = new vscode.ThemeIcon(icon);
+      item.contextValue = `group.${row.group}`;
+      return item;
+    }
+    const item = new vscode.TreeItem(row.key === "*" ? "* (every other name)" : row.key);
+    if (row.group === "defines") {
+      item.description = s.defines[row.key] === "" ? "defined" : `= ${s.defines[row.key]}`;
+    }
+    item.contextValue = "condition";
+    return item;
+  }
+
+  async apply(next: ConditionSettings, what: string) {
+    const r = await ask<Synced & { conditions?: ConditionSettings }>("si/setConditions", {
+      defines: next.defines, undefines: next.undefines, assumeUndefined: next.assumeUndefined, conditionFiles: next.conditionFiles,
+    });
+    if (!r || r.error) {
+      void vscode.window.showErrorMessage(r?.error ?? "SI is not running.");
+      return;
+    }
+    this.settings = r.conditions ?? next;
+    this.changed.fire(undefined);
+    this.afterSync(r, what);
+  }
+
+  private copy(): ConditionSettings {
+    const s = this.settings;
+    return { defines: { ...s.defines }, undefines: [...s.undefines], assumeUndefined: [...s.assumeUndefined], conditionFiles: [...s.conditionFiles] };
+  }
+
+  /** `NAME` or `NAME=value` is defined; a name is one thing or the other. */
+  async define(text: string) {
+    const [name, ...rest] = text.split("=");
+    const next = this.copy();
+    next.defines[name.trim()] = rest.join("=").trim();
+    next.undefines = next.undefines.filter((u) => u !== name.trim());
+    await this.apply(next, `Defined ${name.trim()}`);
+  }
+
+  async undefine(name: string) {
+    const next = this.copy();
+    delete next.defines[name];
+    if (!next.undefines.includes(name)) {
+      next.undefines.push(name);
+    }
+    await this.apply(next, `${name} is not defined`);
+  }
+
+  async add(group: "conditionFiles" | "assumeUndefined", value: string) {
+    const next = this.copy();
+    if (!next[group].includes(value)) {
+      next[group].push(value);
+    }
+    await this.apply(next, group === "conditionFiles" ? `Reading conditions from ${value}` : `Assuming ${value} is not defined`);
+  }
+
+  async remove(row: ConditionRow) {
+    if (row.key === undefined) {
+      return;
+    }
+    const next = this.copy();
+    if (row.group === "defines") {
+      delete next.defines[row.key];
+    } else {
+      next[row.group] = next[row.group].filter((x) => x !== row.key);
+    }
+    await this.apply(next, `Removed ${row.key}`);
+  }
+}
+
 // ---------------------------------------------------------------- webviews
 
 const STYLE = `
@@ -445,7 +574,12 @@ const STYLE = `
   .row { display: flex; gap: 8px; padding: 2px 8px; cursor: pointer; white-space: nowrap; align-items: baseline; }
   html, body { height: 100%; }
   body { display: flex; flex-direction: column; }
-  #count { color: var(--vscode-descriptionForeground); font-size: 0.85em; padding: 0 0 4px; }
+  #bar { display: flex; align-items: center; gap: 8px; padding: 0 0 4px; }
+  #count { color: var(--vscode-descriptionForeground); font-size: 0.85em; }
+  #order { margin-left: auto; display: flex; border: 1px solid var(--vscode-panel-border); border-radius: 3px; overflow: hidden; }
+  #order button { font: inherit; font-size: 0.85em; padding: 0 8px; border: 0; background: none; color: var(--vscode-descriptionForeground); cursor: pointer; }
+  #order button[aria-pressed="true"] { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+  #order button:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
   #scroll { flex: 1; overflow-y: auto; position: relative; min-height: 0; }
   #scroll #list .row { position: absolute; left: 0; right: 0; height: 22px; box-sizing: border-box; padding: 0 8px; align-items: center; }
   #space { width: 1px; }
@@ -491,7 +625,8 @@ class Search implements vscode.WebviewViewProvider {
     this.view = view;
     view.webview.html = page(
       view.webview,
-      `<div class="wrap"><input id="q" placeholder="Fragments or initials: init cache, bci" spellcheck="false"><div id="count"></div></div>
+      `<div class="wrap"><input id="q" placeholder="Fragments or initials: init cache, bci" spellcheck="false">
+       <div id="bar"><span id="count"></span><span id="order" role="group" aria-label="Sort"><button data-order="name" title="Sort by name">Name</button><button data-order="kind" title="Functions together, then macros, types, variables and members; each by name">Kind</button></span></div></div>
        <div id="scroll"><div id="space"></div><div id="list"></div></div>`,
       `
       const q = document.getElementById("q"), list = document.getElementById("list"), space = document.getElementById("space");
@@ -501,6 +636,11 @@ class Search implements vscode.WebviewViewProvider {
       // fetched a page at a time as it scrolls into view. With something
       // typed: the matches, best first.
       let timer, query = "", results = [], total = 0, pages = new Map(), asked = new Set(), epoch = 0;
+      let order = (vscode.getState() || {}).order || "name";
+      const RANK = { function: 0, macro: 1, struct: 2, union: 3, enum: 4, enum_const: 5, typedef: 6, global: 7, field: 8 };
+      // Matches come best first; by kind, the best of each kind first.
+      const arranged = (found) => (order === "kind" ? found.map((r, i) => [r, i]).sort((a, b) => RANK[a[0].kind] - RANK[b[0].kind] || a[1] - b[1]).map((x) => x[0]) : found);
+      let found = [];
       const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
       // Mark what matched: each word as a substring, else its letters in order.
       function mark(name, words) {
@@ -525,7 +665,8 @@ class Search implements vscode.WebviewViewProvider {
       function render() {
         const n = query ? results.length : total;
         space.style.height = n * ROW + "px";
-        count.textContent = query ? (n ? n + " matches" : "No matching symbols") : (n ? n.toLocaleString() + " symbols, by name" : "");
+        count.textContent = query ? (n ? n + " matches" : "No matching symbols") : (n ? n.toLocaleString() + " symbols" : "");
+        document.querySelectorAll("[data-order]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.order === order)));
         const first = Math.max(0, Math.floor(scroll.scrollTop / ROW) - 10);
         const last = Math.min(n, Math.ceil((scroll.scrollTop + scroll.clientHeight) / ROW) + 10);
         const w = words();
@@ -534,11 +675,20 @@ class Search implements vscode.WebviewViewProvider {
         list.innerHTML = html;
         if (!query) {
           for (let p = Math.floor(first / PAGE); p <= Math.floor(Math.max(first, last - 1) / PAGE); p++) {
-            if (!pages.has(p) && !asked.has(p)) { asked.add(p); vscode.postMessage({ page: p, size: PAGE, epoch }); }
+            if (!pages.has(p) && !asked.has(p)) { asked.add(p); vscode.postMessage({ page: p, size: PAGE, epoch, order }); }
           }
         }
       }
       function reset() { epoch++; pages = new Map(); asked = new Set(); render(); }
+      document.getElementById("order").addEventListener("click", (e) => {
+        const b = e.target.closest("button");
+        if (!b || b.dataset.order === order) return;
+        order = b.dataset.order;
+        vscode.setState({ order });
+        scroll.scrollTop = 0;
+        results = arranged(found);
+        reset();
+      });
       scroll.addEventListener("scroll", render);
       new ResizeObserver(render).observe(scroll);
       q.addEventListener("input", () => {
@@ -546,7 +696,7 @@ class Search implements vscode.WebviewViewProvider {
         timer = setTimeout(() => {
           query = q.value.trim();
           scroll.scrollTop = 0;
-          if (query) vscode.postMessage({ query }); else { results = []; render(); }
+          if (query) vscode.postMessage({ query }); else { found = []; results = []; render(); }
         }, 60);
       });
       q.addEventListener("keydown", (e) => { const r = item(0); if (e.key === "Enter" && r) vscode.postMessage({ open: r, beside: e.ctrlKey || e.metaKey }); });
@@ -563,7 +713,8 @@ class Search implements vscode.WebviewViewProvider {
           total = d.total;
           pages.set(d.page, d.items);
         } else if (d.query === query) {
-          results = d.results;
+          found = d.results;
+          results = arranged(found);
         }
         render();
       });
@@ -571,7 +722,7 @@ class Search implements vscode.WebviewViewProvider {
       q.focus();`,
     );
     const decorate = <T extends { kind: string }>(e: T) => ({ ...e, kindName: KIND_NAMES[e.kind] ?? e.kind, icon: ICONS[e.kind] ?? "symbol-misc" });
-    view.webview.onDidReceiveMessage(async (m: { query?: string; page?: number; size?: number; epoch?: number; open?: { file: string; line: number; name: string }; beside?: boolean }) => {
+    view.webview.onDidReceiveMessage(async (m: { query?: string; page?: number; size?: number; epoch?: number; order?: string; open?: { file: string; line: number; name: string }; beside?: boolean }) => {
       if (m.open) {
         // A listing carries no columns: ask where the name is written.
         const at = await ask<{ uri: string; range: Entry["range"] }>("si/place", { file: m.open.file, line: m.open.line, name: m.open.name });
@@ -580,7 +731,7 @@ class Search implements vscode.WebviewViewProvider {
         }
       } else if (m.page !== undefined) {
         const size = m.size ?? 200;
-        const r = await ask<{ total: number; items: { name: string; kind: string; file: string; line: number }[] }>("si/symbols", { offset: m.page * size, limit: size });
+        const r = await ask<{ total: number; items: { name: string; kind: string; file: string; line: number }[] }>("si/symbols", { offset: m.page * size, limit: size, order: m.order ?? "name" });
         void view.webview.postMessage({ type: "page", page: m.page, epoch: m.epoch, total: r?.total ?? 0, items: (r?.items ?? []).map(decorate) });
       } else if (m.query !== undefined) {
         const found = (await ask<Entry[]>("si/search", { query: m.query, limit: 200 })) ?? [];
@@ -776,11 +927,14 @@ export async function activate(context: vscode.ExtensionContext) {
   });
   /** A folder from the scope tree (its path) or from the Explorer (a URI). */
   const folderOf = (arg: unknown): string | undefined => (typeof arg === "string" ? arg : arg instanceof vscode.Uri ? scopeTree.relative(arg) : undefined);
+  const conditions = new ConditionsTree(afterSync);
+  const validName = (v: string) => (/^[A-Za-z_][A-Za-z0-9_]*(\s*=.*)?$/.test(v.trim()) ? undefined : "A macro name, optionally followed by =value");
   async function sync() {
     status.text = "$(sync~spin) SI syncing";
     const r = await ask<Synced>("si/sync", {});
     if (r) {
       scopeTree.scope = { include: r.include, exclude: r.exclude, config: r.config };
+      await conditions.load();
       afterSync(r, "Synced with disk");
     } else {
       await refreshStatus();
@@ -866,6 +1020,7 @@ export async function activate(context: vscode.ExtensionContext) {
     }
     await refreshStatus();
     await scopeTree.load();
+    await conditions.load();
     follow(vscode.window.activeTextEditor, true);
   }
 
@@ -937,6 +1092,34 @@ export async function activate(context: vscode.ExtensionContext) {
       await start();
     }),
     scopeView,
+    vscode.window.registerTreeDataProvider("si.conditions", conditions),
+    vscode.commands.registerCommand("si.conditions.define", async (arg?: unknown) => {
+      const text = typeof arg === "string" ? arg : await vscode.window.showInputBox({ prompt: "Macro the build defines", placeHolder: "CONFIG_SMP  or  ARCH_SIZE=64", validateInput: validName });
+      return text ? conditions.define(text.trim()) : undefined;
+    }),
+    vscode.commands.registerCommand("si.conditions.undefine", async (arg?: unknown) => {
+      const text = typeof arg === "string" ? arg : await vscode.window.showInputBox({ prompt: "Macro the build does not define", placeHolder: "_WIN32", validateInput: (v) => (/^[A-Za-z_][A-Za-z0-9_]*$/.test(v.trim()) ? undefined : "A macro name") });
+      return text ? conditions.undefine(text.trim()) : undefined;
+    }),
+    vscode.commands.registerCommand("si.conditions.addFile", async (arg?: unknown) => {
+      const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+      let file = typeof arg === "string" ? arg : undefined;
+      if (!file && root) {
+        const picked = await vscode.window.showOpenDialog({ defaultUri: root, canSelectMany: false, openLabel: "Read Conditions from This File", title: "A header of #define lines, or a Kconfig .config" });
+        // Inside the workspace a relative path keeps the setting portable.
+        file = picked?.[0] ? scopeTree.relative(picked[0]) ?? picked[0].fsPath : undefined;
+      }
+      return file ? conditions.add("conditionFiles", file) : undefined;
+    }),
+    vscode.commands.registerCommand("si.conditions.assume", async (arg?: unknown) => {
+      const text = typeof arg === "string" ? arg : await vscode.window.showInputBox({
+        prompt: "Names with this prefix are not defined unless listed or defined in the sources",
+        placeHolder: "CONFIG_   (or * for every name the build does not define)",
+      });
+      return text ? conditions.add("assumeUndefined", text.trim()) : undefined;
+    }),
+    vscode.commands.registerCommand("si.conditions.remove", (row: ConditionRow) => conditions.remove(row)),
+    vscode.commands.registerCommand("si.conditions.get", () => conditions.settings),
     vscode.commands.registerCommand("si.sync", sync),
     vscode.commands.registerCommand("si.scope.apply", () => scopeTree.applyDraft()),
     vscode.commands.registerCommand("si.scope.discard", () => scopeTree.discard()),

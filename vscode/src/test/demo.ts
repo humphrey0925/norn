@@ -28,6 +28,14 @@ export async function run(): Promise<void> {
     await vscode.commands.executeCommand("workbench.actions.treeView.si.fileSymbols.collapseAll");
     await vscode.commands.executeCommand("si.scope.focus");
   }
+  if (process.env.SI_DEMO_CONDITIONS) {
+    await vscode.commands.executeCommand("si.conditions.define", "HAVE_MMAP=1");
+    await vscode.commands.executeCommand("si.conditions.define", "ARCH_SIZE=64");
+    await vscode.commands.executeCommand("si.conditions.undefine", "_WIN32");
+    await vscode.commands.executeCommand("si.conditions.assume", "CONFIG_");
+    await vscode.commands.executeCommand("workbench.actions.treeView.si.fileSymbols.collapseAll");
+    await vscode.commands.executeCommand("si.conditions.focus");
+  }
   if (process.env.SI_DEMO_SEARCH) {
     // Nothing to type into a webview from here; the list is shown by the
     // check script's own query. Left for manual runs.

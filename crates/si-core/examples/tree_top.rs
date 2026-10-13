@@ -11,7 +11,7 @@ fn main() {
         // With a corpus root, use its transparent macros rather than this file's own.
         let t = match args.get(2) {
             Some(root) => si_core::prescan(&si_core::scan(std::path::Path::new(root))),
-            None => si_core::mask::MacroSets::from_defines(si_core::mask::defines(&src)),
+            None => si_core::mask::MacroSets::from_defines(si_core::mask::defines(&src, &si_core::cond::Conditions::default())),
         };
         si_core::mask::lex(&src, &t).masked
     };
