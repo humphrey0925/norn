@@ -237,6 +237,12 @@ pub fn link(files: &[FileFacts]) -> (Graph, LinkStats) {
 }
 
 pub fn link_with(files: &[FileFacts], options: &Options) -> (Graph, LinkStats) {
+    link_cached(files, options, &mut crate::expand::Cache::default())
+}
+
+/// Link, reusing the macro expansions `cache` holds from the last link of
+/// these files where they are still good.
+pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::expand::Cache) -> (Graph, LinkStats) {
     let mut stats = LinkStats::default();
 
     // 0. Which file includes which, then macro expansion: it needs the
@@ -245,10 +251,9 @@ pub fn link_with(files: &[FileFacts], options: &Options) -> (Graph, LinkStats) {
     let includes = include_edges(files, &options.include_aliases, &mut stats);
     stats.include_ms = ms(t);
     let t = Instant::now();
-    let (expanded, counts) = crate::expand::expand(files, &includes);
-    (stats.sites, stats.expanded_defs, stats.expanded_refs) = counts;
+    (stats.sites, stats.expanded_defs, stats.expanded_refs) = crate::expand::expand(files, &includes, cache);
     stats.expand_ms = ms(t);
-    let files: Vec<&FileFacts> = files.iter().zip(&expanded).map(|(f, e)| e.as_ref().unwrap_or(f)).collect();
+    let files: Vec<&FileFacts> = files.iter().zip(&cache.expanded).map(|(f, e)| e.as_ref().unwrap_or(f)).collect();
     let files = &files[..];
 
     // 1. Intern every file-local name into one global table, then sort it so

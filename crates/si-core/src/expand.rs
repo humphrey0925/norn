@@ -34,8 +34,12 @@ const BARREN_USES: u32 = 16;
 const MAX_UNITS: usize = 32;
 /// Places remembered for one name of a definition.
 const MAX_CONTEXTS: usize = 8;
+/// Uses in one file expanded in one stretch; more are split across threads.
+const PARALLEL_USES: usize = 512;
 /// Translation units an initializer is expanded in.
 const MAX_INIT_UNITS: usize = 2048;
+/// Distinct expansions kept of one initializer in one unit.
+const MAX_INIT_VARIANTS: usize = 4;
 const MAX_TOKENS: usize = 20_000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -306,6 +310,8 @@ struct Engine<'a> {
     /// Set when the engine stands for all the translation units of this
     /// file together.
     merged: Option<u32>,
+    /// Distinct expansions wanted of one input.
+    max_variants: usize,
 }
 
 impl<'a> Engine<'a> {
@@ -320,6 +326,7 @@ impl<'a> Engine<'a> {
             steps: 0,
             hiding: FxHashMap::default(),
             merged: None,
+            max_variants: MAX_VARIANTS,
         }
     }
 
@@ -592,7 +599,7 @@ impl<'a> Engine<'a> {
         let mut free: Vec<(Box<str>, usize)> = Vec::new();
         let mut choice = pinned.clone();
         let mut stale = 0;
-        for _ in 0..MAX_VARIANTS * 2 {
+        for _ in 0..self.max_variants * 2 {
             if stale >= BLIND_RUNS {
                 break;
             }
@@ -613,7 +620,7 @@ impl<'a> Engine<'a> {
                 }
                 results.push((out, self.choice.clone()));
             }
-            if results.len() >= MAX_VARIANTS {
+            if results.len() >= self.max_variants {
                 break;
             }
             // Next combination, the most recently met name turning fastest.
@@ -977,6 +984,19 @@ fn closure(root: u32, fwd: &[Vec<u32>]) -> Vec<bool> {
     seen
 }
 
+/// What one expansion of one use adds to its file.
+struct Made {
+    line: u32,
+    scope: u32,
+    /// The first of the scopes the use is expanded for; declarations are
+    /// taken from that one only.
+    first: bool,
+    found: Found,
+    /// An initialized object the expansion declares: its type's name and
+    /// the names in the initializer.
+    stored: Option<(String, Vec<(Place, String)>)>,
+}
+
 /// Where an expansion holds: which translation unit (as an index into the
 /// file's engines) and which definitions were chosen there.
 type Contexts = Vec<(usize, Choice)>;
@@ -997,11 +1017,14 @@ fn expand_file(fi: usize, f: &FileFacts, table: &Table, fwd: &[Vec<u32>], rev: &
     // expands to agrees with what the others do there. A header in too many
     // gets a single engine that sees them all at once.
     let units = roots(fi as u32, table.files, rev);
-    let mut engines: Vec<Engine> = if units.len() <= MAX_UNITS {
-        units.iter().map(|&r| Engine::new(table, closure(r, fwd))).collect()
-    } else {
-        vec![Engine { merged: Some(fi as u32), ..Engine::new(table, visible(fi as u32, fwd, rev)) }]
+    let make_engines = || -> Vec<Engine> {
+        if units.len() <= MAX_UNITS {
+            units.iter().map(|&r| Engine::new(table, closure(r, fwd))).collect()
+        } else {
+            vec![Engine { merged: Some(fi as u32), ..Engine::new(table, visible(fi as u32, fwd, rev)) }]
+        }
     };
+    let mut engines = make_engines();
     let mut out = f.clone();
     let mut names = Names { ids: (0..f.n_names()).map(|i| (f.name(i).to_string(), i as u32)).collect() };
     let (n_defs, n_refs) = (f.defs.len(), f.refs.len());
@@ -1053,66 +1076,86 @@ fn expand_file(fi: usize, f: &FileFacts, table: &Table, fwd: &[Vec<u32>], rev: &
 
     // 3. Every other use: the names its expansions make. Inside one of the
     //    definitions above, only where that definition has that name.
+    let everywhere: Contexts = (0..engines.len()).map(|e| (e, Choice::default())).collect();
+    let read = |engines: &mut [Engine], sites: &[&Site]| -> Vec<Made> {
+        let mut made = Vec::new();
+        // A macro whose first uses here all expand to nothing of interest
+        // (a table row, typically) is not tried again.
+        let mut barren: FxHashMap<u32, u32> = FxHashMap::default();
+        for s in sites {
+            if barren.get(&s.name).is_some_and(|&n| n >= BARREN_USES) {
+                continue;
+            }
+            let mut fruitful = false;
+            let toks = site_tokens(f, s);
+            let macro_name = f.name(s.name as usize);
+            let scopes: Vec<(u32, &Contexts)> = match variants.get(&s.scope) {
+                Some(v) => v.iter().map(|(scope, contexts)| (*scope, contexts)).collect(),
+                None => vec![(s.scope, &everywhere)],
+            };
+            for (i, (scope, contexts)) in scopes.into_iter().enumerate() {
+                for (ei, pinned) in contexts {
+                    let mut known = FxHashSet::default();
+                    let novel = |exp: &[T]| recognise(exp, s, macro_name).novel(&mut known);
+                    for (exp, _) in engines[*ei].variants(&toks, pinned, novel) {
+                        let found = recognise(&exp, s, macro_name);
+                        // A macro that declares a whole initialized object.
+                        let stored = declared_initializer(&exp)
+                            .filter(|_| s.flags & site::TOP != 0)
+                            .map(|(type_name, array, at)| (type_name, init_names(&exp[at..], array)));
+                        if found.is_empty() && stored.is_none() {
+                            continue;
+                        }
+                        fruitful = true;
+                        made.push(Made { line: s.line, scope, first: i == 0, found, stored });
+                    }
+                }
+            }
+            let n = barren.entry(s.name).or_default();
+            *n = if fruitful { 0 } else { *n + 1 };
+        }
+        made
+    };
+    let rest: Vec<&Site> = live.iter().copied().filter(|s| s.def == NONE).collect();
+    let made: Vec<Made> = if rest.len() <= PARALLEL_USES {
+        read(&mut engines, &rest)
+    } else {
+        // A table of thousands of rows: each stretch with engines of its own.
+        rest.par_chunks(PARALLEL_USES).flat_map_iter(|chunk| read(&mut make_engines(), chunk)).collect()
+    };
     // A prototype and the definition it announces are two things.
     let key = |d: &Def| (d.name, d.line, d.kind, d.flags & flag::DECL);
     let mut seen_defs: FxHashSet<(u32, u32, u8, u8)> = out.defs.iter().map(key).collect();
     let mut seen_refs: FxHashSet<(u32, u32, u32, u8)> = FxHashSet::default();
     let mut seen_binds: FxHashSet<Bind> = FxHashSet::default();
-    let everywhere: Contexts = (0..engines.len()).map(|e| (e, Choice::default())).collect();
-    // A macro whose first uses here all expand to nothing of interest (a
-    // table row, typically) is not tried again in this file.
-    let mut barren: FxHashMap<u32, u32> = FxHashMap::default();
-    for s in live.iter().filter(|s| s.def == NONE) {
-        if barren.get(&s.name).is_some_and(|&n| n >= BARREN_USES) {
-            continue;
+    for m in made {
+        for (n, kind) in m.found.refs {
+            let name = names.id(&mut out, &n);
+            if seen_refs.insert((name, m.line, m.scope, kind)) {
+                out.refs.push(Ref { name, line: m.line, scope: m.scope, kind });
+            }
         }
-        let mut fruitful = false;
-        let toks = site_tokens(f, s);
-        let macro_name = f.name(s.name as usize);
-        let scopes: Vec<(u32, &Contexts)> = match variants.get(&s.scope) {
-            Some(v) => v.iter().map(|(scope, contexts)| (*scope, contexts)).collect(),
-            None => vec![(s.scope, &everywhere)],
-        };
-        for (i, (scope, contexts)) in scopes.into_iter().enumerate() {
-            for (ei, pinned) in contexts {
-                let mut known = FxHashSet::default();
-                let novel = |exp: &[T]| recognise(exp, s, macro_name).novel(&mut known);
-                for (exp, _) in engines[*ei].variants(&toks, pinned, novel) {
-                    let found = recognise(&exp, s, macro_name);
-                    fruitful |= !found.is_empty();
-                    for (n, kind) in found.refs {
-                        let name = names.id(&mut out, &n);
-                        if seen_refs.insert((name, s.line, scope, kind)) {
-                            out.refs.push(Ref { name, line: s.line, scope, kind });
-                        }
-                    }
-                    for (n, kind, flags) in found.decls {
-                        let name = names.id(&mut out, &n);
-                        let def = Def { name, line: s.line, end_line: s.line, kind, flags };
-                        if i == 0 && seen_defs.insert(key(&def)) {
-                            out.defs.push(def);
-                        }
-                    }
-                    // A macro that declares a whole initialized object.
-                    if let Some((type_name, array, at)) = declared_initializer(&exp).filter(|_| s.flags & site::TOP != 0) {
-                        let slot = names.id(&mut out, &type_name);
-                        for (place, func) in init_names(&exp[at..], array) {
-                            let func = names.id(&mut out, &func);
-                            let (slot, index) = match place {
-                                Place::Member(m) => (names.id(&mut out, &m), NONE),
-                                Place::Index(i) => (slot, i),
-                            };
-                            let bind = Bind { slot, index, func, line: s.line, scope, var: false, unit: NONE };
-                            if seen_binds.insert(bind) {
-                                out.binds.push(bind);
-                            }
-                        }
-                    }
+        for (n, kind, flags) in m.found.decls {
+            let name = names.id(&mut out, &n);
+            let def = Def { name, line: m.line, end_line: m.line, kind, flags };
+            if m.first && seen_defs.insert(key(&def)) {
+                out.defs.push(def);
+            }
+        }
+        if let Some((type_name, stored)) = m.stored {
+            let type_name = names.id(&mut out, &type_name);
+            for (place, func) in stored {
+                let func = names.id(&mut out, &func);
+                let (slot, index) = match place {
+                    Place::Member(m) => (names.id(&mut out, &m), NONE),
+                    Place::Index(i) => (type_name, i),
+                };
+                let bind = Bind { slot, index, func, line: m.line, scope: m.scope, var: false, unit: NONE };
+                if seen_binds.insert(bind) {
+                    out.binds.push(bind);
                 }
             }
         }
-        let n = barren.entry(s.name).or_default();
-        *n = if fruitful { 0 } else { *n + 1 };
     }
 
     // 4. Initializers with macros in them: now that they can be expanded,
@@ -1128,12 +1171,15 @@ fn expand_file(fi: usize, f: &FileFacts, table: &Table, fwd: &[Vec<u32>], rev: &
         // (member, name, the unit it was read in)
         let mut known: FxHashSet<(Place, String, u32)> = FxHashSet::default();
         let mut read = |eng: &mut Engine, unit: u32| {
+            // A whole table at a time: a few readings have to do.
+            eng.max_variants = MAX_INIT_VARIANTS;
             for toks in &readings {
                 let novel = |exp: &[T]| {
                     init_names(exp, init.array).into_iter().fold(false, |new, (place, name)| known.insert((place, name, unit)) || new)
                 };
                 eng.variants(toks, &Choice::default(), novel);
             }
+            eng.max_variants = MAX_VARIANTS;
         };
         if units.len() <= MAX_UNITS {
             for (eng, &unit) in engines.iter_mut().zip(&units) {
@@ -1184,51 +1230,100 @@ fn expand_file(fi: usize, f: &FileFacts, table: &Table, fwd: &[Vec<u32>], rev: &
     Some((out, added.0, added.1))
 }
 
-/// Expand the macro uses recorded in `files`. Returns a replacement for each
-/// file that had any, and (uses, definitions added, references added).
-pub fn expand(files: &[FileFacts], includes: &[Vec<u32>]) -> (Vec<Option<FileFacts>>, (u64, u64, u64)) {
+/// Expansions kept from one link to the next. What a file expands to
+/// depends on the file and on every macro body and include edge of the
+/// corpus; while the latter stand (the usual edit touches neither), only
+/// changed files are expanded again.
+#[derive(Default)]
+pub struct Cache {
+    /// Digest of all macro bodies and include edges.
+    environment: u64,
+    /// Per file: its content hash when expanded, the replacement if it had
+    /// anything to expand, and the definitions and references that added.
+    hashes: Vec<u64>,
+    pub(crate) expanded: Vec<Option<FileFacts>>,
+    added: Vec<(u64, u64)>,
+}
+
+impl Cache {
+    /// Expand file `i` again at the next link even if its hash is the same.
+    pub fn forget(&mut self, i: usize) {
+        if let Some(h) = self.hashes.get_mut(i) {
+            *h = !*h;
+        }
+    }
+}
+
+fn environment(files: &[FileFacts], includes: &[Vec<u32>]) -> u64 {
+    use xxhash_rust::xxh3::xxh3_64_with_seed as mix;
+    let mut h = files.len() as u64;
+    for (f, edges) in files.iter().zip(includes) {
+        h = mix(f.path.as_bytes(), h);
+        h = mix(bytemuck::cast_slice(edges), h);
+        for m in &f.macros {
+            h = mix(f.name(m.name as usize).as_bytes(), h);
+            h = mix(f.name(m.text as usize).as_bytes(), h);
+            h = mix(guard_text(f, m).as_bytes(), h ^ (m.function_like as u64 | (m.conditional as u64) << 1 | (m.fallback as u64) << 2));
+        }
+    }
+    h
+}
+
+/// Expand the macro uses recorded in `files` into `cache.expanded`: a
+/// replacement for each file that had any. Returns (uses, definitions added,
+/// references added).
+pub fn expand(files: &[FileFacts], includes: &[Vec<u32>], cache: &mut Cache) -> (u64, u64, u64) {
     let sites: u64 = files.iter().map(|f| (f.sites.len() + f.inits.len()) as u64).sum();
-    if sites == 0 {
-        return (files.iter().map(|_| None).collect(), (0, 0, 0));
+    let environment = environment(files, includes);
+    if cache.environment != environment || cache.hashes.len() != files.len() {
+        *cache = Cache {
+            environment,
+            // No file hashes to its own complement, so every file is stale.
+            hashes: files.iter().map(|f| !f.hash).collect(),
+            expanded: files.iter().map(|_| None).collect(),
+            added: vec![(0, 0); files.len()],
+        };
     }
-    let mut by_name: FxHashMap<&str, Vec<(u32, u32)>> = FxHashMap::default();
-    for (fi, f) in files.iter().enumerate() {
-        for (i, m) in f.macros.iter().enumerate() {
-            by_name.entry(f.name(m.name as usize)).or_default().push((fi as u32, i as u32));
+    let stale: Vec<usize> = (0..files.len()).filter(|&i| cache.hashes[i] != files[i].hash).collect();
+    if sites > 0 && !stale.is_empty() {
+        let mut by_name: FxHashMap<&str, Vec<(u32, u32)>> = FxHashMap::default();
+        for (fi, f) in files.iter().enumerate() {
+            for (i, m) in f.macros.iter().enumerate() {
+                by_name.entry(f.name(m.name as usize)).or_default().push((fi as u32, i as u32));
+            }
         }
-    }
-    let parsed: Vec<Vec<Parsed>> = files
-        .par_iter()
-        .map(|f| {
-            let one = |m: &crate::model::MacroBody| Parsed {
-                conditional: m.conditional,
-                fallback: m.fallback,
-                ..parse(f.name(m.text as usize), m.function_like, guard_text(f, m))
-            };
-            f.macros.iter().map(one).collect()
-        })
-        .collect();
-    let table = Table { files, by_name, parsed };
-    let mut rev: Vec<Vec<u32>> = vec![Vec::new(); files.len()];
-    for (from, tos) in includes.iter().enumerate() {
-        for &to in tos {
-            rev[to as usize].push(from as u32);
-        }
-    }
-    let done: Vec<Option<(FileFacts, u64, u64)>> =
-        files.par_iter().enumerate().map(|(fi, f)| expand_file(fi, f, &table, includes, &rev)).collect();
-    let (mut defs, mut refs) = (0, 0);
-    let out = done
-        .into_iter()
-        .map(|d| {
-            d.map(|(f, nd, nr)| {
-                defs += nd;
-                refs += nr;
-                f
+        let parsed: Vec<Vec<Parsed>> = files
+            .par_iter()
+            .map(|f| {
+                let one = |m: &crate::model::MacroBody| Parsed {
+                    conditional: m.conditional,
+                    fallback: m.fallback,
+                    ..parse(f.name(m.text as usize), m.function_like, guard_text(f, m))
+                };
+                f.macros.iter().map(one).collect()
             })
-        })
-        .collect();
-    (out, (sites, defs, refs))
+            .collect();
+        let table = Table { files, by_name, parsed };
+        let mut rev: Vec<Vec<u32>> = vec![Vec::new(); files.len()];
+        for (from, tos) in includes.iter().enumerate() {
+            for &to in tos {
+                rev[to as usize].push(from as u32);
+            }
+        }
+        let done: Vec<Option<(FileFacts, u64, u64)>> =
+            stale.par_iter().map(|&fi| expand_file(fi, &files[fi], &table, includes, &rev)).collect();
+        for (&fi, d) in stale.iter().zip(done) {
+            (cache.expanded[fi], cache.added[fi]) = match d {
+                Some((f, defs, refs)) => (Some(f), (defs, refs)),
+                None => (None, (0, 0)),
+            };
+        }
+    }
+    for i in stale {
+        cache.hashes[i] = files[i].hash;
+    }
+    let (defs, refs) = cache.added.iter().fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+    (sites, defs, refs)
 }
 
 #[cfg(test)]

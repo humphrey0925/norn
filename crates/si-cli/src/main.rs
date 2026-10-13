@@ -390,7 +390,9 @@ fn bench_incr(root: &Path, n: usize, seed: u64) -> Value {
     let files = si_core::scan(root);
     let transparent = si_core::prescan(&files);
     let mut facts = si_core::extract_all(root, &files, &transparent);
-    let (g, _) = si_core::link::link(&facts);
+    let options = si_core::link::Options::default();
+    let mut cache = si_core::expand::Cache::default();
+    let (g, _) = si_core::link::link_cached(&facts, &options, &mut cache);
     let edges = g.out.len();
     drop(g);
 
@@ -402,7 +404,9 @@ fn bench_incr(root: &Path, n: usize, seed: u64) -> Value {
         let t0 = Instant::now();
         facts[i] = si_core::extract_file(&mut ex, root, &files[i], &transparent);
         let t1 = Instant::now();
-        let (g, _) = si_core::link::link(&facts);
+        // The content is the same, but an edit would not be: expand it again.
+        cache.forget(i);
+        let (g, _) = si_core::link::link_cached(&facts, &options, &mut cache);
         let t2 = Instant::now();
         assert_eq!(g.out.len(), edges, "relink of unchanged content must be stable");
         extract_ns.push((t1 - t0).as_nanos() as u64);
