@@ -6,6 +6,8 @@
 // results open in that editor's group (or beside it, on request), and each
 // view can be locked so it stops following.
 
+import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 import { LanguageClient, LanguageClientOptions, ServerOptions } from "vscode-languageclient/node";
@@ -437,10 +439,24 @@ class Lenses implements vscode.CodeLensProvider {
 
 // ---------------------------------------------------------------- activation
 
+/** The setting as a path: quotes around it (as copied from Explorer or a
+ *  shell), `~` and `${workspaceFolder}` are all things people write. */
+function serverPath(): string {
+  let p = vscode.workspace.getConfiguration("si").get<string>("serverPath", "si").trim();
+  p = p.replace(/^(["'])(.*)\1$/, "$2").trim();
+  const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (folder) {
+    p = p.replace(/\$\{workspaceFolder\}/g, folder);
+  }
+  if (p === "~" || p.startsWith("~/") || p.startsWith("~\\")) {
+    p = path.join(os.homedir(), p.slice(1));
+  }
+  return p || "si";
+}
+
 function serverCommand(): { command: string; args: string[] } {
-  const config = vscode.workspace.getConfiguration("si");
-  const aliases = config.get<string[]>("includeAliases", []);
-  return { command: config.get<string>("serverPath", "si"), args: ["lsp", ...aliases.flatMap((a) => ["--include-alias", a])] };
+  const aliases = vscode.workspace.getConfiguration("si").get<string[]>("includeAliases", []);
+  return { command: serverPath(), args: ["lsp", ...aliases.flatMap((a) => ["--include-alias", a])] };
 }
 
 export async function activate(context: vscode.ExtensionContext) {
@@ -479,6 +495,16 @@ export async function activate(context: vscode.ExtensionContext) {
 
   async function start() {
     const { command, args } = serverCommand();
+    // A path that is not there is the usual reason for not starting: say so
+    // plainly instead of leaving a spawn error in the log.
+    if (/[\/]/.test(command) && !fs.existsSync(command)) {
+      status.text = "$(warning) SI 未啟動";
+      const pick = await vscode.window.showErrorMessage(`找不到 si 執行檔：${command}`, "開啟設定");
+      if (pick) {
+        void vscode.commands.executeCommand("workbench.action.openSettings", "si.serverPath");
+      }
+      return;
+    }
     const serverOptions: ServerOptions = { command, args, options: { cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath } };
     const clientOptions: LanguageClientOptions = {
       documentSelector: selector as LanguageClientOptions["documentSelector"],
@@ -550,12 +576,19 @@ export async function activate(context: vscode.ExtensionContext) {
     }),
     vscode.commands.registerCommand("si.restart", async () => {
       status.text = "$(sync~spin) SI 建立索引中";
-      await client?.stop();
+      if (client?.isRunning()) {
+        await client.stop();
+      }
       await start();
+    }),
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      // A corrected path should take effect without reloading the window.
+      if (e.affectsConfiguration("si.serverPath") || e.affectsConfiguration("si.includeAliases")) {
+        void vscode.commands.executeCommand("si.restart");
+      }
     }),
     { dispose: () => void client?.stop() },
   );
-  void path;
   await start();
 }
 

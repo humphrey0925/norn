@@ -15,7 +15,7 @@ async function main() {
   }
   fs.mkdirSync(path.join(work, ".vscode"));
   const server = path.join(root, "target", "release", process.platform === "win32" ? "si.exe" : "si");
-  fs.writeFileSync(path.join(work, ".vscode", "settings.json"), JSON.stringify({ "si.serverPath": server }));
+  fs.writeFileSync(path.join(work, ".vscode", "settings.json"), JSON.stringify({ "si.serverPath": `"${server}"` }));
   try {
     await runTests({
       extensionDevelopmentPath: path.resolve(__dirname, "../.."),

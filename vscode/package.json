@@ -2,7 +2,7 @@
   "name": "si-code-index",
   "displayName": "SI Code Index",
   "description": "Source-Insight-style symbol search, context and relation views for C, backed by the si index.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "humphrey0925",
   "repository": {
     "type": "git",
@@ -179,7 +179,7 @@
         "si.serverPath": {
           "type": "string",
           "default": "si",
-          "description": "si 執行檔的路徑（預設從 PATH 尋找）。"
+          "description": "si 執行檔的完整路徑，例如 D:\\tools\\si-windows-x64.exe（不需要引號；預設從 PATH 尋找 si）。"
         },
         "si.includeAliases": {
           "type": "array",
