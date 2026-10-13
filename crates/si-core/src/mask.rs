@@ -102,7 +102,7 @@ pub struct Lexed {
 
 /// A `#define` reduced to what decides transparency: `deps` is `Some` when
 /// the body is nothing but attributes and invocations of the listed macros.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Define {
     pub name: Vec<u8>,
     pub function_like: bool,

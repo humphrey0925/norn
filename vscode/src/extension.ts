@@ -444,8 +444,16 @@ function serverPath(): string {
 }
 
 function serverCommand(): { command: string; args: string[] } {
-  const aliases = vscode.workspace.getConfiguration("si").get<string[]>("includeAliases", []);
-  return { command: serverPath(), args: ["lsp", ...aliases.flatMap((a) => ["--include-alias", a])] };
+  const config = vscode.workspace.getConfiguration("si");
+  const aliases = config.get<string[]>("includeAliases", []);
+  const args = ["lsp", ...aliases.flatMap((a) => ["--include-alias", a])];
+  // The index is kept between sessions unless told otherwise.
+  if (!config.get<boolean>("cache.enabled", true)) {
+    args.push("--no-cache");
+  } else if (config.get<string>("cache.directory", "").trim()) {
+    args.push("--cache-dir", config.get<string>("cache.directory", "").trim());
+  }
+  return { command: serverPath(), args };
 }
 
 export async function activate(context: vscode.ExtensionContext) {
@@ -460,8 +468,12 @@ export async function activate(context: vscode.ExtensionContext) {
   const selector: vscode.DocumentSelector = [{ scheme: "file", pattern: "**/*.{c,h}" }];
 
   async function refreshStatus() {
-    const s = await ask<{ files: number; symbols: number }>("si/status", {});
+    const s = await ask<{ files: number; symbols: number; loaded: number; parsed: number; cache: string | null }>("si/status", {});
     status.text = s ? `$(symbol-namespace) SI ${s.files.toLocaleString()} 檔 · ${s.symbols.toLocaleString()} 符號` : "$(warning) SI 未啟動";
+    status.tooltip = s
+      ? `啟動時從上次保存讀回 ${s.loaded.toLocaleString()} 檔，重新解析 ${s.parsed.toLocaleString()} 檔
+` + (s.cache ? `索引保存於 ${s.cache}` : "索引未保存（si.cache.enabled 已關閉）")
+      : undefined;
   }
 
   let timer: NodeJS.Timeout | undefined;
@@ -480,8 +492,11 @@ export async function activate(context: vscode.ExtensionContext) {
     }, now ? 0 : 150);
   }
 
-  async function start() {
+  async function start(rebuild = false) {
     const { command, args } = serverCommand();
+    if (rebuild && !args.includes("--no-cache")) {
+      args.push("--rebuild");
+    }
     // A path that is not there is the usual reason for not starting: say so
     // plainly instead of leaving a spawn error in the log.
     if (/[\/]/.test(command) && !fs.existsSync(command)) {
@@ -569,9 +584,16 @@ export async function activate(context: vscode.ExtensionContext) {
       }
       await start();
     }),
+    vscode.commands.registerCommand("si.rebuild", async () => {
+      status.text = "$(sync~spin) SI 完整重建索引中";
+      if (client?.isRunning()) {
+        await client.stop();
+      }
+      await start(true);
+    }),
     vscode.workspace.onDidChangeConfiguration((e) => {
       // A corrected path should take effect without reloading the window.
-      if (e.affectsConfiguration("si.serverPath") || e.affectsConfiguration("si.includeAliases")) {
+      if (e.affectsConfiguration("si.serverPath") || e.affectsConfiguration("si.includeAliases") || e.affectsConfiguration("si.cache")) {
         void vscode.commands.executeCommand("si.restart");
       }
     }),

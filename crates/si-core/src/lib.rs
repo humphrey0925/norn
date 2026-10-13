@@ -10,6 +10,7 @@ pub mod packed;
 pub mod search;
 pub mod session;
 pub mod sqlite;
+pub mod store;
 
 use mask::MacroSets;
 use model::FileFacts;

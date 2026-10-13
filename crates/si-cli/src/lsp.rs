@@ -9,7 +9,6 @@
 
 use serde_json::{json, Value};
 use si_core::graph::Graph;
-use si_core::link::Options;
 use si_core::model::{flag, kind, refkind};
 use si_core::session::Session;
 use std::collections::HashMap;
@@ -108,6 +107,8 @@ fn symbol_kind(k: u8) -> u32 {
 
 struct Server {
     session: Session,
+    /// At start: files read back from the last run's save, files parsed.
+    opened: (usize, usize),
     root: PathBuf,
     /// Text of the documents the editor has open, by path.
     open: HashMap<PathBuf, String>,
@@ -411,7 +412,9 @@ impl Server {
             "si/search" => self.search(params),
             "si/context" => self.context(params),
             "si/relation" => self.relation(params),
-            "si/status" => json!({ "files": self.session.files(), "symbols": self.g().syms.len(), "edges": self.g().out.len() }),
+            "si/status" => json!({ "files": self.session.files(), "symbols": self.g().syms.len(), "edges": self.g().out.len(),
+                                   "loaded": self.opened.0, "parsed": self.opened.1,
+                                   "cache": self.session.cache_dir().map(|d| d.to_string_lossy().into_owned()) }),
             "shutdown" => Value::Null,
             _ => return None,
         })
@@ -447,7 +450,7 @@ impl Server {
     }
 }
 
-pub fn run(root: Option<&Path>, options: &Options) {
+pub fn run(root: Option<&Path>, open: &dyn Fn(&Path) -> (Session, si_core::session::Update)) {
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let stdout = std::io::stdout();
@@ -459,7 +462,9 @@ pub fn run(root: Option<&Path>, options: &Options) {
         if method == "initialize" {
             let from_client = params["rootUri"].as_str().map(uri_to_path).or(params["rootPath"].as_str().map(PathBuf::from));
             let dir = root.map(Path::to_path_buf).or(from_client).unwrap_or_else(|| PathBuf::from("."));
-            server = Some(Server { session: Session::open(&dir, options.clone()), root: dir, open: HashMap::new(), lines: HashMap::new() });
+            let (session, opened) = open(&dir);
+            let opened = (opened.loaded, opened.extracted);
+            server = Some(Server { session, opened, root: dir, open: HashMap::new(), lines: HashMap::new() });
             let capabilities = json!({
                 "textDocumentSync": { "openClose": true, "change": 1, "save": true },
                 "definitionProvider": true, "declarationProvider": true, "referencesProvider": true,

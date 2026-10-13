@@ -17,6 +17,7 @@ use crate::graph::Graph;
 use crate::link::{link_cached, LinkStats, Options};
 use crate::mask::{self, Define, MacroSets};
 use crate::model::FileFacts;
+use crate::store::{stamp, Stamp, Store};
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,10 @@ pub struct Session {
     sets: MacroSets,
     cache: Cache,
     options: Options,
+    /// Where facts are kept between runs, and each file's size and time
+    /// when its facts were made.
+    store: Option<Store>,
+    stamps: Vec<Stamp>,
     pub graph: Graph,
     pub stats: LinkStats,
 }
@@ -38,6 +43,8 @@ pub struct Session {
 /// What one `update` did.
 #[derive(Debug, Default)]
 pub struct Update {
+    /// Files whose facts were read from the last run's save (at opening).
+    pub loaded: usize,
     pub changed: usize,
     pub added: usize,
     pub removed: usize,
@@ -67,7 +74,116 @@ impl Session {
         let facts = crate::extract_all(root, &files, &sets);
         let mut cache = Cache::default();
         let (graph, stats) = link_cached(&facts, &options, &mut cache);
-        Session { root: root.to_path_buf(), files, defines, facts, sets, cache, options, graph, stats }
+        let stamps = files.par_iter().map(|p| stamp(p)).collect();
+        Session { root: root.to_path_buf(), files, defines, facts, sets, cache, options, store: None, stamps, graph, stats }
+    }
+
+    /// Like `open`, keeping every file's facts in `dir` between runs: what
+    /// was saved there is read back, and only the sources that changed
+    /// since (or that a change of macros touches) are parsed again.
+    pub fn open_cached(root: &Path, options: Options, dir: PathBuf) -> (Session, Update) {
+        let t = Instant::now();
+        let store = Store::new(dir);
+        if let Some(mut session) = Session::restore(root, &options, &store) {
+            let loaded = session.files.len();
+            // What the tree looks like now, against what was saved.
+            let now = crate::scan(root);
+            let mut paths: Vec<PathBuf> = now.iter().filter(|p| session.files.binary_search(p).is_err()).cloned().collect();
+            let on_disk: FxHashSet<&PathBuf> = now.iter().collect();
+            let stale: Vec<Option<bool>> = (0..session.files.len())
+                .into_par_iter()
+                .map(|i| {
+                    let path = &session.files[i];
+                    if !on_disk.contains(path) {
+                        return Some(true); // gone
+                    }
+                    if stamp(path) == session.stamps[i] {
+                        return None;
+                    }
+                    // Touched: the content says whether it changed.
+                    let same = std::fs::read(path).is_ok_and(|src| xxhash_rust::xxh3::xxh3_64(&src) == session.facts[i].hash);
+                    Some(!same)
+                })
+                .collect();
+            let mut restamp = Vec::new();
+            for (i, s) in stale.into_iter().enumerate() {
+                match s {
+                    Some(true) => paths.push(session.files[i].clone()),
+                    Some(false) => restamp.push(i),
+                    None => {}
+                }
+            }
+            for i in restamp {
+                session.stamps[i] = stamp(&session.files[i]);
+                store.save(&crate::rel_path(root, &session.files[i]), session.stamps[i], &session.defines[i], &session.facts[i]);
+            }
+            session.store = Some(store);
+            let mut up = session.update(&paths);
+            up.loaded = loaded;
+            up.extract_ms = ms(t) - up.link_ms;
+            return (session, up);
+        }
+        // Nothing usable saved: index everything, and save it.
+        let mut session = Session::open(root, options);
+        store.invalidate();
+        let s = &session;
+        (0..s.files.len()).into_par_iter().for_each(|i| {
+            store.save(&crate::rel_path(root, &s.files[i]), s.stamps[i], &s.defines[i], &s.facts[i]);
+        });
+        session.store = Some(store);
+        session.save_manifest();
+        let up = Update { extracted: session.files.len(), extract_ms: ms(t), ..Update::default() };
+        (session, up)
+    }
+
+    /// The session as it was last saved, not yet linked; `None` if the save
+    /// is missing, from another version, incomplete or inconsistent.
+    fn restore(root: &Path, options: &Options, store: &Store) -> Option<Session> {
+        let manifest = store.manifest()?;
+        let saved: Vec<Option<crate::store::Saved>> = manifest.files.par_iter().map(|rel| store.load(rel)).collect();
+        let mut files = Vec::with_capacity(saved.len());
+        let (mut defines, mut facts, mut stamps) = (Vec::new(), Vec::new(), Vec::new());
+        for (rel, s) in manifest.files.iter().zip(saved) {
+            let s = s?;
+            files.push(root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR)));
+            defines.push(s.defines);
+            facts.push(s.facts);
+            stamps.push(s.stamp);
+        }
+        if !files.windows(2).all(|w| w[0] < w[1]) {
+            return None;
+        }
+        // The facts were all extracted under these sets, or the save was
+        // interrupted and cannot be trusted.
+        let sets = MacroSets::from_defines(defines.iter().flatten().cloned());
+        if sets.digest() != manifest.sets {
+            return None;
+        }
+        Some(Session {
+            root: root.to_path_buf(),
+            files,
+            defines,
+            facts,
+            sets,
+            cache: Cache::default(),
+            options: options.clone(),
+            store: None,
+            stamps,
+            graph: Graph::default(),
+            stats: LinkStats::default(),
+        })
+    }
+
+    fn save_manifest(&self) {
+        if let Some(store) = &self.store {
+            let files = self.files.iter().map(|p| crate::rel_path(&self.root, p)).collect();
+            store.save_manifest(self.sets.digest(), files);
+        }
+    }
+
+    /// Where facts are kept between runs, if they are.
+    pub fn cache_dir(&self) -> Option<&Path> {
+        self.store.as_ref().map(|s| s.dir())
     }
 
     pub fn files(&self) -> usize {
@@ -95,9 +211,13 @@ impl Session {
                     up.changed += 1;
                 }
                 (Ok(i), false) => {
+                    if let Some(store) = &self.store {
+                        store.remove(&crate::rel_path(&self.root, &path));
+                    }
                     self.files.remove(i);
                     self.defines.remove(i);
                     self.facts.remove(i);
+                    self.stamps.remove(i);
                     touched.remove(&path);
                     defines_changed = true;
                     up.removed += 1;
@@ -106,6 +226,7 @@ impl Session {
                     self.files.insert(i, path.clone());
                     self.defines.insert(i, mask::defines(&std::fs::read(&path).unwrap_or_default()));
                     self.facts.insert(i, FileFacts::new(String::new()));
+                    self.stamps.insert(i, (0, 0));
                     defines_changed = true;
                     up.added += 1;
                 }
@@ -135,8 +256,20 @@ impl Session {
         let fresh: Vec<FileFacts> =
             stale.par_iter().map_init(Extractor::new, |ex, &i| crate::extract_file(ex, root, &files[i], sets)).collect();
         up.extracted = fresh.len();
-        for (i, f) in stale.into_iter().zip(fresh) {
+        for (&i, f) in stale.iter().zip(fresh) {
             self.facts[i] = f;
+            self.stamps[i] = stamp(&self.files[i]);
+        }
+        // Keep the save in step. Until the manifest is rewritten it does
+        // not vouch for anything, so an interruption costs a full index
+        // and never a wrong one.
+        if let Some(store) = self.store.as_ref().filter(|_| !stale.is_empty() || up.removed > 0) {
+            store.invalidate();
+            let s = &*self;
+            stale.par_iter().for_each(|&i| {
+                store.save(&crate::rel_path(&s.root, &s.files[i]), s.stamps[i], &s.defines[i], &s.facts[i]);
+            });
+            self.save_manifest();
         }
         up.extract_ms = ms(t);
 
@@ -205,6 +338,51 @@ mod tests {
         assert!(up.macros_reclassified >= 1);
         assert_eq!(up.extracted, 2, "a.h and b.c, not c.c");
         assert_eq!((functions(&s, "run_x"), functions(&s, "other"), functions(&s, "unrelated")), (1, 1, 1));
+    }
+
+    #[test]
+    fn a_saved_index_is_read_back_and_only_changes_are_parsed() {
+        let d = Dir::new("saved");
+        let cache = d.0.join(".cache");
+        d.write("a.h", "#define TAG(x) x\n");
+        d.write("b.c", "#include \"a.h\"\nint TAG (run) (void) { return other (); }\nint other (void) { return 1; }\n");
+        d.write("c.c", "int unrelated (void) { return 2; }\n");
+        let open = |d: &Dir| Session::open_cached(&d.0, Options::default(), cache.clone());
+
+        let (s, up) = open(&d);
+        assert_eq!((up.loaded, up.extracted), (0, 3), "nothing saved yet");
+        let edges = s.graph.out.len();
+        drop(s);
+
+        let (s, up) = open(&d);
+        assert_eq!((up.loaded, up.extracted), (3, 0), "all read back");
+        assert_eq!((s.graph.out.len(), functions(&s, "other"), functions(&s, "unrelated")), (edges, 1, 1));
+        drop(s);
+
+        // An edit while nothing was running.
+        d.write("c.c", "int unrelated (void) { return 3; }\nint added (void) { return unrelated (); }\n");
+        let (s, up) = open(&d);
+        assert_eq!((up.loaded, up.changed, up.extracted), (3, 1, 1));
+        assert_eq!(functions(&s, "added"), 1);
+        drop(s);
+
+        // A macro changed character while nothing was running: its users
+        // are parsed again though their text is the same.
+        d.write("a.h", "#define TAG(x) x##_x\n");
+        let (s, up) = open(&d);
+        assert_eq!((up.loaded, up.extracted), (3, 2), "a.h and b.c, not c.c");
+        assert_eq!((functions(&s, "run_x"), functions(&s, "added")), (1, 1));
+        drop(s);
+
+        // A file deleted, another created.
+        std::fs::remove_file(d.0.join("c.c")).unwrap();
+        d.write("e.c", "int fresh (void) { return 0; }\n");
+        let (s, up) = open(&d);
+        assert_eq!((up.loaded, up.removed, up.added, s.files()), (3, 1, 1, 3));
+        assert_eq!((functions(&s, "fresh"), functions(&s, "unrelated")), (1, 0));
+        drop(s);
+        let (s, up) = open(&d);
+        assert_eq!((up.loaded, up.extracted, functions(&s, "fresh")), (3, 0, 1));
     }
 
     #[test]

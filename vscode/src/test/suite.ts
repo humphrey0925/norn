@@ -61,7 +61,7 @@ export async function run(): Promise<void> {
   for (const view of ["si.relation.focus", "si.context.focus", "si.search.focus", "si.fileSymbols.focus"]) {
     await vscode.commands.executeCommand(view);
   }
-  for (const command of ["si.relation.callers", "si.relation.references", "si.relation.callees", "si.relation.lock", "si.relation.unlock", "si.context.lock", "si.context.unlock"]) {
+  for (const command of ["si.relation.graph", "si.relation.tree", "si.relation.callers", "si.relation.references", "si.relation.callees", "si.relation.lock", "si.relation.unlock", "si.context.lock", "si.context.unlock"]) {
     await vscode.commands.executeCommand(command);
   }
 

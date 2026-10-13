@@ -104,9 +104,8 @@
       '<div class="row' + (n.parent ? "" : " top") + '" data-id="' + n.id + '" style="padding-left:' + (8 + depth * 16) + 'px" tabindex="0">' +
         '<span class="tw" data-act="toggle">' + (n.loading ? "…" : twisty) + "</span>" +
         '<span class="k k-' + (n.slot ? "field" : e.kind) + '">' + (n.slot ? "·" : KIND[e.kind] ?? "?") + "</span>" +
-        '<span class="name">' + esc(n.slot ?? e.name) + "</span>" + badges(n) +
-        '<span class="loc">' + esc(where) + calls + "</span>" +
-        (n.slot ? "" : '<span class="go" data-act="def" title="跳到定義">⤳</span>') +
+        '<span class="name" data-act="name" title="' + (n.slot ? "到呼叫處" : "跳到這個函式") + '">' + esc(n.slot ?? e.name) + "</span>" + badges(n) +
+        '<span class="loc" title="到呼叫處">' + esc(where) + calls + "</span>" +
         "</div>",
     );
     if (n.open && n.children) for (const c of n.children) treeRows(c, depth + 1, out);
@@ -138,7 +137,7 @@
     let row = 0;
     (function place(n, depth) {
       n.depth = depth;
-      cols[depth] = Math.max(cols[depth] ?? 0, width(n));
+      cols[depth] = Math.max(cols[depth] ?? 0, width(n) + 20);
       const kids = n.open && n.children ? n.children : [];
       if (!kids.length) {
         n.y = row++ * ROW;
@@ -161,13 +160,20 @@
       const w = width(n), nx = mode === "callers" ? left(n) + cols[n.depth] - w : left(n), ny = n.y + 6;
       const e = n.entry;
       const cls = n.slot ? "slot" : !n.parent ? "rootnode" : e.through || e.pointer ? "ptr" : e.viaMacro ? "mac" : "";
-      const more = !n.slot && !n.children ? '<text class="plus" x="' + (mode === "callers" ? nx - 10 : nx + w + 4) + '" y="' + (ny + 16) + '">+</text>' : "";
+      // The knob beside a node grows or folds the graph; the node itself
+      // is the function, and clicking it goes there.
+      const leaf = n.children && n.children.length === 0;
+      const kx = mode === "callers" ? nx - 11 : nx + w + 11, ky = ny + H / 2;
+      const more = leaf ? "" :
+        '<g class="knob" data-act="toggle"><title>' + (n.open ? "收合" : "展開") + '</title><circle cx="' + kx + '" cy="' + ky + '" r="7"></circle>' +
+        '<text x="' + kx + '" y="' + (ky + 4) + '" text-anchor="middle">' + (n.loading ? "…" : n.open ? "−" : "+") + "</text></g>";
       shapes.push(
         '<g class="gn ' + cls + (e && e.certain === false ? " amb" : "") + '" data-id="' + n.id + '"><title>' + esc(n.slot ? "結構成員（函式指標）" : e.file + ":" + e.line) + "</title>" +
           '<rect x="' + nx + '" y="' + ny + '" width="' + w + '" height="' + H + '" rx="' + (n.slot ? 12 : 3) + '"></rect>' +
           '<text x="' + (nx + 10) + '" y="' + (ny + 16) + '">' + esc(n.slot ?? e.name) + "</text>" + more + "</g>",
       );
-      n.box = { x: nx, y: ny + H / 2, w };
+      // Edges leave from beyond the knob.
+      n.box = { x: mode === "callers" ? nx - (leaf ? 0 : 20) : nx, y: ny + H / 2, w: w + (leaf ? 0 : 20) };
       if (n.open && n.children)
         for (const c of n.children) {
           draw(c);
@@ -179,7 +185,7 @@
     })(top);
     root.innerHTML =
       '<div class="graph"><svg width="' + Math.max(total, 200) + '" height="' + (row * ROW + 12) + '">' + edges.join("") + shapes.join("") + "</svg></div>" +
-      '<div class="hint">點節點展開或收合；雙擊或 Ctrl＋點到呼叫處。</div>';
+      '<div class="hint">點函式名稱跳到該函式（Ctrl＋點開在旁邊）；點旁邊的 ＋／− 展開或收合。</div>';
   }
 
   // ---------------------------------------------------------------- common
@@ -221,17 +227,11 @@
     if (!el) return;
     const n = nodes.get(+el.dataset.id);
     const what = e.target.closest("[data-act]")?.dataset.act;
-    if (what === "def") return vscode.postMessage({ open: definition(n), beside });
-    if (view === "graph" && mode !== "references") {
-      // In the graph a click grows the graph; going there takes more intent.
-      if (dbl || beside) {
-        const t = site(n);
-        if (t) vscode.postMessage({ open: t, beside });
-      } else if (!dbl) toggle(n);
-      return;
-    }
+    if (dbl) return;
     if (what === "toggle") return toggle(n);
-    const t = site(n);
+    // The name is the function: go to it. The rest of a row in the tree is
+    // the call: go to the line it is made on.
+    const t = view === "graph" || what === "name" ? definition(n) : site(n);
     if (t) vscode.postMessage({ open: t, beside });
   }
   root.addEventListener("click", (e) => act(e, false));

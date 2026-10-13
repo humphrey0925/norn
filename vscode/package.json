@@ -2,7 +2,7 @@
   "name": "si-code-index",
   "displayName": "SI Code Index",
   "description": "Source-Insight-style symbol search, context and relation views for C, backed by the si index.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "humphrey0925",
   "repository": {
     "type": "git",
@@ -105,7 +105,7 @@
       },
       {
         "command": "si.restart",
-        "title": "SI: 重新建立索引"
+        "title": "SI: 重新啟動索引（只重新解析有變動的檔案）"
       },
       {
         "command": "si.relation.tree",
@@ -114,6 +114,10 @@
       {
         "command": "si.relation.graph",
         "title": "SI: Relation 以圖形顯示"
+      },
+      {
+        "command": "si.rebuild",
+        "title": "SI: 捨棄保存的索引並完整重建"
       }
     ],
     "menus": {
@@ -173,6 +177,16 @@
           "type": "boolean",
           "default": true,
           "description": "在函式定義上方顯示呼叫者與被呼叫者數量。"
+        },
+        "si.cache.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "把索引保存在磁碟上，下次開啟時只重新解析有變動的檔案。"
+        },
+        "si.cache.directory": {
+          "type": "string",
+          "default": "",
+          "description": "索引保存的位置（留空則放在使用者的快取目錄，依專案路徑區分）。"
         }
       }
     }

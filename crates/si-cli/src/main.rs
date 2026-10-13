@@ -92,6 +92,8 @@ enum Cmd {
         root: PathBuf,
         #[arg(long, value_name = "FROM=TO")]
         include_alias: Vec<String>,
+        #[command(flatten)]
+        keep: Keep,
     },
     /// Language Server over stdin/stdout, for editors. The root is the
     /// workspace the editor names unless one is given here.
@@ -99,11 +101,44 @@ enum Cmd {
         root: Option<PathBuf>,
         #[arg(long, value_name = "FROM=TO")]
         include_alias: Vec<String>,
+        #[command(flatten)]
+        keep: Keep,
     },
     /// Every symbol as `file<TAB>line<TAB>kind<TAB>decl|def<TAB>name` (for accuracy checks).
     Symbols { dir: PathBuf },
     /// Every call edge, tab-separated (for accuracy checks).
     Calls { dir: PathBuf },
+}
+
+/// Whether and where a live index is kept between runs.
+#[derive(clap::Args, Clone)]
+struct Keep {
+    /// Where to keep the index between runs (default: the user's cache
+    /// directory, by the root's path).
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+    /// Index from scratch every time and keep nothing.
+    #[arg(long)]
+    no_cache: bool,
+    /// Throw away what is kept, index from scratch, and keep that.
+    #[arg(long)]
+    rebuild: bool,
+}
+
+impl Keep {
+    fn open(&self, root: &Path, options: &si_core::link::Options) -> (si_core::session::Session, si_core::session::Update) {
+        use si_core::session::{Session, Update};
+        if self.no_cache {
+            let s = Session::open(root, options.clone());
+            let extracted = s.files();
+            return (s, Update { extracted, ..Update::default() });
+        }
+        let dir = self.cache_dir.clone().unwrap_or_else(|| si_core::store::Store::default_dir(root));
+        if self.rebuild {
+            si_core::store::Store::new(dir.clone()).invalidate();
+        }
+        Session::open_cached(root, options.clone(), dir)
+    }
 }
 
 fn ms(t: Instant) -> f64 {
@@ -470,12 +505,14 @@ fn answer(g: &Graph, req: &Value) -> Value {
     run_query(g, op, req["name"].as_str().unwrap_or(""), req["depth"].as_u64().unwrap_or(3) as u32)
 }
 
-fn live(root: &Path, options: &si_core::link::Options) {
+fn live(root: &Path, keep: &Keep, options: &si_core::link::Options) {
     let t = Instant::now();
-    let mut session = si_core::session::Session::open(root, options.clone());
+    let (mut session, opened) = keep.open(root, options);
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let ready = json!({ "ready": true, "files": session.files(), "symbols": session.graph.syms.len(), "ms": ms(t) });
+    let ready = json!({ "ready": true, "files": session.files(), "symbols": session.graph.syms.len(), "ms": ms(t),
+                        "loaded": opened.loaded, "extracted": opened.extracted, "link_ms": opened.link_ms,
+                        "cache": session.cache_dir().map(|d| d.to_string_lossy().into_owned()) });
     writeln!(out, "{ready}").and_then(|_| out.flush()).expect("write response");
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
@@ -557,10 +594,14 @@ fn main() {
         Cmd::BenchIncr { root, n, seed } => bench_incr(root, *n, *seed),
         Cmd::Sample { dir, n, seed } => sample(dir, *n, *seed),
         Cmd::Serve { dir } => return serve(dir),
-        Cmd::Lsp { root, include_alias } => {
-            return lsp::run(root.as_deref(), &si_core::link::Options { include_aliases: aliases(include_alias) })
+        Cmd::Lsp { root, include_alias, keep } => {
+            let options = si_core::link::Options { include_aliases: aliases(include_alias) };
+            let keep = keep.clone();
+            return lsp::run(root.as_deref(), &move |dir: &Path| keep.open(dir, &options));
         }
-        Cmd::Live { root, include_alias } => return live(root, &si_core::link::Options { include_aliases: aliases(include_alias) }),
+        Cmd::Live { root, include_alias, keep } => {
+            return live(root, keep, &si_core::link::Options { include_aliases: aliases(include_alias) })
+        }
         Cmd::Symbols { dir } => return symbols(dir),
         Cmd::Calls { dir } => return calls(dir),
     };

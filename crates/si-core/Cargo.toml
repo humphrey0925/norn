@@ -11,5 +11,7 @@ rustc-hash = "2"
 bytemuck = { version = "1", features = ["derive"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 walkdir = "2"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 libmimalloc-sys = { version = "0.1", features = ["extended"] }

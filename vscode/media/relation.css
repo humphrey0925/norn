@@ -21,6 +21,7 @@ body { padding: 0; margin: 0; color: var(--vscode-foreground); font-family: var(
 .k-field { color: var(--vscode-symbolIcon-fieldForeground, var(--vscode-charts-blue)); }
 .k-global { color: var(--vscode-symbolIcon-variableForeground, var(--vscode-charts-blue)); }
 .name { font-family: var(--vscode-editor-font-family); }
+.row .name[data-act]:hover { text-decoration: underline; }
 .name.text { color: var(--vscode-foreground); overflow: hidden; text-overflow: ellipsis; }
 .ln { width: 4em; flex: none; text-align: right; color: var(--vscode-editorLineNumber-foreground); font-family: var(--vscode-editor-font-family); }
 .loc { color: var(--vscode-descriptionForeground); font-size: 0.9em; }
@@ -38,8 +39,12 @@ body { padding: 0; margin: 0; color: var(--vscode-foreground); font-family: var(
 .gn { cursor: pointer; }
 .gn rect { fill: var(--vscode-editorWidget-background); stroke: var(--vscode-editorWidget-border, var(--vscode-panel-border)); }
 .gn text { fill: var(--vscode-foreground); font-family: var(--vscode-editor-font-family); font-size: 12px; }
-.gn .plus { fill: var(--vscode-descriptionForeground); }
-.gn:hover rect { stroke: var(--vscode-focusBorder); }
+.knob circle { fill: var(--vscode-editor-background); stroke: var(--vscode-descriptionForeground); }
+.knob text { fill: var(--vscode-foreground); font-family: var(--vscode-editor-font-family); font-size: 12px; pointer-events: none; }
+.knob:hover circle { stroke: var(--vscode-focusBorder); fill: var(--vscode-list-hoverBackground); }
+.gn:hover > rect { stroke: var(--vscode-focusBorder); }
+.gn text { text-decoration: none; }
+.gn:hover > text { text-decoration: underline; }
 .gn.rootnode rect { fill: var(--vscode-list-activeSelectionBackground); stroke: var(--vscode-focusBorder); }
 .gn.rootnode text { fill: var(--vscode-list-activeSelectionForeground); }
 .gn.slot rect { stroke: var(--vscode-charts-blue); fill: color-mix(in srgb, var(--vscode-charts-blue) 14%, transparent); }

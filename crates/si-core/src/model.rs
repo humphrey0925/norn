@@ -1,6 +1,7 @@
 //! Shared data model: per-file facts (extraction output) and the linked graph.
 
 use bytemuck::{Pod, Zeroable};
+use serde::{Deserialize, Serialize};
 
 pub mod kind {
     pub const FILE: u8 = 0;
@@ -85,7 +86,7 @@ pub mod site {
 
 /// The text of a `#define` an expansion may need: `text` is everything after
 /// the name, parameter list included.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct MacroBody {
     pub name: u32,
     pub text: u32,
@@ -101,7 +102,7 @@ pub struct MacroBody {
 
 /// A use of an expanding macro, to be expanded at link time, when the
 /// definitions in other files are known.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Site {
     pub name: u32,
     /// The argument list as written, parentheses included, or `NONE`.
@@ -116,7 +117,7 @@ pub struct Site {
 /// A function stored where a call can later find it: in a struct member or
 /// in a variable. `func` is only a name; whether it is a function is
 /// decided at link time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Bind {
     /// The member or variable name; or, when `index` is not `NONE`, the name
     /// of the struct type whose `index`-th member is meant (an initializer
@@ -134,7 +135,7 @@ pub struct Bind {
 }
 
 /// A call a function makes through one of its parameters.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct ParamCall {
     /// The function, as a definition of this file.
     pub scope: u32,
@@ -145,7 +146,7 @@ pub struct ParamCall {
 
 /// A name passed as an argument in a call by name: if the callee calls
 /// through that parameter and the name is a function, that is who it calls.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct ArgPass {
     pub callee: u32,
     pub index: u32,
@@ -154,7 +155,7 @@ pub struct ArgPass {
 
 /// A braced initializer with macro uses in it, kept as text: which member
 /// each element initializes is only known once the macros are expanded.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct InitSite {
     /// The struct type's name, or `NONE`.
     pub type_name: u32,
@@ -166,14 +167,14 @@ pub struct InitSite {
 }
 
 /// The members of a struct or union, in order (`NONE` for an unnamed one).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
     pub name: u32,
     pub fields: Vec<u32>,
 }
 
 /// A definition found in one file. `name` indexes the file-local name table.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Def {
     pub name: u32,
     pub line: u32,
@@ -184,7 +185,7 @@ pub struct Def {
 
 /// A reference found in one file. `scope` is the index of the enclosing def
 /// in the same file (0 = the file itself).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Ref {
     pub name: u32,
     pub line: u32,
@@ -195,7 +196,7 @@ pub struct Ref {
 /// Everything extracted from a single file. Depends only on that file's
 /// content and the transparent-macro set, so it can be produced in parallel
 /// and cached by (content hash, set digest).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FileFacts {
     pub path: String,
     pub hash: u64,
