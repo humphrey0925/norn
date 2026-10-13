@@ -517,7 +517,23 @@ fn live(root: &Path, keep: &Keep, options: &si_core::link::Options) {
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         let req: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
-        let resp = if req["op"] == "update" {
+        let resp = if req["op"] == "sync" || req["op"] == "scope" {
+            // `scope` with `include`/`exclude` sets the project's folders
+            // (kept in .si/config.json); both bring the index in line with
+            // the disk.
+            let list = |key: &str| -> Vec<String> {
+                req[key].as_array().into_iter().flatten().filter_map(|v| v.as_str()).map(str::to_string).collect()
+            };
+            let up = if req["op"] == "scope" {
+                session.set_scope(si_core::scope::Scope { include: list("include"), exclude: list("exclude") }).unwrap_or_default()
+            } else {
+                session.sync()
+            };
+            json!({ "added": up.added, "removed": up.removed, "changed": up.changed, "extracted": up.extracted,
+                    "files": session.files(), "symbols": session.graph.syms.len(),
+                    "include": session.scope().include, "exclude": session.scope().exclude,
+                    "extract_ms": up.extract_ms, "link_ms": up.link_ms })
+        } else if req["op"] == "update" {
             let files: Vec<PathBuf> = req["files"].as_array().into_iter().flatten().filter_map(|f| f.as_str()).map(PathBuf::from).collect();
             let up = session.update(&files);
             json!({ "changed": up.changed, "added": up.added, "removed": up.removed, "extracted": up.extracted,

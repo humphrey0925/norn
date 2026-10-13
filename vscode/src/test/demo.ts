@@ -23,6 +23,11 @@ export async function run(): Promise<void> {
   await vscode.window.showTextDocument(doc, { selection: new vscode.Range(at, at) });
   editor.revealRange(new vscode.Range(at, at), vscode.TextEditorRevealType.InCenter);
   await sleep(1500);
+  if (process.env.SI_DEMO_SCOPE) {
+    await vscode.commands.executeCommand("si.scope.exclude", vscode.Uri.file(path.join(folder, "include")));
+    await vscode.commands.executeCommand("workbench.actions.treeView.si.fileSymbols.collapseAll");
+    await vscode.commands.executeCommand("si.scope.focus");
+  }
   if (process.env.SI_DEMO_VIEW === "graph") {
     await vscode.commands.executeCommand("si.relation.graph");
   }

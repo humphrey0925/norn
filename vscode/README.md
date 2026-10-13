@@ -14,6 +14,11 @@ Source-Insight-style views for C in VS Code, backed by the `si` index.
 - A line above each function with its number of callers and callees
   (`si.codeLens.enabled`).
 
+- **Index Scope**: the folders of the workspace with a checkbox each;
+  checked folders are indexed. The choice is kept in `.si/config.json` in
+  the workspace and is there the next time. The sync button brings the
+  index in line with the disk whenever you want it.
+
 Go to definition, find references, workspace symbols and call hierarchy use
 the same index.
 

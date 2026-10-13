@@ -7,6 +7,7 @@ pub mod link;
 pub mod mask;
 pub mod model;
 pub mod packed;
+pub mod scope;
 pub mod search;
 pub mod session;
 pub mod sqlite;
@@ -25,6 +26,22 @@ pub fn scan(root: &Path) -> Vec<PathBuf> {
         .filter(|e| e.file_type().is_file())
         .map(|e| e.into_path())
         .filter(|p| matches!(p.extension().and_then(|x| x.to_str()), Some("c" | "h")))
+        .collect();
+    files.sort_unstable();
+    files
+}
+
+/// The C sources and headers under `root` that `scope` makes part of the
+/// project, sorted. Folders that hold nothing of it are not entered.
+pub fn scan_scope(root: &Path, scope: &scope::Scope) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !e.file_type().is_dir() || scope.reaches(&rel_path(root, e.path())))
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .filter(|p| matches!(p.extension().and_then(|x| x.to_str()), Some("c" | "h")))
+        .filter(|p| scope.contains(&rel_path(root, p)))
         .collect();
     files.sort_unstable();
     files

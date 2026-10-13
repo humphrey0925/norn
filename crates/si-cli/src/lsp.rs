@@ -393,6 +393,26 @@ impl Server {
         json!({ "root": self.entry(root), "entries": entries })
     }
 
+    /// `si/scope`: which folders are indexed, and where that is written.
+    fn scope(&self) -> Value {
+        let s = self.session.scope();
+        json!({ "include": s.include, "exclude": s.exclude,
+                "config": si_core::scope::Scope::config_path(&self.root).to_string_lossy() })
+    }
+
+    fn synced(&mut self, up: si_core::session::Update) -> Value {
+        self.lines.clear();
+        let mut v = self.scope();
+        v["files"] = json!(self.session.files());
+        v["symbols"] = json!(self.g().syms.len());
+        v["added"] = json!(up.added);
+        v["removed"] = json!(up.removed);
+        v["changed"] = json!(up.changed);
+        v["parsed"] = json!(up.extracted);
+        v["ms"] = json!(up.extract_ms + up.link_ms);
+        v
+    }
+
     fn update(&mut self, paths: Vec<PathBuf>) {
         if !paths.is_empty() {
             self.session.update(&paths);
@@ -412,6 +432,21 @@ impl Server {
             "si/search" => self.search(params),
             "si/context" => self.context(params),
             "si/relation" => self.relation(params),
+            "si/scope" => self.scope(),
+            "si/setScope" => {
+                let list = |key: &str| -> Vec<String> {
+                    params[key].as_array().into_iter().flatten().filter_map(|v| v.as_str()).map(str::to_string).collect()
+                };
+                let scope = si_core::scope::Scope { include: list("include"), exclude: list("exclude") };
+                match self.session.set_scope(scope) {
+                    Ok(up) => self.synced(up),
+                    Err(e) => json!({ "error": format!("could not save {}: {e}", si_core::scope::Scope::config_path(&self.root).display()) }),
+                }
+            }
+            "si/sync" => {
+                let up = self.session.sync();
+                self.synced(up)
+            }
             "si/status" => json!({ "files": self.session.files(), "symbols": self.g().syms.len(), "edges": self.g().out.len(),
                                    "loaded": self.opened.0, "parsed": self.opened.1,
                                    "cache": self.session.cache_dir().map(|d| d.to_string_lossy().into_owned()) }),

@@ -139,6 +139,17 @@ def main():
         callers = sorted(x["from"]["name"] for x in c.request("callHierarchy/incomingCalls", {"item": items[0]}))
         assert "si_probe" in callers, callers
         print(f"after saving an edit: si_probe indexed and calls bfd_cache_init ({time.perf_counter() - t:.3f}s)")
+        # The project's scope: leave `include/` out, and it is gone; the
+        # setting is written into the tree; a sync sees files appear.
+        r = c.request("si/setScope", {"include": [], "exclude": ["include"]})
+        assert r["removed"] == 1 and (work / ".si" / "config.json").is_file(), r
+        assert not c.request("workspace/symbol", {"query": "ATTRIBUTE_UNUSED"})
+        (work / "bfd" / "extra.c").write_text("int si_extra (void) { return 0; }\n")
+        r = c.request("si/sync", {})
+        assert r["added"] == 1 and r["exclude"] == ["include"], r
+        r = c.request("si/setScope", {"include": [], "exclude": []})
+        assert r["added"] == 1 and c.request("workspace/symbol", {"query": "ATTRIBUTE_UNUSED"}), r
+        print("scope: folders leave and return, saved in .si/config.json; sync picks up new files")
         c.close()
     print("ok")
 

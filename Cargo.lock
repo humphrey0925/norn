@@ -506,6 +506,7 @@ dependencies = [
  "rusqlite",
  "rustc-hash",
  "serde",
+ "serde_json",
  "tree-sitter",
  "tree-sitter-c",
  "walkdir",

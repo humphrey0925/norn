@@ -77,6 +77,24 @@ export async function run(): Promise<void> {
   await vscode.commands.executeCommand("si.open", { uri: doc.uri.toString(), line: 10, character: 0 }, false);
   assert.strictEqual(vscode.window.activeTextEditor!.viewColumn, vscode.ViewColumn.Two, "opens where the focus was");
 
+  // The index scope: a folder excluded is gone from the index, the choice
+  // is written into the workspace, and taking it back brings it back.
+  const has = async (name: string) => {
+    const s = await vscode.commands.executeCommand<vscode.SymbolInformation[]>("vscode.executeWorkspaceSymbolProvider", name);
+    return !!s?.some((x) => x.name === name);
+  };
+  assert.ok(await has("ATTRIBUTE_UNUSED"));
+  await vscode.commands.executeCommand("si.scope.exclude", vscode.Uri.file(path.join(folder, "include")));
+  assert.ok(!(await has("ATTRIBUTE_UNUSED")), "include/ left the index");
+  const config = JSON.parse(Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(folder, ".si", "config.json")))).toString());
+  assert.deepStrictEqual(config, { include: [], exclude: ["include"] });
+  await vscode.commands.executeCommand("si.scope.only", vscode.Uri.file(path.join(folder, "bfd")));
+  assert.ok((await has("bfd_cache_init")) && !(await has("ATTRIBUTE_UNUSED")));
+  await vscode.commands.executeCommand("si.scope.all");
+  assert.ok(await has("ATTRIBUTE_UNUSED"), "the whole workspace again");
+  await vscode.commands.executeCommand("si.scope.focus");
+  await vscode.commands.executeCommand("si.sync");
+
   // Saving an edit re-indexes it.
   const edit = new vscode.WorkspaceEdit();
   edit.insert(doc.uri, new vscode.Position(doc.lineCount, 0), "\nint si_probe (void) { return 0; }\n");

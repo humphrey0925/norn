@@ -242,6 +242,126 @@ class FileSymbols implements vscode.TreeDataProvider<Node> {
   }
 }
 
+// ---------------------------------------------------------------- Index scope
+
+interface ScopeState {
+  include: string[];
+  exclude: string[];
+  config: string;
+}
+
+interface Synced extends ScopeState {
+  files: number;
+  symbols: number;
+  added: number;
+  removed: number;
+  changed: number;
+  parsed: number;
+  ms: number;
+  error?: string;
+}
+
+const NEVER = [".si", ".git", ".svn", ".hg"];
+
+function under(p: string, rule: string): boolean {
+  return rule === "" || p === rule || p.startsWith(rule + "/");
+}
+
+/** Is the folder part of the project? The rule on its longest enclosing
+ *  folder decides (the server applies the same rule to files). */
+function inScope(scope: ScopeState, rel: string): boolean {
+  const longest = (rules: string[]) => Math.max(-1, ...rules.filter((r) => under(rel, r)).map((r) => r.length));
+  const inc = longest(scope.include), exc = longest(scope.exclude);
+  return inc < 0 && exc < 0 ? scope.include.length === 0 : inc > exc;
+}
+
+/** The folders of the workspace, each with a checkbox: checked folders are
+ *  indexed. What is chosen is kept in `.si/config.json` in the workspace. */
+class ScopeTree implements vscode.TreeDataProvider<string> {
+  private readonly changed = new vscode.EventEmitter<string | undefined>();
+  readonly onDidChangeTreeData = this.changed.event;
+  scope: ScopeState = { include: [], exclude: [], config: "" };
+
+  constructor(private readonly afterSync: (r: Synced, what: string) => void) {}
+
+  private root(): vscode.Uri | undefined {
+    return vscode.workspace.workspaceFolders?.[0]?.uri;
+  }
+
+  async load() {
+    const s = await ask<ScopeState>("si/scope", {});
+    if (s) {
+      this.scope = s;
+      this.changed.fire(undefined);
+    }
+  }
+
+  /** Folder path relative to the workspace, `/` between parts. */
+  relative(uri: vscode.Uri): string | undefined {
+    const root = this.root();
+    if (!root) {
+      return undefined;
+    }
+    const rel = path.relative(root.fsPath, uri.fsPath).split(path.sep).join("/");
+    return rel.startsWith("..") ? undefined : rel;
+  }
+
+  async getChildren(rel?: string): Promise<string[]> {
+    const root = this.root();
+    if (!root) {
+      return [];
+    }
+    try {
+      const entries = await vscode.workspace.fs.readDirectory(rel ? vscode.Uri.joinPath(root, rel) : root);
+      return entries
+        .filter(([name, type]) => (type & vscode.FileType.Directory) !== 0 && !NEVER.includes(name))
+        .map(([name]) => (rel ? `${rel}/${name}` : name))
+        .sort();
+    } catch {
+      return [];
+    }
+  }
+
+  getTreeItem(rel: string): vscode.TreeItem {
+    const item = new vscode.TreeItem(path.posix.basename(rel), vscode.TreeItemCollapsibleState.Collapsed);
+    item.id = rel;
+    item.iconPath = vscode.ThemeIcon.Folder;
+    item.checkboxState = inScope(this.scope, rel) ? vscode.TreeItemCheckboxState.Checked : vscode.TreeItemCheckboxState.Unchecked;
+    // Say where a rule is written; the folders under it follow it.
+    item.description = this.scope.include.includes(rel) ? "included" : this.scope.exclude.includes(rel) ? "excluded" : undefined;
+    item.contextValue = "folder";
+    return item;
+  }
+
+  /** Put `rel` in or out, dropping the rules under it that this overrides. */
+  async set(rel: string, wanted: boolean) {
+    const keep = (rules: string[]) => rules.filter((r) => !under(r, rel));
+    const next: ScopeState = { ...this.scope, include: keep(this.scope.include), exclude: keep(this.scope.exclude) };
+    const listed = this.scope.include.length > 0;
+    if (inScope(next, rel) !== wanted) {
+      (wanted ? next.include : next.exclude).push(rel);
+    }
+    if (listed && next.include.length === 0 && !wanted) {
+      // The last listed folder was unchecked: with nothing listed the
+      // whole workspace would be the project again, which is not what
+      // unchecking asks for. Say so instead of doing it silently.
+      void vscode.window.showWarningMessage(`"${rel}" was the only folder listed, so the whole workspace is indexed again, except "${rel}".`);
+    }
+    await this.apply(next, wanted ? `Added ${rel}` : `Removed ${rel}`);
+  }
+
+  async apply(next: { include: string[]; exclude: string[] }, what: string) {
+    const r = await ask<Synced>("si/setScope", { include: next.include, exclude: next.exclude });
+    if (!r || r.error) {
+      void vscode.window.showErrorMessage(r?.error ?? "SI is not running.");
+      return;
+    }
+    this.scope = { include: r.include, exclude: r.exclude, config: r.config };
+    this.changed.fire(undefined);
+    this.afterSync(r, what);
+  }
+}
+
 // ---------------------------------------------------------------- webviews
 
 const STYLE = `
@@ -463,6 +583,7 @@ export async function activate(context: vscode.ExtensionContext) {
   const lenses = new Lenses();
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 10);
   status.text = "$(sync~spin) SI indexing";
+  status.command = "si.sync";
   status.show();
 
   const selector: vscode.DocumentSelector = [{ scheme: "file", pattern: "**/*.{c,h}" }];
@@ -471,9 +592,41 @@ export async function activate(context: vscode.ExtensionContext) {
     const s = await ask<{ files: number; symbols: number; loaded: number; parsed: number; cache: string | null }>("si/status", {});
     status.text = s ? `$(symbol-namespace) SI ${s.files.toLocaleString()} files · ${s.symbols.toLocaleString()} symbols` : "$(warning) SI not running";
     status.tooltip = s
-      ? `At start: ${s.loaded.toLocaleString()} files read from the saved index, ${s.parsed.toLocaleString()} parsed
+      ? `Click to sync the index with the disk.\nAt start: ${s.loaded.toLocaleString()} files read from the saved index, ${s.parsed.toLocaleString()} parsed
 ` + (s.cache ? `Index kept in ${s.cache}` : "Index not kept (si.cache.enabled is off)")
       : undefined;
+  }
+
+  function afterSync(r: Synced, what: string) {
+    fileSymbols.refresh();
+    lenses.refresh();
+    void refreshStatus();
+    if (current) {
+      follow(current, true);
+    }
+    vscode.window.setStatusBarMessage(
+      `SI: ${what}: ${r.added} added, ${r.removed} removed, ${r.changed} changed, ${r.parsed} parsed (${Math.round(r.ms)} ms)`,
+      6000,
+    );
+  }
+  const scopeTree = new ScopeTree(afterSync);
+  const scopeView = vscode.window.createTreeView("si.scope", { treeDataProvider: scopeTree, manageCheckboxStateManually: true });
+  scopeView.onDidChangeCheckboxState(async (e) => {
+    for (const [rel, state] of e.items) {
+      await scopeTree.set(rel, state === vscode.TreeItemCheckboxState.Checked);
+    }
+  });
+  /** A folder from the scope tree (its path) or from the Explorer (a URI). */
+  const folderOf = (arg: unknown): string | undefined => (typeof arg === "string" ? arg : arg instanceof vscode.Uri ? scopeTree.relative(arg) : undefined);
+  async function sync() {
+    status.text = "$(sync~spin) SI syncing";
+    const r = await ask<Synced>("si/sync", {});
+    if (r) {
+      scopeTree.scope = { include: r.include, exclude: r.exclude, config: r.config };
+      afterSync(r, "Synced with disk");
+    } else {
+      await refreshStatus();
+    }
   }
 
   let timer: NodeJS.Timeout | undefined;
@@ -521,6 +674,7 @@ export async function activate(context: vscode.ExtensionContext) {
       return;
     }
     await refreshStatus();
+    await scopeTree.load();
     follow(vscode.window.activeTextEditor, true);
   }
 
@@ -547,6 +701,11 @@ export async function activate(context: vscode.ExtensionContext) {
       }
     }),
     vscode.workspace.onDidSaveTextDocument(async (doc) => {
+      // The scope edited by hand takes effect when its file is saved.
+      if (scopeTree.scope.config && doc.uri.fsPath.toLowerCase() === scopeTree.scope.config.toLowerCase()) {
+        await sync();
+        return;
+      }
       if (isSource(doc)) {
         // The server re-indexes on the save notification; ask after it has.
         await refreshStatus();
@@ -583,6 +742,30 @@ export async function activate(context: vscode.ExtensionContext) {
         await client.stop();
       }
       await start();
+    }),
+    scopeView,
+    vscode.commands.registerCommand("si.sync", sync),
+    vscode.commands.registerCommand("si.scope.include", (arg: unknown) => {
+      const rel = folderOf(arg);
+      return rel !== undefined && rel !== "" ? scopeTree.set(rel, true) : undefined;
+    }),
+    vscode.commands.registerCommand("si.scope.exclude", (arg: unknown) => {
+      const rel = folderOf(arg);
+      return rel !== undefined && rel !== "" ? scopeTree.set(rel, false) : undefined;
+    }),
+    vscode.commands.registerCommand("si.scope.only", (arg: unknown) => {
+      const rel = folderOf(arg);
+      return rel ? scopeTree.apply({ include: [rel], exclude: [] }, `Indexing only ${rel}`) : undefined;
+    }),
+    vscode.commands.registerCommand("si.scope.all", () => scopeTree.apply({ include: [], exclude: [] }, "Indexing the whole workspace")),
+    vscode.commands.registerCommand("si.scope.openConfig", async () => {
+      if (!scopeTree.scope.config || !fs.existsSync(scopeTree.scope.config)) {
+        // Nothing chosen yet: write the setting out so there is a file to edit.
+        await scopeTree.apply({ include: scopeTree.scope.include, exclude: scopeTree.scope.exclude }, "Wrote the scope");
+      }
+      if (scopeTree.scope.config) {
+        await vscode.window.showTextDocument(vscode.Uri.file(scopeTree.scope.config));
+      }
     }),
     vscode.commands.registerCommand("si.rebuild", async () => {
       status.text = "$(sync~spin) SI rebuilding";

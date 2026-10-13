@@ -2,7 +2,7 @@
   "name": "si-code-index",
   "displayName": "SI Code Index",
   "description": "Source-Insight-style symbol search, context and relation views for C, backed by the si index.",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "humphrey0925",
   "repository": {
     "type": "git",
@@ -47,6 +47,10 @@
         {
           "id": "si.fileSymbols",
           "name": "File Symbols"
+        },
+        {
+          "id": "si.scope",
+          "name": "Index Scope"
         }
       ],
       "siPanel": [
@@ -117,7 +121,35 @@
       },
       {
         "command": "si.rebuild",
-        "title": "SI: Discard the Saved Index and Rebuild"
+        "title": "SI: Discard the Saved Index and Rebuild",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "si.sync",
+        "title": "SI: Sync Index with Disk",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "si.scope.include",
+        "title": "SI: Index This Folder"
+      },
+      {
+        "command": "si.scope.exclude",
+        "title": "SI: Exclude This Folder from the Index"
+      },
+      {
+        "command": "si.scope.only",
+        "title": "SI: Index Only This Folder"
+      },
+      {
+        "command": "si.scope.all",
+        "title": "SI: Index the Whole Workspace",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "si.scope.openConfig",
+        "title": "SI: Open the Scope File (.si/config.json)",
+        "icon": "$(go-to-file)"
       }
     ],
     "menus": {
@@ -141,6 +173,26 @@
           "command": "si.context.unlock",
           "when": "view == si.context && si.contextLocked",
           "group": "navigation@1"
+        },
+        {
+          "command": "si.sync",
+          "when": "view == si.scope || view == si.search || view == si.fileSymbols",
+          "group": "navigation@1"
+        },
+        {
+          "command": "si.scope.openConfig",
+          "when": "view == si.scope",
+          "group": "navigation@2"
+        },
+        {
+          "command": "si.scope.all",
+          "when": "view == si.scope",
+          "group": "navigation@3"
+        },
+        {
+          "command": "si.rebuild",
+          "when": "view == si.scope",
+          "group": "navigation@4"
         }
       ],
       "view/item/context": [
@@ -148,12 +200,56 @@
           "command": "si.openToSide",
           "when": "view == si.fileSymbols",
           "group": "inline@1"
+        },
+        {
+          "command": "si.scope.only",
+          "when": "view == si.scope && viewItem == folder",
+          "group": "si@1"
+        },
+        {
+          "command": "si.scope.include",
+          "when": "view == si.scope && viewItem == folder",
+          "group": "si@2"
+        },
+        {
+          "command": "si.scope.exclude",
+          "when": "view == si.scope && viewItem == folder",
+          "group": "si@3"
         }
       ],
       "commandPalette": [
         {
           "command": "si.openToSide",
           "when": "false"
+        },
+        {
+          "command": "si.scope.include",
+          "when": "false"
+        },
+        {
+          "command": "si.scope.exclude",
+          "when": "false"
+        },
+        {
+          "command": "si.scope.only",
+          "when": "false"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "si.scope.include",
+          "when": "explorerResourceIsFolder",
+          "group": "si@1"
+        },
+        {
+          "command": "si.scope.exclude",
+          "when": "explorerResourceIsFolder",
+          "group": "si@2"
+        },
+        {
+          "command": "si.scope.only",
+          "when": "explorerResourceIsFolder",
+          "group": "si@3"
         }
       ]
     },

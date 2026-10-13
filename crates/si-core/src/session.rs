@@ -17,6 +17,7 @@ use crate::graph::Graph;
 use crate::link::{link_cached, LinkStats, Options};
 use crate::mask::{self, Define, MacroSets};
 use crate::model::FileFacts;
+use crate::scope::Scope;
 use crate::store::{stamp, Stamp, Store};
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
@@ -36,6 +37,8 @@ pub struct Session {
     /// when its facts were made.
     store: Option<Store>,
     stamps: Vec<Stamp>,
+    /// Which part of the tree is the project (`.si/config.json`).
+    scope: Scope,
     pub graph: Graph,
     pub stats: LinkStats,
 }
@@ -67,7 +70,8 @@ fn is_source(path: &Path) -> bool {
 
 impl Session {
     pub fn open(root: &Path, options: Options) -> Session {
-        let files = crate::scan(root);
+        let scope = Scope::load(root);
+        let files = crate::scan_scope(root, &scope);
         let defines: Vec<Vec<Define>> =
             files.par_iter().map(|p| mask::defines(&std::fs::read(p).unwrap_or_default())).collect();
         let sets = MacroSets::from_defines(defines.iter().flatten().cloned());
@@ -75,7 +79,67 @@ impl Session {
         let mut cache = Cache::default();
         let (graph, stats) = link_cached(&facts, &options, &mut cache);
         let stamps = files.par_iter().map(|p| stamp(p)).collect();
-        Session { root: root.to_path_buf(), files, defines, facts, sets, cache, options, store: None, stamps, graph, stats }
+        Session { root: root.to_path_buf(), files, defines, facts, sets, cache, options, store: None, stamps, scope, graph, stats }
+    }
+
+    pub fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    /// Make `scope` the project's, save it in the tree, and bring the index
+    /// in line with it.
+    pub fn set_scope(&mut self, scope: Scope) -> std::io::Result<Update> {
+        scope.save(&self.root)?;
+        Ok(self.sync())
+    }
+
+    /// Bring the index in line with what is on disk now: the scope as
+    /// saved in the tree, and every file in it that was added, removed or
+    /// changed, however that happened.
+    pub fn sync(&mut self) -> Update {
+        let t = Instant::now();
+        self.scope = Scope::load(&self.root);
+        let paths = self.out_of_date();
+        let mut up = self.update(&paths);
+        up.extract_ms = ms(t) - up.link_ms;
+        up
+    }
+
+    /// Files that are not as the index has them: new ones, ones that are
+    /// gone or out of scope, and ones whose content changed.
+    fn out_of_date(&mut self) -> Vec<PathBuf> {
+        let now = crate::scan_scope(&self.root, &self.scope);
+        let mut paths: Vec<PathBuf> = now.iter().filter(|p| self.files.binary_search(p).is_err()).cloned().collect();
+        let on_disk: FxHashSet<&PathBuf> = now.iter().collect();
+        let this = &*self;
+        let stale: Vec<Option<bool>> = (0..this.files.len())
+            .into_par_iter()
+            .map(|i| {
+                let path = &this.files[i];
+                if !on_disk.contains(path) {
+                    return Some(true); // gone
+                }
+                if stamp(path) == this.stamps[i] {
+                    return None;
+                }
+                // Touched: the content says whether it changed.
+                let same = std::fs::read(path).is_ok_and(|src| xxhash_rust::xxh3::xxh3_64(&src) == this.facts[i].hash);
+                Some(!same)
+            })
+            .collect();
+        for (i, s) in stale.into_iter().enumerate() {
+            match s {
+                Some(true) => paths.push(self.files[i].clone()),
+                Some(false) => {
+                    self.stamps[i] = stamp(&self.files[i]);
+                    if let Some(store) = &self.store {
+                        store.save(&crate::rel_path(&self.root, &self.files[i]), self.stamps[i], &self.defines[i], &self.facts[i]);
+                    }
+                }
+                None => {}
+            }
+        }
+        paths
     }
 
     /// Like `open`, keeping every file's facts in `dir` between runs: what
@@ -86,38 +150,9 @@ impl Session {
         let store = Store::new(dir);
         if let Some(mut session) = Session::restore(root, &options, &store) {
             let loaded = session.files.len();
-            // What the tree looks like now, against what was saved.
-            let now = crate::scan(root);
-            let mut paths: Vec<PathBuf> = now.iter().filter(|p| session.files.binary_search(p).is_err()).cloned().collect();
-            let on_disk: FxHashSet<&PathBuf> = now.iter().collect();
-            let stale: Vec<Option<bool>> = (0..session.files.len())
-                .into_par_iter()
-                .map(|i| {
-                    let path = &session.files[i];
-                    if !on_disk.contains(path) {
-                        return Some(true); // gone
-                    }
-                    if stamp(path) == session.stamps[i] {
-                        return None;
-                    }
-                    // Touched: the content says whether it changed.
-                    let same = std::fs::read(path).is_ok_and(|src| xxhash_rust::xxh3::xxh3_64(&src) == session.facts[i].hash);
-                    Some(!same)
-                })
-                .collect();
-            let mut restamp = Vec::new();
-            for (i, s) in stale.into_iter().enumerate() {
-                match s {
-                    Some(true) => paths.push(session.files[i].clone()),
-                    Some(false) => restamp.push(i),
-                    None => {}
-                }
-            }
-            for i in restamp {
-                session.stamps[i] = stamp(&session.files[i]);
-                store.save(&crate::rel_path(root, &session.files[i]), session.stamps[i], &session.defines[i], &session.facts[i]);
-            }
             session.store = Some(store);
+            // What the tree looks like now, against what was saved.
+            let paths = session.out_of_date();
             let mut up = session.update(&paths);
             up.loaded = loaded;
             up.extract_ms = ms(t) - up.link_ms;
@@ -169,6 +204,7 @@ impl Session {
             options: options.clone(),
             store: None,
             stamps,
+            scope: Scope::load(root),
             graph: Graph::default(),
             stats: LinkStats::default(),
         })
@@ -203,7 +239,9 @@ impl Session {
             if !is_source(&path) || !touched.insert(path.clone()) {
                 continue;
             }
-            match (self.files.binary_search(&path), path.is_file()) {
+            // A file out of the project's scope is as good as not there.
+            let there = path.is_file() && self.scope.contains(&crate::rel_path(&self.root, &path));
+            match (self.files.binary_search(&path), there) {
                 (Ok(i), true) => {
                     let defines = mask::defines(&std::fs::read(&path).unwrap_or_default());
                     defines_changed |= defines != self.defines[i];
@@ -383,6 +421,41 @@ mod tests {
         drop(s);
         let (s, up) = open(&d);
         assert_eq!((up.loaded, up.extracted, functions(&s, "fresh")), (3, 0, 1));
+    }
+
+    #[test]
+    fn the_scope_kept_in_the_tree_says_what_is_indexed() {
+        let d = Dir::new("scope");
+        std::fs::create_dir_all(d.0.join("lib")).unwrap();
+        std::fs::create_dir_all(d.0.join("tests")).unwrap();
+        d.write("lib/a.c", "int a (void) { return 0; }\n");
+        d.write("tests/t.c", "int t (void) { return a (); }\n");
+        d.write("main.c", "int main (void) { return a (); }\n");
+        let cache = d.0.join("cache-outside-scan");
+        let open = |d: &Dir| Session::open_cached(&d.0, Options::default(), cache.clone()).0;
+
+        let mut s = open(&d);
+        assert_eq!((s.files(), functions(&s, "t")), (3, 1));
+        // Leave the tests out; the setting goes into the tree.
+        let up = s.set_scope(Scope { include: vec![], exclude: vec!["tests".into()] }).unwrap();
+        assert_eq!((up.removed, s.files(), functions(&s, "t"), functions(&s, "a")), (1, 2, 0, 1));
+        assert!(Scope::config_path(&d.0).is_file());
+        drop(s);
+
+        // The next start finds the setting by itself.
+        let mut s = open(&d);
+        assert_eq!((s.files(), functions(&s, "t"), s.scope().exclude.len()), (2, 0, 1));
+        // Only `lib`: a file outside it is out even when told it changed.
+        s.set_scope(Scope { include: vec!["lib".into()], exclude: vec![] }).unwrap();
+        assert_eq!((s.files(), functions(&s, "main")), (1, 0));
+        assert_eq!(s.update(&[PathBuf::from("main.c")]).added, 0);
+        // Back to everything; and a sync picks up what changed meanwhile.
+        s.set_scope(Scope::default()).unwrap();
+        assert_eq!(s.files(), 3);
+        d.write("lib/b.c", "int b (void) { return 1; }\n");
+        std::fs::remove_file(d.0.join("main.c")).unwrap();
+        let up = s.sync();
+        assert_eq!((up.added, up.removed, functions(&s, "b"), functions(&s, "main")), (1, 1, 1, 0));
     }
 
     #[test]
