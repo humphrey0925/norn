@@ -91,8 +91,9 @@ pub struct Lexed {
     pub masked: Vec<u8>,
     /// In source order.
     pub events: Vec<Event>,
-    /// `#include` operands, quotes or angle brackets stripped.
-    pub includes: Vec<(u32, u32)>,
+    /// `#include` operands, quotes or angle brackets stripped, and whether
+    /// the directive is under an `#if`.
+    pub includes: Vec<(u32, u32, bool)>,
     /// Top-level `{ ... }` blocks by bracket matching alone: (start byte, end
     /// byte, last line). These are function bodies, and stay right where the
     /// parser's error recovery cuts a function short.
@@ -915,7 +916,8 @@ impl<'a> Lexer<'a> {
                     _ => 0,
                 };
                 if let Some(len) = text.iter().skip(1).position(|&b| b == close) {
-                    self.out.includes.push((open as u32 + 1, (open + 1 + len) as u32));
+                    let conditional = self.conds.iter().any(|c| !c.include_guard);
+                    self.out.includes.push((open as u32 + 1, (open + 1 + len) as u32, conditional));
                 }
             }
             _ => {}
@@ -1258,7 +1260,7 @@ struct s { int a; };
     fn includes_are_collected() {
         let src = "#include \"a/b.h\"\n# include <c.h> /* x */\n";
         let l = lex(src.as_bytes(), &MacroSets::default());
-        let got: Vec<&str> = l.includes.iter().map(|&(a, e)| &src[a as usize..e as usize]).collect();
+        let got: Vec<&str> = l.includes.iter().map(|&(a, e, _)| &src[a as usize..e as usize]).collect();
         assert_eq!(got, ["a/b.h", "c.h"]);
     }
 }

@@ -42,6 +42,8 @@ pub mod flag {
     /// A typedef of a function or function pointer type, or a member that
     /// can hold a function.
     pub const CALLABLE: u8 = 8;
+    /// A macro defined under an `#if`: it may not be defined at all.
+    pub const CONDITIONAL: u8 = 16;
 }
 
 pub mod refkind {
@@ -57,6 +59,10 @@ pub mod refkind {
     /// A call through a local pointer variable that the function assigns
     /// this name to: `fn = cond ? f : g; fn (x);`.
     pub const PCALL: u8 = 5;
+    /// Flag on a reference in the facts (not in the graph): it comes from
+    /// expanding a macro that is only defined in some configurations, so it
+    /// is one reading of the line, not the reading.
+    pub const MAYBE: u8 = 0x80;
 }
 
 pub const NONE: u32 = u32::MAX;
@@ -206,6 +212,9 @@ pub struct FileFacts {
     pub refs: Vec<Ref>,
     /// `#include` operands as written, as file-local name ids.
     pub includes: Vec<u32>,
+    /// For each of them, whether it is under an `#if` (other than the
+    /// file's include guard): the file may not be read at all.
+    pub include_conditional: Vec<bool>,
     pub macros: Vec<MacroBody>,
     pub sites: Vec<Site>,
     pub binds: Vec<Bind>,

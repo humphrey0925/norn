@@ -175,9 +175,10 @@ impl Extractor {
 
         let t = std::time::Instant::now();
         let lexed = mask::lex(src, transparent);
-        for &(a, e) in &lexed.includes {
+        for &(a, e, conditional) in &lexed.includes {
             let id = out.push_name(&String::from_utf8_lossy(&src[a as usize..e as usize]));
             out.includes.push(id);
+            out.include_conditional.push(conditional);
         }
         out.mask_ns = t.elapsed().as_nanos() as u64;
         let t = std::time::Instant::now();
@@ -349,7 +350,7 @@ impl<'a> Walk<'a> {
             match ev {
                 Event::Macro(m) => {
                     let name = self.intern(self.tok_text(&m.name));
-                    self.out.defs.push(Def { name, line: m.name.line, end_line: m.end_line, kind: kind::MACRO, flags: 0 });
+                    self.out.defs.push(Def { name, line: m.name.line, end_line: m.end_line, kind: kind::MACRO, flags: if m.conditional { flag::CONDITIONAL } else { 0 } });
                     let scope = (self.out.defs.len() - 1) as u32;
                     for t in &m.refs {
                         self.push_tok_ref(t, scope);

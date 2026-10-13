@@ -113,6 +113,11 @@ pub fn callers_through_macros(g: &graph::Graph, sym: u32) -> Vec<Caller> {
             if call_pending && !called && !from_macro {
                 continue;
             }
+            // A member is called only where it is called: a macro that
+            // merely names it (`.callback = (f)`) calls nothing.
+            if slot == Some(target) && !called {
+                continue;
+            }
             let ambiguous = via_ambiguous || e.ambiguous();
             let pending = call_pending && !called;
             if !pending {

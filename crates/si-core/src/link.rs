@@ -94,18 +94,21 @@ pub struct Options {
     pub include_aliases: Vec<(String, String)>,
 }
 
-fn include_edges(files: &[FileFacts], aliases: &[(String, String)], stats: &mut LinkStats) -> Vec<Vec<u32>> {
+/// Returns the edges twice: all of them, and those not under an `#if`.
+fn include_edges(files: &[FileFacts], aliases: &[(String, String)], stats: &mut LinkStats) -> (Vec<Vec<u32>>, Vec<Vec<u32>>) {
     let by_path: FxHashMap<&str, u32> = files.iter().enumerate().map(|(i, f)| (f.path.as_str(), i as u32)).collect();
     let mut by_base: FxHashMap<&str, Vec<u32>> = FxHashMap::default();
     for (i, f) in files.iter().enumerate() {
         by_base.entry(f.path.rsplit('/').next().unwrap_or(&f.path)).or_default().push(i as u32);
     }
-    let edges: Vec<(Vec<u32>, u64)> = files
+    let edges: Vec<(Vec<u32>, u64, Vec<u32>)> = files
         .par_iter()
         .map(|f| {
             let dir = dir_of(&f.path);
-            let (mut out, mut missing) = (Vec::new(), 0);
-            for &inc in &f.includes {
+            let (mut out, mut sure, mut missing) = (Vec::new(), Vec::new(), 0);
+            for (k, &inc) in f.includes.iter().enumerate() {
+                let before = out.len();
+                let always = !f.include_conditional.get(k).copied().unwrap_or(false);
                 let written = f.name(inc as usize);
                 let renamed = aliases.iter().find_map(|(from, to)| {
                     let dir = written.strip_suffix(from.as_str())?;
@@ -114,6 +117,9 @@ fn include_edges(files: &[FileFacts], aliases: &[(String, String)], stats: &mut 
                 let operand = renamed.as_deref().unwrap_or(written);
                 if let Some(&id) = by_path.get(join(dir, operand).as_str()) {
                     out.push(id);
+                    if always {
+                        sure.push(id);
+                    }
                     continue;
                 }
                 let tail = join("", operand);
@@ -131,15 +137,20 @@ fn include_edges(files: &[FileFacts], aliases: &[(String, String)], stats: &mut 
                     Some(best) => out.extend(cands.iter().copied().filter(|&c| shared(c) == best)),
                     None => missing += 1,
                 }
+                if always {
+                    sure.extend_from_slice(&out[before..]);
+                }
             }
             out.sort_unstable();
             out.dedup();
-            (out, missing)
+            sure.sort_unstable();
+            sure.dedup();
+            (out, missing, sure)
         })
         .collect();
     stats.includes_found = edges.iter().map(|e| e.0.len() as u64).sum();
     stats.includes_missing = edges.iter().map(|e| e.1).sum();
-    edges.into_iter().map(|e| e.0).collect()
+    edges.into_iter().map(|e| (e.0, e.2)).unzip()
 }
 
 /// Per-thread scratch for one file's include closure: membership in O(1),
@@ -248,10 +259,10 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
     // 0. Which file includes which, then macro expansion: it needs the
     //    definitions other files give, and adds definitions and references.
     let t = Instant::now();
-    let includes = include_edges(files, &options.include_aliases, &mut stats);
+    let (includes, sure_includes) = include_edges(files, &options.include_aliases, &mut stats);
     stats.include_ms = ms(t);
     let t = Instant::now();
-    (stats.sites, stats.expanded_defs, stats.expanded_refs) = crate::expand::expand(files, &includes, cache);
+    (stats.sites, stats.expanded_defs, stats.expanded_refs) = crate::expand::expand(files, &includes, &sure_includes, cache);
     stats.expand_ms = ms(t);
     let files: Vec<&FileFacts> = files.iter().zip(&cache.expanded).map(|(f, e)| e.as_ref().unwrap_or(f)).collect();
     let files = &files[..];
@@ -371,18 +382,21 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
     let per_file: Vec<(Vec<[u32; 3]>, [u64; 4], Vec<[u32; 4]>, Vec<[u32; 3]>)> = files
         .par_iter()
         .enumerate()
-        .map_init(|| Closure::new(files.len()), |closure, (fi, f)| {
+        .map_init(|| (Closure::new(files.len()), Closure::new(files.len())), |(closure, sure), (fi, f)| {
             closure.fill(fi as u32, &includes);
+            // What the file reads in every configuration.
+            sure.fill(fi as u32, &sure_includes);
             let base = g.files[fi].sym_start;
             let end = base + f.defs.len() as u32;
             let mut edges = Vec::with_capacity(f.refs.len());
             let mut counts = [0u64; 4]; // resolved, ambiguous, unresolved, capped
             let mut tmp: Vec<u32> = Vec::new();
             for r in &f.refs {
+                let (kind, maybe) = (r.kind & !refkind::MAYBE, r.kind & refkind::MAYBE != 0);
                 let cands = g.syms_named(remap[fi][r.name as usize]);
                 // A member name can only mean a member, and nothing else can.
-                let member = matches!(r.kind, refkind::MEMBER | refkind::ICALL);
-                let through = r.kind == refkind::ICALL;
+                let member = matches!(kind, refkind::MEMBER | refkind::ICALL);
+                let through = kind == refkind::ICALL;
                 // `#define error(...) (error (__VA_ARGS__), flag ())`: a macro
                 // is not expanded inside itself, so there the name is the
                 // function.
@@ -401,7 +415,7 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
                     continue;
                 }
                 let callable = |c: &u32| matches!(syms[*c as usize].kind, kind::FUNCTION | kind::MACRO);
-                if matches!(r.kind, refkind::CALL | refkind::PCALL) && tmp.iter().any(callable) {
+                if matches!(kind, refkind::CALL | refkind::PCALL) && tmp.iter().any(callable) {
                     tmp.retain(callable);
                 }
                 let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
@@ -410,7 +424,7 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
                 }
                 // Without types, a member name shared by many structs says
                 // nothing about which one is meant.
-                if r.kind == refkind::MEMBER && tmp.len() > MAX_MEMBER_CANDIDATES {
+                if kind == refkind::MEMBER && tmp.len() > MAX_MEMBER_CANDIDATES {
                     counts[2] += 1;
                     continue;
                 }
@@ -418,9 +432,15 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
                     tmp.truncate(MAX_CANDIDATES);
                     counts[3] += 1;
                 }
-                let ambiguous = tmp.len() > 1;
+                // A macro that is not there in every configuration is one
+                // reading of the name; so is what a call through it reaches.
+                let optional = |c: &u32| {
+                    let s = &syms[*c as usize];
+                    s.kind == kind::MACRO && (s.flags & flag::CONDITIONAL != 0 || s.file != fi as u32 && !sure.member[s.file as usize])
+                };
+                let ambiguous = tmp.len() > 1 || maybe || tmp.iter().any(optional);
                 counts[ambiguous as usize] += 1;
-                let meta = pack_meta(r.line, ambiguous, r.kind);
+                let meta = pack_meta(r.line, ambiguous, kind);
                 edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta]));
             }
 
