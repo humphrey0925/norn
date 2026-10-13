@@ -287,7 +287,8 @@ def bench_roundtrip(index_dir, project, n, with_cbm):
             if op == "find":
                 unique_def[name] = sum(x["kind"] == "function" and not x["decl"] for x in r["results"]) == 1
             if op == "callers":
-                fns = [x for x in r["results"] if x["kind"] == "function"]
+                # Compared with a tool that follows no function pointers.
+                fns = [x for x in r["results"] if x["kind"] == "function" and "through" not in x]
                 si_callers[name] = ({x["name"] for x in fns if x["certain"]}, {x["name"] for x in fns})
     srv.close()
     res["si"] = {k: latency(v) for k, v in t.items()}
@@ -333,6 +334,16 @@ def bench_roundtrip(index_dir, project, n, with_cbm):
     return res
 
 
+INCLUDE_ALIASES = ["bfd.h=bfd-in2.h", "elf32-target.h=elfxx-target.h", "elf64-target.h=elfxx-target.h"]
+
+
+def truth_line(score):
+    d, c, i = score["definitions"], score["calls"], score["indirect_calls_by_member"]
+    return (f"definitions recall {d['recall']:.2%} precision {d['precision']:.2%}; "
+            f"calls recall {c['recall_any']:.2%} ({c['recall_certain']:.2%} certain) precision {c['precision_certain']:.2%}; "
+            f"through members recall {i['recall']:.2%} precision {i['precision']:.2%}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus", default=str(ROOT / "corpus" / "c-only"))
@@ -362,7 +373,7 @@ def main():
 
     print("si: in-process queries and incremental", flush=True)
     index_dir = OUT / "si"
-    si("index", corpus, "--out", index_dir, "--stores", "csr,csr-packed,sqlite-naive,sqlite-tuned")
+    si("index", corpus, "--out", index_dir, "--stores", "csr,csr-packed,sqlite-naive,sqlite-tuned", "--dump-binds")
     res["si_query"] = si("bench-query", index_dir, "--n", 2000)[2]
     expected, found, missing = check_defs.recall(corpus, index_dir)
     res["si_accuracy"] = {"function_defs_expected": expected, "function_defs_found": found,
@@ -371,10 +382,16 @@ def main():
     truth = ROOT / "out" / "gt" / "truth.json"  # from bench/gt_extract.py, if the corpus was built
     if truth.exists():
         res["si_truth"] = check_truth.score(truth, index_dir, corpus)[0]
-        d, c = res["si_truth"]["definitions"], res["si_truth"]["calls"]
-        print(f"  against clang: definitions recall {d['recall']:.2%} precision {d['precision']:.2%}; "
-              f"calls recall {c['recall_any']:.2%} ({c['recall_certain']:.2%} certain) "
-              f"precision {c['precision_certain']:.2%}", flush=True)
+        print("  against clang:", truth_line(res["si_truth"]), flush=True)
+        # The same with the project told which templates its generated
+        # headers come from, when it is the corpus those names belong to.
+        if (Path(corpus) / "bfd" / "bfd-in2.h").exists():
+            aliased = OUT / "si-aliased"
+            si("index", corpus, "--out", aliased, "--stores", "csr", "--dump-binds",
+               *[x for a in INCLUDE_ALIASES for x in ("--include-alias", a)])
+            res["si_truth_with_include_aliases"] = {"aliases": INCLUDE_ALIASES,
+                                                    **check_truth.score(truth, aliased, corpus)[0]}
+            print("  with include aliases:", truth_line(res["si_truth_with_include_aliases"]), flush=True)
     wall, peak, js = si("bench-incr", corpus, "--n", 30)
     res["si_incremental"] = js
 
@@ -388,6 +405,9 @@ def main():
         res["cbm_incremental"] = {"after_edit": touch_and_reindex(corpus, "full"), "no_change": cbm_index(corpus, "full")}
         for k, r in res["cbm_incremental"].items():
             print(f"  cbm reindex {k:10s} wall {r['wall_s']:6.2f}s  peak {r['peak_rss_bytes'] >> 20} MB", flush=True)
+        if truth.exists():
+            res["cbm_truth"] = check_truth.score(truth, CBM_CACHE / f"{project}.db", corpus, cbm=True)[0]
+            print("  cbm against clang:", truth_line(res["cbm_truth"]), flush=True)
 
     print("round-trip queries over stdio", flush=True)
     res["roundtrip"] = bench_roundtrip(index_dir, project, 100 if args.quick else 300, not args.skip_cbm)

@@ -522,6 +522,118 @@ mod tests {
         out
     }
 
+    /// Like `graph`, with the corpus-wide pre-pass, so macros are expanded.
+    fn expanded(files: &[(&str, &str)]) -> Graph {
+        let sets = MacroSets::from_defines(files.iter().flat_map(|(_, src)| crate::mask::defines(src.as_bytes())));
+        let mut ex = Extractor::new();
+        let facts: Vec<FileFacts> = files.iter().map(|(path, src)| ex.extract(path, src.as_bytes(), &sets)).collect();
+        link(&facts).0
+    }
+
+    fn kinds(g: &Graph, name: &str) -> Vec<u8> {
+        g.find(name).iter().map(|&s| g.syms[s as usize].kind).collect()
+    }
+
+    /// (callee, member or variable it was reached through) for all `caller` calls.
+    fn callees(g: &Graph, caller: &str) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = g
+            .find(caller)
+            .iter()
+            .flat_map(|&s| crate::callees_through_slots(g, s))
+            .map(|c| (g.sym_name(c.caller).to_string(), c.slot.map_or(String::new(), |m| g.sym_name(m).to_string())))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn a_pasted_name_is_a_definition_in_each_unit_that_makes_it() {
+        let g = expanded(&[
+            ("cat.h", "#define CAT(a,b) a##b\n"),
+            ("tmpl.h", "#include \"cat.h\"\nint NAME (helper) (void) { return 0; }\nint NAME (entry) (void) { return NAME (helper) (); }\n"),
+            ("x32.c", "#define NAME(x) CAT (x, _32)\n#include \"tmpl.h\"\n"),
+            ("x64.c", "#define NAME(x) CAT (x, _64)\n#include \"tmpl.h\"\n"),
+            ("user.c", "int entry_32 (void);\nint f (void) { return entry_32 (); }\n"),
+        ]);
+        assert_eq!(targets(&g, "f", "entry_32"), ["tmpl.h"]);
+        // Each variant calls its own helper, not the other unit's.
+        assert_eq!(targets(&g, "entry_32", "helper_32"), ["tmpl.h"]);
+        assert!(targets(&g, "entry_32", "helper_64").is_empty());
+        assert_eq!(targets(&g, "entry_64", "helper_64"), ["tmpl.h"]);
+        assert!(g.find("NAME").iter().all(|&s| g.syms[s as usize].kind == kind::MACRO));
+    }
+
+    #[test]
+    fn a_macro_that_declares_its_argument_declares_it() {
+        let g = expanded(&[
+            ("r.h", "#define START(n) enum n {\n#define NUM(n, v) n = v,\n#define END(n) n };\n"),
+            ("avr.h", "#include \"r.h\"\nSTART (kinds)\n  NUM (K_NONE, 0)\n  NUM (K_ONE, 1)\nEND (K_max)\n"),
+        ]);
+        assert_eq!(kinds(&g, "kinds"), [kind::ENUM]);
+        assert_eq!(kinds(&g, "K_ONE"), [kind::ENUM_CONST]);
+    }
+
+    #[test]
+    fn a_renaming_macro_names_the_definition_only_where_it_is_defined() {
+        let g = expanded(&[
+            ("impl.c", "#ifdef WIDE\n#define build wide_build\n#endif\nint build (int x) { return x; }\n"),
+            ("wide.c", "#define WIDE\n#include \"impl.c\"\n"),
+        ]);
+        assert_eq!(kinds(&g, "wide_build"), [kind::FUNCTION]);
+        assert!(kinds(&g, "build").contains(&kind::FUNCTION));
+    }
+
+    #[test]
+    fn calls_through_a_member_reach_what_is_stored_there() {
+        let g = expanded(&[
+            ("ops.h", "struct ops { int (*open) (int); int (*close) (int); int count; };\n#define CALL(o, m, a) ((*((o)->m)) (a))\n"),
+            (
+                "a.c",
+                "#include \"ops.h\"\nstatic int a_open (int x) { return x; }\nstatic int a_close (int x) { return x; }\n\
+                 #define PAIR(p) p##_open, p##_close\nconst struct ops a_ops = { PAIR (a), 0 };\n",
+            ),
+            (
+                "b.c",
+                "#include \"ops.h\"\nstatic int b_open (int x) { return x; }\nint b_close (int x) { return x; }\n\
+                 const struct ops b_ops = {\n#ifdef FAST\n  b_open,\n#else\n  0,\n#endif\n  b_close };\n",
+            ),
+            ("use.c", "#include \"ops.h\"\nint run (struct ops *o) { return o->open (1) + CALL (o, close, 2) + o->count; }\n"),
+        ]);
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            callees(&g, "run"),
+            [pair("CALL", ""), pair("a_close", "close"), pair("a_open", "open"), pair("b_close", "close"), pair("b_open", "open")]
+        );
+        let callers: Vec<&str> =
+            crate::callers_through_macros(&g, g.find("a_close")[0]).iter().filter(|c| c.indirect()).map(|c| g.sym_name(c.caller)).collect();
+        assert_eq!(callers, ["run"]);
+        // Members are symbols; a plain use of one is not a call through it.
+        assert_eq!(kinds(&g, "count"), [kind::FIELD]);
+        assert_eq!(targets(&g, "run", "count"), ["ops.h"]);
+    }
+
+    #[test]
+    fn calls_through_a_variable_reach_what_is_assigned_to_it() {
+        let g = graph(&[(
+            "h.c",
+            "static int (*hook) (int);\nstatic int impl (int x) { return x; }\nstatic int other (int x) { return x; }\n\
+             void set (int fast) { hook = fast ? impl : &other; }\nint go (void) { return hook (3); }\n",
+        )]);
+        assert_eq!(callees(&g, "go"), [("hook".to_string(), String::new()), ("impl".to_string(), "hook".to_string()), ("other".to_string(), "hook".to_string())]);
+    }
+
+    #[test]
+    fn a_member_that_cannot_hold_a_function_is_no_slot() {
+        let g = graph(&[
+            ("t.h", "typedef int (*handler) (int);\ntypedef unsigned long word;\nstruct a { word f; };\nstruct b { handler f; };\n"),
+            ("u.c", "#include \"t.h\"\nint h (int x) { return x; }\nvoid set (struct b *p) { p->f = h; }\nint go (struct b *p) { return p->f (1); }\n"),
+        ]);
+        assert_eq!(callees(&g, "go"), [("h".to_string(), "f".to_string())]);
+        let slots: Vec<u32> = g.find("h").iter().flat_map(|&s| g.refs_to(s)).filter(|e| e.kind() == refkind::BIND).map(|e| g.syms[e.other as usize].line).collect();
+        assert_eq!(slots, [4], "only the member of struct b");
+    }
+
     #[test]
     fn a_static_function_is_visible_to_a_file_that_includes_it() {
         let g = graph(&[

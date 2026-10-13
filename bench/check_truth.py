@@ -204,6 +204,9 @@ def score(truth_path, index, corpus, cbm=False):
                   "precision": len(right_pairs) / max(1, len(pairs)),
                   "truth_stores": len(truth_pairs), "recall": len(right_pairs) / max(1, len(truth_pairs))}
     got_ind, judged_ind = set(), set()
+    if cbm:
+        # It has one kind of call edge; any of them may be one of these.
+        got_ind = {(cf, cn, ef, en) for _sf, _sl, cn, cf, en, ef, _how, _decl in call_rows}
     for site_file, site_line, cn, cf, en, ef, via, decl in indirect_rows:
         if decl == "decl":
             continue
