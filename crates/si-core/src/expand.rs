@@ -19,6 +19,12 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
+/// Where expansion spends its time, in nanoseconds (`SI_EXPAND_PROFILE`).
+static SPENT: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+fn spend(i: usize, since: std::time::Instant) {
+    SPENT[i].fetch_add(since.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Distinct expansions kept for one use.
 const MAX_VARIANTS: usize = 24;
 /// Definitions of one name tried at one use.
@@ -295,6 +301,12 @@ fn parse(text: &str, function_like: bool, guard: &str) -> Parsed {
 struct Table<'a> {
     files: &'a [FileFacts],
     by_name: FxHashMap<&'a str, Vec<(u32, u32)>>,
+    /// The same definitions in the order of their text, each with a number
+    /// that definitions of the same text (spacing aside) share: sorted and
+    /// compared once for the corpus, where every file's engine would
+    /// otherwise do it again for every name it meets, and a common name
+    /// has thousands of definitions.
+    by_text: FxHashMap<&'a str, Vec<(u32, u32, u32)>>,
     parsed: Vec<Vec<Parsed>>,
 }
 
@@ -319,6 +331,12 @@ struct Engine<'a> {
     active: Vec<Arc<str>>,
     steps: u32,
     hiding: FxHashMap<Box<str>, bool>,
+    /// This engine's own copy of each macro body it has used. The tokens
+    /// of the bodies in the table are shared by every thread, and copying
+    /// one counts a reference on it: with every core expanding the same
+    /// few macros (`BIT`, `GENMASK`), they spend their time taking the
+    /// counter from each other. A copy made once is this thread's alone.
+    bodies: FxHashMap<usize, std::rc::Rc<Vec<T>>>,
     /// Set when the engine stands for all the translation units of this
     /// file together.
     merged: Option<u32>,
@@ -327,6 +345,29 @@ struct Engine<'a> {
     /// Files this unit reads whatever the configuration (no `#include`
     /// under an `#if` on the way). Empty: all of them.
     sure: Vec<bool>,
+}
+
+impl<'a> Table<'a> {
+    fn new(files: &'a [FileFacts], by_name: FxHashMap<&'a str, Vec<(u32, u32)>>, parsed: Vec<Vec<Parsed>>) -> Self {
+        let text = |f: u32, i: u32| files[f as usize].name(files[f as usize].macros[i as usize].text as usize);
+        let by_text = by_name
+            .par_iter()
+            .map(|(&name, defs)| {
+                let mut sorted: Vec<(&str, u32, u32)> = defs.iter().map(|&(f, i)| (text(f, i), f, i)).collect();
+                sorted.sort_unstable();
+                // Texts that differ only in spacing are one definition,
+                // wherever the order of the texts puts them.
+                let mut classes: FxHashMap<Vec<&str>, u32> = FxHashMap::default();
+                let mut out = Vec::with_capacity(sorted.len());
+                for &(t, f, i) in &sorted {
+                    let n = classes.len() as u32;
+                    out.push((f, i, *classes.entry(t.split_whitespace().collect()).or_insert(n)));
+                }
+                (name, out)
+            })
+            .collect();
+        Table { files, by_name, by_text, parsed }
+    }
 }
 
 impl<'a> Engine<'a> {
@@ -340,6 +381,7 @@ impl<'a> Engine<'a> {
             active: Vec::new(),
             steps: 0,
             hiding: FxHashMap::default(),
+            bodies: FxHashMap::default(),
             merged: None,
             max_variants: MAX_VARIANTS,
             sure: Vec::new(),
@@ -365,38 +407,41 @@ impl<'a> Engine<'a> {
 
     fn candidates(&mut self, name: &str) -> &[&'a Parsed] {
         if !self.cands.contains_key(name) {
-            let all = self.table.by_name.get(name).map_or(&[][..], |v| &v[..]);
-            let mut seen: Vec<(&str, u32, u32)> = all
-                .iter()
-                .filter(|(f, _)| self.visible[*f as usize])
-                .map(|&(f, i)| (self.table.files[f as usize].name(self.table.files[f as usize].macros[i as usize].text as usize), f, i))
-                .collect();
+            // The definitions this unit can see, one of each text, in the
+            // order of the texts (which must not depend on which file was
+            // read first).
+            let all = self.table.by_text.get(name).map_or(&[][..], |v| &v[..]);
+            let one_of_each = |defs: &mut dyn Iterator<Item = &(u32, u32, u32)>| -> Vec<(u32, u32, u32)> {
+                let mut out: Vec<(u32, u32, u32)> = Vec::new();
+                for &d in defs {
+                    if out.last().is_none_or(|l| l.2 != d.2) {
+                        out.push(d);
+                    }
+                }
+                out
+            };
+            let mut seen = one_of_each(&mut all.iter().filter(|d| self.visible[d.0 as usize]));
             if seen.is_empty() {
                 // An `#include` that could not be followed (a generated
                 // header, say) may hide the definition. A header can reach
                 // any file, a source file only itself. If several headers
                 // define the name differently there is no telling which is
                 // meant.
-                let headers: Vec<(&str, u32, u32)> = all
-                    .iter()
-                    .filter(|(f, _)| self.table.files[*f as usize].path.ends_with(".h"))
-                    .map(|&(f, i)| {
-                        let file = &self.table.files[f as usize];
-                        (file.name(file.macros[i as usize].text as usize), f, i)
-                    })
-                    .collect();
-                let one_file = headers.iter().all(|h| h.1 == headers[0].1);
-                let one_text = headers.iter().all(|h| h.0.split_whitespace().eq(headers[0].0.split_whitespace()));
-                if one_file || one_text {
-                    seen = headers;
+                let header = |d: &&(u32, u32, u32)| self.table.files[d.0 as usize].path.ends_with(".h");
+                let mut headers = all.iter().filter(header);
+                if let Some(first) = headers.next() {
+                    let (mut one_file, mut one_text) = (true, true);
+                    for d in headers {
+                        one_file &= d.0 == first.0;
+                        one_text &= d.2 == first.2;
+                    }
+                    if one_file || one_text {
+                        seen = one_of_each(&mut all.iter().filter(header));
+                    }
                 }
             }
-            // The same text is the same definition; the order must not depend
-            // on which file was read first.
-            seen.sort_unstable();
-            seen.dedup_by(|a, b| a.0.split_whitespace().eq(b.0.split_whitespace()));
             seen.truncate(MAX_CANDIDATES);
-            let mut list: Vec<&'a Parsed> = seen.iter().map(|&(_, f, i)| &self.table.parsed[f as usize][i as usize]).collect();
+            let mut list: Vec<&'a Parsed> = seen.iter().map(|&(f, i, _)| &self.table.parsed[f as usize][i as usize]).collect();
             // `#ifndef X` / `#define X default` gives way to any other
             // definition there is.
             if list.iter().any(|p| !p.fallback) {
@@ -550,10 +595,15 @@ impl<'a> Engine<'a> {
         args.resize(np, Vec::new());
         let mut expanded: Vec<Option<Vec<T>>> = vec![None; np];
         let empty = || T { text: "".into(), k: K::Other, origin: Origin::Body, noexpand: false };
+        let own = self
+            .bodies
+            .entry(m as *const Parsed as usize)
+            .or_insert_with(|| std::rc::Rc::new(m.body.iter().map(|t| T { text: Arc::from(&*t.text), k: t.k, origin: t.origin, noexpand: t.noexpand }).collect()))
+            .clone();
         let mut res: Vec<T> = Vec::with_capacity(m.body.len());
         let mut i = 0;
         while i < m.body.len() {
-            let t = &m.body[i];
+            let t = &own[i];
             let p = m.param_at[i];
             if t.is("#") && m.function_like && m.param_at.get(i + 1).is_some_and(|&p| p != NONE) {
                 res.push(T { text: "\"\"".into(), k: K::Other, origin: Origin::Body, noexpand: false });
@@ -629,14 +679,21 @@ impl<'a> Engine<'a> {
             self.met.clear();
             self.active.clear();
             self.steps = 0;
+            let t = std::time::Instant::now();
             let out = self.expand(toks.to_vec());
+            spend(0, t);
+            SPENT[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SPENT[5].fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
             for m in self.met.drain(..) {
                 if !pinned.contains_key(&m.0) && !free.iter().any(|f| f.0 == m.0) {
                     free.push(m);
                 }
             }
             if !results.iter().any(|r| r.0.len() == out.len() && r.0.iter().zip(&out).all(|(a, b)| a.text == b.text)) {
-                if novel(&out) {
+                let t = std::time::Instant::now();
+                let is_novel = novel(&out);
+                spend(1, t);
+                if is_novel {
                     stale = 0;
                 }
                 results.push((out, self.choice.clone()));
@@ -1103,6 +1160,7 @@ fn expand_file(
             vec![Engine { merged: Some(fi as u32), ..Engine::new(table, visible(fi as u32, fwd, rev)) }]
         }
     };
+    let t_setup = std::time::Instant::now();
     let mut engines = make_engines();
     let mut out = f.clone();
     let mut names = Names { ids: (0..f.n_names()).map(|i| (f.name(i).to_string(), i as u32)).collect() };
@@ -1110,6 +1168,7 @@ fn expand_file(
     let live: Vec<&Site> =
         f.sites.iter().filter(|s| engines.iter_mut().any(|e| e.hides(f.name(s.name as usize)))).collect();
 
+    spend(2, t_setup);
     // 1. Definitions written under a macro's name: one per expansion.
     let mut variants: FxHashMap<u32, Vec<(u32, Contexts)>> = FxHashMap::default();
     for s in live.iter().filter(|s| s.def != NONE) {
@@ -1298,6 +1357,18 @@ fn expand_file(
                 out.binds.push(bind);
             }
         }
+    }
+
+    // Nothing came of it (the usual case: most uses expand to nothing that
+    // names anything): the file stands as it was, and no second copy of
+    // its facts is kept.
+    let same = out.defs.len() == f.defs.len()
+        && out.refs.len() == f.refs.len()
+        && out.binds.len() == f.binds.len()
+        && out.ref_hints.len() == f.ref_hints.len()
+        && out.defs.iter().zip(&f.defs).all(|(a, b)| a.name == b.name);
+    if same {
+        return None;
     }
 
     // Keep the definitions in line order, as the link expects.
@@ -1563,15 +1634,39 @@ pub fn expand(files: &[FileFacts], includes: &[Vec<u32>], sure_includes: &[Vec<u
                 f.macros.iter().map(one).collect()
             })
             .collect();
-        let table = Table { files, by_name, parsed };
+        let table = Table::new(files, by_name, parsed);
         let mut rev: Vec<Vec<u32>> = vec![Vec::new(); files.len()];
         for (from, tos) in includes.iter().enumerate() {
             for &to in tos {
                 rev[to as usize].push(from as u32);
             }
         }
-        let done: Vec<Option<(FileFacts, u64, u64)>> =
-            stale.par_iter().map(|&fi| expand_file(fi, &files[fi], &table, includes, sure_includes, &rev)).collect();
+        let profile = std::env::var_os("SI_EXPAND_PROFILE").is_some();
+        let spent: Vec<std::sync::atomic::AtomicU64> = if profile { files.iter().map(|_| Default::default()).collect() } else { Vec::new() };
+        let done: Vec<Option<(FileFacts, u64, u64)>> = stale
+            .par_iter()
+            .map(|&fi| {
+                let t = std::time::Instant::now();
+                let out = expand_file(fi, &files[fi], &table, includes, sure_includes, &rev);
+                if profile {
+                    spent[fi].store(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                out
+            })
+            .collect();
+        if profile {
+            let mut all: Vec<(u64, usize)> = spent.iter().enumerate().map(|(i, s)| (s.load(std::sync::atomic::Ordering::Relaxed), i)).collect();
+            all.sort_unstable_by(|a, b| b.cmp(a));
+            let total: u64 = all.iter().map(|a| a.0).sum();
+            let headers: u64 = all.iter().filter(|a| files[a.1].path.ends_with(".h")).map(|a| a.0).sum();
+            let at = |i: usize| SPENT[i].load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!("  expanding {:.1} s, recognising new {:.1} s, engines and live {:.1} s; {} runs, {} tokens out", at(0) as f64 / 1e9, at(1) as f64 / 1e9, at(2) as f64 / 1e9, at(4), at(5));
+            eprintln!("expand: {:.1} cpu-s in all, {:.1} in headers; top 1% of files {:.1}", total as f64 / 1e6, headers as f64 / 1e6, all.iter().take(all.len() / 100).map(|a| a.0).sum::<u64>() as f64 / 1e6);
+            for (us, i) in all.iter().take(15) {
+                let f = &files[*i];
+                eprintln!("  {:8.1} ms  {} sites {} inits {} rev {}", *us as f64 / 1e3, f.path, f.sites.len(), f.inits.len(), rev[*i].len());
+            }
+        }
         for (&fi, d) in stale.iter().zip(done) {
             (cache.expanded[fi], cache.added[fi]) = match d {
                 Some((f, defs, refs)) => (Some(f), (defs, refs)),
@@ -1640,7 +1735,7 @@ mod tests {
         for (i, m) in files[0].macros.iter().enumerate() {
             by_name.entry(files[0].name(m.name as usize)).or_default().push((0, i as u32));
         }
-        let table = Table { files: &files, by_name, parsed };
+        let table = Table::new(&files, by_name, parsed);
         let mut eng = Engine::new(&table, vec![true]);
         for (src, want) in [
             ("NAME (elf)", "elf32"),
