@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use si_core::graph::Graph;
 use si_core::model::{flag, kind, refkind};
 use si_core::session::Session;
+
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -353,7 +354,16 @@ impl Server {
             let callable = |s: &Server, x: u32| matches!(s.g().syms[x as usize].kind, kind::FUNCTION | kind::MACRO);
             let mut under: Vec<u32> = self.targets(params).into_iter().filter(|&x| callable(self, x)).collect();
             under.sort_by_key(|&x| self.g().syms[x as usize].flags & flag::DECL != 0);
-            under.first().copied().or_else(|| {
+            // On a variable, a type, a member or a constant: who uses it is
+            // its "called by"; a member or variable that holds functions
+            // "calls" those.
+            let found = self.targets(params);
+            let other = {
+                let g = self.g();
+                let wanted = |&x: &u32| g.syms[x as usize].kind != kind::FILE && (incoming || !si_core::stored_in(g, x).is_empty());
+                found.into_iter().find(wanted)
+            };
+            under.first().copied().or(other).or_else(|| {
                 // Not on a function's name: the function the cursor is in.
                 let file = self.relative(&uri_to_path(params["textDocument"]["uri"].as_str()?))?;
                 let line = params["position"]["line"].as_u64()? as u32 + 1;
@@ -364,11 +374,27 @@ impl Server {
         };
         let Some(root) = root else { return json!({ "root": null, "entries": [] }) };
         let g = self.g();
-        let edges = if incoming { si_core::callers_through_macros(g, root) } else { si_core::callees_through_slots(g, root) };
+        let root_kind = g.syms[root as usize].kind;
+        let edges = match (incoming, root_kind) {
+            (true, kind::FUNCTION) => si_core::callers_through_macros(g, root),
+            // A macro is called, and (as a constant, say) just used.
+            (true, kind::MACRO) => {
+                let mut all = si_core::callers_through_macros(g, root);
+                let known: std::collections::HashSet<(u32, u32)> = all.iter().map(|c| (c.caller, c.line)).collect();
+                all.extend(si_core::users(g, root).into_iter().filter(|c| !known.contains(&(c.caller, c.line))));
+                all
+            }
+            (true, _) => si_core::users(g, root),
+            (false, kind::FUNCTION | kind::MACRO) => si_core::callees_through_slots(g, root),
+            (false, _) => si_core::stored_in(g, root),
+        };
+        let callable_root = matches!(root_kind, kind::FUNCTION | kind::MACRO);
         // (other end, macro, member or variable, pointer) -> (lines, certain)
         let mut groups: Vec<((u32, Option<u32>, Option<u32>, bool), Vec<u32>, bool)> = Vec::new();
         for c in edges {
-            if !matches!(g.syms[c.caller as usize].kind, kind::FUNCTION | kind::MACRO | kind::GLOBAL) {
+            // A function is called from code; anything else may also be
+            // mentioned by a type, or at the top of a file.
+            if callable_root && !matches!(g.syms[c.caller as usize].kind, kind::FUNCTION | kind::MACRO | kind::GLOBAL) {
                 continue;
             }
             let key = (c.caller, c.via.filter(|v| Some(*v) != c.slot), c.slot, c.pointer);
@@ -385,6 +411,7 @@ impl Server {
         for ((other, via, slot, pointer), mut lines, certain) in groups {
             lines.sort_unstable();
             lines.dedup();
+            lines.retain(|&l| l != 0);
             let names = { let g = self.g(); (via.map(|m| g.sym_name(m).to_string()), slot.map(|m| g.sym_name(m).to_string())) };
             let mut v = self.entry(other);
             v["lines"] = json!(lines);

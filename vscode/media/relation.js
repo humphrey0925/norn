@@ -234,7 +234,7 @@
     if (mode === "references") return refs ? renderRefs() : (root.innerHTML = "");
     if (mode === "assignments") return renderAssigned();
     if (!top) {
-      root.innerHTML = '<div class="empty">Put the cursor on a function to see what it calls and what calls it.</div>';
+      root.innerHTML = '<div class="empty">Put the cursor on a function to see what it calls and what calls it, or on a variable, type or member to see what uses it.</div>';
       return;
     }
     if (view === "graph") return renderGraph();

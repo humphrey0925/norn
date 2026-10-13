@@ -187,8 +187,11 @@ class Relation implements vscode.WebviewViewProvider {
     if (at !== this.at) {
       return; // the cursor has moved on
     }
-    const what = this.mode === "callers" ? "called by" : "calls";
-    const message = r?.root ? `${r.root.name} ${what} ${r.entries.length}` : "The cursor is not on a function";
+    // A function is called; a variable, a type or a member is used, and a
+    // member or variable holds the functions stored in it.
+    const callable = r?.root?.kind === "function" || r?.root?.kind === "macro";
+    const what = this.mode === "callers" ? (callable ? "called by" : "used by") : callable ? "calls" : "holds";
+    const message = r?.root ? `${r.root.name} ${what} ${r.entries.length}` : "The cursor is not on a symbol";
     void w.postMessage({ type: "root", mode: this.mode, root: r?.root ?? null, entries: r?.entries ?? [], message });
   }
 

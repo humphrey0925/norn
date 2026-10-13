@@ -155,6 +155,21 @@ def main():
         where = c.request("si/assignments", c.at("bfd/cache.c", "cache_bread (struct bfd *abfd"))
         assert where["by"] == "function" and [r["member"]["name"] for r in where["rows"]] == ["bread"], where
         assert where["rows"][0]["inside"] == "cache_iovec", where["rows"][0]
+        # "Called by" of what is not a function: who uses it. A variable...
+        rel = c.request("si/relation", {**c.at("bfd/cache.c", "bfd_last_cache", 1), "direction": "callers"})
+        users = {e["name"] for e in rel["entries"]}
+        assert rel["root"]["kind"] == "global" and {"insert", "snip", "bfd_cache_lookup_worker"} <= users, (rel["root"], users)
+        assert all(e["lines"] for e in rel["entries"])
+        # ...a struct member (here one that is called through)...
+        rel = c.request("si/relation", {**c.at("bfd/bfdio.c", "bread (abfd, ptr"), "direction": "callers"})
+        assert rel["root"]["kind"] == "field" and "bfd_read" in {e["name"] for e in rel["entries"]}, rel["root"]
+        # ...which "calls" the functions stored in it...
+        rel = c.request("si/relation", {**c.at("bfd/bfdio.c", "bread (abfd, ptr"), "direction": "callees"})
+        assert rel["root"]["kind"] == "field" and "cache_bread" in {e["name"] for e in rel["entries"]}, rel
+        # ...and a type.
+        rel = c.request("si/relation", {**c.at("bfd/cache.c", "bfd_iovec cache_iovec"), "direction": "callers"})
+        assert rel["root"]["name"] == "bfd_iovec" and rel["entries"], rel["root"]
+        print("called by: variables, members and types list who uses them")
         print("si/relation, si/context, si/search answer as the views expect")
 
         # Save an edit: a new function calling an existing one.

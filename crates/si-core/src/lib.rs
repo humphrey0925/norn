@@ -175,6 +175,29 @@ pub fn callers_through_macros(g: &graph::Graph, sym: u32) -> Vec<Caller> {
     out
 }
 
+/// Who mentions `sym`, whatever it is: the "called by" of a variable, a
+/// type, a member, a constant or a macro. A function's callers are these
+/// only in part (see [`callers_through_macros`]).
+pub fn users(g: &graph::Graph, sym: u32) -> Vec<Caller> {
+    use model::refkind;
+    let of = |e: &model::EdgeHalf| Caller {
+        caller: e.other,
+        line: e.line(),
+        ambiguous: e.ambiguous(),
+        via: None,
+        slot: None,
+        pointer: e.kind() == refkind::PCALL,
+    };
+    g.refs_to(sym).iter().filter(|e| e.kind() != refkind::BIND).map(of).collect()
+}
+
+/// The functions stored in the member or variable `slot`: what a call
+/// through it may reach.
+pub fn stored_in(g: &graph::Graph, slot: u32) -> Vec<Caller> {
+    let of = |e: &model::EdgeHalf| Caller { caller: e.other, line: 0, ambiguous: e.ambiguous(), via: None, slot: None, pointer: false };
+    g.refs_from(slot).iter().filter(|e| e.kind() == model::refkind::BIND).map(of).collect()
+}
+
 /// What `sym` calls: by name, and through members and variables (`via`),
 /// each function stored there.
 pub fn callees_through_slots(g: &graph::Graph, sym: u32) -> Vec<Caller> {
