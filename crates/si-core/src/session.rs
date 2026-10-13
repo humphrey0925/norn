@@ -120,6 +120,13 @@ impl Session {
         Settings::load(&self.root)
     }
 
+    /// Replace every set of conditions the project has, and which is in
+    /// force; index again if that changes anything.
+    pub fn set_condition_project(&mut self, project: &crate::cond::Project) -> std::io::Result<Update> {
+        project.save(&self.root)?;
+        Ok(self.sync())
+    }
+
     /// How many macros the conditions settle, one way or the other.
     pub fn conditions_known(&self) -> usize {
         self.conditions.len()

@@ -445,102 +445,177 @@ interface ConditionSettings {
   undefines: string[];
   assumeUndefined: string[];
   conditionFiles: string[];
-  known?: number;
 }
 
-/** One row of the Conditions view: a group, or a setting in it. */
-interface ConditionRow {
-  group: "defines" | "undefines" | "conditionFiles" | "assumeUndefined";
-  key?: string;
+/** What the server says of the conditions: every set, the one in force,
+ *  what that comes to, and build configurations a set could follow. */
+interface ConditionState {
+  configurations: Record<string, Partial<ConditionSettings>>;
+  active: string | null;
+  available: { name: string; source: string }[];
+  effective: { name: string; value: string | null; source: string }[];
+  known: number;
+}
+
+/** One row of the Conditions view. */
+type ConditionRow =
+  | { type: "config" }
+  | { type: "source"; source: string }
+  | { type: "macro"; name: string; value: string | null; source: string }
+  | { type: "assume"; prefix: string };
+
+/** `.cproject#Debug` as "Debug (.cproject)"; a plain file as its name. */
+function sourceLabel(source: string): string {
+  const hash = source.lastIndexOf("#");
+  const [file, name] = hash > 0 ? [source.slice(0, hash), source.slice(hash + 1)] : [source, ""];
+  const base = file.split(/[\\/]/).pop() ?? file;
+  return name ? `${name} (${base})` : base;
 }
 
 /** What the build defines, so that `#if` branches it does not compile are
- *  left out of the index. Kept in `.si/config.json` with the scope. */
+ *  left out of the index: several sets, as a build has configurations, one
+ *  in force. The view shows what that one comes to, macro by macro, under
+ *  what says so. Kept in `.si/config.json` with the scope. */
 class ConditionsTree implements vscode.TreeDataProvider<ConditionRow> {
   private readonly changed = new vscode.EventEmitter<ConditionRow | undefined>();
   readonly onDidChangeTreeData = this.changed.event;
-  settings: ConditionSettings = { defines: {}, undefines: [], assumeUndefined: [], conditionFiles: [] };
+  state: ConditionState = { configurations: {}, active: null, available: [], effective: [], known: 0 };
 
   constructor(
     private readonly afterSync: (r: Synced, what: string) => void,
     private readonly busy: <T>(viewId: string, what: string, work: () => Promise<T>) => Promise<T>,
+    private readonly onState: (s: ConditionState) => void,
   ) {}
 
+  private took(s: ConditionState) {
+    this.state = s;
+    this.changed.fire(undefined);
+    this.onState(s);
+  }
+
   async load() {
-    const s = await ask<ConditionSettings>("si/conditions", {});
+    const s = await ask<ConditionState>("si/conditions", {});
     if (s) {
-      this.settings = s;
-      this.changed.fire(undefined);
+      this.took(s);
     }
+  }
+
+  /** The set in force, with every list there. */
+  get settings(): ConditionSettings {
+    return this.of(this.state.active ? this.state.configurations[this.state.active] : undefined);
+  }
+
+  private of(c: Partial<ConditionSettings> | undefined): ConditionSettings {
+    return { defines: { ...c?.defines }, undefines: [...(c?.undefines ?? [])], assumeUndefined: [...(c?.assumeUndefined ?? [])], conditionFiles: [...(c?.conditionFiles ?? [])] };
   }
 
   getChildren(row?: ConditionRow): ConditionRow[] {
-    const s = this.settings;
     if (!row) {
-      return [{ group: "defines" }, { group: "undefines" }, { group: "conditionFiles" }, { group: "assumeUndefined" }];
+      const s = this.settings;
+      const sources: ConditionRow[] = ["", ...s.conditionFiles].map((source) => ({ type: "source", source }));
+      return [{ type: "config" }, ...sources, ...s.assumeUndefined.map((prefix): ConditionRow => ({ type: "assume", prefix }))];
     }
-    if (row.key !== undefined) {
+    if (row.type !== "source") {
       return [];
     }
-    const keys = row.group === "defines" ? Object.keys(s.defines).sort() : [...s[row.group]].sort();
-    return keys.map((key) => ({ group: row.group, key }));
+    return this.state.effective.filter((e) => e.source === row.source).map((e) => ({ type: "macro", ...e }));
   }
 
   getTreeItem(row: ConditionRow): vscode.TreeItem {
-    const s = this.settings;
-    if (row.key === undefined) {
-      const titles = {
-        defines: ["Defined", "Macros the build defines", "symbol-constant"],
-        undefines: ["Not defined", "Macros the build does not define", "circle-slash"],
-        conditionFiles: ["From files", "Files read for more: a header of #define lines, or a Kconfig .config", "file"],
-        assumeUndefined: ["Assume not defined", "Prefixes (or * for everything) whose names are not defined unless listed or defined in the sources", "question"],
-      } as const;
-      const [label, tip, icon] = titles[row.group];
-      const count = row.group === "defines" ? Object.keys(s.defines).length : s[row.group].length;
-      const item = new vscode.TreeItem(label, count ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
-      item.description = count ? String(count) : "none";
-      item.tooltip = tip;
-      item.iconPath = new vscode.ThemeIcon(icon);
-      item.contextValue = `group.${row.group}`;
+    if (row.type === "config") {
+      const names = Object.keys(this.state.configurations);
+      const item = new vscode.TreeItem(this.state.active ?? "No configuration");
+      item.description = names.length > 1 ? `configuration in force · ${names.length} in all` : "configuration in force";
+      item.tooltip = "The set of compile conditions in force. Click to switch, add or remove sets.";
+      item.iconPath = new vscode.ThemeIcon("list-selection");
+      item.command = { command: "si.conditions.switch", title: "Switch Configuration" };
+      item.contextValue = "config";
       return item;
     }
-    const item = new vscode.TreeItem(row.key === "*" ? "* (every other name)" : row.key);
-    if (row.group === "defines") {
-      item.description = s.defines[row.key] === "" ? "defined" : `= ${s.defines[row.key]}`;
+    if (row.type === "assume") {
+      const item = new vscode.TreeItem(row.prefix === "*" ? "Every other name: not defined" : `${row.prefix}…: not defined unless listed`);
+      item.tooltip = "Names the build does not define are taken as not defined, unless the sources define them somewhere.";
+      item.iconPath = new vscode.ThemeIcon("question");
+      item.contextValue = "assume";
+      return item;
     }
-    item.contextValue = "condition";
+    if (row.type === "source") {
+      const count = this.state.effective.filter((e) => e.source === row.source).length;
+      const item = new vscode.TreeItem(
+        row.source === "" ? "Set here" : sourceLabel(row.source),
+        count === 0 ? vscode.TreeItemCollapsibleState.None : count > 40 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.Expanded,
+      );
+      item.description = count ? `${count}` : row.source === "" ? "nothing yet" : "nothing read";
+      item.tooltip = row.source === "" ? "Macros set in this configuration. They have the last word over what files say." : `Read from ${row.source}; follows that file on Sync.`;
+      item.iconPath = new vscode.ThemeIcon(row.source === "" ? "edit" : row.source.includes("#") ? "link" : "file");
+      item.contextValue = row.source === "" ? "source.own" : "source.file";
+      return item;
+    }
+    const item = new vscode.TreeItem(row.name);
+    item.description = row.value === null ? "not defined" : row.value === "" ? "defined" : `= ${row.value}`;
+    item.iconPath = new vscode.ThemeIcon(row.value === null ? "circle-slash" : "symbol-constant");
+    item.tooltip = `${row.name} ${item.description}\n${row.source === "" ? "set in this configuration" : "from " + row.source}`;
+    item.contextValue = row.source === "" ? "condition" : "condition.from";
     return item;
   }
 
-  async apply(next: ConditionSettings, what: string) {
-    const r = await this.busy("si.conditions", "indexing", () => ask<Synced & { conditions?: ConditionSettings }>("si/setConditions", {
-      defines: next.defines, undefines: next.undefines, assumeUndefined: next.assumeUndefined, conditionFiles: next.conditionFiles,
-    }));
+  /** Save every set and which is in force, and index under it. */
+  private async send(configurations: Record<string, Partial<ConditionSettings>>, active: string | null, what: string) {
+    const r = await this.busy("si.conditions", "indexing", () =>
+      ask<Synced & { conditions?: ConditionState }>("si/setConditions", { configurations, activeConfiguration: active }),
+    );
     if (!r || r.error) {
       void vscode.window.showErrorMessage(r?.error ?? "SI is not running.");
       return;
     }
-    this.settings = r.conditions ?? next;
-    this.changed.fire(undefined);
+    if (r.conditions) {
+      this.took(r.conditions);
+    }
     this.afterSync(r, what);
   }
 
-  private copy(): ConditionSettings {
-    const s = this.settings;
-    return { defines: { ...s.defines }, undefines: [...s.undefines], assumeUndefined: [...s.assumeUndefined], conditionFiles: [...s.conditionFiles] };
+  /** Change the set in force (making one if there is none yet). */
+  async apply(next: ConditionSettings, what: string) {
+    const active = this.state.active ?? "Default";
+    await this.send({ ...this.state.configurations, [active]: next }, active, what);
+  }
+
+  async switchTo(name: string) {
+    await this.send(this.state.configurations, name, `Configuration ${name}`);
+  }
+
+  /** A new set, in force at once: empty, a copy, or one that follows a
+   *  build configuration found in the workspace. */
+  async create(name: string, from?: Partial<ConditionSettings>) {
+    await this.send({ ...this.state.configurations, [name]: this.of(from) }, name, `Configuration ${name}`);
+  }
+
+  async follow(available: { name: string; source: string }) {
+    let name = available.name;
+    for (let n = 2; this.state.configurations[name]; n++) {
+      name = `${available.name} ${n}`;
+    }
+    await this.create(name, { conditionFiles: [available.source] });
+  }
+
+  async delete(name: string) {
+    const rest = { ...this.state.configurations };
+    delete rest[name];
+    const active = this.state.active === name ? Object.keys(rest)[0] ?? null : this.state.active;
+    await this.send(rest, active, `Removed configuration ${name}`);
   }
 
   /** `NAME` or `NAME=value` is defined; a name is one thing or the other. */
   async define(text: string) {
     const [name, ...rest] = text.split("=");
-    const next = this.copy();
+    const next = this.settings;
     next.defines[name.trim()] = rest.join("=").trim();
     next.undefines = next.undefines.filter((u) => u !== name.trim());
     await this.apply(next, `Defined ${name.trim()}`);
   }
 
   async undefine(name: string) {
-    const next = this.copy();
+    const next = this.settings;
     delete next.defines[name];
     if (!next.undefines.includes(name)) {
       next.undefines.push(name);
@@ -549,7 +624,7 @@ class ConditionsTree implements vscode.TreeDataProvider<ConditionRow> {
   }
 
   async add(group: "conditionFiles" | "assumeUndefined", value: string) {
-    const next = this.copy();
+    const next = this.settings;
     if (!next[group].includes(value)) {
       next[group].push(value);
     }
@@ -557,16 +632,22 @@ class ConditionsTree implements vscode.TreeDataProvider<ConditionRow> {
   }
 
   async remove(row: ConditionRow) {
-    if (row.key === undefined) {
+    const next = this.settings;
+    let what: string;
+    if (row.type === "macro" && row.source === "") {
+      delete next.defines[row.name];
+      next.undefines = next.undefines.filter((u) => u !== row.name);
+      what = row.name;
+    } else if (row.type === "source" && row.source !== "") {
+      next.conditionFiles = next.conditionFiles.filter((f) => f !== row.source);
+      what = row.source;
+    } else if (row.type === "assume") {
+      next.assumeUndefined = next.assumeUndefined.filter((p) => p !== row.prefix);
+      what = row.prefix;
+    } else {
       return;
     }
-    const next = this.copy();
-    if (row.group === "defines") {
-      delete next.defines[row.key];
-    } else {
-      next[row.group] = next[row.group].filter((x) => x !== row.key);
-    }
-    await this.apply(next, `Removed ${row.key}`);
+    await this.apply(next, `Removed ${what}`);
   }
 }
 
@@ -950,7 +1031,34 @@ export async function activate(context: vscode.ExtensionContext) {
   });
   /** A folder from the scope tree (its path) or from the Explorer (a URI). */
   const folderOf = (arg: unknown): string | undefined => (typeof arg === "string" ? arg : arg instanceof vscode.Uri ? scopeTree.relative(arg) : undefined);
-  const conditions = new ConditionsTree(afterSync, busy);
+  // Which set of conditions is in force, where it is always in sight.
+  const configStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 9);
+  configStatus.command = "si.conditions.switch";
+  let conditionsView: vscode.TreeView<ConditionRow> | undefined;
+  let offered = false;
+  const conditions = new ConditionsTree(afterSync, busy, (s) => {
+    const sets = Object.keys(s.configurations).length;
+    if (conditionsView) {
+      conditionsView.description = s.active ?? undefined;
+    }
+    if (s.active || s.available.length) {
+      configStatus.text = `$(list-selection) ${s.active ?? "No configuration"}`;
+      configStatus.tooltip = `SI compile conditions: ${s.active ? `${s.active} (${s.known.toLocaleString()} macros settled)` : "none in force"}. Click to switch.`;
+      configStatus.show();
+    } else {
+      configStatus.hide();
+    }
+    // The build has configurations of its own and none is used yet: say so, once.
+    if (!sets && s.available.length && !offered && !context.workspaceState.get("si.conditions.offered")) {
+      offered = true;
+      void context.workspaceState.update("si.conditions.offered", true);
+      const files = [...new Set(s.available.map((a) => sourceLabel(a.source).replace(/^.*\((.*)\)$/, "$1")))].join(", ");
+      void vscode.window
+        .showInformationMessage(`SI found build configurations (${s.available.map((a) => a.name).join(", ")}) in ${files}. Use one for compile conditions?`, "Choose…")
+        .then((pick) => pick && vscode.commands.executeCommand("si.conditions.switch"));
+    }
+  });
+  conditionsView = vscode.window.createTreeView("si.conditions", { treeDataProvider: conditions });
   const validName = (v: string) => (/^[A-Za-z_][A-Za-z0-9_]*(\s*=.*)?$/.test(v.trim()) ? undefined : "A macro name, optionally followed by =value");
   async function sync() {
     const r = await busy("si.scope", "syncing", () => ask<Synced>("si/sync", {}));
@@ -1115,7 +1223,59 @@ export async function activate(context: vscode.ExtensionContext) {
       await start();
     }),
     scopeView,
-    vscode.window.registerTreeDataProvider("si.conditions", conditions),
+    conditionsView,
+    configStatus,
+    vscode.commands.registerCommand("si.conditions.switch", async (arg?: unknown) => {
+      if (typeof arg === "string") {
+        const found = conditions.state.available.find((a) => a.source === arg);
+        return found ? conditions.follow(found) : conditions.state.configurations[arg] ? conditions.switchTo(arg) : conditions.create(arg);
+      }
+      const s = conditions.state;
+      type Pick = vscode.QuickPickItem & { run?: () => Thenable<unknown> | undefined };
+      const picks: Pick[] = Object.keys(s.configurations).map((name) => ({
+        label: `${name === s.active ? "$(check)" : "$(blank)"} ${name}`,
+        description: (s.configurations[name].conditionFiles ?? []).map(sourceLabel).join(", "),
+        run: () => (name === s.active ? undefined : conditions.switchTo(name)),
+      }));
+      const followed = new Set(Object.values(s.configurations).flatMap((c) => c.conditionFiles ?? []));
+      const fresh = s.available.filter((a) => !followed.has(a.source));
+      if (fresh.length) {
+        picks.push({ label: "Follow a build configuration", kind: vscode.QuickPickItemKind.Separator });
+        picks.push(...fresh.map((a): Pick => ({ label: `$(link) ${a.name}`, description: a.source, detail: "Uses its defines, and follows them when they change", run: () => conditions.follow(a) })));
+      }
+      picks.push({ label: "", kind: vscode.QuickPickItemKind.Separator });
+      const named = async (value: string) => {
+        const name = await vscode.window.showInputBox({ prompt: "Name of the configuration", value, validateInput: (v) => (!v.trim() ? "A name" : s.configurations[v.trim()] ? "There is one of that name" : undefined) });
+        return name?.trim();
+      };
+      picks.push({ label: "$(add) New configuration…", run: async () => { const n = await named(""); return n ? conditions.create(n) : undefined; } });
+      if (s.active) {
+        const active = s.active;
+        picks.push({ label: `$(copy) Duplicate "${active}"…`, run: async () => { const n = await named(`${active} copy`); return n ? conditions.create(n, s.configurations[active]) : undefined; } });
+        picks.push({ label: `$(trash) Delete "${active}"`, run: () => conditions.delete(active) });
+      }
+      const pick = await vscode.window.showQuickPick(picks, { placeHolder: "Compile conditions: which configuration is in force" });
+      return pick?.run?.();
+    }),
+    vscode.commands.registerCommand("si.conditions.add", async () => {
+      const picks = [
+        { label: "$(symbol-constant) Define a macro…", detail: "NAME or NAME=value", command: "si.conditions.define" },
+        { label: "$(circle-slash) Mark a macro as not defined…", command: "si.conditions.undefine" },
+        { label: "$(link) Follow a build configuration…", detail: "DS-5 / Eclipse .cproject, or VS Code C/C++ settings (c_cpp_properties.json)", command: "si.conditions.switch" },
+        { label: "$(file) Read from a file…", detail: "A header of #define lines, or a Kconfig .config", command: "si.conditions.addFile" },
+        { label: "$(question) Assume names are not defined…", detail: "A prefix such as CONFIG_, or * for every name the build does not define", command: "si.conditions.assume" },
+      ];
+      const pick = await vscode.window.showQuickPick(picks, { placeHolder: `Add to ${conditions.state.active ?? "a new configuration"}` });
+      return pick ? vscode.commands.executeCommand(pick.command) : undefined;
+    }),
+    vscode.commands.registerCommand("si.conditions.delete", (arg?: unknown) => (typeof arg === "string" ? conditions.delete(arg) : undefined)),
+    vscode.commands.registerCommand("si.conditions.override", async (row: ConditionRow) => {
+      if (row?.type !== "macro") {
+        return;
+      }
+      const text = await vscode.window.showInputBox({ prompt: `Value of ${row.name} in this configuration`, value: `${row.name}=${row.value ?? ""}`, validateInput: validName });
+      return text ? conditions.define(text.trim()) : undefined;
+    }),
     vscode.commands.registerCommand("si.conditions.define", async (arg?: unknown) => {
       const text = typeof arg === "string" ? arg : await vscode.window.showInputBox({ prompt: "Macro the build defines", placeHolder: "CONFIG_SMP  or  ARCH_SIZE=64", validateInput: validName });
       return text ? conditions.define(text.trim()) : undefined;
@@ -1142,7 +1302,7 @@ export async function activate(context: vscode.ExtensionContext) {
       return text ? conditions.add("assumeUndefined", text.trim()) : undefined;
     }),
     vscode.commands.registerCommand("si.conditions.remove", (row: ConditionRow) => conditions.remove(row)),
-    vscode.commands.registerCommand("si.conditions.get", () => conditions.settings),
+    vscode.commands.registerCommand("si.conditions.get", () => ({ ...conditions.settings, state: conditions.state })),
     vscode.commands.registerCommand("si.sync", sync),
     vscode.commands.registerCommand("si.scope.apply", () => scopeTree.applyDraft()),
     vscode.commands.registerCommand("si.scope.discard", () => scopeTree.discard()),

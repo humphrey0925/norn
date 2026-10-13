@@ -2,7 +2,7 @@
   "name": "si-code-index",
   "displayName": "SI Code Index",
   "description": "Source-Insight-style symbol search, context and relation views for C, backed by the si index.",
-  "version": "0.9.3",
+  "version": "0.10.0",
   "publisher": "humphrey0925",
   "repository": {
     "type": "git",
@@ -190,6 +190,16 @@
         "title": "SI: Show Function Pointer Assignments"
       },
       {
+        "command": "si.conditions.add",
+        "title": "SI: Add a Compile Condition…",
+        "icon": "$(add)"
+      },
+      {
+        "command": "si.conditions.switch",
+        "title": "SI: Switch Compile Configuration…",
+        "icon": "$(list-selection)"
+      },
+      {
         "command": "si.conditions.define",
         "title": "SI: Define a Macro for Conditions…",
         "icon": "$(add)"
@@ -213,6 +223,15 @@
         "command": "si.conditions.remove",
         "title": "Remove",
         "icon": "$(trash)"
+      },
+      {
+        "command": "si.conditions.override",
+        "title": "Set Another Value Here",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "si.conditions.delete",
+        "title": "Delete Configuration"
       }
     ],
     "menus": {
@@ -283,24 +302,14 @@
           "group": "9_si@1"
         },
         {
-          "command": "si.conditions.define",
+          "command": "si.conditions.add",
           "when": "view == si.conditions",
           "group": "navigation@1"
         },
         {
-          "command": "si.conditions.undefine",
+          "command": "si.conditions.switch",
           "when": "view == si.conditions",
           "group": "navigation@2"
-        },
-        {
-          "command": "si.conditions.addFile",
-          "when": "view == si.conditions",
-          "group": "navigation@3"
-        },
-        {
-          "command": "si.conditions.assume",
-          "when": "view == si.conditions",
-          "group": "navigation@4"
         },
         {
           "command": "si.scope.openConfig",
@@ -331,27 +340,22 @@
         },
         {
           "command": "si.conditions.remove",
-          "when": "view == si.conditions && viewItem == condition",
+          "when": "view == si.conditions && viewItem =~ /^(condition|source.file|assume)$/",
           "group": "inline@1"
         },
         {
-          "command": "si.conditions.define",
-          "when": "view == si.conditions && viewItem == group.defines",
+          "command": "si.conditions.override",
+          "when": "view == si.conditions && viewItem == condition.from",
           "group": "inline@1"
         },
         {
-          "command": "si.conditions.undefine",
-          "when": "view == si.conditions && viewItem == group.undefines",
+          "command": "si.conditions.add",
+          "when": "view == si.conditions && viewItem == source.own",
           "group": "inline@1"
         },
         {
-          "command": "si.conditions.addFile",
-          "when": "view == si.conditions && viewItem == group.conditionFiles",
-          "group": "inline@1"
-        },
-        {
-          "command": "si.conditions.assume",
-          "when": "view == si.conditions && viewItem == group.assumeUndefined",
+          "command": "si.conditions.switch",
+          "when": "view == si.conditions && viewItem == config",
           "group": "inline@1"
         }
       ],
@@ -374,6 +378,14 @@
         },
         {
           "command": "si.conditions.remove",
+          "when": "false"
+        },
+        {
+          "command": "si.conditions.override",
+          "when": "false"
+        },
+        {
+          "command": "si.conditions.delete",
           "when": "false"
         }
       ],

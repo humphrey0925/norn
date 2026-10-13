@@ -26,6 +26,20 @@
 //! are read for more: lines of `#define NAME value`, `#undef NAME`,
 //! `NAME=value` and `# NAME is not set` (with `=y` as 1 and `=m` defining
 //! `NAME_MODULE`, the way Kconfig means them).
+//!
+//! A project may have several such sets, as a build has configurations,
+//! one of them in force:
+//!
+//! ```json
+//! { "activeConfiguration": "Debug",
+//!   "configurations": { "Debug": { "defines": { "DEBUG": "1" } },
+//!                       "Release": { "conditionFiles": [".cproject#Release"] } } }
+//! ```
+//!
+//! and a condition file may be the build's own description, with the
+//! configuration meant after a `#`: an Eclipse CDT `.cproject` (DS-5, Arm
+//! Development Studio), or the `c_cpp_properties.json` of VS Code's C/C++
+//! extension. The set then follows what is written there.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
@@ -45,19 +59,263 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// The configuration in force.
     pub fn load(root: &Path) -> Settings {
-        let path = crate::scope::Scope::config_path(root);
-        std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+        Project::load(root).current()
     }
 
     pub fn is_empty(&self) -> bool {
         *self == Settings::default()
     }
 
+    /// As the configuration in force, into `.si/config.json`.
+    pub fn save(&self, root: &Path) -> std::io::Result<()> {
+        let mut project = Project::load(root);
+        let name = project.active.clone().unwrap_or_else(|| DEFAULT.to_string());
+        project.configurations.insert(name.clone(), self.clone());
+        project.active = Some(name);
+        project.save(root)
+    }
+}
+
+/// What a set is called when nobody named it.
+pub const DEFAULT: &str = "Default";
+
+/// Every set of conditions the project has, and which is in force.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Project {
+    #[serde(default)]
+    pub configurations: std::collections::BTreeMap<String, Settings>,
+    #[serde(default, rename = "activeConfiguration")]
+    pub active: Option<String>,
+}
+
+impl Project {
+    pub fn load(root: &Path) -> Project {
+        let path = crate::scope::Scope::config_path(root);
+        let Some(bytes) = std::fs::read(path).ok() else { return Project::default() };
+        let mut project: Project = serde_json::from_slice(&bytes).unwrap_or_default();
+        // Written before there were configurations: one set, at the top.
+        if project.configurations.is_empty() {
+            let one: Settings = serde_json::from_slice(&bytes).unwrap_or_default();
+            if !one.is_empty() {
+                project.configurations.insert(DEFAULT.to_string(), one);
+                project.active = Some(DEFAULT.to_string());
+            }
+        }
+        if project.active.as_ref().is_some_and(|a| !project.configurations.contains_key(a)) {
+            project.active = None;
+        }
+        project
+    }
+
+    pub fn current(&self) -> Settings {
+        self.active.as_ref().and_then(|a| self.configurations.get(a)).cloned().unwrap_or_default()
+    }
+
     /// Into `.si/config.json`, beside the scope.
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
-        crate::scope::write_settings(root, serde_json::to_value(self).unwrap())
+        let mut written = serde_json::to_value(self).unwrap();
+        for old in ["defines", "undefines", "assumeUndefined", "conditionFiles"] {
+            written[old] = serde_json::Value::Null;
+        }
+        crate::scope::write_settings(root, written)
     }
+}
+
+/// A macro as the configuration in force has it, and what says so.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Effective {
+    pub name: String,
+    /// `None`: not defined.
+    pub value: Option<String>,
+    /// A condition file as written in the settings, or empty for the
+    /// settings themselves.
+    pub source: String,
+}
+
+/// What `settings` come to, name by name, with where each is from.
+pub fn effective(settings: &Settings, root: &Path) -> Vec<Effective> {
+    let mut all: std::collections::BTreeMap<String, (Option<String>, String)> = Default::default();
+    let mut add = |c: &Conditions, source: &str| {
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        for (name, value) in &c.defined {
+            all.insert(text(name), (Some(text(value)), source.to_string()));
+        }
+        for name in &c.undefined {
+            all.insert(text(name), (None, source.to_string()));
+        }
+    };
+    for file in &settings.condition_files {
+        let mut c = Conditions::default();
+        c.read_source(root, file);
+        add(&c, file);
+    }
+    let own = Settings { defines: settings.defines.clone(), undefines: settings.undefines.clone(), ..Settings::default() };
+    add(&Conditions::from_settings(&own, root), "");
+    all.into_iter().map(|(name, (value, source))| Effective { name, value, source }).collect()
+}
+
+/// A build's own configurations found in the tree, as condition-file
+/// entries: `(name, entry)`.
+pub fn discover(root: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for file in [".cproject", ".vscode/c_cpp_properties.json"] {
+        let Ok(text) = std::fs::read(root.join(file)) else { continue };
+        let text = String::from_utf8_lossy(&text);
+        let names = if file.ends_with(".cproject") { cproject(&text) } else { cpp_properties(&text) };
+        out.extend(names.into_iter().map(|c| (c.name.clone(), format!("{file}#{}", c.name))));
+    }
+    out
+}
+
+/// One configuration of a build description.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Build {
+    name: String,
+    defines: Vec<String>,
+    undefines: Vec<String>,
+}
+
+/// `-DNAME=value` and `-UNAME` in a line of compiler flags.
+fn flags(line: &str, into: &mut Build) {
+    for word in line.split_whitespace() {
+        if let Some(d) = word.strip_prefix("-D").filter(|d| !d.is_empty()) {
+            into.defines.push(d.trim_matches('"').to_string());
+        } else if let Some(u) = word.strip_prefix("-U").filter(|u| !u.is_empty()) {
+            into.undefines.push(u.to_string());
+        }
+    }
+}
+
+/// The configurations of an Eclipse CDT `.cproject`: under each
+/// `<configuration name=...>`, the options that list defined and undefined
+/// symbols, whatever the toolchain calls them, and `-D` in free-form flags.
+/// Settings for single files are left out.
+fn cproject(text: &str) -> Vec<Build> {
+    let unescape = |v: &str| v.replace("&quot;", "\"").replace("&apos;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
+    let mut out: Vec<Build> = Vec::new();
+    // Elements open: (name, the list it collects into, in a configuration, for one file)
+    let mut open: Vec<(&str, u8, bool, bool)> = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find('<') {
+        rest = &rest[at + 1..];
+        if rest.starts_with(['?', '!']) {
+            rest = rest.find('>').map_or("", |e| &rest[e + 1..]);
+            continue;
+        }
+        if let Some(closing) = rest.strip_prefix('/') {
+            let name = closing.split(['>', ' ']).next().unwrap_or("");
+            if let Some(k) = open.iter().rposition(|o| o.0 == name) {
+                open.truncate(k);
+            }
+            continue;
+        }
+        let end = rest.find(|c: char| c.is_whitespace() || c == '>' || c == '/').unwrap_or(rest.len());
+        let name = &rest[..end];
+        rest = &rest[end..];
+        let mut attrs: Vec<(&str, String)> = Vec::new();
+        let self_closing = loop {
+            rest = rest.trim_start();
+            if let Some(r) = rest.strip_prefix("/>") {
+                rest = r;
+                break true;
+            }
+            if let Some(r) = rest.strip_prefix('>') {
+                rest = r;
+                break false;
+            }
+            let Some(eq) = rest.find('=') else { break true };
+            let key = rest[..eq].trim();
+            let after = rest[eq + 1..].trim_start();
+            let Some(quote) = after.chars().next().filter(|c| matches!(c, '"' | '\'')) else { break true };
+            let Some(close) = after[1..].find(quote) else { break true };
+            attrs.push((key, unescape(&after[1..1 + close])));
+            rest = &after[close + 2..];
+        };
+        let attr = |k: &str| attrs.iter().find(|a| a.0 == k).map(|a| a.1.as_str());
+        let (mut list, mut inside, mut one_file) = open.last().map_or((0, false, false), |o| (o.1, o.2, o.3));
+        match name {
+            "configuration" if attr("name").is_some() && !inside => {
+                out.push(Build { name: attr("name").unwrap().to_string(), ..Build::default() });
+                inside = true;
+            }
+            "fileInfo" => one_file = true,
+            "option" if inside && !one_file => {
+                list = match attr("valueType") {
+                    Some("definedSymbols") => 1,
+                    Some("undefDefinedSymbols") => 2,
+                    _ => 0,
+                };
+                if let (0, Some(value), Some(b)) = (list, attr("value"), out.last_mut()) {
+                    flags(value, b);
+                }
+            }
+            "listOptionValue" if list != 0 => {
+                if let (Some(value), Some(b)) = (attr("value"), out.last_mut()) {
+                    let value = value.trim().to_string();
+                    if list == 1 { b.defines.push(value) } else { b.undefines.push(value) }
+                }
+            }
+            _ => {}
+        }
+        if !self_closing {
+            open.push((name, if name == "option" { list } else { 0 }, inside, one_file));
+        }
+    }
+    out
+}
+
+/// The configurations of a `c_cpp_properties.json` (VS Code's C/C++
+/// extension): `defines`, and `-D` in `compilerArgs`. The file may have
+/// comments and trailing commas.
+fn cpp_properties(text: &str) -> Vec<Build> {
+    // Comments out, then commas that end a list.
+    let (mut plain, mut chars, mut in_string) = (String::with_capacity(text.len()), text.chars().peekable(), false);
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => in_string = !in_string,
+            '\\' if in_string => {
+                plain.push(c);
+                plain.extend(chars.next());
+                continue;
+            }
+            '/' if !in_string && chars.peek() == Some(&'/') => {
+                while chars.next_if(|&c| c != '\n').is_some() {}
+                continue;
+            }
+            '/' if !in_string && chars.peek() == Some(&'*') => {
+                let mut last = ' ';
+                for c in chars.by_ref() {
+                    if last == '*' && c == '/' {
+                        break;
+                    }
+                    last = c;
+                }
+                continue;
+            }
+            '}' | ']' if !in_string => {
+                let kept = plain.trim_end().len();
+                if plain[..kept].ends_with(',') {
+                    plain.truncate(kept - 1);
+                }
+            }
+            _ => {}
+        }
+        plain.push(c);
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&plain) else { return Vec::new() };
+    let strings = |v: &serde_json::Value| v.as_array().into_iter().flatten().filter_map(|x| x.as_str()).map(str::to_string).collect::<Vec<_>>();
+    let mut out = Vec::new();
+    for c in v["configurations"].as_array().into_iter().flatten() {
+        let Some(name) = c["name"].as_str() else { continue };
+        let mut b = Build { name: name.to_string(), defines: strings(&c["defines"]), ..Build::default() };
+        // `${default}` and the like stand for settings kept elsewhere.
+        b.defines.retain(|d| !d.contains("${"));
+        flags(&strings(&c["compilerArgs"]).join(" "), &mut b);
+        out.push(b);
+    }
+    out
 }
 
 /// What is known about macros when conditions are evaluated.
@@ -114,9 +372,7 @@ impl Conditions {
     pub fn from_settings(settings: &Settings, root: &Path) -> Conditions {
         let mut c = Conditions::default();
         for file in &settings.condition_files {
-            if let Ok(text) = std::fs::read(root.join(file)) {
-                c.read_file(&String::from_utf8_lossy(&text));
-            }
+            c.read_source(root, file);
         }
         // What is written in the settings themselves has the last word.
         for (name, value) in &settings.defines {
@@ -139,6 +395,32 @@ impl Conditions {
     pub fn undefine(&mut self, name: &str) {
         self.defined.remove(name.as_bytes());
         self.undefined.insert(name.as_bytes().to_vec());
+    }
+
+    /// A condition file as the settings name it: a path, and for a build
+    /// description the configuration meant after `#` (else its first).
+    fn read_source(&mut self, root: &Path, entry: &str) {
+        let (path, wanted) = match entry.rsplit_once('#') {
+            Some((path, name)) if !name.contains(['/', '\\']) => (path, Some(name)),
+            _ => (entry, None),
+        };
+        let Ok(text) = std::fs::read(root.join(path)) else { return };
+        let text = String::from_utf8_lossy(&text);
+        let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
+        let builds = match file {
+            ".cproject" => cproject(&text),
+            "c_cpp_properties.json" => cpp_properties(&text),
+            _ => return self.read_file(&text),
+        };
+        let Some(b) = builds.iter().find(|b| wanted.is_none_or(|w| b.name == w)) else { return };
+        for d in &b.defines {
+            // `-DNAME` is `#define NAME 1`.
+            let (name, value) = d.split_once('=').unwrap_or((d, "1"));
+            self.define(name.trim(), value);
+        }
+        for u in &b.undefines {
+            self.undefine(u.trim());
+        }
     }
 
     /// A header of `#define`s, or a Kconfig `.config`.
@@ -463,6 +745,69 @@ mod tests {
         assert_eq!((c.defined(b"FOO_H"), c.defined(b"HAVE_ZLIB")), (Tri::Unknown, Tri::Unknown));
         assert_eq!(c.eval(b"defined(_WIN32) || defined(HAVE_ZLIB)"), Tri::Unknown);
         assert_eq!(c.eval(b"defined(_WIN32) && defined(HAVE_ZLIB)"), Tri::False);
+    }
+
+    #[test]
+    fn a_build_description_gives_its_configurations() {
+        let xml = r#"<?xml version="1.0"?><cproject><storageModule moduleId="org.eclipse.cdt.core.settings">
+          <cconfiguration id="a"><storageModule moduleId="cdtBuildSystem"><configuration name="Debug" artifactName="x">
+            <folderInfo id="f" resourcePath=""><toolChain><tool name="ARM C Compiler 5">
+              <option id="o1" superClass="com.arm.tool.c.compiler.option.defmac" valueType="definedSymbols">
+                <listOptionValue builtIn="false" value="DEBUG"/><listOptionValue builtIn="false" value="BOARD=&quot;evk&quot;"/>
+                <listOptionValue value="LEVEL=3"/></option>
+              <option id="o2" valueType="undefDefinedSymbols"><listOptionValue value="NDEBUG"/></option>
+              <option id="o3" superClass="x.other" value="-O2 -DFROM_FLAGS=7 -UGONE" valueType="string"/>
+              <option id="o4" valueType="includePath"><listOptionValue value="../inc"/></option>
+            </tool></toolChain></folderInfo>
+            <fileInfo id="one" resourcePath="a.c"><tool><option valueType="definedSymbols"><listOptionValue value="ONLY_A"/></option></tool></fileInfo>
+          </configuration></storageModule></cconfiguration>
+          <cconfiguration id="b"><storageModule moduleId="cdtBuildSystem"><configuration name="Release">
+            <folderInfo><toolChain><tool><option valueType="definedSymbols"><listOptionValue value="NDEBUG"/></option></tool></toolChain></folderInfo>
+          </configuration></storageModule></cconfiguration></storageModule></cproject>"#;
+        let b = cproject(xml);
+        assert_eq!(b.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["Debug", "Release"]);
+        assert_eq!(b[0].defines, ["DEBUG", "BOARD=\"evk\"", "LEVEL=3", "FROM_FLAGS=7"]);
+        assert_eq!(b[0].undefines, ["NDEBUG", "GONE"]);
+        assert_eq!(b[1].defines, ["NDEBUG"]);
+
+        let json = "{ // comment\n \"configurations\": [ { \"name\": \"Win32\", \"defines\": [\"_DEBUG\", \"UNICODE\", \"N=2\", \"${default}\",], /* x */\n\"compilerArgs\": [\"-DARG=1\"], }, { \"name\": \"Linux\", \"defines\": [] } ], \"version\": 4 }";
+        let b = cpp_properties(json);
+        assert_eq!(b.len(), 2);
+        assert_eq!((b[0].name.as_str(), &b[0].defines), ("Win32", &vec!["_DEBUG".to_string(), "UNICODE".into(), "N=2".into(), "ARG=1".into()]));
+
+        // As condition files, with the configuration after `#`.
+        let dir = std::env::temp_dir().join(format!("si-cond-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".vscode")).unwrap();
+        std::fs::write(dir.join(".cproject"), xml).unwrap();
+        std::fs::write(dir.join(".vscode/c_cpp_properties.json"), json).unwrap();
+        assert_eq!(discover(&dir).iter().map(|d| d.1.as_str()).collect::<Vec<_>>(), [".cproject#Debug", ".cproject#Release", ".vscode/c_cpp_properties.json#Win32", ".vscode/c_cpp_properties.json#Linux"]);
+        let mut settings = Settings { condition_files: vec![".cproject#Release".into()], ..Settings::default() };
+        let c = Conditions::from_settings(&settings, &dir);
+        assert_eq!((c.defined(b"NDEBUG"), c.defined(b"DEBUG")), (Tri::True, Tri::Unknown));
+        settings.condition_files = vec![".cproject#Debug".into(), ".vscode/c_cpp_properties.json#Win32".into()];
+        settings.defines.insert("LEVEL".into(), "9".into());
+        let c = Conditions::from_settings(&settings, &dir);
+        assert_eq!((c.eval(b"LEVEL == 9 && N == 2 && DEBUG"), c.defined(b"NDEBUG"), c.defined(b"ONLY_A")), (Tri::True, Tri::False, Tri::Unknown));
+        // What it all comes to, and who says so.
+        let e = effective(&settings, &dir);
+        let of = |n: &str| e.iter().find(|x| x.name == n).map(|x| (x.value.as_deref(), x.source.as_str()));
+        assert_eq!(of("LEVEL"), Some((Some("9"), "")));
+        assert_eq!(of("DEBUG"), Some((Some("1"), ".cproject#Debug")));
+        assert_eq!(of("NDEBUG"), Some((None, ".cproject#Debug")));
+        assert_eq!(of("N"), Some((Some("2"), ".vscode/c_cpp_properties.json#Win32")));
+
+        // Several sets in one project, one in force; an old file is one set.
+        std::fs::create_dir_all(dir.join(".si")).unwrap();
+        std::fs::write(dir.join(".si/config.json"), r#"{"include":["src"],"defines":{"OLD":"1"}}"#).unwrap();
+        let mut p = Project::load(&dir);
+        assert_eq!((p.active.as_deref(), p.current().defines.get("OLD").map(String::as_str)), (Some(DEFAULT), Some("1")));
+        p.configurations.insert("Debug".into(), settings.clone());
+        p.active = Some("Debug".into());
+        p.save(&dir).unwrap();
+        assert_eq!((Project::load(&dir), Settings::load(&dir)), (p, settings));
+        let written = std::fs::read_to_string(dir.join(".si/config.json")).unwrap();
+        assert!(written.contains("\"include\"") && !written.contains("\n  \"defines\""), "{written}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -459,13 +459,17 @@ impl Server {
         json!({ "target": target.map(|t| self.entry(t)), "by": if by_slot { "member" } else { "function" }, "rows": rows })
     }
 
-    /// `si/conditions`: what the build is said to define (the settings as
-    /// written), and how many macros that settles once the files they name
-    /// are read.
+    /// `si/conditions`: the sets of conditions the project has and which is
+    /// in force, what that one comes to macro by macro (and what says so),
+    /// and the build configurations found in the tree that a set could
+    /// follow.
     fn conditions(&self) -> Value {
-        let s = self.session.condition_settings();
-        json!({ "defines": s.defines, "undefines": s.undefines, "assumeUndefined": s.assume_undefined,
-                "conditionFiles": s.condition_files, "known": self.session.conditions_known() })
+        use si_core::cond;
+        let project = cond::Project::load(&self.root);
+        let effective = cond::effective(&project.current(), &self.root);
+        let available: Vec<Value> = cond::discover(&self.root).into_iter().map(|(name, source)| json!({ "name": name, "source": source })).collect();
+        json!({ "configurations": project.configurations, "active": project.active, "available": available,
+                "effective": effective, "known": self.session.conditions_known() })
     }
 
     /// `si/scope`: which folders are indexed, and where that is written.
@@ -567,8 +571,8 @@ impl Server {
             "si/place" => self.place(params),
             "si/conditions" => self.conditions(),
             "si/setConditions" => {
-                let settings: si_core::cond::Settings = serde_json::from_value(params.clone()).unwrap_or_default();
-                match self.session.set_conditions(&settings) {
+                let project: si_core::cond::Project = serde_json::from_value(params.clone()).unwrap_or_default();
+                match self.session.set_condition_project(&project) {
                     Ok(up) => {
                         let mut v = self.synced(up);
                         v["conditions"] = self.conditions();

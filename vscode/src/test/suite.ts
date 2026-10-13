@@ -1,5 +1,6 @@
 // What the extension has to do inside the editor, checked there.
 import * as assert from "assert";
+import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 
@@ -116,11 +117,35 @@ export async function run(): Promise<void> {
   // Compile conditions: bfdio.c defines FD_CLOEXEC under `#ifndef
   // FD_CLOEXEC`. Told the build defines it, that branch is not indexed.
   assert.ok(await has("FD_CLOEXEC"));
+  type Conditions = { defines: Record<string, string>; conditionFiles: string[]; state: { active: string | null; configurations: Record<string, unknown>; available: { name: string; source: string }[]; effective: { name: string; value: string | null; source: string }[] } };
+  const conditionsNow = () => vscode.commands.executeCommand<Conditions>("si.conditions.get");
   await vscode.commands.executeCommand("si.conditions.define", "FD_CLOEXEC=1");
   assert.ok(!(await has("FD_CLOEXEC")) && (await has("bfd_read")), "the skipped branch left the index");
-  const conditions = await vscode.commands.executeCommand<{ defines: Record<string, string> }>("si.conditions.get");
+  let conditions = await conditionsNow();
   assert.deepStrictEqual(conditions.defines, { FD_CLOEXEC: "1" });
-  await vscode.commands.executeCommand("si.conditions.remove", { group: "defines", key: "FD_CLOEXEC" });
+  assert.deepStrictEqual([conditions.state.active, conditions.state.effective], ["Default", [{ name: "FD_CLOEXEC", value: "1", source: "" }]]);
+  // Another set, in force when made: nothing is said there, both branches are back.
+  await vscode.commands.executeCommand("si.conditions.switch", "Release");
+  assert.ok(await has("FD_CLOEXEC"));
+  await vscode.commands.executeCommand("si.conditions.switch", "Default");
+  assert.ok(!(await has("FD_CLOEXEC")));
+  await vscode.commands.executeCommand("si.conditions.remove", { type: "macro", name: "FD_CLOEXEC", value: "1", source: "" });
+  assert.ok(await has("FD_CLOEXEC"));
+  // A set that follows the build's own description: a DS-5 project.
+  fs.writeFileSync(path.join(folder, ".cproject"), `<?xml version="1.0"?><cproject><configuration name="Debug"><folderInfo><toolChain><tool>
+    <option valueType="definedSymbols"><listOptionValue value="FD_CLOEXEC=1"/><listOptionValue value="BOARD_EVK"/></option></tool></toolChain></folderInfo></configuration></cproject>`);
+  await vscode.commands.executeCommand("si.sync");
+  conditions = await conditionsNow();
+  assert.deepStrictEqual(conditions.state.available, [{ name: "Debug", source: ".cproject#Debug" }]);
+  await vscode.commands.executeCommand("si.conditions.switch", ".cproject#Debug");
+  conditions = await conditionsNow();
+  assert.deepStrictEqual([conditions.state.active, conditions.conditionFiles], ["Debug", [".cproject#Debug"]]);
+  assert.deepStrictEqual(conditions.state.effective.map((e) => [e.name, e.value, e.source]), [["BOARD_EVK", "1", ".cproject#Debug"], ["FD_CLOEXEC", "1", ".cproject#Debug"]]);
+  assert.ok(!(await has("FD_CLOEXEC")));
+  for (const name of ["Debug", "Release"]) {
+    await vscode.commands.executeCommand("si.conditions.delete", name);
+  }
+  fs.rmSync(path.join(folder, ".cproject"));
   assert.ok(await has("FD_CLOEXEC"));
   await vscode.commands.executeCommand("si.conditions.focus");
 

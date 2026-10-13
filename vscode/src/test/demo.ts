@@ -29,12 +29,22 @@ export async function run(): Promise<void> {
     await vscode.commands.executeCommand("si.scope.focus");
   }
   if (process.env.SI_DEMO_CONDITIONS) {
-    await vscode.commands.executeCommand("si.conditions.define", "HAVE_MMAP=1");
+    const fs = await import("fs");
+    fs.writeFileSync(path.join(folder, ".cproject"), `<?xml version="1.0"?><cproject>
+      <configuration name="Debug"><folderInfo><toolChain><tool><option valueType="definedSymbols"><listOptionValue value="DEBUG"/><listOptionValue value="BOARD_REV=3"/><listOptionValue value="USE_RTOS"/><listOptionValue value="HAVE_MMAP=1"/></option>
+      <option valueType="undefDefinedSymbols"><listOptionValue value="NDEBUG"/></option></tool></toolChain></folderInfo></configuration>
+      <configuration name="Release"><folderInfo><toolChain><tool><option valueType="definedSymbols"><listOptionValue value="NDEBUG"/><listOptionValue value="BOARD_REV=3"/></option></tool></toolChain></folderInfo></configuration></cproject>`);
+    await vscode.commands.executeCommand("si.sync");
+    await vscode.commands.executeCommand("si.conditions.switch", ".cproject#Release");
+    await vscode.commands.executeCommand("si.conditions.switch", ".cproject#Debug");
     await vscode.commands.executeCommand("si.conditions.define", "ARCH_SIZE=64");
     await vscode.commands.executeCommand("si.conditions.undefine", "_WIN32");
     await vscode.commands.executeCommand("si.conditions.assume", "CONFIG_");
     await vscode.commands.executeCommand("workbench.actions.treeView.si.fileSymbols.collapseAll");
     await vscode.commands.executeCommand("si.conditions.focus");
+    if (process.env.SI_DEMO_CONDITIONS === "pick") {
+      void vscode.commands.executeCommand("si.conditions.switch");
+    }
   }
   if (process.env.SI_DEMO_SEARCH) {
     // Nothing to type into a webview from here; the list is shown by the

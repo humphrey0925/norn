@@ -20,11 +20,20 @@ Source-Insight-style views for C in VS Code, backed by the `si` index.
   index in line with the disk whenever you want it.
 
 - **Compile Conditions**: what the build defines, so that `#if` branches
-  it does not compile are left out. Macros can be listed as defined (with a
-  value) or not defined, read from a file (a header of `#define` lines, or
-  a Kconfig `.config`), and names with a prefix, or all names, can be
-  assumed not defined unless the build or the sources define them. Kept in
-  `.si/config.json` with the scope.
+  it does not compile are left out. A project can have several sets, as a
+  build has configurations (Debug, Release, one per board), with one in
+  force: it is named in the status bar, and a click there switches. The
+  view lists what the set in force comes to, macro by macro with its
+  value, under what says so.
+  - A set can *follow* a build configuration found in the workspace: a
+    DS-5 / Arm Development Studio / Eclipse CDT `.cproject`, or the
+    `c_cpp_properties.json` of VS Code's C/C++ extension. Its defines are
+    then read from there, and Sync picks up changes made there.
+  - Macros can also be set by hand (they have the last word), read from a
+    header of `#define` lines or a Kconfig `.config`, and names with a
+    prefix, or all names, can be assumed not defined unless the build or
+    the sources define them.
+  - Kept in `.si/config.json` with the scope.
 
 Go to definition, find references, workspace symbols and call hierarchy use
 the same index.

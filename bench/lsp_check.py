@@ -198,11 +198,27 @@ def main():
         # FD_CLOEXEC 1`; told the build defines it, that branch is skipped.
         has = lambda name: any(x["name"] == name for x in c.request("workspace/symbol", {"query": name}))
         assert has("FD_CLOEXEC")
-        r = c.request("si/setConditions", {"defines": {"FD_CLOEXEC": "1"}})
+        one = lambda **k: {"configurations": {"Debug": k, "Release": {}}, "activeConfiguration": "Debug"}
+        r = c.request("si/setConditions", one(defines={"FD_CLOEXEC": "1"}))
         assert r["conditions"]["known"] == 1 and r["parsed"] >= 7, r
+        assert r["conditions"]["effective"] == [{"name": "FD_CLOEXEC", "value": "1", "source": ""}], r["conditions"]
         assert not has("FD_CLOEXEC") and has("bfd_read")
         saved = json.loads((work / ".si" / "config.json").read_text())
-        assert saved["defines"] == {"FD_CLOEXEC": "1"} and "exclude" in saved, saved
+        assert saved["configurations"]["Debug"]["defines"] == {"FD_CLOEXEC": "1"} and "exclude" in saved, saved
+        # The other set is in force: nothing is said about it there.
+        r = c.request("si/setConditions", {**one(defines={"FD_CLOEXEC": "1"}), "activeConfiguration": "Release"})
+        assert has("FD_CLOEXEC") and r["conditions"]["effective"] == []
+        # A set that follows the build's own description: VS Code's C/C++ settings.
+        (work / ".vscode").mkdir(exist_ok=True)
+        (work / ".vscode" / "c_cpp_properties.json").write_text('{ "configurations": [ { "name": "Win32", "defines": ["FD_CLOEXEC=1", "UNICODE"], } ] } // x')
+        r = c.request("si/conditions", {})
+        assert r["available"] == [{"name": "Win32", "source": ".vscode/c_cpp_properties.json#Win32"}], r["available"]
+        r = c.request("si/setConditions", one(conditionFiles=[".vscode/c_cpp_properties.json#Win32"]))
+        assert not has("FD_CLOEXEC") and {e["name"]: e["source"] for e in r["conditions"]["effective"]} == dict.fromkeys(["FD_CLOEXEC", "UNICODE"], ".vscode/c_cpp_properties.json#Win32")
+        # It changes there; a sync follows it.
+        (work / ".vscode" / "c_cpp_properties.json").write_text('{ "configurations": [ { "name": "Win32", "defines": ["UNICODE"] } ] }')
+        c.request("si/sync", {})
+        assert has("FD_CLOEXEC")
         c.request("si/setConditions", {})
         assert has("FD_CLOEXEC")
         print("conditions: a branch the build does not compile leaves the index, and comes back")

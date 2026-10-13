@@ -32,7 +32,12 @@ pub fn write_settings(root: &Path, settings: serde_json::Value) -> std::io::Resu
     let existing = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
     let mut all = existing.filter(|v| v.is_object()).unwrap_or_else(|| serde_json::json!({}));
     for (key, value) in settings.as_object().into_iter().flatten() {
-        all[key] = value.clone();
+        // (A null takes the setting out of the file.)
+        if value.is_null() {
+            all.as_object_mut().unwrap().remove(key);
+        } else {
+            all[key] = value.clone();
+        }
     }
     std::fs::write(path, serde_json::to_string_pretty(&all).unwrap() + "\n")
 }
