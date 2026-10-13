@@ -25,6 +25,21 @@ fn main() {
         .map(|p| {
             let src = std::fs::read(p).unwrap_or_default();
             let src = if raw { src } else { si_core::mask::lex(&src, &transparent).masked };
+            // `SI_BLANK_COND=1`: what if no conditional directive were left
+            // for the parser at all?
+            let mut src = src;
+            if std::env::var_os("SI_BLANK_COND").is_some() {
+                let mut at = 0;
+                while at < src.len() {
+                    let end = src[at..].iter().position(|&b| b == b'\n').map_or(src.len(), |e| at + e);
+                    let line = src[at..end].trim_ascii_start();
+                    let word = line.strip_prefix(b"#").map(|r| r.trim_ascii_start());
+                    if word.is_some_and(|w| [&b"if"[..], b"elif", b"else", b"endif"].iter().any(|k| w.starts_with(k))) {
+                        src[at..end].iter_mut().for_each(|b| *b = b' ');
+                    }
+                    at = end + 1;
+                }
+            }
             let mut parser = tree_sitter::Parser::new();
             parser.set_language(&lang).unwrap();
             let tree = parser.parse(&src, None).unwrap();

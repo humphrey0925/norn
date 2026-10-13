@@ -318,7 +318,8 @@ impl Session {
         let mut defines_changed = false;
         for p in paths {
             let path = if p.is_absolute() { p.clone() } else { self.root.join(p) };
-            if !is_source(&path) || !touched.insert(path.clone()) {
+            // (A file of another kind is in the index when a source includes it.)
+            if !(is_source(&path) || self.files.binary_search(&path).is_ok()) || !touched.insert(path.clone()) {
                 continue;
             }
             // A file out of the project's scope is as good as not there.

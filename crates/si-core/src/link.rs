@@ -539,7 +539,7 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
             // member or variable to the function.
             let mut bound: Vec<[u32; 3]> = Vec::new();
             let mut slots: Vec<u32> = Vec::new();
-            for b in &f.binds {
+            for b in f.binds.iter().filter(|b| b.slot != NONE) {
                 let typed = (!b.var && b.index == NONE && b.hint != NONE)
                     .then(|| types.member(&f.hints[b.hint as usize], remap[fi][b.slot as usize], fi, &g, base..end, closure, &mut scratch))
                     .flatten();

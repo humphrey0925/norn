@@ -35,16 +35,58 @@ pub fn scan(root: &Path) -> Vec<PathBuf> {
 
 /// The C sources and headers under `root` that `scope` makes part of the
 /// project, sorted. Folders that hold nothing of it are not entered.
+///
+/// A file of another kind is one of them when a source includes it by
+/// name (`#include "commands.def"`, `#include "table.inc"`): such files
+/// are C all the same, often the lists that tables are generated from.
 pub fn scan_scope(root: &Path, scope: &scope::Scope) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = walkdir::WalkDir::new(root)
+    let is_c = |p: &Path| matches!(p.extension().and_then(|x| x.to_str()), Some("c" | "h"));
+    let (mut files, others): (Vec<PathBuf>, Vec<PathBuf>) = walkdir::WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| e.depth() == 0 || !e.file_type().is_dir() || scope.reaches(&rel_path(root, e.path())))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .map(|e| e.into_path())
-        .filter(|p| matches!(p.extension().and_then(|x| x.to_str()), Some("c" | "h")))
         .filter(|p| scope.contains(&rel_path(root, p)))
-        .collect();
+        .partition(|p| is_c(p));
+    // The other files by name, for the includes that mean them.
+    let mut by_name: rustc_hash::FxHashMap<&std::ffi::OsStr, Vec<&PathBuf>> = Default::default();
+    for p in &others {
+        by_name.entry(p.file_name().unwrap_or_default()).or_default().push(p);
+    }
+    let mut taken: rustc_hash::FxHashSet<PathBuf> = Default::default();
+    let mut look_in: Vec<PathBuf> = files.clone();
+    while !look_in.is_empty() && !by_name.is_empty() {
+        let found: Vec<PathBuf> = look_in
+            .par_iter()
+            .flat_map_iter(|p| {
+                let src = std::fs::read(p).unwrap_or_default();
+                let mut out = Vec::new();
+                for line in src.split(|&b| b == b'\n') {
+                    let Some(rest) = line.trim_ascii_start().strip_prefix(b"#") else { continue };
+                    let Some(rest) = rest.trim_ascii_start().strip_prefix(b"include") else { continue };
+                    let Some(rest) = rest.trim_ascii_start().strip_prefix(b"\"") else { continue };
+                    let Some(end) = rest.iter().position(|&b| b == b'"') else { continue };
+                    let Ok(name) = std::str::from_utf8(&rest[..end]) else { continue };
+                    if name.ends_with(".c") || name.ends_with(".h") {
+                        continue;
+                    }
+                    // Beside the file that includes it, or the only one of that name.
+                    let beside = p.parent().map(|d| d.join(name));
+                    let base = std::ffi::OsStr::new(name.rsplit(['/', '\\']).next().unwrap_or(name));
+                    let Some(same) = by_name.get(base) else { continue };
+                    match beside.filter(|b| same.iter().any(|s| *s == b)) {
+                        Some(b) => out.push(b),
+                        None if same.len() == 1 => out.push(same[0].clone()),
+                        None => {}
+                    }
+                }
+                out
+            })
+            .collect();
+        look_in = found.into_iter().filter(|p| taken.insert(p.clone())).collect();
+    }
+    files.extend(taken);
     files.sort_unstable();
     files
 }

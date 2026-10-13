@@ -637,6 +637,11 @@ impl<'a> Walk<'a> {
     }
 
     fn bind(&mut self, value: Node<'a>, slot: u32, index: u32, var: bool, scope: u32, hint: u32) {
+        // Stored in something without a name (a declarator the parser made
+        // up past an error): nothing can be called through that.
+        if slot == NONE {
+            return;
+        }
         let mut fns = Vec::new();
         self.function_names(value, &mut fns);
         for f in fns {
