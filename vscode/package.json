@@ -2,7 +2,7 @@
   "name": "si-code-index",
   "displayName": "SI Code Index",
   "description": "Source-Insight-style symbol search, context and relation views for C, backed by the si index.",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "publisher": "humphrey0925",
   "repository": {
     "type": "git",
@@ -255,6 +255,10 @@
       {
         "command": "si.context.shown",
         "title": "SI: Context shown"
+      },
+      {
+        "command": "si.serverInUse",
+        "title": "SI: Server in use"
       }
     ],
     "menus": {
@@ -433,6 +437,10 @@
         {
           "command": "si.context.shown",
           "when": "false"
+        },
+        {
+          "command": "si.serverInUse",
+          "when": "false"
         }
       ],
       "explorer/context": [
@@ -458,8 +466,8 @@
       "properties": {
         "si.serverPath": {
           "type": "string",
-          "default": "si",
-          "description": "Full path of the si executable, for example D:\\tools\\si-windows-x64.exe (no quotes needed). By default si is looked up on PATH."
+          "default": "",
+          "description": "Leave empty to use the server that comes with the extension (Windows x64), or si on PATH where there is none. Set it to the full path of another si executable to use that instead, for example D:\\tools\\si-windows-x64.exe (no quotes needed)."
         },
         "si.includeAliases": {
           "type": "array",

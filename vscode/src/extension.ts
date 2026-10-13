@@ -1142,9 +1142,21 @@ class Lenses implements vscode.CodeLensProvider {
 
 /** The setting as a path: quotes around it (as copied from Explorer or a
  *  shell), `~` and `${workspaceFolder}` are all things people write. */
+/** The server that comes inside the extension, when it has one for this
+ *  kind of machine. */
+function bundledServer(): string | undefined {
+  const exe = path.join(home.fsPath, "bin", `${process.platform}-${process.arch}`, process.platform === "win32" ? "si.exe" : "si");
+  return fs.existsSync(exe) ? exe : undefined;
+}
+
+/** Which server to start: the one `si.serverPath` names when it names
+ *  one, else the one that came with the extension, else `si` on PATH. */
 function serverPath(): string {
-  let p = vscode.workspace.getConfiguration("si").get<string>("serverPath", "si").trim();
+  let p = vscode.workspace.getConfiguration("si").get<string>("serverPath", "").trim();
   p = p.replace(/^(["'])(.*)\1$/, "$2").trim();
+  if (p === "" || p === "si") {
+    return bundledServer() ?? "si";
+  }
   const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (folder) {
     p = p.replace(/\$\{workspaceFolder\}/g, folder);
@@ -1372,6 +1384,23 @@ export async function activate(context: vscode.ExtensionContext) {
     if (rebuild && !args.includes("--no-cache")) {
       args.push("--rebuild");
     }
+    // A setting from before the server came inside the extension starts
+    // an older server, which may not know what this extension asks of it.
+    const builtIn = bundledServer();
+    if (builtIn && command !== builtIn && !context.workspaceState.get("si.keepServerPath")) {
+      void vscode.window
+        .showInformationMessage(`SI now includes its server. si.serverPath (${command}) is used instead of it; an older server may lack features of this version.`, "Use the Built-in Server", "Keep My Setting")
+        .then(async (pick) => {
+          if (pick === "Use the Built-in Server") {
+            const config = vscode.workspace.getConfiguration("si");
+            for (const target of [vscode.ConfigurationTarget.Global, vscode.ConfigurationTarget.Workspace, vscode.ConfigurationTarget.WorkspaceFolder]) {
+              await config.update("serverPath", undefined, target).then(undefined, () => undefined);
+            }
+          } else if (pick) {
+            await context.workspaceState.update("si.keepServerPath", true);
+          }
+        });
+    }
     // A path that is not there is the usual reason for not starting: say so
     // plainly instead of leaving a spawn error in the log.
     if (/[\/]/.test(command) && !fs.existsSync(command)) {
@@ -1451,6 +1480,7 @@ export async function activate(context: vscode.ExtensionContext) {
       return editor ? relation.sync(editor) : undefined;
     }),
     vscode.commands.registerCommand("si.relation.target", () => relation.target),
+    vscode.commands.registerCommand("si.serverInUse", () => serverPath()),
     vscode.commands.registerCommand("si.context.shown", () => contextView.state),
     vscode.window.onDidChangeActiveColorTheme(() => setTimeout(() => contextView.colors(), 300)),
     vscode.commands.registerCommand("si.context.sync", () => {

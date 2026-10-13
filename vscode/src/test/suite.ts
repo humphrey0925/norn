@@ -57,6 +57,12 @@ export async function run(): Promise<void> {
   assert.ok(resolved.some((l) => /callers/.test(l.command!.title)));
   assert.ok(resolved.some((l) => /through function pointers/.test(l.command!.title)), resolved.map((l) => l.command!.title).slice(0, 8).join(" | "));
 
+  // With no path set, the server is the one inside the extension.
+  if (process.env.SI_TEST_BUNDLED) {
+    const used = await vscode.commands.executeCommand<string>("si.serverInUse");
+    assert.ok(/[\\/]bin[\\/][a-z0-9]+-[a-z0-9]+[\\/]si(\.exe)?$/.test(used), used);
+  }
+
   // The views and their commands exist and run.
   editor.selection = new vscode.Selection(read, read);
   for (const view of ["si.relation.focus", "si.context.focus", "si.search.focus", "si.fileSymbols.focus"]) {

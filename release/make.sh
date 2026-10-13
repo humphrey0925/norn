@@ -7,7 +7,11 @@ cd "$(dirname "$0")/.."
 version=$(node -p "require('./vscode/package.json').version")
 seven="${SEVENZIP:-/c/Program Files/7-Zip/7z.exe}"
 cargo build --release
+# The server goes inside the extension, under the name of what it runs on.
+rm -rf vscode/bin && mkdir -p vscode/bin/win32-x64
+cp target/release/si.exe vscode/bin/win32-x64/si.exe
 (cd vscode && npm run package)
+unzip -l out/si-code-index.vsix | grep -q "extension/bin/win32-x64/si.exe" || { echo "the package has no server in it"; exit 1; }
 packed=$(unzip -p out/si-code-index.vsix extension/package.json | node -p "JSON.parse(require('fs').readFileSync(0)).version")
 [ "$packed" = "$version" ] || { echo "the package is $packed, not $version"; exit 1; }
 stage=out/release-stage

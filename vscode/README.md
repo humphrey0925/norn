@@ -60,9 +60,12 @@ following.
 
 ## Setup
 
-Build `si` (`cargo build --release` at the repository root) and point
-`si.serverPath` at the executable, or put it on `PATH`. The index is built in
-memory when a folder with C files is opened and updated when files are saved.
+The packaged extension for Windows x64 has the `si` server inside it:
+install the `.vsix` and open a folder. Elsewhere, build `si`
+(`cargo build --release` at the repository root) and point `si.serverPath`
+at the executable, or put it on `PATH`; a path set there is always used in
+place of the built-in server. The index is built when a folder with C
+files is opened, kept in `.si/cache`, and updated when files are saved.
 
 `si.includeAliases` tells the index which template a generated header comes
 from, for example `bfd.h=bfd-in2.h`.
