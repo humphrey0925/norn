@@ -70,6 +70,8 @@ pub mod site {
     pub const BRACE_FOLLOWS: u8 = 8;
     /// Inside an initializer's braces.
     pub const INIT: u8 = 16;
+    /// The recorded arguments follow a name that takes none itself.
+    pub const TRAILING: u8 = 32;
 }
 
 /// The text of a `#define` an expansion may need: `text` is everything after

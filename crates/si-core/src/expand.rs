@@ -682,7 +682,15 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str) -> Found {
         && toks[0].k == K::Ident
         && toks[0].origin != Origin::Site
         && toks[1].is("(")
-        && toks[1..].iter().all(|t| t.origin == Origin::Site)
+        && toks[1].origin == Origin::Site
+        && {
+            // ... all of it, in one pair of parentheses.
+            let mut depth = 0;
+            toks[1..].iter().position(|t| {
+                depth += t.is("(") as i32 - t.is(")") as i32;
+                depth == 0
+            }) == Some(n - 2)
+        }
         && !is_keyword(toks[0].text.as_bytes())
         && &*toks[0].text != "NULL";
     if renamed {
@@ -1008,7 +1016,7 @@ fn expand_file(fi: usize, f: &FileFacts, table: &Table, fwd: &[Vec<u32>], rev: &
         let mut named: Vec<(String, Contexts)> = Vec::new();
         for (ei, eng) in engines.iter_mut().enumerate() {
             // Where the name is not a macro, or may not be, it is the name.
-            if s.args == NONE && eng.maybe_undefined(macro_name) {
+            if (s.args == NONE || s.flags & site::TRAILING != 0) && eng.maybe_undefined(macro_name) {
                 add_name(&mut named, macro_name, (ei, Choice::default()));
             }
             let mut known = FxHashSet::default();

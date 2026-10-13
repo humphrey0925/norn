@@ -782,6 +782,18 @@ impl<'a> Lexer<'a> {
             b'{' => site::BRACE_FOLLOWS,
             _ => 0,
         };
+        // A name that takes no arguments, called: what it expands to may
+        // take them (`#define H_PUT_16 bfd_h_put_16`).
+        if flags == site::CALLED && args_end == 0 {
+            let at = (self.c.i, self.c.line);
+            if self.c.skip_parens() {
+                args_end = self.c.i as u32;
+                flags |= site::TRAILING;
+                self.c.skip_space(true);
+            } else {
+                (self.c.i, self.c.line) = at;
+            }
+        }
         let top = self.nest.braces.is_empty() && self.nest.parens == 0;
         // `const bfd_target MY (vec) = { ... }`: the parser cannot make a
         // declaration of this, so the initializer is taken here.
