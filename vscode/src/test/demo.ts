@@ -46,6 +46,19 @@ export async function run(): Promise<void> {
       void vscode.commands.executeCommand("si.conditions.switch");
     }
   }
+  if (process.env.SI_DEMO_SOURCES) {
+    const fs = await import("fs");
+    fs.writeFileSync(path.join(folder, "include", "config.h"), ["#ifndef CONFIG_H", "#define CONFIG_H", "#define USE_NET 1", "#define USE_USB 0", "#define BOARD_REV 3", "#endif", ""].join("\n"));
+    fs.writeFileSync(
+      path.join(folder, "bfd", "net.c"),
+      ['#include "config.h"', "#if USE_NET", "int net_init (void) { return 1; }", "#endif", "#if USE_USB", "int usb_init (void) { return 1; }", "#endif", "#if BOARD_REV >= 3", "int rev3 (void) { return 1; }", "#endif", ""].join("\n"),
+    );
+    await vscode.commands.executeCommand("si.sync");
+    await vscode.commands.executeCommand("workbench.actions.treeView.si.fileSymbols.collapseAll");
+    await vscode.commands.executeCommand("si.conditions.focus");
+    await vscode.commands.executeCommand("list.focusLast");
+    await vscode.commands.executeCommand("list.expand");
+  }
   if (process.env.SI_DEMO_SEARCH) {
     // Nothing to type into a webview from here; the list is shown by the
     // check script's own query. Left for manual runs.

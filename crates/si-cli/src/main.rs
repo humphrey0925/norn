@@ -190,11 +190,11 @@ fn index(root: &Path, out: &Path, stores: &str, stride: usize, options: &si_core
     // the build defines.
     let scope = si_core::scope::Scope::load(root);
     let files: Vec<PathBuf> = si_core::scan_scope(root, &scope).into_iter().step_by(stride.max(1)).collect();
-    let conditions = si_core::conditions_of(root, &files);
+    let mut conditions = si_core::conditions_of(root, &files);
     let scan_ms = ms(t);
 
     let t = Instant::now();
-    let transparent = si_core::prescan_under(&files, &conditions);
+    let transparent = si_core::prescan_under(root, &files, &mut conditions);
     let prescan_ms = ms(t);
 
     let t = Instant::now();

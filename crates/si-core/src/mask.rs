@@ -112,6 +112,158 @@ pub struct Define {
     pub hides: bool,
     /// Names the body refers to.
     pub refs: Vec<Vec<u8>>,
+    /// The body as a value (see `cond::value_of`), for a macro without
+    /// parameters whose body is short enough to be one.
+    pub value: Option<Vec<u8>>,
+    /// Nothing around it may keep it from being compiled (an include
+    /// guard apart).
+    pub certain: bool,
+    /// Directly under `#ifndef` of its own name: a default.
+    pub fallback: bool,
+    /// The file's include guard.
+    pub guard: bool,
+    /// Not a definition but an `#undef` of the name.
+    pub undef: bool,
+    /// Not a definition but an `#include`, `name` being the file as written.
+    pub include: bool,
+    /// Not a definition but a name some `#if` of the file tests.
+    pub test: bool,
+}
+
+impl Define {
+    /// A note about `name` that is not a definition of it.
+    fn note(name: &[u8], certain: bool) -> Define {
+        Define {
+            name: name.to_vec(),
+            function_like: false,
+            deps: None,
+            hides: false,
+            refs: Vec::new(),
+            value: None,
+            certain,
+            fallback: false,
+            guard: false,
+            undef: false,
+            include: false,
+            test: false,
+        }
+    }
+}
+
+/// What the sources settle about the macros their `#if`s test, and where
+/// (see `cond`): `per_file` are the files' `#define`s with their
+/// `#include`s, `#undef`s and tested names, `paths` the files as they are
+/// indexed, in the same order.
+///
+/// A name has a value in a file when every source file the file is
+/// compiled as part of certainly includes a certain definition of it to
+/// that value, and none of them can reach a line that undefines it, may
+/// define it, or defines it otherwise.
+pub fn source_of(per_file: &[Vec<Define>], paths: &[String]) -> crate::cond::Source {
+    use rayon::prelude::*;
+    let n = paths.len();
+    let mut source = crate::cond::Source::new(paths);
+    // Who includes whom: every include line, and those certainly compiled.
+    let mut by_base: FxHashMap<&str, Vec<u32>> = FxHashMap::default();
+    for (i, t) in paths.iter().enumerate() {
+        by_base.entry(t.rsplit('/').next().unwrap_or(t)).or_default().push(i as u32);
+    }
+    // The files an include line may mean: those whose path ends with it.
+    let targets = |name: &[u8]| -> Vec<u32> {
+        let name = String::from_utf8_lossy(name).replace('\\', "/");
+        let name = name.trim_start_matches("./").trim_start_matches("../");
+        let all = by_base.get(name.rsplit('/').next().unwrap_or(name)).map_or(&[][..], |v| &v[..]);
+        let exact: Vec<u32> = all.iter().copied().filter(|&i| paths[i as usize] == name || paths[i as usize].ends_with(&format!("/{name}"))).collect();
+        if exact.is_empty() { all.to_vec() } else { exact }
+    };
+    let (mut down, mut up, mut up_certain) = (vec![Vec::new(); n], vec![Vec::new(); n], vec![Vec::new(); n]);
+    let mut tested: FxHashSet<&[u8]> = FxHashSet::default();
+    for (f, defines) in per_file.iter().enumerate() {
+        for d in defines {
+            if d.test {
+                tested.insert(&d.name);
+            } else if d.include {
+                for t in targets(&d.name) {
+                    down[f].push(t);
+                    up[t as usize].push(f as u32);
+                    if d.certain {
+                        up_certain[t as usize].push(f as u32);
+                    }
+                }
+            }
+        }
+    }
+    // What a compilation starts from: a file that is not a header, or a
+    // header nothing here includes (it is somebody's, out of sight).
+    let roots: Vec<u32> = (0..n as u32).filter(|&i| !paths[i as usize].ends_with(".h") || up[i as usize].is_empty()).collect();
+    // What is said of each tested name, and where.
+    #[derive(Default)]
+    struct Said<'a> {
+        /// (value, file) of each definition that is certainly compiled.
+        sure: Vec<(&'a [u8], u32)>,
+        /// Files with a line that leaves the name's value open.
+        open: Vec<u32>,
+    }
+    let mut said: FxHashMap<&[u8], Said> = FxHashMap::default();
+    for (f, defines) in per_file.iter().enumerate() {
+        for d in defines.iter().filter(|d| !d.include && !d.test && tested.contains(&d.name[..])) {
+            let e = said.entry(&d.name).or_default();
+            match d.value.as_deref().filter(|_| !d.undef && !d.function_like && !d.guard && d.certain) {
+                Some(value) => e.sure.push((value, f as u32)),
+                // A default (`#ifndef X` / `#define X`) leaves things as they are where X is defined.
+                None if d.fallback && !d.undef => {}
+                None => e.open.push(f as u32),
+            }
+        }
+    }
+    let said: Vec<(&[u8], Said)> = said.into_iter().filter(|(_, s)| !s.sure.is_empty()).collect();
+    // Too much to work out in reasonable time is left alone.
+    let edges: usize = down.iter().map(Vec::len).sum();
+    if said.len().saturating_mul(n + edges) > 400_000_000 {
+        return source;
+    }
+    let reach = |from: &[u32], next: &[Vec<u32>]| -> Vec<bool> {
+        let mut seen = vec![false; n];
+        let mut work = from.to_vec();
+        while let Some(f) = work.pop() {
+            if !std::mem::replace(&mut seen[f as usize], true) {
+                work.extend(next[f as usize].iter().copied().filter(|&t| !seen[t as usize]));
+            }
+        }
+        seen
+    };
+    let found: Vec<(&[u8], &[u8], Vec<bool>)> = said
+        .par_iter()
+        .flat_map_iter(|(name, s)| {
+            let mut values: Vec<&[u8]> = s.sure.iter().map(|x| x.0).collect();
+            values.sort_unstable();
+            values.dedup();
+            let mut out = Vec::new();
+            for value in values {
+                let definers: Vec<u32> = s.sure.iter().filter(|x| x.0 == value).map(|x| x.1).collect();
+                let others: Vec<u32> = s.sure.iter().filter(|x| x.0 != value).map(|x| x.1).chain(s.open.iter().copied()).collect();
+                // Files that certainly get the definition, and files that may get something else.
+                let sure = reach(&definers, &up_certain);
+                let spoiled = reach(&others, &up);
+                let (good, bad): (Vec<u32>, Vec<u32>) = roots.iter().partition(|&&r| sure[r as usize] && !spoiled[r as usize]);
+                if good.is_empty() {
+                    continue;
+                }
+                // Known where a good compilation gets to and no other does.
+                let mut known = reach(&good, &down);
+                let unknown = reach(&bad, &down);
+                known.iter_mut().zip(&unknown).for_each(|(k, u)| *k &= !u);
+                if known.iter().any(|k| *k) {
+                    out.push((*name, value, known));
+                }
+            }
+            out
+        })
+        .collect();
+    for (name, value, known) in found {
+        source.add(name, value, &known);
+    }
+    source
 }
 
 /// What the corpus-wide pre-pass learns about macros, by name.
@@ -158,7 +310,7 @@ impl MacroSets {
         let mut bodies: FxHashMap<Vec<u8>, (bool, bool, Vec<Vec<u8>>)> = FxHashMap::default();
         for d in defines {
             // `#define inline` and the like: the keyword still matters to us.
-            if is_keyword(&d.name) {
+            if is_keyword(&d.name) || d.undef || d.include || d.test {
                 continue;
             }
             let b = bodies.entry(d.name.clone()).or_default();
@@ -563,6 +715,10 @@ struct Lexer<'a> {
     conditions: &'a Conditions,
     out: Lexed,
     defines: Option<Vec<Define>>,
+    /// What the file has said of macros so far (see `cond::Local`).
+    local: crate::cond::Local,
+    /// The file, as the conditions' `Source` numbers it.
+    file: Option<u32>,
     nest: Nest,
     /// Nesting at each open `#if`, restored at `#else` so that alternative
     /// branches do not both count their brackets.
@@ -934,6 +1090,18 @@ impl<'a> Lexer<'a> {
                 self.define();
                 hide = true;
             }
+            b"undef" => {
+                self.c.skip_space(false);
+                let (a, e) = self.c.ident();
+                if e > a {
+                    // From here on the name is not defined, if this line is compiled at all.
+                    let certain = !self.conds.iter().any(|c| !c.include_guard && c.compiled != Tri::True);
+                    self.local.insert(s[a..e].to_vec(), certain.then_some(None));
+                    if let Some(defines) = &mut self.defines {
+                        defines.push(Define { undef: true, ..Define::note(&s[a..e], certain) });
+                    }
+                }
+            }
             b"include" | b"include_next" => {
                 self.c.skip_space(false);
                 let open = self.c.i;
@@ -947,6 +1115,9 @@ impl<'a> Lexer<'a> {
                 if let Some(len) = text.iter().skip(1).position(|&b| b == close) {
                     let conditional = self.conds.iter().any(|c| !c.include_guard && c.compiled != Tri::True);
                     self.out.includes.push((open as u32 + 1, (open + 1 + len) as u32, conditional));
+                    if let Some(defines) = &mut self.defines {
+                        defines.push(Define { include: true, ..Define::note(&s[open + 1..open + 1 + len], !conditional) });
+                    }
                 }
             }
             _ => {}
@@ -974,12 +1145,12 @@ impl<'a> Lexer<'a> {
                     let mut c = Cur { s: &s[..span.1], i: e, line: 0 };
                     c.skip_space(false);
                     let (a, e) = c.ident();
-                    self.conditions.defined(&s[a..e])
+                    self.conditions.defined_in(&self.local, self.file, &s[a..e])
                 };
                 let holds = match word {
                     b"ifdef" => named(),
                     b"ifndef" => named().not(),
-                    _ => self.conditions.eval(&s[e..span.1]),
+                    _ => self.conditions.eval_in(&self.local, self.file, &s[e..span.1]),
                 };
                 self.conds.push(Cond {
                     nest: self.nest.clone(),
@@ -1006,7 +1177,7 @@ impl<'a> Lexer<'a> {
                     // This branch is compiled only if none before it was,
                     // and (for `#elif`) its own condition holds.
                     if word != b"endif" {
-                        let own = if word == b"elif" { self.conditions.eval(&s[e..span.1]) } else if word == b"else" { Tri::True } else { Tri::Unknown };
+                        let own = if word == b"elif" { self.conditions.eval_in(&self.local, self.file, &s[e..span.1]) } else if word == b"else" { Tri::True } else { Tri::Unknown };
                         c.compiled = c.taken.not().and(own);
                         skip = c.compiled == Tri::False;
                         c.taken = c.taken.or(own);
@@ -1119,6 +1290,25 @@ impl<'a> Lexer<'a> {
         let (end, end_line) = (self.c.i, self.c.line);
         let mut refs = Vec::new();
         scan_refs(s, body, end, line, &params, &mut refs);
+        let name = Tok { start: a as u32, end: e as u32, line, call: function_like, member: false };
+        // `#ifndef FOO_H` / `#define FOO_H` with nothing or `1` after it,
+        // around the whole file.
+        let mut guard = false;
+        if self.conds.len() == 1 && self.conds[0].ifndef.as_deref() == Some(&s[a..e]) {
+            let text = s[body..end].trim_ascii();
+            if !function_like && (text.is_empty() || text == b"1") {
+                self.conds[0].include_guard = true;
+                guard = true;
+            }
+        }
+        let conditional = self.conds.iter().any(|c| !c.include_guard && c.compiled != Tri::True);
+        let fallback = self.conds.last().is_some_and(|c| !c.include_guard && c.compiled != Tri::True && c.ifndef.as_deref() == Some(&s[a..e]));
+        // From here on in this file the name has this value, if the line
+        // is compiled at all. (One with parameters is defined, to nothing
+        // a condition can use.)
+        let value = if function_like { None } else { crate::cond::value_of(&s[body..end]) };
+        let known = if function_like { Some(b"(".to_vec()) } else { value.clone().or(Some(b"(".to_vec())) };
+        self.local.insert(s[a..e].to_vec(), (!conditional).then_some(known));
         if let Some(defines) = &mut self.defines {
             defines.push(Define {
                 name: s[a..e].to_vec(),
@@ -1126,20 +1316,18 @@ impl<'a> Lexer<'a> {
                 deps: transparent_deps(s, body, end, &refs),
                 hides: crate::expand::hides_names(&s[body..end], &params),
                 refs: refs.iter().filter(|t| !t.member).map(|t| s[t.start as usize..t.end as usize].to_vec()).collect(),
+                value,
+                certain: !conditional,
+                fallback,
+                guard,
+                undef: false,
+                include: false,
+                test: false,
             });
         }
-        let name = Tok { start: a as u32, end: e as u32, line, call: function_like, member: false };
-        // `#ifndef FOO_H` / `#define FOO_H` with nothing or `1` after it,
-        // around the whole file.
-        if self.conds.len() == 1 && self.conds[0].ifndef.as_deref() == Some(&s[a..e]) {
-            let body = s[body..end].iter().filter(|b| !b.is_ascii_whitespace()).count();
-            if !function_like && body <= 1 {
-                self.conds[0].include_guard = true;
-            }
-        }
-        let conditional = self.conds.iter().any(|c| !c.include_guard && c.compiled != Tri::True);
-        let fallback = self.conds.last().is_some_and(|c| !c.include_guard && c.compiled != Tri::True && c.ifndef.as_deref() == Some(&s[a..e]));
         let keep = self.transparent.kept.contains(&s[a..e]);
+        let guard_flag = guard;
+        let _ = guard_flag;
         let mut guard = String::new();
         if keep {
             for (n, v, negated) in self.conds.iter().filter_map(|c| c.test.as_ref()) {
@@ -1192,13 +1380,32 @@ fn transparent_deps(s: &[u8], start: usize, end: usize, refs: &[Tok]) -> Option<
     }
 }
 
-fn lexer<'a>(src: &'a [u8], transparent: &'a MacroSets, conditions: &'a Conditions, mask: bool) -> Lexer<'a> {
+fn lexer<'a>(src: &'a [u8], transparent: &'a MacroSets, conditions: &'a Conditions, mask: bool, path: Option<&str>) -> Lexer<'a> {
+    // What the file itself defines or undefines is not known before the
+    // line that does it, whatever is known of the name elsewhere.
+    let mut local = crate::cond::Local::default();
+    for line in src.split(|&b| b == b'\n') {
+        let Some(rest) = line.trim_ascii_start().strip_prefix(b"#") else { continue };
+        let rest = rest.trim_ascii_start();
+        let Some(rest) = rest.strip_prefix(b"define").or(rest.strip_prefix(b"undef")) else { continue };
+        if !rest.first().is_some_and(|b| matches!(b, b' ' | b'\t')) {
+            continue;
+        }
+        let rest = rest.trim_ascii_start();
+        let end = rest.iter().position(|&b| !is_ident(b)).unwrap_or(rest.len());
+        // (What the settings say of a name stands until the file says otherwise.)
+        if end > 0 && !conditions.settles(&rest[..end]) {
+            local.insert(rest[..end].to_vec(), None);
+        }
+    }
     Lexer {
+        file: path.and_then(|p| conditions.source()?.file(p)),
         c: Cur { s: src, i: 0, line: 1 },
         transparent,
         conditions,
         out: Lexed { masked: if mask { src.to_vec() } else { Vec::new() }, ..Default::default() },
         defines: None,
+        local,
         nest: Nest::default(),
         conds: Vec::new(),
         prev: 0,
@@ -1212,7 +1419,13 @@ fn lexer<'a>(src: &'a [u8], transparent: &'a MacroSets, conditions: &'a Conditio
 
 /// Mask `src` for parsing and report what was hidden.
 pub fn lex(src: &[u8], transparent: &MacroSets) -> Lexed {
-    let mut l = lexer(src, transparent, &transparent.conditions, true);
+    lex_file(src, transparent, None)
+}
+
+/// The same for the file indexed as `path`: what the sources settle about
+/// macros is told file by file.
+pub fn lex_file(src: &[u8], transparent: &MacroSets, path: Option<&str>) -> Lexed {
+    let mut l = lexer(src, transparent, &transparent.conditions, true, path);
     l.run();
     l.out
 }
@@ -1240,11 +1453,54 @@ pub fn defined_names(src: &[u8]) -> Vec<&[u8]> {
 /// The `#define`s of one file, for building the [`MacroSets`] set: those
 /// in branches the build compiles, as far as `conditions` say.
 pub fn defines(src: &[u8], conditions: &Conditions) -> Vec<Define> {
+    defines_of(src, conditions, None)
+}
+
+/// The same for the file indexed as `path`, with notes of what it includes
+/// and which names its `#if`s test.
+pub fn defines_of(src: &[u8], conditions: &Conditions, path: Option<&str>) -> Vec<Define> {
     static NONE: std::sync::OnceLock<MacroSets> = std::sync::OnceLock::new();
-    let mut l = lexer(src, NONE.get_or_init(MacroSets::default), conditions, false);
+    let mut l = lexer(src, NONE.get_or_init(MacroSets::default), conditions, false, path);
     l.defines = Some(Vec::new());
     l.run();
-    l.defines.unwrap_or_default()
+    let mut defines = l.defines.unwrap_or_default();
+    // Includes on lines that were passed over (a branch the build does not
+    // compile) are includes all the same when it comes to whose a header
+    // is: noted, as ones that may not happen. And the names tested.
+    let mut seen: FxHashSet<Vec<u8>> = defines.iter().filter(|d| d.include).map(|d| d.name.clone()).collect();
+    let mut tested: FxHashSet<&[u8]> = FxHashSet::default();
+    for line in src.split(|&b| b == b'\n') {
+        let Some(rest) = line.trim_ascii_start().strip_prefix(b"#") else { continue };
+        let rest = rest.trim_ascii_start();
+        if let Some(rest) = rest.strip_prefix(b"include_next").or(rest.strip_prefix(b"include")) {
+            let rest = rest.trim_ascii_start();
+            let close = match rest.first() {
+                Some(b'"') => b'"',
+                Some(b'<') => b'>',
+                _ => continue,
+            };
+            let Some(len) = rest[1..].iter().position(|&b| b == close) else { continue };
+            if seen.insert(rest[1..1 + len].to_vec()) {
+                defines.push(Define { include: true, ..Define::note(&rest[1..1 + len], false) });
+            }
+        } else if rest.starts_with(b"if") || rest.starts_with(b"elif") {
+            let mut i = 0;
+            while i < rest.len() {
+                if is_ident_start(rest[i]) {
+                    let a = i;
+                    while i < rest.len() && is_ident(rest[i]) {
+                        i += 1;
+                    }
+                    if a > 0 && tested.insert(&rest[a..i]) {
+                        defines.push(Define { test: true, ..Define::note(&rest[a..i], false) });
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    defines
 }
 
 #[cfg(test)]
@@ -1327,13 +1583,63 @@ mod tests {
             assert_eq!(m.contains(name), there, "{name}");
         }
         // Only the definition in the compiled branch counts.
-        let names: Vec<String> = defines(src.as_bytes(), &c).iter().map(|d| String::from_utf8(d.name.clone()).unwrap()).collect();
+        let noted = |d: &&Define| !(d.test || d.include || d.undef);
+        let names: Vec<String> = defines(src.as_bytes(), &c).iter().filter(noted).map(|d| String::from_utf8(d.name.clone()).unwrap()).collect();
         assert_eq!(names, ["W"]);
         let macros = l.events.iter().filter(|e| matches!(e, Event::Macro(_))).count();
         assert_eq!(macros, 1);
         // With nothing configured only `#if 0` is passed over.
         let plain = masked(src, &MacroSets::default());
         assert!(plain.contains("wide") && plain.contains("win") && !plain.contains("dead"));
+    }
+
+    #[test]
+    fn what_a_file_defines_settles_its_own_conditions_below() {
+        let src = "#ifndef CFG_H\n#define CFG_H\n#if USE_A\nint early (void);\n#endif\n#define USE_A 1\n#define LEVEL (2)\n#undef OLD\n\
+                   #if USE_A\nint a_on (void);\n#else\nint a_off (void);\n#endif\n\
+                   #if LEVEL > 1 && !defined(OLD)\nint high (void);\n#else\nint low (void);\n#endif\n\
+                   #ifdef MAYBE\n#define USE_B 1\n#endif\n#if USE_B\nint b_on (void);\n#else\nint b_off (void);\n#endif\n\
+                   #ifndef DFLT\n#define DFLT 4\n#endif\n#undef USE_A\n#ifdef USE_A\nint still (void);\n#endif\n#endif\n";
+        let m = masked(src, &MacroSets::default());
+        for (name, there) in [("early", true), ("a_on", true), ("a_off", false), ("high", true), ("low", false), ("b_on", true), ("b_off", true), ("still", false)] {
+            assert_eq!(m.contains(name), there, "{name}");
+        }
+    }
+
+    #[test]
+    fn what_the_sources_define_is_known_in_the_files_it_reaches() {
+        let files: Vec<(&str, &str)> = vec![
+            // A switch in a header everything includes...
+            ("cfg.h", "#ifndef CFG_H\n#define CFG_H\n#define USE_NET 1\n#define LEVEL 2\n#endif\n"),
+            ("a.c", "#include \"cfg.h\"\n#include \"shared.h\"\n#if USE_NET\n#endif\n"),
+            // ...a macro one file sets before a shared header, which another does not...
+            ("b.c", "#include \"cfg.h\"\n#define NO_RELOCS\n#include \"shared.h\"\n#include \"mine.h\"\n"),
+            ("shared.h", "#ifdef NO_RELOCS\n#endif\n#if LEVEL > 1\n#endif\n#ifdef WIN\n#endif\n#if SIZE == 64\n#endif\n"),
+            // ...a header of one file only...
+            ("mine.h", "#ifdef NO_RELOCS\n#endif\n"),
+            // ...a platform's header, included where a condition may not hold...
+            ("win.h", "#define WIN 1\n"),
+            ("c.c", "#include \"cfg.h\"\n#ifdef SOMETHING\n#include \"win.h\"\n#endif\n#include \"shared.h\"\n#ifdef WIN\n#endif\n"),
+            // ...and files that give a name different values.
+            ("d64.c", "#define SIZE 64\n#include \"sized.h\"\n"),
+            ("d32.c", "#define SIZE 32\n#include \"sized.h\"\n#include \"only32.h\"\n"),
+            ("sized.h", "#if SIZE == 64\n#endif\n"),
+            ("only32.h", "#if SIZE == 64\n#endif\n"),
+        ];
+        let paths: Vec<String> = files.iter().map(|f| f.0.to_string()).collect();
+        let defines: Vec<Vec<Define>> = files.iter().map(|f| defines(f.1.as_bytes(), &Conditions::default())).collect();
+        let mut c = Conditions::default();
+        c.set_source(Some(std::sync::Arc::new(source_of(&defines, &paths))));
+        let none = crate::cond::Local::default();
+        let known = |file: &str, expr: &str| c.eval_in(&none, c.source().unwrap().file(file), expr.as_bytes());
+        // Everything includes cfg.h: its switches are known wherever they are tested.
+        assert_eq!((known("a.c", "USE_NET"), known("shared.h", "LEVEL > 1"), known("mine.h", "LEVEL == 2")), (Tri::True, Tri::True, Tri::True));
+        // Only b.c defines NO_RELOCS: not known in the header a.c includes too, known in b.c's own.
+        assert_eq!((known("shared.h", "defined(NO_RELOCS)"), known("mine.h", "defined(NO_RELOCS)")), (Tri::Unknown, Tri::True));
+        // Nobody certainly includes win.h.
+        assert_eq!((known("c.c", "defined(WIN)"), known("shared.h", "defined(WIN)")), (Tri::Unknown, Tri::Unknown));
+        // Two values: known where only one of them gets to.
+        assert_eq!((known("sized.h", "SIZE == 64"), known("only32.h", "SIZE == 64"), known("shared.h", "SIZE == 64")), (Tri::Unknown, Tri::False, Tri::Unknown));
     }
 
     #[test]

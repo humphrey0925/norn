@@ -189,7 +189,7 @@ impl Extractor {
             out.defined_names.push(id);
         }
         let t = std::time::Instant::now();
-        let lexed = mask::lex(src, transparent);
+        let lexed = mask::lex_file(src, transparent, Some(path));
         for &(a, e, conditional) in &lexed.includes {
             let id = out.push_name(&String::from_utf8_lossy(&src[a as usize..e as usize]));
             out.includes.push(id);

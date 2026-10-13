@@ -49,6 +49,13 @@ Source-Insight-style views for C in VS Code, backed by the `si` index.
     in `.vscode/c_cpp_properties.json` gets its defines and, from a
     `.cproject`, its include paths, and is rewritten when the set changes
     or another is switched to. Select `SI` in the C/C++ extension once.
+  - What the sources define themselves counts as well, without being
+    set: a `#define` settles the name for the rest of its file, and a
+    name is known in a file when every source file that file is compiled
+    as part of certainly includes a definition of it, all to one value (a
+    switch in a configuration header everything includes). "From the
+    sources" lists those, with the number of files each is known in, and
+    can be turned off there; anything set by hand overrules them.
   - Kept in `.si/config.json` with the scope.
 
 Go to definition, find references, workspace symbols and call hierarchy use

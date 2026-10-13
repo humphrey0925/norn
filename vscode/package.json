@@ -2,7 +2,7 @@
   "name": "si-code-index",
   "displayName": "SI Code Index",
   "description": "Source-Insight-style symbol search, context and relation views for C, backed by the si index.",
-  "version": "0.13.1",
+  "version": "0.14.0",
   "publisher": "humphrey0925",
   "repository": {
     "type": "git",
@@ -259,6 +259,16 @@
       {
         "command": "si.serverInUse",
         "title": "SI: Server in use"
+      },
+      {
+        "command": "si.conditions.sourcesOff",
+        "title": "Do Not Use the Sources' Own #defines",
+        "icon": "$(eye-closed)"
+      },
+      {
+        "command": "si.conditions.sourcesOn",
+        "title": "Use the Sources' Own #defines",
+        "icon": "$(eye)"
       }
     ],
     "menus": {
@@ -399,6 +409,16 @@
           "command": "si.conditions.switch",
           "when": "view == si.conditions && viewItem == config",
           "group": "inline@1"
+        },
+        {
+          "command": "si.conditions.sourcesOff",
+          "when": "view == si.conditions && viewItem == sources.on",
+          "group": "inline@1"
+        },
+        {
+          "command": "si.conditions.sourcesOn",
+          "when": "view == si.conditions && viewItem == sources.off",
+          "group": "inline@1"
         }
       ],
       "commandPalette": [
@@ -440,6 +460,14 @@
         },
         {
           "command": "si.serverInUse",
+          "when": "false"
+        },
+        {
+          "command": "si.conditions.sourcesOff",
+          "when": "false"
+        },
+        {
+          "command": "si.conditions.sourcesOn",
           "when": "false"
         }
       ],

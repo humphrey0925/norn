@@ -206,6 +206,22 @@ export async function run(): Promise<void> {
   }
   fs.rmSync(path.join(folder, ".cproject"));
   assert.ok(await has("FD_CLOEXEC"));
+  // What the sources define themselves decides branches too: a switch in
+  // a header the file includes.
+  fs.writeFileSync(path.join(folder, "bfd", "sw.h"), "#ifndef SW_H\n#define SW_H\n#define USE_PROBE 0\n#endif\n");
+  fs.writeFileSync(path.join(folder, "bfd", "sw.c"), '#include "sw.h"\n#if USE_PROBE\nint probe_on (void) { return 1; }\n#else\nint probe_off (void) { return 0; }\n#endif\n');
+  await vscode.commands.executeCommand("si.sync");
+  assert.ok((await has("probe_off")) && !(await has("probe_on")), "the header's switch decides the branch");
+  const sourced = (await conditionsNow()).state as unknown as { fromSources: { name: string; value: string; files: number }[] };
+  assert.ok(sourced.fromSources.some((e) => e.name === "USE_PROBE" && e.value === "0" && e.files === 2), JSON.stringify(sourced.fromSources.slice(0, 5)));
+  await vscode.commands.executeCommand("si.conditions.sourcesOff");
+  assert.ok((await has("probe_off")) && (await has("probe_on")), "told not to, both branches");
+  await vscode.commands.executeCommand("si.conditions.sourcesOn");
+  assert.ok(!(await has("probe_on")));
+  await vscode.commands.executeCommand("si.conditions.delete", "Default");
+  fs.rmSync(path.join(folder, "bfd", "sw.h"));
+  fs.rmSync(path.join(folder, "bfd", "sw.c"));
+  await vscode.commands.executeCommand("si.sync");
   await vscode.commands.executeCommand("si.conditions.focus");
 
   // The index is kept in the workspace, and git is told to leave it alone.

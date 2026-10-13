@@ -457,6 +457,8 @@ interface ConditionSettings {
   undefines: string[];
   assumeUndefined: string[];
   conditionFiles: string[];
+  /** `false`: what the sources define themselves is not used across files. */
+  sourceDefines?: boolean;
 }
 
 /** What the server says of the conditions: every set, the one in force,
@@ -468,6 +470,11 @@ interface ConditionState {
   effective: { name: string; value: string | null; source: string }[];
   /** Where the build looks for headers, as far as a build description says. */
   includePaths?: string[];
+  /** Macros whose value the sources settle, and in how many files each is known. */
+  fromSources?: { name: string; value: string; files: number }[];
+  fromSourcesTotal?: number;
+  files?: number;
+  sourceDefines?: boolean;
   known: number;
 }
 
@@ -529,6 +536,8 @@ type ConditionRow =
   | { type: "config" }
   | { type: "source"; source: string }
   | { type: "macro"; name: string; value: string | null; source: string }
+  | { type: "sources" }
+  | { type: "sourced"; name: string; value: string; files: number }
   | { type: "assume"; prefix: string };
 
 /** `.cproject#Debug` as "Debug (.cproject)"; a plain file as its name. */
@@ -573,14 +582,23 @@ class ConditionsTree implements vscode.TreeDataProvider<ConditionRow> {
   }
 
   private of(c: Partial<ConditionSettings> | undefined): ConditionSettings {
-    return { defines: { ...c?.defines }, undefines: [...(c?.undefines ?? [])], assumeUndefined: [...(c?.assumeUndefined ?? [])], conditionFiles: [...(c?.conditionFiles ?? [])] };
+    const out: ConditionSettings = { defines: { ...c?.defines }, undefines: [...(c?.undefines ?? [])], assumeUndefined: [...(c?.assumeUndefined ?? [])], conditionFiles: [...(c?.conditionFiles ?? [])] };
+    if (c?.sourceDefines === false) {
+      out.sourceDefines = false;
+    }
+    return out;
   }
 
   getChildren(row?: ConditionRow): ConditionRow[] {
     if (!row) {
       const s = this.settings;
       const sources: ConditionRow[] = ["", ...s.conditionFiles].map((source) => ({ type: "source", source }));
-      return [{ type: "config" }, ...sources, ...s.assumeUndefined.map((prefix): ConditionRow => ({ type: "assume", prefix }))];
+      return [{ type: "config" }, ...sources, { type: "sources" }, ...s.assumeUndefined.map((prefix): ConditionRow => ({ type: "assume", prefix }))];
+    }
+    if (row.type === "sources") {
+      // Those the settings above overrule are theirs, not the sources'.
+      const settled = new Set(this.state.effective.map((e) => e.name));
+      return (this.state.fromSources ?? []).filter((e) => !settled.has(e.name)).map((e) => ({ type: "sourced", ...e }));
     }
     if (row.type !== "source") {
       return [];
@@ -604,6 +622,27 @@ class ConditionsTree implements vscode.TreeDataProvider<ConditionRow> {
       item.tooltip = "Names the build does not define are taken as not defined, unless the sources define them somewhere.";
       item.iconPath = new vscode.ThemeIcon("question");
       item.contextValue = "assume";
+      return item;
+    }
+    if (row.type === "sources") {
+      const on = this.state.sourceDefines !== false;
+      const total = this.state.fromSourcesTotal ?? 0;
+      const item = new vscode.TreeItem("From the sources", on && total ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None);
+      item.description = !on ? "not used" : total ? `${total.toLocaleString()}` : "nothing settled";
+      item.tooltip = on
+        ? "Macros the code tests whose value its own #defines settle: known in a file when every source file it is compiled as part of certainly includes the definition, and none can reach another. What is set above overrules them."
+        : "The sources' own #defines are not used to decide #if branches across files.";
+      item.iconPath = new vscode.ThemeIcon("code");
+      item.contextValue = on ? "sources.on" : "sources.off";
+      return item;
+    }
+    if (row.type === "sourced") {
+      const all = this.state.files ?? 0;
+      const item = new vscode.TreeItem(row.name);
+      item.description = `${row.value === "" ? "defined" : "= " + row.value}  ·  ${row.files >= all ? "everywhere" : `${row.files.toLocaleString()} of ${all.toLocaleString()} files`}`;
+      item.tooltip = `${row.name} ${row.value === "" ? "is defined" : "= " + row.value}\nKnown in ${row.files.toLocaleString()} of ${all.toLocaleString()} files; where it is not, both branches of a test are indexed.`;
+      item.iconPath = new vscode.ThemeIcon("symbol-constant");
+      item.contextValue = "condition.from";
       return item;
     }
     if (row.type === "source") {
@@ -696,6 +735,17 @@ class ConditionsTree implements vscode.TreeDataProvider<ConditionRow> {
       next[group].push(value);
     }
     await this.apply(next, group === "conditionFiles" ? `Reading conditions from ${value}` : `Assuming ${value} is not defined`);
+  }
+
+  /** Use, or do not use, what the sources define themselves. */
+  async useSources(on: boolean) {
+    const next = this.settings;
+    if (on) {
+      delete next.sourceDefines;
+    } else {
+      next.sourceDefines = false;
+    }
+    await this.apply(next, on ? "Using the sources' own #defines" : "Not using the sources' own #defines");
   }
 
   async remove(row: ConditionRow) {
@@ -1586,6 +1636,8 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
       const pick = await vscode.window.showQuickPick(picks, { placeHolder: `Add to ${conditions.state.active ?? "a new configuration"}` });
       return pick ? vscode.commands.executeCommand(pick.command) : undefined;
     }),
+    vscode.commands.registerCommand("si.conditions.sourcesOff", () => conditions.useSources(false)),
+    vscode.commands.registerCommand("si.conditions.sourcesOn", () => conditions.useSources(true)),
     vscode.commands.registerCommand("si.conditions.toCpp", () => {
       if (!conditions.state.active) {
         void vscode.window.showInformationMessage("SI has no compile configuration in force to pass on.");
@@ -1595,7 +1647,7 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
     }),
     vscode.commands.registerCommand("si.conditions.delete", (arg?: unknown) => (typeof arg === "string" ? conditions.delete(arg) : undefined)),
     vscode.commands.registerCommand("si.conditions.override", async (row: ConditionRow) => {
-      if (row?.type !== "macro") {
+      if (row?.type !== "macro" && row?.type !== "sourced") {
         return;
       }
       const text = await vscode.window.showInputBox({ prompt: `Value of ${row.name} in this configuration`, value: `${row.name}=${row.value ?? ""}`, validateInput: validName });

@@ -57,7 +57,7 @@ pub fn rel_path(root: &Path, path: &Path) -> String {
 /// Corpus-wide pre-pass: which macros can be dropped before parsing, and
 /// which have to be expanded.
 pub fn prescan(files: &[PathBuf]) -> MacroSets {
-    prescan_under(files, &cond::Conditions::default())
+    prescan_under(Path::new(""), files, &mut cond::Conditions::without_source())
 }
 
 /// The compile conditions the tree's settings give, told (when they assume
@@ -74,11 +74,36 @@ pub fn conditions_of(root: &Path, files: &[PathBuf]) -> cond::Conditions {
     conditions
 }
 
+/// Every file's `#define`s under `conditions`, with what the sources settle
+/// about macros put into `conditions` on the way: which definitions are
+/// compiled depends on that, and that on which are compiled, so it is done
+/// until nothing changes.
+pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions) -> Vec<Vec<mask::Define>> {
+    conditions.set_source(None);
+    let paths: Vec<String> = files.iter().map(|p| rel_path(root, p)).collect();
+    let read = |c: &cond::Conditions| -> Vec<Vec<mask::Define>> {
+        files.par_iter().zip(&paths).map(|(p, rel)| mask::defines_of(&std::fs::read(p).unwrap_or_default(), c, Some(rel))).collect()
+    };
+    let mut defines = read(conditions);
+    if !conditions.uses_source() {
+        return defines;
+    }
+    for _ in 0..4 {
+        let source = mask::source_of(&defines, &paths);
+        if conditions.source().map_or(source.is_empty(), |s| **s == source) {
+            break;
+        }
+        conditions.set_source(Some(std::sync::Arc::new(source)));
+        defines = read(conditions);
+    }
+    defines
+}
+
 /// The same, with what the build is known to define: `#define`s in branches
 /// it never compiles do not count, and extraction skips those branches.
-pub fn prescan_under(files: &[PathBuf], conditions: &cond::Conditions) -> MacroSets {
-    let defines: Vec<Vec<mask::Define>> =
-        files.par_iter().map(|p| mask::defines(&std::fs::read(p).unwrap_or_default(), conditions)).collect();
+/// `conditions` come back with what the sources settle added.
+pub fn prescan_under(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions) -> MacroSets {
+    let defines = settle(root, files, conditions);
     MacroSets::from_defines(defines.into_iter().flatten()).with_conditions(conditions.clone())
 }
 

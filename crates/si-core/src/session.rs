@@ -78,9 +78,8 @@ impl Session {
     pub fn open(root: &Path, options: Options) -> Session {
         let scope = Scope::load(root);
         let files = crate::scan_scope(root, &scope);
-        let conditions = crate::conditions_of(root, &files);
-        let defines: Vec<Vec<Define>> =
-            files.par_iter().map(|p| mask::defines(&std::fs::read(p).unwrap_or_default(), &conditions)).collect();
+        let mut conditions = crate::conditions_of(root, &files);
+        let defines: Vec<Vec<Define>> = crate::settle(root, &files, &mut conditions);
         let sets = MacroSets::from_defines(defines.iter().flatten().cloned()).with_conditions(conditions.clone());
         let facts = crate::extract_all(root, &files, &sets);
         let mut cache = Cache::default();
@@ -127,6 +126,12 @@ impl Session {
         Ok(self.sync())
     }
 
+    /// The macros whose value the sources settle, each with the number of
+    /// files it is known in; empty when the settings turn that off.
+    pub fn source_defines(&self) -> Vec<(String, String, usize)> {
+        self.conditions.source().map(|s| s.summary()).unwrap_or_default()
+    }
+
     /// How many macros the conditions settle, one way or the other.
     pub fn conditions_known(&self) -> usize {
         self.conditions.len()
@@ -157,7 +162,9 @@ impl Session {
         let t = Instant::now();
         self.scope = Scope::load(&self.root);
         // Other conditions make other facts of every file.
-        let conditions = Session::conditions_now(&self.root, &self.facts);
+        // (What the sources define is settled again in `update`.)
+        let mut conditions = Session::conditions_now(&self.root, &self.facts);
+        conditions.set_source(self.conditions.source().cloned());
         if conditions != self.conditions {
             self.conditions = conditions;
             self.all_stale = true;
@@ -255,7 +262,14 @@ impl Session {
         // interrupted and cannot be trusted.
         // (The conditions are part of the sets: a save made under other
         // conditions does not match and is rebuilt.)
-        let conditions = Session::conditions_now(root, &facts);
+        let mut conditions = Session::conditions_now(root, &facts);
+        if conditions.uses_source() {
+            let paths: Vec<String> = files.iter().map(|p| crate::rel_path(root, p)).collect();
+            let source = mask::source_of(&defines, &paths);
+            if !source.is_empty() {
+                conditions.set_source(Some(std::sync::Arc::new(source)));
+            }
+        }
         let sets = MacroSets::from_defines(defines.iter().flatten().cloned()).with_conditions(conditions.clone());
         if sets.digest() != manifest.sets {
             return None;
@@ -345,10 +359,25 @@ impl Session {
         // New conditions: which `#define`s count has to be seen again, and
         // every file read under them.
         let all_stale = std::mem::take(&mut self.all_stale);
-        if all_stale {
-            let (files, conditions) = (&self.files, &self.conditions);
-            self.defines = files.par_iter().map(|p| mask::defines(&std::fs::read(p).unwrap_or_default(), conditions)).collect();
+        // What the sources settle about macros may have changed with the
+        // definitions (an edit to a configuration header reaches every
+        // file that includes it): the files told something else now are
+        // read again.
+        let mut retold: FxHashSet<PathBuf> = FxHashSet::default();
+        if all_stale || defines_changed && self.conditions.uses_source() {
+            let before = self.conditions.source().cloned();
+            self.defines = crate::settle(&self.root, &self.files, &mut self.conditions);
             defines_changed = true;
+            let now = self.conditions.source();
+            if before.as_ref() != now {
+                let digest = |s: Option<&std::sync::Arc<crate::cond::Source>>, rel: &str| s.map_or(0, |s| s.file_digest(rel));
+                for p in &self.files {
+                    let rel = crate::rel_path(&self.root, p);
+                    if digest(before.as_ref(), &rel) != digest(now, &rel) {
+                        retold.insert(p.clone());
+                    }
+                }
+            }
         }
         // Did any macro change character? Then whoever mentions it is stale.
         let mut reclassified = FxHashSet::default();
@@ -364,6 +393,7 @@ impl Session {
                 let f = &self.facts[i];
                 all_stale
                     || touched.contains(&self.files[i])
+                    || retold.contains(&self.files[i])
                     || !reclassified.is_empty() && (0..f.n_names()).any(|n| reclassified.contains(f.name(n).as_bytes()))
             })
             .collect();
@@ -570,6 +600,32 @@ mod tests {
         Settings::default().save(&d.0).unwrap();
         let (s, up) = open(&d);
         assert_eq!((up.loaded, functions(&s, "net_init"), functions(&s, "net_stub")), (0, 1, 1));
+    }
+
+    #[test]
+    fn a_switch_in_a_configuration_header_decides_branches_everywhere() {
+        let d = Dir::new("source-defines");
+        d.write("config.h", "#ifndef CONFIG_H\n#define CONFIG_H\n#define USE_NET 1\n#define USE_USB 0\n#endif\n");
+        d.write("a.c", "#include \"config.h\"\n#if USE_NET\nint net_init (void) { return 1; }\n#else\nint net_stub (void) { return 0; }\n#endif\n#if USE_USB\nint usb_init (void) { return 1; }\n#endif\n");
+        let cache = d.0.join("cache-outside-scan");
+        let open = |d: &Dir| Session::open_cached(&d.0, Options::default(), cache.clone());
+        let (mut s, _) = open(&d);
+        assert_eq!((functions(&s, "net_init"), functions(&s, "net_stub"), functions(&s, "usb_init")), (1, 0, 0));
+        // The switch is thrown in the header: the file that tests it is read again.
+        d.write("config.h", "#ifndef CONFIG_H\n#define CONFIG_H\n#define USE_NET 0\n#define USE_USB 1\n#endif\n");
+        let up = s.update(&[d.0.join("config.h")]);
+        assert_eq!((up.extracted, functions(&s, "net_init"), functions(&s, "net_stub"), functions(&s, "usb_init")), (2, 0, 1, 1));
+        drop(s);
+        // From the save, the same.
+        let (mut s, up) = open(&d);
+        assert_eq!((up.loaded, up.extracted, functions(&s, "net_stub"), functions(&s, "usb_init")), (2, 0, 1, 1));
+        // The settings overrule the sources, and can turn this off.
+        let mut settings = Settings::default();
+        settings.defines.insert("USE_NET".into(), "1".into());
+        s.set_conditions(&settings).unwrap();
+        assert_eq!((functions(&s, "net_init"), functions(&s, "net_stub")), (1, 0));
+        s.set_conditions(&Settings { source_defines: Some(false), ..Settings::default() }).unwrap();
+        assert_eq!((functions(&s, "net_init"), functions(&s, "net_stub"), functions(&s, "usb_init")), (1, 1, 1));
     }
 
     #[test]

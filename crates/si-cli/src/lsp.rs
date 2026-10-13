@@ -468,7 +468,11 @@ impl Server {
         let project = cond::Project::load(&self.root);
         let effective = cond::effective(&project.current(), &self.root);
         let available: Vec<Value> = cond::discover(&self.root).into_iter().map(|(name, source)| json!({ "name": name, "source": source })).collect();
+        let all = self.session.source_defines();
+        let from_sources: Vec<Value> = all.iter().take(2000).map(|(name, value, files)| json!({ "name": name, "value": value, "files": files })).collect();
         json!({ "configurations": project.configurations, "active": project.active, "available": available,
+                "fromSources": from_sources, "fromSourcesTotal": all.len(), "files": self.session.files(),
+                "sourceDefines": project.current().source_defines != Some(false),
                 "effective": effective, "includePaths": cond::include_paths(&project.current(), &self.root),
                 "known": self.session.conditions_known() })
     }

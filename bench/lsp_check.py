@@ -221,6 +221,24 @@ def main():
         assert has("FD_CLOEXEC")
         c.request("si/setConditions", {})
         assert has("FD_CLOEXEC")
+        # What the sources define themselves: a switch in a header that
+        # every file includes is known wherever it is tested.
+        (work / "bfd" / "sw.h").write_text("#ifndef SW_H\n#define SW_H\n#define USE_PROBE 0\n#endif\n")
+        (work / "bfd" / "sw.c").write_text('#include "sw.h"\n#if USE_PROBE\nint probe_on (void) { return 1; }\n#else\nint probe_off (void) { return 0; }\n#endif\n')
+        r = c.request("si/sync", {})
+        assert has("probe_off") and not has("probe_on")
+        got = c.request("si/conditions", {})
+        assert {"name": "USE_PROBE", "value": "0", "files": 2} in got["fromSources"] and got["sourceDefines"], got["fromSources"][:5]
+        # The switch is thrown: the file that tests it is read again.
+        (work / "bfd" / "sw.h").write_text("#ifndef SW_H\n#define SW_H\n#define USE_PROBE 1\n#endif\n")
+        c.request("si/sync", {})
+        assert has("probe_on") and not has("probe_off")
+        # Told not to, both branches are kept.
+        c.request("si/setConditions", {"configurations": {"Default": {"sourceDefines": False}}, "activeConfiguration": "Default"})
+        assert has("probe_on") and has("probe_off") and c.request("si/conditions", {})["fromSources"] == []
+        c.request("si/setConditions", {})
+        (work / "bfd" / "sw.h").unlink(); (work / "bfd" / "sw.c").unlink()
+        c.request("si/sync", {})
         print("conditions: a branch the build does not compile leaves the index, and comes back")
         c.close()
     print("ok")

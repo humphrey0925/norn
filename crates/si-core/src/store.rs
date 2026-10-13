@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped whenever what extraction records, or how it is laid out, changes:
 /// facts written by another version are not read.
-const FORMAT: u32 = 3;
+const FORMAT: u32 = 4;
 
 /// Size and modification time of a source file when its facts were made.
 pub type Stamp = (u64, u64);

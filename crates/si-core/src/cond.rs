@@ -27,6 +27,17 @@
 //! `NAME=value` and `# NAME is not set` (with `=y` as 1 and `=m` defining
 //! `NAME_MODULE`, the way Kconfig means them).
 //!
+//! What the sources themselves define counts too, where it can be told
+//! without running the preprocessor. Within a file, a `#define` or `#undef`
+//! that is certainly compiled settles the name for the lines after it.
+//! Across files, a name tested in a file is known there when every source
+//! file that the file is compiled as part of certainly includes a
+//! certain definition of it, all to the same value, and none of them can
+//! reach anything that undefines it or may define it otherwise: a switch
+//! in a configuration header everything includes is known everywhere, a
+//! macro one `.c` file sets before including a shared header is not known
+//! in that header. `"sourceDefines": false` turns the second off.
+//!
 //! A project may have several such sets, as a build has configurations,
 //! one of them in force:
 //!
@@ -56,6 +67,10 @@ pub struct Settings {
     pub assume_undefined: Vec<String>,
     #[serde(default, rename = "conditionFiles")]
     pub condition_files: Vec<String>,
+    /// `false`: macros the sources define to one value are not taken as
+    /// known outside the file that defines them.
+    #[serde(default, rename = "sourceDefines", skip_serializing_if = "Option::is_none")]
+    pub source_defines: Option<bool>,
 }
 
 impl Settings {
@@ -405,6 +420,137 @@ pub struct Conditions {
     assume_all: bool,
     /// Names the sources `#define` somewhere: not for assuming about.
     in_source: FxHashSet<Vec<u8>>,
+    /// What the sources define, file by file (see [`Source`]). What the
+    /// settings say of a name comes first.
+    source: Option<std::sync::Arc<Source>>,
+    /// Set when the settings say not to use those.
+    no_source: bool,
+}
+
+/// The macros whose value the sources settle, and in which files each is
+/// known (see the module's comment). Files are numbered as they were
+/// listed when this was made, and found by the path they are indexed by.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Source {
+    files: FxHashMap<String, u32>,
+    /// name -> (value, the files it is known in as a bit set), one entry per value.
+    names: FxHashMap<Vec<u8>, Vec<(Vec<u8>, Vec<u64>)>>,
+}
+
+impl Source {
+    pub fn new(paths: &[String]) -> Source {
+        Source { files: paths.iter().enumerate().map(|(i, p)| (p.clone(), i as u32)).collect(), names: FxHashMap::default() }
+    }
+
+    /// `name` has `value` in the files of `known` (one flag per file).
+    pub fn add(&mut self, name: &[u8], value: &[u8], known: &[bool]) {
+        let mut bits = vec![0u64; known.len().div_ceil(64)];
+        for (i, _) in known.iter().enumerate().filter(|(_, k)| **k) {
+            bits[i / 64] |= 1 << (i % 64);
+        }
+        self.names.entry(name.to_vec()).or_default().push((value.to_vec(), bits));
+    }
+
+    pub fn file(&self, path: &str) -> Option<u32> {
+        self.files.get(path).copied()
+    }
+
+    fn get(&self, file: u32, name: &[u8]) -> Option<&[u8]> {
+        let (word, bit) = (file as usize / 64, 1u64 << (file % 64));
+        self.names.get(name)?.iter().find(|(_, bits)| bits.get(word).is_some_and(|w| w & bit != 0)).map(|(v, _)| &v[..])
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    fn digest(&self) -> u64 {
+        use xxhash_rust::xxh3::xxh3_64_with_seed as h;
+        let each = |(k, values): (&Vec<u8>, &Vec<(Vec<u8>, Vec<u64>)>)| {
+            values.iter().fold(0, |acc, (v, bits)| acc ^ h(bytemuck::cast_slice(bits), h(v, h(k, 15))))
+        };
+        self.names.iter().map(each).fold(self.files.len() as u64, |a, b| a ^ b)
+    }
+
+    /// What `file` is told: other facts come of it when this changes.
+    pub fn file_digest(&self, path: &str) -> u64 {
+        use xxhash_rust::xxh3::xxh3_64_with_seed as h;
+        let Some(file) = self.file(path) else { return 0 };
+        let (word, bit) = (file as usize / 64, 1u64 << (file % 64));
+        let mut d = 0;
+        for (k, values) in &self.names {
+            for (v, bits) in values {
+                if bits.get(word).is_some_and(|w| w & bit != 0) {
+                    d ^= h(v, h(k, 16));
+                }
+            }
+        }
+        d
+    }
+
+    /// Each macro and value, with the number of files it is known in.
+    pub fn summary(&self) -> Vec<(String, String, usize)> {
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        let mut out: Vec<_> = self
+            .names
+            .iter()
+            .flat_map(|(k, values)| values.iter().map(move |(v, bits)| (text(k), text(v), bits.iter().map(|w| w.count_ones() as usize).sum())))
+            .collect();
+        out.sort();
+        out
+    }
+}
+
+/// What a file has said of macros so far, on the way down it: defined to
+/// a value, undefined, or (`None`) one or the other depending on a branch
+/// that may or may not be compiled.
+pub type Local = FxHashMap<Vec<u8>, Option<Option<Vec<u8>>>>;
+
+/// The conditions as seen from a place in a file.
+struct View<'a> {
+    c: &'a Conditions,
+    local: &'a Local,
+    /// The file, as [`Source`] numbers it.
+    file: Option<u32>,
+}
+
+impl View<'_> {
+    /// From the sources, where the settings say nothing of the name.
+    fn sourced(&self, name: &[u8]) -> Option<&[u8]> {
+        self.c.source.as_ref()?.get(self.file?, name)
+    }
+
+    fn defined(&self, name: &[u8]) -> Tri {
+        match self.local.get(name) {
+            Some(Some(Some(_))) => Tri::True,
+            Some(Some(None)) => Tri::False,
+            Some(None) => Tri::Unknown,
+            None if self.c.defined.contains_key(name) => Tri::True,
+            None if self.c.undefined.contains(name) => Tri::False,
+            None if self.sourced(name).is_some() => Tri::True,
+            None => self.c.defined(name),
+        }
+    }
+
+    fn text(&self, name: &[u8]) -> Option<Option<&[u8]>> {
+        match self.local.get(name) {
+            Some(Some(v)) => Some(v.as_deref()),
+            Some(None) => None,
+            None => match self.c.defined.get(name).map(|v| &v[..]).or(if self.c.undefined.contains(name) { None } else { self.sourced(name) }) {
+                Some(v) => Some(Some(v)),
+                None => (self.c.defined(name) == Tri::False).then_some(None),
+            },
+        }
+    }
+
+    /// The value of a name in an `#if`: its definition if that is a number
+    /// (or a name that is), 0 if it is known not to be defined.
+    fn value(&self, name: &[u8], depth: u8) -> Option<i64> {
+        match self.text(name)? {
+            None => Some(0),
+            Some(v) => number(v).or(if v.is_empty() || v == name || depth > 8 { None } else { self.value(v, depth + 1) }),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -461,6 +607,7 @@ impl Conditions {
         let prefixes = || settings.assume_undefined.iter().map(|p| p.trim_end_matches('*')).filter(|p| !p.is_empty());
         c.assume_undefined = prefixes().map(|p| p.as_bytes().to_vec()).collect();
         c.assume_all = settings.assume_undefined.iter().any(|p| p == "*");
+        c.no_source = settings.source_defines == Some(false);
         c
     }
 
@@ -551,6 +698,29 @@ impl Conditions {
         self.in_source = names;
     }
 
+    /// Are macros the sources define to one value to be taken as known?
+    pub fn uses_source(&self) -> bool {
+        !self.no_source
+    }
+
+    /// Do the settings themselves say whether `name` is defined?
+    pub fn settles(&self, name: &[u8]) -> bool {
+        self.defined.contains_key(name) || self.undefined.contains(name)
+    }
+
+    pub fn source(&self) -> Option<&std::sync::Arc<Source>> {
+        self.source.as_ref()
+    }
+
+    pub fn set_source(&mut self, source: Option<std::sync::Arc<Source>>) {
+        self.source = source;
+    }
+
+    /// The same conditions, with nothing taken from the sources.
+    pub fn without_source() -> Conditions {
+        Conditions { no_source: true, ..Conditions::default() }
+    }
+
     /// How many names are known one way or the other.
     pub fn len(&self) -> usize {
         self.defined.len() + self.undefined.len()
@@ -564,7 +734,8 @@ impl Conditions {
         let u = self.undefined.iter().fold(0, |acc, k| acc ^ h(k, 12));
         let a = self.assume_undefined.iter().fold(self.assume_all as u64, |acc, k| acc ^ h(k, 13));
         let s = self.in_source.iter().fold(0, |acc, k| acc ^ h(k, 14));
-        d ^ u ^ a ^ s
+        let c = self.source.as_ref().map_or(0, |s| s.digest()) ^ self.no_source as u64;
+        d ^ u ^ a ^ s ^ c
     }
 
     pub fn defined(&self, name: &[u8]) -> Tri {
@@ -579,25 +750,63 @@ impl Conditions {
         }
     }
 
-    /// The value of a name in an `#if`: its definition if that is a number,
-    /// 0 if it is known not to be defined (as the preprocessor has it).
-    fn value(&self, name: &[u8]) -> Option<i64> {
-        match self.defined.get(name) {
-            Some(v) => number(v).or(if v.is_empty() { None } else { self.value(v).filter(|_| v != name) }),
-            None => (self.defined(name) == Tri::False).then_some(0),
-        }
-    }
-
     /// Whether the condition of an `#if` or `#elif` holds, as far as known.
     pub fn eval(&self, expr: &[u8]) -> Tri {
+        static NONE: std::sync::OnceLock<Local> = std::sync::OnceLock::new();
+        self.eval_in(NONE.get_or_init(Local::default), None, expr)
+    }
+
+    /// The same at a place in a file, after what the file said of macros
+    /// above it.
+    pub fn eval_in(&self, local: &Local, file: Option<u32>, expr: &[u8]) -> Tri {
         let toks = tokens(expr);
-        let mut p = Parser { c: self, toks: &toks, at: 0 };
+        let mut p = Parser { c: View { c: self, local, file }, toks: &toks, at: 0 };
         let v = p.or();
         if p.at != toks.len() {
             return Tri::Unknown;
         }
         truth(v)
     }
+
+    pub fn defined_in(&self, local: &Local, file: Option<u32>, name: &[u8]) -> Tri {
+        View { c: self, local, file }.defined(name)
+    }
+}
+
+/// A macro's body as a value: comments out, spaces closed up, the
+/// parentheses around all of it off. `None` if it is too long to be one.
+pub fn value_of(body: &[u8]) -> Option<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < body.len() {
+        match (body[i], body.get(i + 1)) {
+            (b'/', Some(b'*')) => {
+                i += 2;
+                while i < body.len() && !(body[i] == b'*' && body.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i += 2;
+                out.push(b' ');
+            }
+            (b'/', Some(b'/')) => break,
+            (b'\\', _) => i += 1,
+            (b, _) if b.is_ascii_whitespace() => {
+                if out.last().is_some_and(|l| *l != b' ') {
+                    out.push(b' ');
+                }
+                i += 1;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    let mut v = out.trim_ascii();
+    while v.first() == Some(&b'(') && v.last() == Some(&b')') && !v[1..v.len() - 1].iter().any(|b| matches!(b, b'(' | b')')) {
+        v = v[1..v.len() - 1].trim_ascii();
+    }
+    (v.len() <= 120).then(|| v.to_vec())
 }
 
 fn number(v: &[u8]) -> Option<i64> {
@@ -662,7 +871,7 @@ fn tokens(s: &[u8]) -> Vec<Tok<'_>> {
 /// logic: `None` is a value that is not known. Anything else in a condition
 /// (arithmetic, a macro with arguments) is not known either.
 struct Parser<'a> {
-    c: &'a Conditions,
+    c: View<'a>,
     toks: &'a [Tok<'a>],
     at: usize,
 }
@@ -744,7 +953,7 @@ impl Parser<'_> {
             Some(Tok::Ident(name)) => {
                 self.at += 1;
                 if !self.op(b"(") {
-                    return self.c.value(name);
+                    return self.c.value(name, 0);
                 }
                 // A macro with arguments: the kernel's own, or unknown.
                 let arg = match (self.toks.get(self.at).cloned(), self.toks.get(self.at + 1)) {
@@ -884,6 +1093,35 @@ mod tests {
         let written = std::fs::read_to_string(dir.join(".si/config.json")).unwrap();
         assert!(written.contains("\"include\"") && !written.contains("\n  \"defines\""), "{written}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_the_sources_define_is_known_where_it_can_be() {
+        let files = ["a.c".to_string(), "b.c".to_string(), "cfg.h".to_string()];
+        let mut source = Source::new(&files);
+        source.add(b"USE_NET", b"1", &[true, true, true]);
+        source.add(b"LEVEL", b"DEFAULT_LEVEL", &[true, false, false]);
+        source.add(b"DEFAULT_LEVEL", b"3", &[true, false, false]);
+        source.add(b"HAVE_X", b"", &[true, true, false]);
+        let mut c = Conditions::default();
+        c.set_source(Some(std::sync::Arc::new(source)));
+        let none = Local::default();
+        let (a, b) = (c.source().unwrap().file("a.c"), c.source().unwrap().file("b.c"));
+        assert_eq!((c.eval_in(&none, a, b"USE_NET"), c.eval_in(&none, a, b"defined(HAVE_X) && LEVEL >= 3"), c.eval_in(&none, a, b"OTHER")), (Tri::True, Tri::True, Tri::Unknown));
+        // Known in one file is not known in another, or where no file is said.
+        assert_eq!((c.eval_in(&none, b, b"LEVEL >= 3"), c.eval_in(&none, b, b"USE_NET"), c.eval(b"USE_NET")), (Tri::Unknown, Tri::True, Tri::Unknown));
+        assert_ne!(c.source().unwrap().file_digest("a.c"), c.source().unwrap().file_digest("b.c"));
+        // The settings have the last word.
+        c.undefine("USE_NET");
+        c.define("LEVEL", "1");
+        assert_eq!((c.eval_in(&none, a, b"USE_NET"), c.eval_in(&none, a, b"LEVEL >= 3")), (Tri::False, Tri::False));
+        // And what the file said above the line comes before both.
+        let mut local = Local::default();
+        local.insert(b"LEVEL".to_vec(), Some(Some(b"5".to_vec())));
+        local.insert(b"HAVE_X".to_vec(), Some(None));
+        local.insert(b"DEFAULT_LEVEL".to_vec(), None);
+        assert_eq!((c.eval_in(&local, a, b"LEVEL >= 3"), c.eval_in(&local, a, b"defined HAVE_X"), c.eval_in(&local, a, b"DEFAULT_LEVEL == 3")), (Tri::True, Tri::False, Tri::Unknown));
+        assert_eq!((value_of(b" ( 0x10 ) /* sixteen */"), value_of(b"a  +\tb // x"), value_of(b"")), (Some(b"0x10".to_vec()), Some(b"a + b".to_vec()), Some(Vec::new())));
     }
 
     #[test]
