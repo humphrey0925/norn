@@ -154,18 +154,59 @@
 
   const ROW = 46, GAP = 48, H = 24;
 
-  function width(n) {
+  // Text is measured in the font it is drawn in (the editor's, whatever
+  // the user has set): a guess per character is too narrow for some fonts
+  // and for names in other scripts, and the name then runs out of its box.
+  const pen = document.createElement("canvas").getContext("2d");
+  let family = "monospace";
+  const measured = new Map();
+  function measure(text, size) {
+    const key = size + "|" + text;
+    let w = measured.get(key);
+    if (w === undefined) {
+      pen.font = size + "px " + family;
+      w = pen.measureText(text).width;
+      measured.set(key, w);
+    }
+    return w;
+  }
+  const PAD = 10, WIDEST = 420;
+
+  // The name as drawn: whole, or cut short with an ellipsis when it would
+  // make a column wider than is useful (the tooltip has all of it).
+  function label(n) {
     const text = n.slot ?? n.entry.name;
-    return Math.min(260, Math.max(64, text.length * 7.2 + 26));
+    if (measure(text, 12) + 2 * PAD <= WIDEST) return text;
+    let k = text.length - 1;
+    while (k > 4 && measure(text.slice(0, k) + "…", 12) + 2 * PAD > WIDEST) k--;
+    return text.slice(0, k) + "…";
+  }
+
+  function width(n) {
+    return Math.max(64, Math.ceil(measure(label(n), 12)) + 2 * PAD);
+  }
+
+  // The line numbers under a node, as far as they are shown.
+  function linesUnder(n) {
+    const c = calls(n);
+    const shown = c.uri ? c.lines.slice(0, 6) : [];
+    const more = c.lines.length > shown.length;
+    return { shown, more, width: shown.length ? Math.ceil(measure(shown.join(" · ") + (more ? " …" : ""), 10.5)) + 8 : 0 };
   }
 
   function renderGraph() {
     // Tidy tree: leaves one per row, parents centred on their children.
+    const now = getComputedStyle(document.body).getPropertyValue("--vscode-editor-font-family").trim() || "monospace";
+    if (now !== family) {
+      family = now;
+      measured.clear();
+    }
     const cols = [];
     let row = 0;
     (function place(n, depth) {
       n.depth = depth;
-      cols[depth] = Math.max(cols[depth] ?? 0, width(n) + 20);
+      // A column is as wide as its widest node, or the line numbers under one.
+      cols[depth] = Math.max(cols[depth] ?? 0, Math.max(width(n), linesUnder(n).width) + 20);
       const kids = n.open && n.children ? n.children : [];
       if (!kids.length) {
         n.y = row++ * ROW;
@@ -196,18 +237,19 @@
         '<g class="knob" data-act="toggle"><title>' + (n.open ? "Collapse" : "Expand") + '</title><circle cx="' + kx + '" cy="' + ky + '" r="7"></circle>' +
         '<text x="' + kx + '" y="' + (ky + 4) + '" text-anchor="middle">' + (n.loading ? "…" : n.open ? "−" : "+") + "</text></g>";
       // Under the node, the lines its calls are on, each a link.
-      const c = calls(n);
-      const shownLines = c.uri ? c.lines.slice(0, 6) : [];
-      const under = shownLines.length
-        ? '<text class="glines" x="' + (nx + 4) + '" y="' + (ny + H + 12) + '">' +
-          shownLines.map((l) => '<tspan class="gl" data-line="' + l + '">' + l + "</tspan>").join('<tspan class="sep"> · </tspan>') +
-          (c.lines.length > shownLines.length ? '<tspan class="sep"> …</tspan>' : "") + "</text>"
+      // (Towards the side the node is flush with, so that they stay in its column.)
+      const lu = linesUnder(n);
+      const under = lu.shown.length
+        ? '<text class="glines" ' + (mode === "callers" ? 'text-anchor="end" x="' + (nx + w - 4) : 'x="' + (nx + 4)) + '" y="' + (ny + H + 12) + '">' +
+          lu.shown.map((l) => '<tspan class="gl" data-line="' + l + '">' + l + "</tspan>").join('<tspan class="sep"> · </tspan>') +
+          (lu.more ? '<tspan class="sep"> …</tspan>' : "") + "</text>"
         : "";
+      const full = n.slot ?? e.name;
       shapes.push(
         '<g class="gn ' + cls + (e && e.certain === false ? " amb" : "") + '" data-id="' + n.id + '">' +
-          '<g data-act="name"><title>' + esc(n.slot ? "struct member (function pointer)" : e.file + ":" + e.line) + "</title>" +
+          '<g data-act="name"><title>' + esc(n.slot ? full + "\nstruct member (function pointer)" : full + "\n" + e.file + ":" + e.line) + "</title>" +
           '<rect x="' + nx + '" y="' + ny + '" width="' + w + '" height="' + H + '" rx="' + (n.slot ? 12 : 3) + '"></rect>' +
-          '<text x="' + (nx + 10) + '" y="' + (ny + 16) + '">' + esc(n.slot ?? e.name) + "</text></g>" + under + more + "</g>",
+          '<text x="' + (nx + PAD) + '" y="' + (ny + 16) + '">' + esc(label(n)) + "</text></g>" + under + more + "</g>",
       );
       // Edges leave from beyond the knob.
       n.box = { x: mode === "callers" ? nx - (leaf ? 0 : 20) : nx, y: ny + H / 2, w: w + (leaf ? 0 : 20) };

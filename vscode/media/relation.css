@@ -1,17 +1,18 @@
 body { padding: 0; margin: 0; color: var(--vscode-foreground); font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); }
-#bar { display: flex; align-items: center; gap: 2px; padding: 2px 8px 0; border-bottom: 1px solid var(--vscode-panel-border); flex-wrap: wrap; }
+#bar { display: flex; align-items: center; gap: 2px; padding: 2px 8px 0; border-bottom: 1px solid var(--vscode-contrastBorder, var(--vscode-panel-border, var(--vscode-editorWidget-border, rgba(128,128,128,.45)))); flex-wrap: wrap; }
 #bar button { font: inherit; color: var(--vscode-descriptionForeground); background: none; border: 0; border-bottom: 2px solid transparent; padding: 3px 9px 5px; cursor: pointer; }
 #bar button[aria-selected="true"] { color: var(--vscode-foreground); border-bottom-color: var(--vscode-focusBorder); }
 #bar button:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
-#views { margin-left: auto; display: flex; border: 1px solid var(--vscode-panel-border); border-radius: 3px; overflow: hidden; margin-bottom: 3px; }
+#views { margin-left: auto; display: flex; border: 1px solid var(--vscode-contrastBorder, var(--vscode-panel-border, var(--vscode-editorWidget-border, rgba(128,128,128,.45)))); border-radius: 3px; overflow: hidden; margin-bottom: 3px; }
 #views button { border: 0; padding: 1px 9px; font-size: 0.9em; }
-#views button[aria-pressed="true"] { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+#views button[aria-pressed="true"] { background: var(--vscode-list-activeSelectionBackground, transparent); color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
+  outline: 1px solid var(--vscode-contrastActiveBorder, transparent); outline-offset: -1px; }
 #message { padding: 3px 10px; color: var(--vscode-descriptionForeground); font-size: 0.9em; }
 .empty, .hint { padding: 6px 10px; color: var(--vscode-descriptionForeground); }
 .hint { font-size: 0.85em; }
 
 .row { display: flex; align-items: baseline; gap: 6px; padding: 2px 8px; white-space: nowrap; cursor: pointer; }
-.row:hover { background: var(--vscode-list-hoverBackground); }
+.row:hover { background: var(--vscode-list-hoverBackground, transparent); outline: 1px dashed var(--vscode-contrastActiveBorder, transparent); outline-offset: -1px; }
 .row:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
 .row.top .name { font-weight: 600; }
 .tw { width: 12px; flex: none; color: var(--vscode-descriptionForeground); text-align: center; }
@@ -50,20 +51,27 @@ body { padding: 0; margin: 0; color: var(--vscode-foreground); font-family: var(
 .graph { overflow: auto; padding: 6px 4px; }
 .graph svg { display: block; }
 .gn { cursor: pointer; }
-.gn rect { fill: var(--vscode-editorWidget-background); stroke: var(--vscode-editorWidget-border, var(--vscode-panel-border)); }
-.gn text { fill: var(--vscode-foreground); font-family: var(--vscode-editor-font-family); font-size: 12px; }
-.knob circle { fill: var(--vscode-editor-background); stroke: var(--vscode-descriptionForeground); }
-.knob text { fill: var(--vscode-foreground); font-family: var(--vscode-editor-font-family); font-size: 12px; pointer-events: none; }
-.knob:hover circle { stroke: var(--vscode-focusBorder); fill: var(--vscode-list-hoverBackground); }
-.gn [data-act="name"]:hover rect { stroke: var(--vscode-focusBorder); }
+/* An SVG shape whose colour is a variable the theme does not set would be
+   black, whatever the theme: each has something to fall back on, and the
+   panel's own background last. */
+.gn rect { fill: var(--vscode-editorWidget-background, var(--vscode-panel-background, var(--vscode-editor-background, transparent)));
+  stroke: var(--vscode-contrastBorder, var(--vscode-editorWidget-border, var(--vscode-panel-border, var(--vscode-descriptionForeground, currentColor)))); }
+.gn text { fill: var(--vscode-foreground, currentColor); font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; }
+.knob circle { fill: var(--vscode-panel-background, var(--vscode-editor-background, transparent)); stroke: var(--vscode-descriptionForeground, currentColor); }
+.knob text { fill: var(--vscode-foreground, currentColor); font-family: var(--vscode-editor-font-family); font-size: 12px; pointer-events: none; }
+.knob:hover circle { stroke: var(--vscode-contrastActiveBorder, var(--vscode-focusBorder, currentColor)); stroke-width: 1.6; }
+.gn [data-act="name"]:hover rect { stroke: var(--vscode-contrastActiveBorder, var(--vscode-focusBorder, currentColor)); }
 .gn [data-act="name"]:hover text { text-decoration: underline; }
-.gn.rootnode rect { fill: var(--vscode-list-activeSelectionBackground); stroke: var(--vscode-focusBorder); }
-.gn.rootnode text { fill: var(--vscode-list-activeSelectionForeground); }
+/* The node everything hangs from: the selection colours where the theme
+   has them (a high-contrast one marks a selection with a border only). */
+.gn.rootnode rect { fill: var(--vscode-list-activeSelectionBackground, var(--vscode-panel-background, var(--vscode-editor-background, transparent)));
+  stroke: var(--vscode-contrastActiveBorder, var(--vscode-focusBorder, currentColor)); stroke-width: 1.6; }
+.gn.rootnode text { fill: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground, currentColor)); font-weight: 600; }
 .gn.slot rect { stroke: var(--vscode-charts-blue); fill: color-mix(in srgb, var(--vscode-charts-blue) 14%, transparent); }
 .gn.ptr rect { stroke: var(--vscode-charts-blue); }
 .gn.mac rect { stroke: var(--vscode-charts-orange); }
 .gn.amb rect { stroke-dasharray: 4 3; }
-.ge { fill: none; stroke: var(--vscode-descriptionForeground); stroke-width: 1.1; opacity: 0.8; }
+.ge { fill: none; stroke: var(--vscode-descriptionForeground, currentColor); stroke-width: 1.1; opacity: 0.8; }
 .ge.ptr { stroke: var(--vscode-charts-blue); stroke-dasharray: 4 3; }
 .ge.mac { stroke: var(--vscode-charts-orange); stroke-dasharray: 4 3; }
 #views[hidden] { display: none; }

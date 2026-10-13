@@ -19,7 +19,7 @@ export async function run(): Promise<void> {
   await vscode.commands.executeCommand("si.search.focus");
   await vscode.commands.executeCommand("si.relation.focus");
   await vscode.commands.executeCommand("si.context.focus");
-  const at = doc.positionAt(doc.getText().indexOf("iovec->bread (abfd, ptr") + 8);
+  const at = doc.positionAt(doc.getText().indexOf(process.env.SI_DEMO_NEEDLE ?? "iovec->bread (abfd, ptr") + Number(process.env.SI_DEMO_OFFSET ?? 8));
   await vscode.window.showTextDocument(doc, { selection: new vscode.Range(at, at) });
   editor.revealRange(new vscode.Range(at, at), vscode.TextEditorRevealType.InCenter);
   await sleep(1500);
