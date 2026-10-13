@@ -130,7 +130,18 @@ pub struct MacroSets {
     kept: FxHashSet<Vec<u8>>,
 }
 
-const ATTRIBUTE_KEYWORDS: [&[u8]; 5] = [b"__attribute__", b"__attribute", b"__declspec", b"__extension__", b"_Noreturn"];
+/// What a macro may expand to and still be dropped: attributes, and
+/// `inline`, which says nothing an index needs.
+const ATTRIBUTE_KEYWORDS: [&[u8]; 8] = [
+    b"__attribute__",
+    b"__attribute",
+    b"__declspec",
+    b"__extension__",
+    b"_Noreturn",
+    b"inline",
+    b"__inline",
+    b"__inline__",
+];
 
 impl MacroSets {
     /// A macro is transparent when every one of its definitions is, which is
@@ -529,6 +540,9 @@ struct Lexer<'a> {
     block: Option<usize>,
     /// The identifier before the one being read.
     last_ident: (u32, u32),
+    /// End of a macro use hidden from the parser whose arguments are being
+    /// read: the names in them are reported from here.
+    hidden_until: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -733,12 +747,18 @@ impl<'a> Lexer<'a> {
         let s = self.c.s;
         let line = self.c.line;
         let (a, e) = self.c.ident();
-        self.prev = b'a';
+        let before_byte = std::mem::replace(&mut self.prev, b'a');
         let before = std::mem::replace(&mut self.last_ident, (a as u32, e as u32));
         if let Some(&function_like) = self.transparent.expanding.get(&s[a..e]) {
             self.site(Tok { start: a as u32, end: e as u32, line, call: false, member: false }, function_like, before);
         }
-        let Some(&function_like) = self.transparent.transparent.get(&s[a..e]) else { return };
+        let Some(&function_like) = self.transparent.transparent.get(&s[a..e]) else {
+            if a < self.hidden_until && !is_keyword(&s[a..e]) {
+                let (call, member) = (self.c.peek(0) == b'(', matches!(before_byte, b'.' | b'>'));
+                self.out.events.push(Event::Ref(Tok { start: a as u32, end: e as u32, line, call, member }));
+            }
+            return;
+        };
         let mut tok = Tok { start: a as u32, end: e as u32, line, call: false, member: false };
         let mut end = e;
         if function_like {
@@ -776,7 +796,24 @@ impl<'a> Lexer<'a> {
                 (self.c.i, self.c.line) = save;
             }
         }
+        let last_line = self.c.line;
         self.c.skip_space(true);
+        // A use that stands as a declaration of its own, alone on its lines
+        // at file scope (`START_RELOC_NUMBERS (x)`, `DEFINE_LIST (y);`). The
+        // parser would take it for the start of whatever follows; its
+        // meaning is in its expansion, which the link reads.
+        let alone = args_end != 0
+            && self.nest.braces.is_empty()
+            && self.nest.parens == 0
+            && match self.c.peek(0) {
+                b';' | 0 => true,
+                b'(' | b'{' | b'=' | b'[' | b',' | b')' => false,
+                _ => self.c.line > last_line,
+            };
+        if alone {
+            blank(&mut self.out.masked, name.start as usize, args_end as usize);
+            self.hidden_until = args_end as usize;
+        }
         let mut flags = match self.c.peek(0) {
             b'(' => site::CALLED,
             b'{' => site::BRACE_FOLLOWS,
@@ -1027,6 +1064,7 @@ fn lexer<'a>(src: &'a [u8], transparent: &'a MacroSets, mask: bool) -> Lexer<'a>
         arg: None,
         block: None,
         last_ident: (0, 0),
+        hidden_until: 0,
     }
 }
 
