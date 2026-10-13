@@ -169,6 +169,27 @@ def main():
         # ...and a type.
         rel = c.request("si/relation", {**c.at("bfd/cache.c", "bfd_iovec cache_iovec"), "direction": "callers"})
         assert rel["root"]["name"] == "bfd_iovec" and rel["entries"], rel["root"]
+        # A parameter and a local variable: declared in the function, used
+        # on these lines, and no part of the project's symbols.
+        src = (work / "bfd" / "bfdio.c").read_text(encoding="latin-1").split("\n")
+        start = next(i for i, l in enumerate(src) if l.startswith("bfd_read (void *ptr"))
+        use = next(i for i in range(start, start + 80) if "nread" in src[i] and "=" in src[i] and "file_ptr" not in src[i])
+        at_use = {"textDocument": {"uri": (work / "bfd" / "bfdio.c").as_uri()}, "position": {"line": use, "character": src[use].index("nread") + 1}}
+        d = c.request("textDocument/definition", at_use)
+        assert len(d) == 1 and "nread" in src[d[0]["range"]["start"]["line"]] and d[0]["range"]["start"]["line"] < use, d
+        ctx = c.request("si/context", at_use)
+        assert ctx["kind"] == "local" and ctx["function"] == "bfd_read", ctx
+        rel = c.request("si/relation", {**at_use, "direction": "callers"})
+        assert rel["root"]["kind"] == "local" and [e["name"] for e in rel["entries"]] == ["bfd_read"] and use + 1 in rel["entries"][0]["lines"], rel
+        refs = c.request("textDocument/references", {**at_use, "context": {"includeDeclaration": True}})
+        assert len(refs) >= 3 and all("nread" in src[r["range"]["start"]["line"]] for r in refs), refs
+        ptr = {"textDocument": at_use["textDocument"], "position": {"line": start, "character": src[start].index("ptr") + 1}}
+        assert c.request("si/context", ptr)["kind"] == "parameter"
+        listed = c.request("si/locals", {"textDocument": at_use["textDocument"]})
+        mine = [(x["name"], x["kind"]) for x in listed if x["function"] == "bfd_read"]
+        assert ("ptr", "parameter") in mine and ("nread", "local") in mine, mine
+        assert not any(x["name"] == "nread" for x in c.request("workspace/symbol", {"query": "nread"}))
+        print("locals: a parameter and a local variable have a definition, references and a relation in their function")
         print("called by: variables, members and types list who uses them")
         print("si/relation, si/context, si/search answer as the views expect")
 

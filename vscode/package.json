@@ -2,7 +2,7 @@
   "name": "si-code-index",
   "displayName": "SI Code Index",
   "description": "Source-Insight-style symbol search, context and relation views for C, backed by the si index.",
-  "version": "0.14.7",
+  "version": "0.15.0",
   "publisher": "humphrey0925",
   "repository": {
     "type": "git",
@@ -269,6 +269,10 @@
         "command": "si.conditions.sourcesOn",
         "title": "Use the Sources' Own #defines",
         "icon": "$(eye)"
+      },
+      {
+        "command": "si.fileSymbols.tree",
+        "title": "SI: File Symbols tree"
       }
     ],
     "menus": {
@@ -469,6 +473,10 @@
         {
           "command": "si.conditions.sourcesOn",
           "when": "false"
+        },
+        {
+          "command": "si.fileSymbols.tree",
+          "when": "false"
         }
       ],
       "explorer/context": [
@@ -525,6 +533,11 @@
           "default": false,
           "scope": "resource",
           "description": "Keep a configuration named \"SI\" in .vscode/c_cpp_properties.json in step with the compile configuration in force: its defines and, from a DS-5 / Eclipse .cproject, its include paths. Select that configuration in the C/C++ extension to use it."
+        },
+        "si.fileSymbols.showLocals": {
+          "type": "boolean",
+          "default": true,
+          "description": "In File Symbols, list each function's parameters and local variables under it."
         }
       }
     },

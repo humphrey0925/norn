@@ -8,8 +8,7 @@
   const message = document.getElementById("message");
   const ICON = {
     function: "symbol-function", macro: "symbol-constant", struct: "symbol-struct", union: "symbol-struct", enum: "symbol-enum",
-    enum_const: "symbol-enum-member", typedef: "symbol-class", global: "symbol-variable", field: "symbol-field",
-  };
+    enum_const: "symbol-enum-member", typedef: "symbol-class", global: "symbol-variable", field: "symbol-field", local: "symbol-variable", parameter: "symbol-parameter" };
 
   let mode = "callees"; // callees | callers | references | assignments
   let view = "tree"; // tree | graph

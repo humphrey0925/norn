@@ -139,6 +139,9 @@ struct Walk<'a> {
     /// Start bytes of identifier nodes already consumed as a def name or call target.
     skip: FxHashSet<usize>,
     locals: FxHashSet<&'a [u8]>,
+    /// The declaration in force for each local name of the function being
+    /// read, as an index into the facts' `locals`.
+    local_ids: FxHashMap<&'a [u8], u32>,
     scope: Option<Scope>,
     /// Name position of each expanding-macro use, and the definition it
     /// turned out to name.
@@ -221,6 +224,7 @@ impl Extractor {
             names: FxHashMap::default(),
             skip: FxHashSet::default(),
             locals: FxHashSet::default(),
+            local_ids: FxHashMap::default(),
             scope: None,
             site_defs: lexed
                 .events
@@ -264,6 +268,24 @@ impl Extractor {
 }
 
 impl<'a> Walk<'a> {
+    /// A parameter or local variable is declared at `name`.
+    fn note_local(&mut self, name: Node<'a>, param: bool) {
+        let text = self.text(name);
+        self.locals.insert(text);
+        let Some(scope) = self.scope.filter(|s| s.is_fn) else { return };
+        let type_name = self.local_types.get(text).copied().unwrap_or(NONE);
+        let id = self.intern(text);
+        self.local_ids.insert(text, self.out.locals.len() as u32);
+        self.out.locals.push(crate::model::Local { name: id, line: name.start_position().row as u32 + 1, scope: scope.def, param, type_name });
+    }
+
+    /// The local `name` is used here.
+    fn use_local(&mut self, name: Node<'a>) {
+        if let Some(&id) = self.local_ids.get(self.text(name)) {
+            self.out.local_uses.push((id, name.start_position().row as u32 + 1));
+        }
+    }
+
     fn text(&self, n: Node) -> &'a [u8] {
         &self.src[n.byte_range()]
     }
@@ -839,7 +861,13 @@ impl<'a> Walk<'a> {
         let ids = self.ids;
 
         if k == ids.identifier {
-            if !self.skip.remove(&node.start_byte()) && !(self.in_fn() && self.locals.contains(self.text(node))) {
+            let taken = self.skip.remove(&node.start_byte());
+            if self.in_fn() && self.locals.contains(self.text(node)) {
+                // (Its own declaration is not a use of it.)
+                if !taken {
+                    self.use_local(node);
+                }
+            } else if !taken {
                 self.push_ref(node, refkind::USE);
             }
             return false;
@@ -986,6 +1014,7 @@ impl<'a> Walk<'a> {
                     self.out.typed.push((def, returns));
                 }
                 self.locals.clear();
+                self.local_ids.clear();
                 if let Some(d) = node.child_by_field_id(ids.f_declarator.get()) {
                     self.note_params(d);
                 }
@@ -1011,12 +1040,12 @@ impl<'a> Walk<'a> {
                 for d in self.declarators(node) {
                     if let Some((name, _)) = self.decl_name(d) {
                         self.skip.insert(name.start_byte());
-                        self.locals.insert(self.text(name));
                         if declared != NONE && !self.declares_function(d) {
                             self.local_types.insert(self.text(name), declared);
                         } else {
                             self.local_types.remove(self.text(name));
                         }
+                        self.note_local(name, false);
                         if let Some(value) = d.child_by_field_id(ids.f_value).filter(|_| d.kind_id() == ids.init_declarator) {
                             self.local_source(self.text(name), value);
                         }
@@ -1052,7 +1081,7 @@ impl<'a> Walk<'a> {
             if let Some((name, _)) = named {
                 self.skip.insert(name.start_byte());
                 if self.in_fn() {
-                    self.locals.insert(self.text(name));
+                    self.note_local(name, true);
                 }
             }
             return true;

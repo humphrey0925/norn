@@ -1403,6 +1403,9 @@ fn expand_file(
     // initializers that were read.
     out.sites = Vec::new();
     out.inits = Vec::new();
+    // (Locals are looked up in the file's own facts, never in this copy.)
+    out.locals = Vec::new();
+    out.local_uses = Vec::new();
     out.shrink();
     let added = ((out.defs.len() - n_defs) as u64, (out.refs.len() - n_refs) as u64);
     Some((out, added.0, added.1))

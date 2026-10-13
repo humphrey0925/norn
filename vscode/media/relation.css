@@ -75,3 +75,5 @@ body { padding: 0; margin: 0; color: var(--vscode-foreground); font-family: var(
 .ge.ptr { stroke: var(--vscode-charts-blue); stroke-dasharray: 4 3; }
 .ge.mac { stroke: var(--vscode-charts-orange); stroke-dasharray: 4 3; }
 #views[hidden] { display: none; }
+.k-local { color: var(--vscode-symbolIcon-variableForeground, var(--vscode-charts-blue)); }
+.k-parameter { color: var(--vscode-symbolIcon-variableForeground, var(--vscode-charts-blue)); }

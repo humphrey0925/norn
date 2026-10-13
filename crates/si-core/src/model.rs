@@ -263,6 +263,25 @@ pub struct FileFacts {
     pub typed: Vec<(u32, u32)>,
     /// Every name the file `#define`s, in whatever branch.
     pub defined_names: Vec<u32>,
+    /// The parameters and local variables of the file's functions, in the
+    /// order they are declared. They are no part of the graph: a local is
+    /// its function's alone, and is looked up in the file it is in.
+    pub locals: Vec<Local>,
+    /// Where each is used: (index into `locals`, line), in source order.
+    pub local_uses: Vec<(u32, u32)>,
+}
+
+/// A parameter or a local variable.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Local {
+    pub name: u32,
+    /// The line of its declaration.
+    pub line: u32,
+    /// The function, as a definition of this file.
+    pub scope: u32,
+    pub param: bool,
+    /// The name of its type when that is a struct, a union or a typedef, else `NONE`.
+    pub type_name: u32,
 }
 
 impl FileFacts {
@@ -307,6 +326,8 @@ impl FileFacts {
         self.ref_hints.shrink_to_fit();
         self.typed.shrink_to_fit();
         self.defined_names.shrink_to_fit();
+        self.locals.shrink_to_fit();
+        self.local_uses.shrink_to_fit();
     }
 
     /// What the names (and the texts kept as names) take.

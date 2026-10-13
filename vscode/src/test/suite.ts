@@ -101,6 +101,30 @@ export async function run(): Promise<void> {
   assert.ok(shown!.uri.endsWith("bfd-in2.h") && shown!.lines === header.lineCount && header.lineAt(shown!.line - 1).text.includes("bfd_set_error"), JSON.stringify(shown));
   editor.selection = new vscode.Selection(read, read);
 
+  // Parameters and local variables: under their function in File Symbols,
+  // and with a definition, a context and a relation of their own.
+  type Listed = { label: string; children?: Listed[] };
+  let listed: Listed[] = [];
+  for (let i = 0; i < 40 && !listed.length; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    listed = (await vscode.commands.executeCommand<Listed[]>("si.fileSymbols.tree")) ?? [];
+  }
+  const readFn = listed.find((g) => g.label === "Functions")?.children?.find((f) => f.label === "bfd_read");
+  const inside = (readFn?.children ?? []).map((c) => c.label);
+  assert.ok(inside.includes("ptr") && inside.includes("nread"), JSON.stringify(inside));
+  const useOf = doc.positionAt(doc.getText().indexOf("nread = abfd->iovec") + 2);
+  const declared = await vscode.commands.executeCommand<vscode.Location[]>("vscode.executeDefinitionProvider", doc.uri, useOf);
+  assert.ok(declared.length === 1 && declared[0].range.start.line < useOf.line && doc.lineAt(declared[0].range.start.line).text.includes("nread"), "a local's definition is its declaration");
+  editor.selection = new vscode.Selection(useOf, useOf);
+  await vscode.commands.executeCommand("si.context.sync");
+  let local: { uri: string; line: number } | undefined;
+  for (let i = 0; i < 40 && local?.line !== declared[0].range.start.line + 1; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    local = await vscode.commands.executeCommand("si.context.shown");
+  }
+  assert.strictEqual(local?.line, declared[0].range.start.line + 1, "Context shows the local's declaration");
+  editor.selection = new vscode.Selection(read, read);
+
   // Split: a result opened "beside" lands in another group, and one opened
   // normally stays in the group of the editor the views follow.
   await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);

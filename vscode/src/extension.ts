@@ -55,11 +55,11 @@ let current: vscode.TextEditor | undefined;
 const ICONS: Record<string, string> = {
   function: "symbol-function", macro: "symbol-constant", struct: "symbol-struct", union: "symbol-struct",
   enum: "symbol-enum", enum_const: "symbol-enum-member", typedef: "symbol-class", global: "symbol-variable",
-  field: "symbol-field", file: "symbol-file",
+  field: "symbol-field", file: "symbol-file", local: "symbol-variable", parameter: "symbol-parameter",
 };
 const KIND_NAMES: Record<string, string> = {
   function: "function", macro: "macro", struct: "struct", union: "union", enum: "enum", enum_const: "enumerator",
-  typedef: "typedef", global: "variable", field: "member",
+  typedef: "typedef", global: "variable", field: "member", local: "local variable", parameter: "parameter",
 };
 
 function isSource(doc: vscode.TextDocument): boolean {
@@ -101,6 +101,8 @@ class Node {
     readonly children?: Node[],
     readonly detail?: string,
     readonly icon?: string,
+    /** Shown closed until opened (a function's locals, of which a file has many). */
+    readonly closed?: boolean,
   ) {}
 }
 
@@ -249,11 +251,40 @@ class FileSymbols implements vscode.TreeDataProvider<Node> {
       [14, "Macros", "symbol-constant"], [12, "Functions", "symbol-function"], [23, "Structs", "symbol-struct"], [10, "Enums", "symbol-enum"],
       [22, "Enumerators", "symbol-enum-member"], [5, "Typedefs", "symbol-class"], [13, "Variables", "symbol-variable"], [8, "Members", "symbol-field"],
     ];
+    // Under each function, its parameters and local variables (si.fileSymbols.showLocals).
+    type LocalRow = { function: string; functionLine: number; name: string; line: number; kind: string; type: string | null; range: Entry["range"] };
+    const wanted = vscode.workspace.getConfiguration("si").get<boolean>("fileSymbols.showLocals", true);
+    const locals = wanted ? (await ask<LocalRow[]>("si/locals", { textDocument: { uri } })) ?? [] : [];
+    if (uri !== this.shown) {
+      return; // another file since
+    }
+    const byFunction = new Map<string, LocalRow[]>();
+    for (const l of locals) {
+      const key = `${l.function}\n${l.functionLine}`;
+      byFunction.set(key, [...(byFunction.get(key) ?? []), l]);
+    }
+    // A function's own row is at its name, its locals say where it begins: the nearest of that name.
+    const localsOf = (name: string, line: number): Node[] | undefined => {
+      let best: [number, LocalRow[]] | undefined;
+      for (const [key, rows] of byFunction) {
+        const [fn, at] = key.split("\n");
+        const far = Math.abs(Number(at) - 1 - line);
+        if (fn === name && (!best || far < best[0])) {
+          best = [far, rows];
+        }
+      }
+      return best?.[1].map(
+        (l) => new Node(l.name, undefined, { uri, line: l.range.start.line, character: l.range.start.character }, undefined, (l.type ? `${l.type}  ` : "") + String(l.line), ICONS[l.kind]),
+      );
+    };
     this.groups = [];
     for (const [kind, title, icon] of order) {
       const kids = symbols
         .filter((s) => s.kind === kind)
-        .map((s) => new Node(s.name, undefined, { uri, line: s.location.range.start.line, character: s.location.range.start.character }, undefined, String(s.location.range.start.line + 1), icon));
+        .map((s) => {
+          const inside = kind === 12 ? localsOf(s.name, s.location.range.start.line) : undefined;
+          return new Node(s.name, undefined, { uri, line: s.location.range.start.line, character: s.location.range.start.character }, inside, String(s.location.range.start.line + 1), icon, true);
+        });
       if (kids.length) {
         this.groups.push(new Node(title, undefined, undefined, kids, String(kids.length), icon));
       }
@@ -269,7 +300,8 @@ class FileSymbols implements vscode.TreeDataProvider<Node> {
   }
 
   getTreeItem(node: Node): vscode.TreeItem {
-    const item = new vscode.TreeItem(node.label, node.children ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
+    const state = !node.children?.length ? vscode.TreeItemCollapsibleState.None : node.closed ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.Expanded;
+    const item = new vscode.TreeItem(node.label, state);
     item.description = node.detail;
     if (node.icon) {
       item.iconPath = new vscode.ThemeIcon(node.icon);
@@ -282,6 +314,12 @@ class FileSymbols implements vscode.TreeDataProvider<Node> {
 
   getChildren(node?: Node): Node[] {
     return node ? node.children ?? [] : this.groups;
+  }
+
+  /** For checks: what is listed, by name. */
+  tree(): unknown {
+    const plain = (n: Node): unknown => ({ label: n.label, detail: n.detail, children: n.children?.map(plain) });
+    return this.groups.map(plain);
   }
 }
 
@@ -1561,6 +1599,7 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
     }),
     vscode.commands.registerCommand("si.relation.target", () => relation.target),
     vscode.commands.registerCommand("si.serverInUse", () => serverPath()),
+    vscode.commands.registerCommand("si.fileSymbols.tree", () => fileSymbols.tree()),
     vscode.commands.registerCommand("si.context.shown", () => contextView.state),
     vscode.window.onDidChangeActiveColorTheme(() => setTimeout(() => contextView.colors(), 300)),
     vscode.commands.registerCommand("si.context.sync", () => {
@@ -1728,6 +1767,9 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
     }),
     vscode.workspace.onDidChangeConfiguration((e) => {
       // A corrected path should take effect without reloading the window.
+      if (e.affectsConfiguration("si.fileSymbols")) {
+        fileSymbols.refresh();
+      }
       if (e.affectsConfiguration("si.serverPath") || e.affectsConfiguration("si.includeAliases") || e.affectsConfiguration("si.cache")) {
         void vscode.commands.executeCommand("si.restart");
       }

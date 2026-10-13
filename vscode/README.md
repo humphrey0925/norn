@@ -26,6 +26,12 @@ Source-Insight-style views for C in VS Code, backed by the `si` index.
   extension installed, or the definition from the index when none
   answers); Ctrl+click goes to its definition, a click marks its other
   occurrences, and a line number opens that line in the editor.
+- **Parameters and local variables** are listed under their function in
+  File Symbols (`si.fileSymbols.showLocals`), and the cursor on one gives
+  its declaration in Context and by Go to Definition, its uses by Find
+  References, and in Relation the function it belongs to with the lines
+  it is used on. They are a function's own: Project Symbols does not list
+  them.
 - **Lock and sync**: Relation and Context follow the cursor until locked.
   A locked view stays on its symbol while you read elsewhere; its target
   button moves it to what the cursor is on now, still locked.

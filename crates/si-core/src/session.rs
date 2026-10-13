@@ -132,6 +132,14 @@ impl Session {
         self.conditions.source().map(|s| s.summary()).unwrap_or_default()
     }
 
+    /// The facts of the file indexed as `rel` (its own, before macro
+    /// expansion): what is known of a file that is no part of the graph,
+    /// such as its functions' parameters and local variables.
+    pub fn facts_of(&self, rel: &str) -> Option<&FileFacts> {
+        let path = self.root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        self.files.binary_search(&path).ok().map(|i| &self.facts[i])
+    }
+
     /// How many macros the conditions settle, one way or the other.
     pub fn conditions_known(&self) -> usize {
         self.conditions.len()
@@ -669,6 +677,30 @@ mod tests {
         assert_eq!((functions(&s, "net_init"), functions(&s, "net_stub")), (1, 0));
         s.set_conditions(&Settings { source_defines: Some(false), ..Settings::default() }).unwrap();
         assert_eq!((functions(&s, "net_init"), functions(&s, "net_stub"), functions(&s, "usb_init")), (1, 1, 1));
+    }
+
+    #[test]
+    fn parameters_and_local_variables_are_kept_with_their_uses() {
+        let d = Dir::new("locals");
+        d.write("a.c", "int total;\nint sum (int *values, int count)\n{\n  int i, acc = 0;\n  for (i = 0; i < count; i++)\n    acc += values[i];\n  total = acc;\n  return acc;\n}\nint other (int count) { return count; }\n");
+        let s = Session::open(&d.0, Options::default());
+        let f = s.facts_of("a.c").unwrap();
+        let of = |name: &str| -> Vec<(u32, bool, Vec<u32>)> {
+            f.locals
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| f.name(l.name as usize) == name)
+                .map(|(i, l)| (l.line, l.param, f.local_uses.iter().filter(|u| u.0 == i as u32).map(|u| u.1).collect()))
+                .collect()
+        };
+        assert_eq!(of("values"), [(2, true, vec![6])]);
+        // The same name in two functions is two locals.
+        assert_eq!(of("count"), [(2, true, vec![5]), (10, true, vec![10])]);
+        assert_eq!(of("i"), [(4, false, vec![5, 5, 5, 6])]);
+        assert_eq!(of("acc"), [(4, false, vec![6, 7, 8])]);
+        // A global used in the function is the graph's, not a local.
+        assert!(of("total").is_empty());
+        assert_eq!(f.name(f.defs[f.locals[0].scope as usize].name as usize), "sum");
     }
 
     #[test]

@@ -46,6 +46,20 @@ fn write_message(out: &mut impl Write, msg: &Value) {
     let _ = out.flush();
 }
 
+/// A parameter or local variable found under the cursor.
+struct LocalHit {
+    file: String,
+    name: String,
+    /// The line of its declaration.
+    line: u32,
+    param: bool,
+    type_name: Option<String>,
+    function: String,
+    function_line: u32,
+    /// The lines it is used on, in order.
+    uses: Vec<u32>,
+}
+
 /// `file:///e%3A/dir/a.c` to a path, and back.
 fn uri_to_path(uri: &str) -> PathBuf {
     let rest = uri.strip_prefix("file://").unwrap_or(uri);
@@ -191,7 +205,80 @@ impl Server {
         found
     }
 
+    /// The parameter or local variable the name under the cursor is, when
+    /// it is one: locals are no part of the graph, they are looked up in
+    /// the facts of the file, in the function the cursor is in.
+    fn local_at(&mut self, params: &Value) -> Option<LocalHit> {
+        let (file, line, name) = self.at(params)?;
+        let f = self.session.facts_of(&file)?;
+        let mut best: Option<(usize, &si_core::model::Local)> = None;
+        for (i, l) in f.locals.iter().enumerate().filter(|(_, l)| f.name(l.name as usize) == name) {
+            let Some(d) = f.defs.get(l.scope as usize) else { continue };
+            if line < d.line || line > d.end_line.max(d.line) {
+                continue;
+            }
+            // The declaration last made at or above the cursor (an inner
+            // block may declare the name again); else the function's first.
+            let better = match best {
+                None => true,
+                Some((_, b)) => l.line <= line && (b.line > line || l.line >= b.line),
+            };
+            if better {
+                best = Some((i, l));
+            }
+        }
+        let (i, l) = best?;
+        let d = &f.defs[l.scope as usize];
+        let mut uses: Vec<u32> = f.local_uses.iter().filter(|u| u.0 == i as u32).map(|u| u.1).collect();
+        uses.dedup();
+        Some(LocalHit {
+            file,
+            name,
+            line: l.line,
+            param: l.param,
+            type_name: (l.type_name != si_core::model::NONE).then(|| f.name(l.type_name as usize).to_string()),
+            function: f.name(d.name as usize).to_string(),
+            function_line: d.line,
+            uses,
+        })
+    }
+
+    /// A local as the views take a symbol.
+    fn local_entry(&mut self, h: &LocalHit) -> Value {
+        let loc = self.location(&h.file, h.line, &h.name);
+        json!({ "name": h.name, "kind": if h.param { "parameter" } else { "local" }, "file": h.file, "line": h.line, "endLine": h.line,
+                "declaration": false, "uri": loc["uri"], "range": loc["range"], "function": h.function, "type": h.type_name,
+                "data": { "file": h.file, "line": h.line, "name": h.name } })
+    }
+
+    /// `si/locals`: the parameters and local variables of each function of
+    /// a file, for listing under the functions.
+    fn locals(&mut self, params: &Value) -> Value {
+        let path = uri_to_path(params["textDocument"]["uri"].as_str().unwrap_or(""));
+        let Some(file) = self.relative(&path) else { return json!([]) };
+        let Some(f) = self.session.facts_of(&file) else { return json!([]) };
+        let rows: Vec<(String, u32, String, u32, bool, Option<String>)> = f
+            .locals
+            .iter()
+            .filter_map(|l| {
+                let d = f.defs.get(l.scope as usize)?;
+                let ty = (l.type_name != si_core::model::NONE).then(|| f.name(l.type_name as usize).to_string());
+                Some((f.name(d.name as usize).to_string(), d.line, f.name(l.name as usize).to_string(), l.line, l.param, ty))
+            })
+            .collect();
+        let mut out = Vec::new();
+        for (function, function_line, name, line, param, ty) in rows {
+            let loc = self.location(&file, line, &name);
+            out.push(json!({ "function": function, "functionLine": function_line, "name": name, "line": line, "kind": if param { "parameter" } else { "local" },
+                             "type": ty, "uri": loc["uri"], "range": loc["range"] }));
+        }
+        json!(out)
+    }
+
     fn definition(&mut self, params: &Value) -> Value {
+        if let Some(h) = self.local_at(params) {
+            return json!([self.location(&h.file, h.line, &h.name)]);
+        }
         let mut found = self.targets(params);
         // The definition, when there is one; else the declarations.
         if found.iter().any(|&s| self.g().syms[s as usize].flags & flag::DECL == 0) {
@@ -201,6 +288,12 @@ impl Server {
     }
 
     fn references(&mut self, params: &Value) -> Value {
+        if let Some(h) = self.local_at(params) {
+            // Within its function: where it is declared, and each line it is used on.
+            let declared = params["context"]["includeDeclaration"].as_bool().unwrap_or(true).then_some(h.line);
+            let lines: Vec<u32> = declared.into_iter().chain(h.uses.iter().copied().filter(|&l| l != h.line)).collect();
+            return json!(lines.into_iter().map(|l| self.location(&h.file, l, &h.name)).collect::<Vec<_>>());
+        }
         let targets = self.targets(params);
         let mut places: Vec<(String, u32, String)> = Vec::new();
         for &t in &targets {
@@ -328,6 +421,11 @@ impl Server {
 
     /// `si/context`: what the name under the cursor is defined as.
     fn context(&mut self, params: &Value) -> Value {
+        if let Some(h) = self.local_at(params) {
+            let mut v = self.local_entry(&h);
+            v["candidates"] = json!(1);
+            return v;
+        }
         let mut found = self.targets(params);
         if found.iter().any(|&s| self.g().syms[s as usize].flags & flag::DECL == 0) {
             found.retain(|&s| self.g().syms[s as usize].flags & flag::DECL == 0);
@@ -349,6 +447,23 @@ impl Server {
     /// variable holding the function, through a pointer; certain or not.
     fn relation(&mut self, params: &Value) -> Value {
         let incoming = params["direction"].as_str() != Some("callees");
+        // On a parameter or local variable: it is used by its function, on
+        // these lines; from the function the tree goes on as for any other.
+        if let Some(h) = (!params["item"].is_object()).then(|| self.local_at(params)).flatten() {
+            let root = self.local_entry(&h);
+            let function = self.item_symbol(&json!({ "data": { "file": h.file, "line": h.function_line, "name": h.function } }));
+            let mut entries = Vec::new();
+            if let Some(sym) = function.filter(|_| incoming) {
+                let mut v = self.entry(sym);
+                v["lines"] = json!(h.uses);
+                v["viaMacro"] = Value::Null;
+                v["through"] = Value::Null;
+                v["pointer"] = json!(false);
+                v["certain"] = json!(true);
+                entries.push(v);
+            }
+            return json!({ "root": root, "entries": entries });
+        }
         let root = if params["item"].is_object() {
             self.item_symbol(&json!({ "data": params["item"] }))
         } else {
@@ -574,6 +689,7 @@ impl Server {
             "si/assignments" => self.assignments(params),
             "si/symbols" => self.symbols(params),
             "si/place" => self.place(params),
+            "si/locals" => self.locals(params),
             "si/conditions" => self.conditions(),
             "si/setConditions" => {
                 let project: si_core::cond::Project = serde_json::from_value(params.clone()).unwrap_or_default();

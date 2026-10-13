@@ -46,6 +46,15 @@ export async function run(): Promise<void> {
       void vscode.commands.executeCommand("si.conditions.switch");
     }
   }
+  if (process.env.SI_DEMO_LOCALS) {
+    // The cursor is on a local; open its function in File Symbols.
+    await vscode.commands.executeCommand("si.fileSymbols.focus");
+    for (let i = 0; i < 14; i++) {
+      await vscode.commands.executeCommand("list.focusDown");
+    }
+    await vscode.commands.executeCommand("list.expand");
+    await vscode.commands.executeCommand("si.relation.callers");
+  }
   if (process.env.SI_DEMO_SOURCES) {
     const fs = await import("fs");
     fs.writeFileSync(path.join(folder, "include", "config.h"), ["#ifndef CONFIG_H", "#define CONFIG_H", "#define USE_NET 1", "#define USE_USB 0", "#define BOARD_REV 3", "#endif", ""].join("\n"));
