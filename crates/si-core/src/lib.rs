@@ -7,6 +7,7 @@ pub mod link;
 pub mod mask;
 pub mod model;
 pub mod packed;
+pub mod session;
 pub mod sqlite;
 
 use mask::MacroSets;
@@ -137,6 +138,26 @@ pub fn callees_through_slots(g: &graph::Graph, sym: u32) -> Vec<Caller> {
             let ambiguous = e.ambiguous() || b.ambiguous();
             out.push(Caller { caller: b.other, line: e.line(), ambiguous, via: Some(e.other), slot: Some(e.other) });
         }
+    }
+    out
+}
+
+/// The symbol the name `name` on `line` of `file` (a path as indexed) refers
+/// to: what "go to definition" wants. Falls back on every symbol of that
+/// name when the line has no such reference (a declaration, say).
+pub fn definition_at(g: &graph::Graph, file: &str, line: u32, name: &str) -> Vec<u32> {
+    let here = (0..g.files.len() as u32).find(|&f| g.file_path(f) == file);
+    let mut out: Vec<u32> = here
+        .map(|f| g.symbol_at(f, line).unwrap_or(g.files[f as usize].sym_start))
+        .into_iter()
+        .flat_map(|scope| g.refs_from(scope))
+        .filter(|e| e.line() == line && e.kind() != model::refkind::BIND && g.sym_name(e.other) == name)
+        .map(|e| e.other)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    if out.is_empty() {
+        out.extend_from_slice(g.find(name));
     }
     out
 }

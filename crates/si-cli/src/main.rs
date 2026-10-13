@@ -85,6 +85,13 @@ enum Cmd {
     },
     /// Line-delimited JSON query server on stdin/stdout.
     Serve { dir: PathBuf },
+    /// The same over the sources themselves, kept up to date: besides the
+    /// queries, `{"op":"update","files":[...]}` after files change.
+    Live {
+        root: PathBuf,
+        #[arg(long, value_name = "FROM=TO")]
+        include_alias: Vec<String>,
+    },
     /// Every symbol as `file<TAB>line<TAB>kind<TAB>decl|def<TAB>name` (for accuracy checks).
     Symbols { dir: PathBuf },
     /// Every call edge, tab-separated (for accuracy checks).
@@ -276,7 +283,7 @@ fn run_query(g: &Graph, op: &str, name: &str, depth: u32) -> Value {
         "tree" => {
             let reached: usize = syms
                 .iter()
-                .map(|&s| si_core::bfs(s, depth, |x, out| out.extend(g.refs_from(x).iter().filter(is_call).map(|e| e.other))))
+                .map(|&s| si_core::bfs(s, depth, |x, out| out.extend(si_core::callees_through_slots(g, x).iter().map(|c| c.caller))))
                 .sum();
             json!({ "reached": reached })
         }
@@ -421,6 +428,49 @@ fn bench_incr(root: &Path, n: usize, seed: u64) -> Value {
     })
 }
 
+fn aliases(given: &[String]) -> Vec<(String, String)> {
+    given.iter().map(|a| a.split_once('=').map(|(from, to)| (from.to_string(), to.to_string())).expect("FROM=TO")).collect()
+}
+
+/// `{"op":"definition","file":...,"line":...,"name":...}`: what the name
+/// written there refers to.
+fn definition(g: &Graph, req: &Value) -> Value {
+    let (file, line, name) = (req["file"].as_str().unwrap_or(""), req["line"].as_u64().unwrap_or(0), req["name"].as_str().unwrap_or(""));
+    let found = si_core::definition_at(g, &file.replace('\\', "/"), line as u32, name);
+    json!({ "results": found.iter().map(|&s| sym_json(g, s)).collect::<Vec<_>>() })
+}
+
+fn answer(g: &Graph, req: &Value) -> Value {
+    let op = req["op"].as_str().unwrap_or("");
+    if op == "definition" {
+        return definition(g, req);
+    }
+    run_query(g, op, req["name"].as_str().unwrap_or(""), req["depth"].as_u64().unwrap_or(3) as u32)
+}
+
+fn live(root: &Path, options: &si_core::link::Options) {
+    let t = Instant::now();
+    let mut session = si_core::session::Session::open(root, options.clone());
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let ready = json!({ "ready": true, "files": session.files(), "symbols": session.graph.syms.len(), "ms": ms(t) });
+    writeln!(out, "{ready}").and_then(|_| out.flush()).expect("write response");
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        let req: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+        let resp = if req["op"] == "update" {
+            let files: Vec<PathBuf> = req["files"].as_array().into_iter().flatten().filter_map(|f| f.as_str()).map(PathBuf::from).collect();
+            let up = session.update(&files);
+            json!({ "changed": up.changed, "added": up.added, "removed": up.removed, "extracted": up.extracted,
+                    "macros_reclassified": up.macros_reclassified, "extract_ms": up.extract_ms, "link_ms": up.link_ms,
+                    "symbols": session.graph.syms.len() })
+        } else {
+            answer(&session.graph, &req)
+        };
+        writeln!(out, "{resp}").and_then(|_| out.flush()).expect("write response");
+    }
+}
+
 fn serve(dir: &Path) {
     let g = Graph::load(&dir.join("graph.si")).expect("load graph.si");
     let stdout = std::io::stdout();
@@ -428,10 +478,7 @@ fn serve(dir: &Path) {
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         let req: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
-        let op = req["op"].as_str().unwrap_or("");
-        let name = req["name"].as_str().unwrap_or("");
-        let depth = req["depth"].as_u64().unwrap_or(3) as u32;
-        let resp = run_query(&g, op, name, depth);
+        let resp = answer(&g, &req);
         writeln!(out, "{resp}").and_then(|_| out.flush()).expect("write response");
     }
 }
@@ -481,17 +528,14 @@ fn main() {
     }
     let result = match &cli.cmd {
         Cmd::Index { root, out, stores, stride, include_alias, dump_binds } => {
-            let include_aliases = include_alias
-                .iter()
-                .map(|a| a.split_once('=').map(|(from, to)| (from.to_string(), to.to_string())).expect("FROM=TO"))
-                .collect();
-            index(root, out, stores, *stride, &si_core::link::Options { include_aliases }, *dump_binds)
+            index(root, out, stores, *stride, &si_core::link::Options { include_aliases: aliases(include_alias) }, *dump_binds)
         }
         Cmd::Query { dir, op, name, depth } => query(dir, op, name, *depth),
         Cmd::BenchQuery { dir, n, seed } => bench_query(dir, *n, *seed),
         Cmd::BenchIncr { root, n, seed } => bench_incr(root, *n, *seed),
         Cmd::Sample { dir, n, seed } => sample(dir, *n, *seed),
         Cmd::Serve { dir } => return serve(dir),
+        Cmd::Live { root, include_alias } => return live(root, &si_core::link::Options { include_aliases: aliases(include_alias) }),
         Cmd::Symbols { dir } => return symbols(dir),
         Cmd::Calls { dir } => return calls(dir),
     };

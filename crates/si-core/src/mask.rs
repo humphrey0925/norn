@@ -101,6 +101,7 @@ pub struct Lexed {
 
 /// A `#define` reduced to what decides transparency: `deps` is `Some` when
 /// the body is nothing but attributes and invocations of the listed macros.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Define {
     pub name: Vec<u8>,
     pub function_like: bool,
@@ -225,6 +226,19 @@ impl MacroSets {
 
     pub fn is_expanding(&self, name: &[u8]) -> bool {
         self.expanding.contains_key(name)
+    }
+
+    /// Names that are not the same kind of macro here and in `other`: facts
+    /// extracted under one view are wrong under the other for any file that
+    /// mentions one.
+    pub fn reclassified(&self, other: &MacroSets) -> FxHashSet<Vec<u8>> {
+        let mut out = FxHashSet::default();
+        for (a, b) in [(&self.transparent, &other.transparent), (&self.expanding, &other.expanding)] {
+            out.extend(a.iter().filter(|(k, v)| b.get(*k) != Some(v)).map(|(k, _)| k.clone()));
+            out.extend(b.iter().filter(|(k, v)| a.get(*k) != Some(v)).map(|(k, _)| k.clone()));
+        }
+        out.extend(self.kept.symmetric_difference(&other.kept).cloned());
+        out
     }
 
     /// Order-independent digest, so cached facts can be keyed on it.
