@@ -19,6 +19,13 @@ Source-Insight-style views for C in VS Code, backed by the `si` index.
   the workspace and is there the next time. The sync button brings the
   index in line with the disk whenever you want it.
 
+- **Context** shows the definition of the name under the cursor in its
+  file: the whole file, at the definition's line, to scroll through and
+  read but not to edit, coloured as the theme colours code. Hovering a
+  name there shows what the editor's hover would (from every language
+  extension installed, or the definition from the index when none
+  answers); Ctrl+click goes to its definition, a click marks its other
+  occurrences, and a line number opens that line in the editor.
 - **Lock and sync**: Relation and Context follow the cursor until locked.
   A locked view stays on its symbol while you read elsewhere; its target
   button moves it to what the cursor is on now, still locked.

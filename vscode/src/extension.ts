@@ -896,37 +896,177 @@ class Search implements vscode.WebviewViewProvider {
   }
 }
 
-/** The definition of whatever the cursor is on, without going there. */
+/** The colours the theme in use gives code, by the kinds the Context view
+ *  tells apart. A webview is given the workbench's colours but not these,
+ *  so they are read from the theme's own file. Kinds the theme says
+ *  nothing about are left out (the view has fallbacks). */
+function themeTokenColors(): Record<string, string> {
+  const wanted = vscode.workspace.getConfiguration("workbench").get<string>("colorTheme");
+  type Rule = { scope?: string | string[]; settings?: { foreground?: string; fontStyle?: string } };
+  let file: string | undefined;
+  for (const ext of vscode.extensions.all) {
+    const themes = (ext.packageJSON as { contributes?: { themes?: { id?: string; label?: string; path?: string }[] } })?.contributes?.themes ?? [];
+    const t = themes.find((t) => t.path && (t.id === wanted || t.label === wanted));
+    if (t?.path) {
+      file = path.join(ext.extensionPath, t.path);
+      break;
+    }
+  }
+  // A theme may build on another (`include`); its own rules come after.
+  const rules: Rule[] = [];
+  const load = (f: string, depth: number) => {
+    let theme: { include?: string; tokenColors?: Rule[] | string } | undefined;
+    try {
+      theme = jsonc.parse(fs.readFileSync(f, "utf8"));
+    } catch {
+      return;
+    }
+    if (theme?.include && depth < 5) {
+      load(path.join(path.dirname(f), theme.include), depth + 1);
+    }
+    if (Array.isArray(theme?.tokenColors)) {
+      rules.push(...theme.tokenColors);
+    }
+  };
+  if (file) {
+    load(file, 0);
+  }
+  // The most specific rule for a scope wins, the later of two alike.
+  const find = (scope: string): Rule["settings"] => {
+    let best: Rule["settings"], score = -1;
+    for (const r of rules) {
+      const selectors = (Array.isArray(r.scope) ? r.scope : (r.scope ?? "").split(",")).map((x) => x.trim().split(/\s+/).pop() ?? "");
+      for (const sel of selectors) {
+        if (sel && (scope === sel || scope.startsWith(sel + ".")) && sel.length >= score && r.settings?.foreground) {
+          best = r.settings;
+          score = sel.length;
+        }
+      }
+    }
+    return best;
+  };
+  const kinds: Record<string, string[]> = {
+    comment: ["comment.block.c", "comment"],
+    string: ["string.quoted.double.c", "string"],
+    number: ["constant.numeric.decimal.c", "constant.numeric"],
+    keyword: ["keyword.control.c", "keyword"],
+    type: ["storage.type.built-in.primitive.c", "storage.type", "storage"],
+    preprocessor: ["keyword.control.directive.define.c", "meta.preprocessor.c", "meta.preprocessor"],
+    function: ["entity.name.function.c", "entity.name.function"],
+    macro: ["entity.name.function.preprocessor.c", "entity.name.function"],
+  };
+  const out: Record<string, string> = {};
+  for (const [kind, scopes] of Object.entries(kinds)) {
+    const found = scopes.map(find).find((x) => x);
+    if (found?.foreground) {
+      out[kind] = found.foreground;
+      if (kind === "comment" && found.fontStyle?.includes("italic")) {
+        out["comment-style"] = "italic";
+      }
+    }
+  }
+  return out;
+}
+
+/** The definition of whatever the cursor is on, without going there: the
+ *  whole file it is in, at its line, to read and scroll through but not
+ *  to edit. Hovering a name and Ctrl+click there ask the editor's language
+ *  features about the real file. */
 class Context implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | undefined;
   locked = false;
   private last = "";
+  /** What is shown, and which text the view was given for it. */
+  private shown: { entry: Entry; doc: vscode.TextDocument } | undefined;
+  private sent = "";
+
+  constructor(private readonly media: vscode.Uri) {}
+
+  /** For checks: what the view was last told to show. */
+  get state() {
+    return this.shown ? { uri: this.shown.entry.uri, line: this.shown.entry.line, lines: this.shown.doc.lineCount, colors: themeTokenColors() } : undefined;
+  }
+
+  colors() {
+    void this.view?.webview.postMessage({ type: "colors", colors: themeTokenColors() });
+  }
 
   resolveWebviewView(view: vscode.WebviewView) {
     this.view = view;
-    view.webview.html = page(
-      view.webview,
-      `<div id="root"><div class="empty">Put the cursor on a name to see its definition here.</div></div>`,
-      `
-      const root = document.getElementById("root");
-      let shown;
-      const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
-      root.addEventListener("click", (e) => { if (shown) vscode.postMessage({ open: shown, beside: e.ctrlKey || e.metaKey }); });
-      window.addEventListener("message", (e) => {
-        const d = e.data;
-        shown = d.entry;
-        if (!d.entry) { root.innerHTML = '<div class="empty">' + esc(d.message) + "</div>"; return; }
-        const more = d.entry.candidates > 1 ? '<span class="dim">' + d.entry.candidates + " candidates</span>" : "";
-        root.innerHTML = '<div class="head"><strong>' + esc(d.entry.name) + "</strong><span>" + esc(d.kindName) + "</span><span>" + esc(d.entry.file) + ":" + d.entry.line + "</span>" + more + "</div><pre>"
-          + d.lines.map((t, i) => '<div class="' + (d.first + i === d.entry.line ? "at" : "") + '"><span class="n">' + (d.first + i) + "</span>" + esc(t) + "</div>").join("") + "</pre>";
-      });`,
-    );
-    view.webview.onDidReceiveMessage(async (m: { open: Entry; beside?: boolean }) => {
-      await open(m.open.uri, m.open.range.start.line, m.open.range.start.character, !!m.beside);
+    const w = view.webview;
+    w.options = { enableScripts: true, localResourceRoots: [this.media] };
+    const file = (name: string) => w.asWebviewUri(vscode.Uri.joinPath(this.media, name));
+    w.html = `<!doctype html><html><head><meta charset="utf-8">
+      <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${w.cspSource} 'unsafe-inline'; script-src ${w.cspSource};">
+      <link rel="stylesheet" href="${file("context.css")}"></head><body>
+      <div id="empty">Put the cursor on a name to see its definition here.</div>
+      <div id="head" hidden title="Open the definition in the editor (Ctrl+click: beside)"></div>
+      <div id="scroll" hidden tabindex="0"><div id="space"></div><div id="rows"></div></div>
+      <div id="tip" hidden></div>
+      <script src="${file("context.js")}"></script></body></html>`;
+    const at = (p: { line: number; character: number }) => new vscode.Position(p.line, p.character);
+    w.onDidReceiveMessage(async (m: {
+      ready?: boolean; open?: Entry; line?: number; beside?: boolean; seq?: number; x?: number; y?: number; top?: number;
+      hover?: { line: number; character: number }; definition?: { line: number; character: number };
+    }) => {
+      const uri = this.shown && vscode.Uri.parse(this.shown.entry.uri);
+      if (m.ready) {
+        // A view made anew has nothing: the colours, and what was shown.
+        this.sent = "";
+        this.colors();
+        if (this.shown) {
+          this.post(this.shown.entry, this.shown.doc);
+        } else if (current) {
+          this.last = "";
+          void this.follow(current, true);
+        }
+      } else if (m.open) {
+        await open(m.open.uri, m.open.range.start.line, m.open.range.start.character, !!m.beside);
+      } else if (m.line !== undefined && uri) {
+        await open(uri.toString(), m.line, 0, !!m.beside);
+      } else if (m.hover && uri) {
+        void w.postMessage({ type: "hover", seq: m.seq, x: m.x, y: m.y, top: m.top, parts: await this.hover(uri, at(m.hover)) });
+      } else if (m.definition && uri) {
+        const found = await vscode.commands.executeCommand<(vscode.Location | vscode.LocationLink)[]>("vscode.executeDefinitionProvider", uri, at(m.definition));
+        const first = found?.[0];
+        if (first) {
+          const [to, range] = "targetUri" in first ? [first.targetUri, first.targetSelectionRange ?? first.targetRange] : [first.uri, first.range];
+          await open(to.toString(), range.start.line, range.start.character, !!m.beside);
+        }
+      }
     });
-    if (current) {
-      void this.follow(current);
+  }
+
+  /** What the editor's hover would say there (every provider's answer),
+   *  or, when nothing answers, the definition as the index has it. */
+  private async hover(uri: vscode.Uri, at: vscode.Position): Promise<string[]> {
+    const hovers = (await vscode.commands.executeCommand<vscode.Hover[]>("vscode.executeHoverProvider", uri, at)) ?? [];
+    const parts = hovers
+      .flatMap((h) => h.contents)
+      .map((c) => (typeof c === "string" ? c : "language" in c ? "```\n" + c.value + "\n```" : c.value))
+      .filter((t) => t.trim());
+    if (parts.length) {
+      return parts;
     }
+    const entry = await ask<Entry | null>("si/context", { textDocument: { uri: uri.toString() }, position: { line: at.line, character: at.character } });
+    if (!entry) {
+      return [];
+    }
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(entry.uri));
+    const end = Math.min(doc.lineCount, Math.max(entry.line, Math.min(entry.endLine, entry.line + 7)));
+    const text: string[] = [];
+    for (let l = entry.line; l <= end; l++) {
+      text.push(doc.lineAt(l - 1).text);
+    }
+    return ["```\n" + text.join("\n") + "\n```", `${KIND_NAMES[entry.kind] ?? entry.kind} · ${entry.file}:${entry.line}`];
+  }
+
+  /** The text goes over once per version of a file; after that, only where to be in it. */
+  private post(entry: Entry, doc: vscode.TextDocument) {
+    const key = `${entry.uri}#${doc.version}`;
+    const text = key === this.sent ? undefined : doc.getText();
+    this.sent = key;
+    void this.view?.webview.postMessage({ type: "show", entry, kindName: KIND_NAMES[entry.kind] ?? entry.kind, key, text });
   }
 
   async follow(editor: vscode.TextEditor, asked = false) {
@@ -944,17 +1084,15 @@ class Context implements vscode.WebviewViewProvider {
       return; // the cursor has moved on
     }
     if (!entry) {
-      void this.view.webview.postMessage({ entry: null, message: "Nothing the index knows here." });
+      // Nothing here: what was shown stays, as a file being read should.
+      if (!this.shown) {
+        void this.view.webview.postMessage({ type: "show", entry: null, message: "Nothing the index knows here." });
+      }
       return;
     }
     const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(entry.uri));
-    const first = Math.max(1, entry.line - 2);
-    const last = Math.min(doc.lineCount, Math.max(entry.endLine, entry.line) + 1, first + 40);
-    const lines: string[] = [];
-    for (let l = first; l <= last; l++) {
-      lines.push(doc.lineAt(l - 1).text);
-    }
-    void this.view.webview.postMessage({ entry, kindName: KIND_NAMES[entry.kind] ?? entry.kind, first, lines });
+    this.shown = { entry, doc };
+    this.post(entry, doc);
   }
 }
 
@@ -1035,7 +1173,7 @@ export async function activate(context: vscode.ExtensionContext) {
   const relation = new Relation(vscode.Uri.joinPath(context.extensionUri, "media"));
   const fileSymbols = new FileSymbols();
   const search = new Search();
-  const contextView = new Context();
+  const contextView = new Context(vscode.Uri.joinPath(context.extensionUri, "media"));
   const lenses = new Lenses();
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 10);
   status.text = "$(sync~spin) SI indexing";
@@ -1313,6 +1451,8 @@ export async function activate(context: vscode.ExtensionContext) {
       return editor ? relation.sync(editor) : undefined;
     }),
     vscode.commands.registerCommand("si.relation.target", () => relation.target),
+    vscode.commands.registerCommand("si.context.shown", () => contextView.state),
+    vscode.window.onDidChangeActiveColorTheme(() => setTimeout(() => contextView.colors(), 300)),
     vscode.commands.registerCommand("si.context.sync", () => {
       const editor = vscode.window.activeTextEditor && isSource(vscode.window.activeTextEditor.document) ? vscode.window.activeTextEditor : current;
       return editor ? contextView.follow(editor, true) : undefined;

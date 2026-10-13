@@ -82,6 +82,17 @@ export async function run(): Promise<void> {
   assert.strictEqual(await shownAt(), elsewhere.line, "asked: the locked view shows the cursor's place");
   await vscode.commands.executeCommand("si.context.sync");
   await vscode.commands.executeCommand("si.relation.unlock");
+  // Context shows the file of the definition, whole, at its line.
+  const setError = doc.positionAt(doc.getText().indexOf("bfd_set_error (bfd_error_invalid_operation)") + 3);
+  editor.selection = new vscode.Selection(setError, setError);
+  await vscode.commands.executeCommand("si.context.sync");
+  let shown: { uri: string; line: number; lines: number } | undefined;
+  for (let i = 0; i < 40 && !shown?.uri.endsWith("bfd-in2.h"); i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    shown = await vscode.commands.executeCommand("si.context.shown");
+  }
+  const header = await vscode.workspace.openTextDocument(vscode.Uri.parse(shown!.uri));
+  assert.ok(shown!.uri.endsWith("bfd-in2.h") && shown!.lines === header.lineCount && header.lineAt(shown!.line - 1).text.includes("bfd_set_error"), JSON.stringify(shown));
   editor.selection = new vscode.Selection(read, read);
 
   // Split: a result opened "beside" lands in another group, and one opened

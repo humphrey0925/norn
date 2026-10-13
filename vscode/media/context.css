@@ -1,0 +1,47 @@
+html, body { height: 100%; }
+body { padding: 0; margin: 0; display: flex; flex-direction: column; color: var(--vscode-foreground); font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); }
+[hidden] { display: none !important; }
+#empty { padding: 8px; color: var(--vscode-descriptionForeground); }
+#head { flex: none; padding: 4px 8px; display: flex; gap: 10px; flex-wrap: wrap; align-items: baseline; cursor: pointer;
+  border-bottom: 1px solid var(--vscode-contrastBorder, var(--vscode-panel-border, var(--vscode-editorWidget-border, rgba(128,128,128,.45)))); }
+#head strong { font-family: var(--vscode-editor-font-family); }
+#head:hover strong { text-decoration: underline; }
+.dim { color: var(--vscode-descriptionForeground); font-size: 0.9em; }
+
+/* The code: every line where it would be in the whole file, only those in sight made. */
+#scroll { flex: 1; min-height: 0; overflow: auto; position: relative; outline: none;
+  background: var(--vscode-editor-background, transparent); color: var(--vscode-editor-foreground, var(--vscode-foreground));
+  font-family: var(--vscode-editor-font-family, monospace); font-size: var(--vscode-editor-font-size, 13px); line-height: 1.5; }
+#space { min-width: 100%; }
+#rows { position: absolute; left: 0; top: 0; min-width: 100%; }
+.l { position: absolute; left: 0; min-width: 100%; box-sizing: border-box; padding-right: 16px; white-space: pre; tab-size: 8; }
+.no { display: inline-block; padding: 0 1.2em 0 0.8em; color: var(--vscode-editorLineNumber-foreground, var(--vscode-descriptionForeground)); cursor: pointer; user-select: none; }
+.no:hover { color: var(--vscode-editorLineNumber-activeForeground, var(--vscode-foreground)); }
+/* The definition's line, and the rest of what it defines. */
+.l.at { background: var(--vscode-editor-lineHighlightBackground, var(--vscode-list-hoverBackground, transparent));
+  outline: 1px solid var(--vscode-editor-lineHighlightBorder, var(--vscode-contrastActiveBorder, transparent)); outline-offset: -1px; }
+.l.at .no { color: var(--vscode-editorLineNumber-activeForeground, var(--vscode-foreground)); }
+.l.at, .l.in { box-shadow: inset 2px 0 0 var(--vscode-focusBorder, currentColor); }
+
+/* Colours come from the theme's own token colours (--tok-*, set by the
+   extension); where a theme has none for a kind, from the colours every
+   theme has for the debugger's values, and last from the text itself. */
+.c { color: var(--tok-comment, var(--vscode-descriptionForeground)); font-style: var(--tok-comment-style, normal); }
+.s { color: var(--tok-string, var(--vscode-debugTokenExpression-string, inherit)); }
+.n { color: var(--tok-number, var(--vscode-debugTokenExpression-number, inherit)); }
+.k { color: var(--tok-keyword, var(--vscode-debugTokenExpression-name, inherit)); }
+.t { color: var(--tok-type, var(--tok-keyword, var(--vscode-debugTokenExpression-name, inherit))); }
+.p { color: var(--tok-preprocessor, var(--tok-keyword, var(--vscode-debugTokenExpression-name, inherit))); }
+.f { color: var(--tok-function, inherit); }
+.m { color: var(--tok-macro, var(--tok-function, inherit)); }
+[data-c] { cursor: text; }
+.hit { background: var(--vscode-editor-wordHighlightBackground, var(--vscode-editor-selectionHighlightBackground, rgba(128,128,128,.25)));
+  outline: 1px solid var(--vscode-editor-wordHighlightBorder, var(--vscode-contrastActiveBorder, transparent)); border-radius: 2px; }
+
+#tip { position: fixed; z-index: 10; max-width: min(640px, calc(100% - 16px)); max-height: 60%; overflow: auto; padding: 6px 10px; box-sizing: border-box;
+  color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground)); background: var(--vscode-editorHoverWidget-background, var(--vscode-editorWidget-background, var(--vscode-editor-background)));
+  border: 1px solid var(--vscode-contrastBorder, var(--vscode-editorHoverWidget-border, var(--vscode-editorWidget-border, rgba(128,128,128,.45)))); border-radius: 3px;
+  box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0,0,0,.3)); font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); line-height: 1.4; user-select: text; }
+#tip pre { margin: 2px 0; font-family: var(--vscode-editor-font-family, monospace); font-size: var(--vscode-editor-font-size, 13px); white-space: pre-wrap; }
+#tip code { font-family: var(--vscode-editor-font-family, monospace); }
+#tip hr { border: 0; border-top: 1px solid var(--vscode-contrastBorder, var(--vscode-editorHoverWidget-border, rgba(128,128,128,.45))); margin: 6px -10px; }
