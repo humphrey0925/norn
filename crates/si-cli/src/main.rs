@@ -516,7 +516,7 @@ fn calls(dir: &Path) {
                 continue;
             }
             let certain = if c.ambiguous { "ambiguous" } else { "certain" };
-            let via = c.slot.or(c.via).map_or("-", |m| g.sym_name(m));
+            let via = c.slot.or(c.via).map_or(if c.pointer { "*" } else { "-" }, |m| g.sym_name(m));
             let how = if c.indirect() { "indirect" } else { "direct" };
             writeln!(out, "{}	{}	{}	{}	{}	{}	{}	{}	{certain}	{decl}	{via}	{how}",
                      g.file_path(from.file), c.line, g.sym_name(c.caller), g.file_path(from.file), from.line,

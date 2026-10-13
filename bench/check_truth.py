@@ -182,7 +182,7 @@ def score(truth_path, index, corpus, cbm=False):
         cf = GENERATED.get(cf, cf)
         if cf not in si_files:
             continue
-        slot = how in ("field", "global")
+        slot = how in ("field", "global", "local")
         sites[how if not slot or stored.get((record, member)) else how + ", nothing stored"] += 1
         if slot:
             callers_ind.add((cf, cn))
@@ -213,7 +213,7 @@ def score(truth_path, index, corpus, cbm=False):
         got_ind.add((cf, cn, ef, en))
         # Only a callee clang compiled can be told right from wrong.
         if (cf, cn) in callers_ind and (ef, en) in truth_names and t.active(site_file, site_line):
-            if compiled_stores is None or (via, ef, en) in compiled_stores:
+            if compiled_stores is None or via == "*" or (via, ef, en) in compiled_stores:
                 judged_ind.add((cf, cn, ef, en))
     indirect = {"truth_call_sites": dict(sites), "truth_edges": len(want_ind), "found": len(want_ind & got_ind),
                 "recall": len(want_ind & got_ind) / max(1, len(want_ind)),

@@ -20,7 +20,13 @@ program: `main` and other names that several programs define have several.
 An indirect call (`icalls`) goes through a struct field (`kind` "field",
 with the record and field names), a variable at file scope ("global", with
 an empty record and the variable's name), a parameter, a local variable
-("var"), or something else. A store into a global has an empty record too. `binds` are the places a function is stored in a field: by an
+("var"), or something else. A store into a global has an empty record too.
+
+A call through a local variable is followed one step back, to what the
+function assigns to that variable: a member or a global (an `icalls` row of
+that kind, as if the call went through it directly) or a function (a store
+into a slot named after the function and the variable, and a call through
+it). `binds` are the places a function is stored in a field: by an
 initializer, positional or designated, or by an assignment. Joining the two
 on (record, field) gives the calls a field-based, type-aware analysis finds;
 it is an upper bound on what runs, not a record of it.
@@ -186,7 +192,61 @@ def binds_in(root, out):
         stack.extend(c.get_children())
 
 
-def calls_in(fn, caller, out, icalls, stats):
+def sources_of(expr):
+    """What a function pointer expression may be: (kind, record, name) for a
+    member or global it is read from, ("func", cursor) for a function."""
+    stack = [expr]
+    while stack:
+        c = stack.pop()
+        if c.kind == CursorKind.MEMBER_REF_EXPR:
+            f = c.referenced
+            if f is not None and f.kind == CursorKind.FIELD_DECL:
+                yield ("field", *slot_of(f))
+        elif c.kind == CursorKind.DECL_REF_EXPR:
+            d = c.referenced
+            if d is not None and d.kind == CursorKind.FUNCTION_DECL:
+                yield ("func", d)
+            elif d is not None and d.kind == CursorKind.VAR_DECL and is_global(d):
+                yield ("global", "", d.spelling)
+        elif c.kind == CursorKind.CONDITIONAL_OPERATOR:
+            stack.extend(list(c.get_children())[1:])
+        elif c.kind in WRAPPERS:
+            kids = list(c.get_children())
+            if kids:
+                stack.append(kids[-1] if c.kind == CursorKind.CSTYLE_CAST_EXPR else kids[0])
+
+
+def local_sources(fn, var):
+    """Everything `fn` assigns to its local variable `var`."""
+    stack = list(fn.get_children())
+    while stack:
+        c = stack.pop()
+        kids = list(c.get_children())
+        if c.kind == CursorKind.VAR_DECL and c == var:
+            for init in kids:
+                if init.kind != CursorKind.TYPE_REF:
+                    yield from sources_of(init)
+        elif c.kind == CursorKind.BINARY_OPERATOR and len(kids) == 2:
+            lhs = kids[0]
+            while lhs.kind == CursorKind.PAREN_EXPR:
+                lhs = next(lhs.get_children())
+            if lhs.kind == CursorKind.DECL_REF_EXPR and lhs.referenced == var and c.type.spelling == kids[0].type.spelling:
+                yield from sources_of(kids[1])
+        stack.extend(kids)
+
+
+def local_var(call):
+    """The local variable an indirect call goes through, if it does."""
+    kids = list(call.get_children())
+    c = kids[0] if kids else None
+    while c is not None and c.kind in WRAPPERS:
+        kids = list(c.get_children())
+        c = (kids[-1] if c.kind == CursorKind.CSTYLE_CAST_EXPR else kids[0]) if kids else None
+    d = c.referenced if c is not None and c.kind == CursorKind.DECL_REF_EXPR else None
+    return d if d is not None and d.kind == CursorKind.VAR_DECL and not is_global(d) else None
+
+
+def calls_in(fn, caller, out, icalls, binds, stats):
     stack = list(fn.get_children())
     while stack:
         c = stack.pop()
@@ -199,7 +259,18 @@ def calls_in(fn, caller, out, icalls, stats):
                 out.add((*caller, callee.get_usr(), callee.spelling, home, site(loc), loc.line))
             else:
                 stats["indirect"] += 1
-                icalls.add((*caller, *target_of(c), site(c.location), c.location.line))
+                where = (site(c.location), c.location.line)
+                icalls.add((*caller, *target_of(c), *where))
+                var = local_var(c)
+                for source in local_sources(fn, var) if var is not None else ():
+                    if source[0] == "func":
+                        slot = (f"<local {caller[0]}:{caller[1]}>", var.spelling)
+                        d = source[1].get_definition()
+                        home = rel(d.location.file.name) if d is not None and d.location.file else None
+                        binds.add((*slot, source[1].get_usr(), source[1].spelling, home, *where))
+                        icalls.add((*caller, "local", *slot, *where))
+                    else:
+                        icalls.add((*caller, "local", *source[1:], *where))
         stack.extend(c.get_children())
 
 
@@ -231,7 +302,7 @@ def one(entry):
         if c.kind != CursorKind.FUNCTION_DECL or not c.is_definition():
             continue
         defs.add((c.get_usr(), c.spelling, file, c.location.line, c.storage_class == cindex.StorageClass.STATIC))
-        calls_in(c, (file, c.spelling, c.location.line), calls, icalls, stats)
+        calls_in(c, (file, c.spelling, c.location.line), calls, icalls, binds, stats)
     read = {rel(path)} | {rel(i.include.name) for i in tu.get_includes()}
     read.discard(None)
     skipped = collections.defaultdict(list)

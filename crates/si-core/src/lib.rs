@@ -73,11 +73,13 @@ pub struct Caller {
     /// reaches this function only if that is what is stored there at the
     /// time.
     pub slot: Option<u32>,
+    /// The call goes through a local pointer variable that may hold this.
+    pub pointer: bool,
 }
 
 impl Caller {
     pub fn indirect(&self) -> bool {
-        self.slot.is_some()
+        self.slot.is_some() || self.pointer
     }
 }
 
@@ -107,14 +109,14 @@ pub fn callers_through_macros(g: &graph::Graph, sym: u32) -> Vec<Caller> {
                 continue;
             }
             let from_macro = g.syms[e.other as usize].kind == kind::MACRO;
-            let called = matches!(e.kind(), refkind::CALL | refkind::ICALL);
+            let called = matches!(e.kind(), refkind::CALL | refkind::ICALL | refkind::PCALL);
             if call_pending && !called && !from_macro {
                 continue;
             }
             let ambiguous = via_ambiguous || e.ambiguous();
             let pending = call_pending && !called;
             if !pending {
-                out.push(Caller { caller: e.other, line: e.line(), ambiguous, via, slot });
+                out.push(Caller { caller: e.other, line: e.line(), ambiguous, via, slot, pointer: e.kind() == refkind::PCALL });
             }
             if from_macro && seen.insert((e.other, pending)) {
                 work.push((e.other, Some(e.other), ambiguous, pending, slot));
@@ -129,14 +131,15 @@ pub fn callers_through_macros(g: &graph::Graph, sym: u32) -> Vec<Caller> {
 pub fn callees_through_slots(g: &graph::Graph, sym: u32) -> Vec<Caller> {
     use model::refkind;
     let mut out = Vec::new();
-    for e in g.refs_from(sym).iter().filter(|e| matches!(e.kind(), refkind::CALL | refkind::ICALL)) {
+    for e in g.refs_from(sym).iter().filter(|e| matches!(e.kind(), refkind::CALL | refkind::ICALL | refkind::PCALL)) {
         let stored: Vec<_> = g.refs_from(e.other).iter().filter(|b| b.kind() == refkind::BIND).collect();
-        if e.kind() == refkind::CALL {
-            out.push(Caller { caller: e.other, line: e.line(), ambiguous: e.ambiguous(), via: None, slot: None });
+        if e.kind() != refkind::ICALL {
+            let pointer = e.kind() == refkind::PCALL;
+            out.push(Caller { caller: e.other, line: e.line(), ambiguous: e.ambiguous(), via: None, slot: None, pointer });
         }
         for b in stored {
             let ambiguous = e.ambiguous() || b.ambiguous();
-            out.push(Caller { caller: b.other, line: e.line(), ambiguous, via: Some(e.other), slot: Some(e.other) });
+            out.push(Caller { caller: b.other, line: e.line(), ambiguous, via: Some(e.other), slot: Some(e.other), pointer: false });
         }
     }
     out

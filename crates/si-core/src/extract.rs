@@ -136,6 +136,11 @@ struct Walk<'a> {
     site_defs: FxHashMap<usize, u32>,
     /// The same positions, sorted.
     site_starts: Vec<usize>,
+    /// In the function being read: what each local variable is assigned
+    /// that a call could go through (a member, or a name that is not
+    /// local), and the calls made through locals.
+    local_sources: FxHashMap<&'a [u8], Vec<(bool, u32)>>,
+    local_calls: Vec<(&'a [u8], u32)>,
 }
 
 impl Default for Extractor {
@@ -200,6 +205,8 @@ impl Extractor {
                 })
                 .collect(),
             site_starts: Vec::new(),
+            local_sources: FxHashMap::default(),
+            local_calls: Vec::new(),
         };
         w.site_starts = w.site_defs.keys().copied().collect();
         w.site_starts.sort_unstable();
@@ -218,6 +225,7 @@ impl Extractor {
             }
         }
         w.flush_events(usize::MAX);
+        w.flush_local_calls();
         w.out.walk_ns = t.elapsed().as_nanos() as u64;
         w.out
     }
@@ -255,8 +263,45 @@ impl<'a> Walk<'a> {
 
     fn leave_scope(&mut self, pos: usize) {
         if self.scope.is_some_and(|s| pos >= s.end) {
+            self.flush_local_calls();
             self.scope = None;
             self.locals.clear();
+        }
+    }
+
+    /// A call through a local variable goes wherever the function gets the
+    /// variable's values from, anywhere in the function.
+    fn flush_local_calls(&mut self) {
+        let scope = self.scope.map_or(0, |s| s.def);
+        for (local, line) in std::mem::take(&mut self.local_calls) {
+            for &(member, name) in self.local_sources.get(local).into_iter().flatten() {
+                let kind = if member { refkind::ICALL } else { refkind::PCALL };
+                self.out.refs.push(Ref { name, line, scope, kind });
+            }
+        }
+        self.local_sources.clear();
+    }
+
+    /// Note what `value` is, as something assigned to the local `local`.
+    fn local_source(&mut self, local: &'a [u8], value: Node<'a>) {
+        let value = self.strip(value);
+        let k = value.kind_id();
+        if k == self.ids.field_expression {
+            if let Some(member) = value.child_by_field_id(self.ids.f_field) {
+                let name = self.intern(self.text(member));
+                self.local_sources.entry(local).or_default().push((true, name));
+            }
+        } else if k == self.ids.identifier {
+            if !self.locals.contains(self.text(value)) {
+                let name = self.intern(self.text(value));
+                self.local_sources.entry(local).or_default().push((false, name));
+            }
+        } else if k == self.ids.conditional_expression {
+            for f in [self.ids.f_consequence, self.ids.f_alternative] {
+                if let Some(c) = value.child_by_field_id(f) {
+                    self.local_source(local, c);
+                }
+            }
         }
     }
 
@@ -588,6 +633,7 @@ impl<'a> Walk<'a> {
                     self.skip.insert(f.start_byte());
                     if self.in_fn() && self.locals.contains(self.text(f)) {
                         self.out.indirect_calls += 1;
+                        self.local_calls.push((self.text(f), f.start_position().row as u32 + 1));
                     } else {
                         self.push_ref(f, refkind::CALL);
                     }
@@ -606,6 +652,8 @@ impl<'a> Walk<'a> {
                         // `(*hook) (...)` through a variable that is not local.
                         self.skip.insert(target.start_byte());
                         self.push_ref(target, refkind::CALL);
+                    } else if tk == ids.identifier {
+                        self.local_calls.push((self.text(target), target.start_position().row as u32 + 1));
                     }
                 }
                 None => self.out.indirect_calls += 1,
@@ -625,6 +673,8 @@ impl<'a> Walk<'a> {
                 } else if left.kind_id() == ids.identifier && !(self.in_fn() && self.locals.contains(self.text(left))) {
                     let slot = self.intern(self.text(left));
                     self.bind(right, slot, NONE, true, scope);
+                } else if left.kind_id() == ids.identifier {
+                    self.local_source(self.text(left), right);
                 }
             }
             return true;
@@ -683,6 +733,9 @@ impl<'a> Walk<'a> {
                     if let Some((name, _)) = self.decl_name(d) {
                         self.skip.insert(name.start_byte());
                         self.locals.insert(self.text(name));
+                        if let Some(value) = d.child_by_field_id(ids.f_value).filter(|_| d.kind_id() == ids.init_declarator) {
+                            self.local_source(self.text(name), value);
+                        }
                     }
                 }
                 self.initializers(node, self.scope.map_or(0, |s| s.def));

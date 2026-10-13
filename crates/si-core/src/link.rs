@@ -388,7 +388,7 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
                     continue;
                 }
                 let callable = |c: &u32| matches!(syms[*c as usize].kind, kind::FUNCTION | kind::MACRO);
-                if r.kind == refkind::CALL && tmp.iter().any(callable) {
+                if matches!(r.kind, refkind::CALL | refkind::PCALL) && tmp.iter().any(callable) {
                     tmp.retain(callable);
                 }
                 let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
@@ -621,6 +621,32 @@ mod tests {
              void set (int fast) { hook = fast ? impl : &other; }\nint go (void) { return hook (3); }\n",
         )]);
         assert_eq!(callees(&g, "go"), [("hook".to_string(), String::new()), ("impl".to_string(), "hook".to_string()), ("other".to_string(), "hook".to_string())]);
+    }
+
+    #[test]
+    fn calls_through_a_local_go_where_its_values_come_from() {
+        let g = graph(&[(
+            "t.c",
+            "struct ops { int (*run) (int); };
+int a (int x) { return x; }
+int b (int x) { return x; }
+int c (int x) { return x; }
+             void set (struct ops *o) { o->run = c; }
+             int go (struct ops *o, int k)
+{
+  int (*f) (int) = k ? a : b;
+  int (*h) (int);
+  int r = f (1) + (*h) (2);
+  h = o->run;
+  return r;
+}
+",
+        )]);
+        // `f` holds a or b; `h` holds whatever is in the member, assigned later or not.
+        assert_eq!(callees(&g, "go"), [("a".to_string(), String::new()), ("b".to_string(), String::new()), ("c".to_string(), "run".to_string())]);
+        let through_pointer: Vec<&str> =
+            crate::callers_through_macros(&g, g.find("a")[0]).iter().filter(|c| c.pointer).map(|c| g.sym_name(c.caller)).collect();
+        assert_eq!(through_pointer, ["go"]);
     }
 
     #[test]

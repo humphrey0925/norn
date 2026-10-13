@@ -54,6 +54,9 @@ pub mod refkind {
     /// Not a reference in the source: an edge from a field or variable to a
     /// function stored in it.
     pub const BIND: u8 = 4;
+    /// A call through a local pointer variable that the function assigns
+    /// this name to: `fn = cond ? f : g; fn (x);`.
+    pub const PCALL: u8 = 5;
 }
 
 pub const NONE: u32 = u32::MAX;
