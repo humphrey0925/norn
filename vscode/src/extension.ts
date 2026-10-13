@@ -10,6 +10,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
+import * as jsonc from "jsonc-parser";
 import { LanguageClient, LanguageClientOptions, ServerOptions } from "vscode-languageclient/node";
 
 /** A symbol as the server's `si/*` requests describe it. */
@@ -465,7 +466,62 @@ interface ConditionState {
   active: string | null;
   available: { name: string; source: string }[];
   effective: { name: string; value: string | null; source: string }[];
+  /** Where the build looks for headers, as far as a build description says. */
+  includePaths?: string[];
   known: number;
+}
+
+/** The configuration of the C/C++ extension that is kept in step. */
+const CPP_CONFIGURATION = "SI";
+
+/** Give the C/C++ extension (ms-vscode.cpptools) the conditions in force:
+ *  a configuration called "SI" in `.vscode/c_cpp_properties.json` with the
+ *  macros that are defined and, where a build description gave them, its
+ *  include paths. The rest of the file, and whatever else that
+ *  configuration has, is left as written. Returns what was done, or
+ *  undefined when the file already says the same. */
+function writeCppProperties(root: string, state: ConditionState): "created" | "added" | "updated" | undefined {
+  const file = path.join(root, ".vscode", "c_cpp_properties.json");
+  const defines = state.effective
+    .filter((e) => e.value !== null)
+    .map((e) => (e.value === "" ? e.name : `${e.name}=${e.value}`))
+    .sort();
+  const fromBuild = (state.includePaths ?? []).map((p) => (/^([A-Za-z]:|\/)/.test(p) ? p : p === "." ? "${workspaceFolder}" : "${workspaceFolder}/" + p));
+  const exists = fs.existsSync(file);
+  let text = exists ? fs.readFileSync(file, "utf8") : '{\n  "configurations": [],\n  "version": 4\n}\n';
+  const before = text;
+  const format = { formattingOptions: { insertSpaces: true, tabSize: 4 } };
+  const edit = (at: jsonc.JSONPath, value: unknown) => {
+    text = jsonc.applyEdits(text, jsonc.modify(text, at, value, format));
+  };
+  let parsed = jsonc.parse(text) as { configurations?: { name?: string; includePath?: string[] }[] } | undefined;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return undefined; // not something to write into
+  }
+  if (!Array.isArray(parsed.configurations)) {
+    edit(["configurations"], []);
+    parsed = { configurations: [] };
+  }
+  const all = parsed.configurations ?? [];
+  let at = all.findIndex((c) => c?.name === CPP_CONFIGURATION);
+  const added = at < 0;
+  if (added) {
+    at = all.length;
+    edit(["configurations", at], { name: CPP_CONFIGURATION, includePath: ["${workspaceFolder}/**"], defines: [] });
+  }
+  edit(["configurations", at, "defines"], defines);
+  if (fromBuild.length) {
+    // Theirs stay; the build's are added once.
+    const have = (added ? ["${workspaceFolder}/**"] : all[at]?.includePath) ?? [];
+    const merged = [...have, ...fromBuild.filter((p) => !have.includes(p))];
+    edit(["configurations", at, "includePath"], merged);
+  }
+  if (text === before && exists) {
+    return undefined;
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, text);
+  return !exists ? "created" : added ? "added" : "updated";
 }
 
 /** One row of the Conditions view. */
@@ -1047,7 +1103,49 @@ export async function activate(context: vscode.ExtensionContext) {
   configStatus.command = "si.conditions.switch";
   let conditionsView: vscode.TreeView<ConditionRow> | undefined;
   let offered = false;
+  /** Pass the conditions in force on to the C/C++ extension, when asked
+   *  to (`si.conditions.updateCppProperties`) or told to now. */
+  function toCpp(s: ConditionState, asked = false) {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const on = vscode.workspace.getConfiguration("si").get<boolean>("conditions.updateCppProperties");
+    if (!root || !(asked || on) || !s.active) {
+      return;
+    }
+    let did: ReturnType<typeof writeCppProperties>;
+    try {
+      did = writeCppProperties(root, s);
+    } catch (e) {
+      void vscode.window.showErrorMessage(`SI could not write .vscode/c_cpp_properties.json: ${e instanceof Error ? e.message : e}`);
+      return;
+    }
+    if (did === "added") {
+      // Among other configurations theirs has to be picked, once; ours cannot pick it for them.
+      void vscode.window
+        .showInformationMessage(`SI added the configuration "${CPP_CONFIGURATION}" to c_cpp_properties.json. Select it in the C/C++ extension to use these defines.`, "Select Configuration…")
+        .then((pick) => pick && vscode.commands.executeCommand("C_Cpp.ConfigurationSelect").then(undefined, () => undefined));
+    } else if (did || asked) {
+      vscode.window.setStatusBarMessage(`SI: C/C++ configuration "${CPP_CONFIGURATION}" ${did ? "now has" : "already has"} the defines of ${s.active}`, 5000);
+    }
+  }
+  let offeredCpp = false;
   const conditions = new ConditionsTree(afterSync, busy, (s) => {
+    toCpp(s);
+    // Conditions in use and the C/C++ extension here: offer, once, to keep it in step.
+    const setting = vscode.workspace.getConfiguration("si").inspect<boolean>("conditions.updateCppProperties");
+    const undecided = setting?.workspaceValue === undefined && setting?.globalValue === undefined && setting?.workspaceFolderValue === undefined;
+    if (s.active && s.effective.length && undecided && !offeredCpp && vscode.extensions.getExtension("ms-vscode.cpptools")) {
+      offeredCpp = true;
+      void vscode.window
+        .showInformationMessage(`Also give the C/C++ extension these defines? SI keeps a configuration "${CPP_CONFIGURATION}" in c_cpp_properties.json in step with the one in force here.`, "Yes", "No")
+        .then(async (pick) => {
+          if (pick) {
+            await vscode.workspace.getConfiguration("si").update("conditions.updateCppProperties", pick === "Yes", vscode.ConfigurationTarget.Workspace);
+            if (pick === "Yes") {
+              toCpp(conditions.state);
+            }
+          }
+        });
+    }
     const sets = Object.keys(s.configurations).length;
     if (conditionsView) {
       conditionsView.description = s.active ?? undefined;
@@ -1287,6 +1385,13 @@ export async function activate(context: vscode.ExtensionContext) {
       ];
       const pick = await vscode.window.showQuickPick(picks, { placeHolder: `Add to ${conditions.state.active ?? "a new configuration"}` });
       return pick ? vscode.commands.executeCommand(pick.command) : undefined;
+    }),
+    vscode.commands.registerCommand("si.conditions.toCpp", () => {
+      if (!conditions.state.active) {
+        void vscode.window.showInformationMessage("SI has no compile configuration in force to pass on.");
+        return;
+      }
+      toCpp(conditions.state, true);
     }),
     vscode.commands.registerCommand("si.conditions.delete", (arg?: unknown) => (typeof arg === "string" ? conditions.delete(arg) : undefined)),
     vscode.commands.registerCommand("si.conditions.override", async (row: ConditionRow) => {

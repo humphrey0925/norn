@@ -469,7 +469,8 @@ impl Server {
         let effective = cond::effective(&project.current(), &self.root);
         let available: Vec<Value> = cond::discover(&self.root).into_iter().map(|(name, source)| json!({ "name": name, "source": source })).collect();
         json!({ "configurations": project.configurations, "active": project.active, "available": available,
-                "effective": effective, "known": self.session.conditions_known() })
+                "effective": effective, "includePaths": cond::include_paths(&project.current(), &self.root),
+                "known": self.session.conditions_known() })
     }
 
     /// `si/scope`: which folders are indexed, and where that is written.

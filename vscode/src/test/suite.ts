@@ -151,7 +151,8 @@ export async function run(): Promise<void> {
   assert.ok(await has("FD_CLOEXEC"));
   // A set that follows the build's own description: a DS-5 project.
   fs.writeFileSync(path.join(folder, ".cproject"), `<?xml version="1.0"?><cproject><configuration name="Debug"><folderInfo><toolChain><tool>
-    <option valueType="definedSymbols"><listOptionValue value="FD_CLOEXEC=1"/><listOptionValue value="BOARD_EVK"/></option></tool></toolChain></folderInfo></configuration></cproject>`);
+    <option valueType="definedSymbols"><listOptionValue value="FD_CLOEXEC=1"/><listOptionValue value="BOARD_EVK"/></option>
+    <option valueType="includePath"><listOptionValue value="../include"/></option></tool></toolChain></folderInfo></configuration></cproject>`);
   await vscode.commands.executeCommand("si.sync");
   conditions = await conditionsNow();
   assert.deepStrictEqual(conditions.state.available, [{ name: "Debug", source: ".cproject#Debug" }]);
@@ -160,6 +161,29 @@ export async function run(): Promise<void> {
   assert.deepStrictEqual([conditions.state.active, conditions.conditionFiles], ["Debug", [".cproject#Debug"]]);
   assert.deepStrictEqual(conditions.state.effective.map((e) => [e.name, e.value, e.source]), [["BOARD_EVK", "1", ".cproject#Debug"], ["FD_CLOEXEC", "1", ".cproject#Debug"]]);
   assert.ok(!(await has("FD_CLOEXEC")));
+  // Passed on to the C/C++ extension: a configuration of its own in a file
+  // that keeps what else is in it, comments included.
+  const cpp = path.join(folder, ".vscode", "c_cpp_properties.json");
+  fs.writeFileSync(cpp, `{
+    // theirs
+    "configurations": [ { "name": "Win32", "defines": ["_DEBUG"], "compilerPath": "cl.exe" } ],
+    "version": 4
+}`);
+  await vscode.commands.executeCommand("si.conditions.toCpp");
+  let written = fs.readFileSync(cpp, "utf8");
+  assert.ok(written.includes("// theirs") && written.includes('"compilerPath": "cl.exe"'), written);
+  let ours = (eval("(" + written + ")") as { configurations: { name: string; defines: string[]; includePath: string[] }[] }).configurations;
+  assert.deepStrictEqual(ours.map((c) => c.name), ["Win32", "SI"]);
+  assert.deepStrictEqual([ours[0].defines, ours[1].defines, ours[1].includePath], [["_DEBUG"], ["BOARD_EVK=1", "FD_CLOEXEC=1"], ["${workspaceFolder}/**", "${workspaceFolder}/include"]]);
+  // In step from then on, when that is asked for; and not offered back as a build to follow.
+  await vscode.workspace.getConfiguration("si").update("conditions.updateCppProperties", true, vscode.ConfigurationTarget.Workspace);
+  await vscode.commands.executeCommand("si.conditions.define", "EXTRA=2");
+  written = fs.readFileSync(cpp, "utf8");
+  ours = (eval("(" + written + ")") as typeof ours extends infer T ? { configurations: T } : never).configurations;
+  assert.deepStrictEqual(ours[1].defines, ["BOARD_EVK=1", "EXTRA=2", "FD_CLOEXEC=1"]);
+  assert.deepStrictEqual((await conditionsNow()).state.available.map((a) => a.source), [".cproject#Debug", ".vscode/c_cpp_properties.json#Win32"]);
+  await vscode.workspace.getConfiguration("si").update("conditions.updateCppProperties", undefined, vscode.ConfigurationTarget.Workspace);
+  fs.rmSync(cpp);
   for (const name of ["Debug", "Release"]) {
     await vscode.commands.executeCommand("si.conditions.delete", name);
   }

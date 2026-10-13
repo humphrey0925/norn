@@ -36,6 +36,12 @@ Source-Insight-style views for C in VS Code, backed by the `si` index.
     header of `#define` lines or a Kconfig `.config`, and names with a
     prefix, or all names, can be assumed not defined unless the build or
     the sources define them.
+  - The set in force can be passed on to VS Code's C/C++ extension
+    (`si.conditions.updateCppProperties`, or "Write Compile Conditions to
+    the C/C++ Extension" in the view's menu): a configuration named `SI`
+    in `.vscode/c_cpp_properties.json` gets its defines and, from a
+    `.cproject`, its include paths, and is rewritten when the set changes
+    or another is switched to. Select `SI` in the C/C++ extension once.
   - Kept in `.si/config.json` with the scope.
 
 Go to definition, find references, workspace symbols and call hierarchy use

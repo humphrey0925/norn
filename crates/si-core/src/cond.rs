@@ -164,9 +164,80 @@ pub fn discover(root: &Path) -> Vec<(String, String)> {
         let Ok(text) = std::fs::read(root.join(file)) else { continue };
         let text = String::from_utf8_lossy(&text);
         let names = if file.ends_with(".cproject") { cproject(&text) } else { cpp_properties(&text) };
-        out.extend(names.into_iter().map(|c| (c.name.clone(), format!("{file}#{}", c.name))));
+        // (The configuration written for the C/C++ extension is our own
+        // conditions on their way out, not a build's to follow.)
+        let theirs = names.into_iter().filter(|c| c.name != WRITTEN);
+        out.extend(theirs.map(|c| (c.name.clone(), format!("{file}#{}", c.name))));
     }
     out
+}
+
+/// The name of the `c_cpp_properties.json` configuration an editor
+/// extension keeps in step with the conditions in force.
+pub const WRITTEN: &str = "SI";
+
+/// Where the build looks for headers, for the build descriptions among the
+/// condition files of `settings`: paths under `root` relative to it, with
+/// `/`, others as they are. Paths that depend on what only the build tool
+/// knows are left out.
+pub fn include_paths(settings: &Settings, root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in &settings.condition_files {
+        let (path, wanted) = split_entry(entry);
+        if path.rsplit(['/', '\\']).next() != Some(".cproject") {
+            continue;
+        }
+        let Ok(text) = std::fs::read(root.join(path)) else { continue };
+        let builds = cproject(&String::from_utf8_lossy(&text));
+        let Some(b) = builds.iter().find(|b| wanted.is_none_or(|w| b.name == w)) else { continue };
+        // The project is the folder of its `.cproject`; a build runs in a
+        // folder named for the configuration, which relative paths start from.
+        let project = path.rsplit_once(['/', '\\']).map_or("", |p| p.0).replace('\\', "/");
+        for raw in &b.includes {
+            let raw = raw.trim().trim_matches('"').replace('\\', "/");
+            let under = |rest: &str| normal(&format!("{project}/{}", rest.trim_start_matches('/')));
+            let found = if let Some(rest) = raw.strip_prefix("${workspace_loc:/").and_then(|r| r.strip_suffix('}')) {
+                // `${workspace_loc:/Project/rest}`: taken to be this project.
+                rest.split_once('/').map_or(Some(under("")), |(_, rest)| Some(under(rest)))
+            } else if let Some(rest) = raw.strip_prefix("${ProjDirPath}").or(raw.strip_prefix("${project_loc}")) {
+                Some(under(rest))
+            } else if raw.contains("${") || raw.is_empty() {
+                None
+            } else if raw.starts_with('/') || raw.as_bytes().get(1) == Some(&b':') {
+                Some(raw.clone())
+            } else {
+                Some(normal(&format!("{project}/{}/{raw}", b.name)))
+            };
+            if let Some(f) = found.filter(|f| !out.contains(f)) {
+                out.push(f);
+            }
+        }
+    }
+    out
+}
+
+/// `a/./b/../c` as `a/c`; the tree's own root as `.`.
+fn normal(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|p| *p != "..") => {
+                parts.pop();
+            }
+            p => parts.push(p),
+        }
+    }
+    if parts.is_empty() { ".".to_string() } else { parts.join("/") }
+}
+
+/// A condition file as the settings name it: the path, and for a build
+/// description the configuration meant after `#`.
+fn split_entry(entry: &str) -> (&str, Option<&str>) {
+    match entry.rsplit_once('#') {
+        Some((path, name)) if !name.contains(['/', '\\']) => (path, Some(name)),
+        _ => (entry, None),
+    }
 }
 
 /// One configuration of a build description.
@@ -175,6 +246,7 @@ struct Build {
     name: String,
     defines: Vec<String>,
     undefines: Vec<String>,
+    includes: Vec<String>,
 }
 
 /// `-DNAME=value` and `-UNAME` in a line of compiler flags.
@@ -245,6 +317,7 @@ fn cproject(text: &str) -> Vec<Build> {
                 list = match attr("valueType") {
                     Some("definedSymbols") => 1,
                     Some("undefDefinedSymbols") => 2,
+                    Some("includePath") => 3,
                     _ => 0,
                 };
                 if let (0, Some(value), Some(b)) = (list, attr("value"), out.last_mut()) {
@@ -254,7 +327,11 @@ fn cproject(text: &str) -> Vec<Build> {
             "listOptionValue" if list != 0 => {
                 if let (Some(value), Some(b)) = (attr("value"), out.last_mut()) {
                     let value = value.trim().to_string();
-                    if list == 1 { b.defines.push(value) } else { b.undefines.push(value) }
+                    match list {
+                        1 => b.defines.push(value),
+                        2 => b.undefines.push(value),
+                        _ => b.includes.push(value),
+                    }
                 }
             }
             _ => {}
@@ -400,10 +477,7 @@ impl Conditions {
     /// A condition file as the settings name it: a path, and for a build
     /// description the configuration meant after `#` (else its first).
     fn read_source(&mut self, root: &Path, entry: &str) {
-        let (path, wanted) = match entry.rsplit_once('#') {
-            Some((path, name)) if !name.contains(['/', '\\']) => (path, Some(name)),
-            _ => (entry, None),
-        };
+        let (path, wanted) = split_entry(entry);
         let Ok(text) = std::fs::read(root.join(path)) else { return };
         let text = String::from_utf8_lossy(&text);
         let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
@@ -757,7 +831,8 @@ mod tests {
                 <listOptionValue value="LEVEL=3"/></option>
               <option id="o2" valueType="undefDefinedSymbols"><listOptionValue value="NDEBUG"/></option>
               <option id="o3" superClass="x.other" value="-O2 -DFROM_FLAGS=7 -UGONE" valueType="string"/>
-              <option id="o4" valueType="includePath"><listOptionValue value="../inc"/></option>
+              <option id="o4" valueType="includePath"><listOptionValue value="../inc"/><listOptionValue value="&quot;${workspace_loc:/${ProjName}/drivers/include}&quot;"/>
+                <listOptionValue value="${ProjDirPath}/bsp"/><listOptionValue value="C:\Arm\include"/><listOptionValue value="${SOMETHING}/x"/></option>
             </tool></toolChain></folderInfo>
             <fileInfo id="one" resourcePath="a.c"><tool><option valueType="definedSymbols"><listOptionValue value="ONLY_A"/></option></tool></fileInfo>
           </configuration></storageModule></cconfiguration>
@@ -788,6 +863,7 @@ mod tests {
         settings.defines.insert("LEVEL".into(), "9".into());
         let c = Conditions::from_settings(&settings, &dir);
         assert_eq!((c.eval(b"LEVEL == 9 && N == 2 && DEBUG"), c.defined(b"NDEBUG"), c.defined(b"ONLY_A")), (Tri::True, Tri::False, Tri::Unknown));
+        assert_eq!(include_paths(&settings, &dir), ["inc", "drivers/include", "bsp", "C:/Arm/include"]);
         // What it all comes to, and who says so.
         let e = effective(&settings, &dir);
         let of = |n: &str| e.iter().find(|x| x.name == n).map(|x| (x.value.as_deref(), x.source.as_str()));

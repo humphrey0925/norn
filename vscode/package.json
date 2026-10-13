@@ -2,7 +2,7 @@
   "name": "si-code-index",
   "displayName": "SI Code Index",
   "description": "Source-Insight-style symbol search, context and relation views for C, backed by the si index.",
-  "version": "0.10.2",
+  "version": "0.11.0",
   "publisher": "humphrey0925",
   "repository": {
     "type": "git",
@@ -246,6 +246,11 @@
       {
         "command": "si.relation.target",
         "title": "SI: Relation target"
+      },
+      {
+        "command": "si.conditions.toCpp",
+        "title": "SI: Write Compile Conditions to the C/C++ Extension (c_cpp_properties.json)",
+        "icon": "$(export)"
       }
     ],
     "menus": {
@@ -339,6 +344,11 @@
           "command": "si.context.sync",
           "when": "view == si.context",
           "group": "navigation@0"
+        },
+        {
+          "command": "si.conditions.toCpp",
+          "when": "view == si.conditions",
+          "group": "1_si@2"
         }
       ],
       "view/item/context": [
@@ -465,6 +475,12 @@
           "type": "string",
           "default": "",
           "description": "Where the index is kept. Empty: .si/cache in the workspace."
+        },
+        "si.conditions.updateCppProperties": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "Keep a configuration named \"SI\" in .vscode/c_cpp_properties.json in step with the compile configuration in force: its defines and, from a DS-5 / Eclipse .cproject, its include paths. Select that configuration in the C/C++ extension to use it."
         }
       }
     },
@@ -477,13 +493,14 @@
     "test": "tsc -p ./ && node ./out/test/runTest.js"
   },
   "dependencies": {
-    "vscode-languageclient": "^9.0.1",
-    "@vscode/codicons": "^0.0.36"
+    "@vscode/codicons": "^0.0.36",
+    "jsonc-parser": "^3.3.1",
+    "vscode-languageclient": "^9.0.1"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
-    "typescript": "^5.4.0",
-    "@vscode/test-electron": "^2.4.0"
+    "@vscode/test-electron": "^2.4.0",
+    "typescript": "^5.4.0"
   }
 }
