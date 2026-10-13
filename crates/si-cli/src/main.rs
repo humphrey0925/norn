@@ -242,6 +242,20 @@ fn run_query(g: &Graph, op: &str, name: &str, depth: u32) -> Value {
     let syms = g.find(name);
     match op {
         "find" => json!({ "results": syms.iter().map(|&s| sym_json(g, s)).collect::<Vec<_>>() }),
+        // Fragments in any order, initials, letters in order: see si_core::search.
+        "search" => {
+            let t = Instant::now();
+            let hits = si_core::search::search(g, name, 50);
+            let results: Vec<Value> = hits
+                .iter()
+                .map(|&(score, s)| {
+                    let mut v = sym_json(g, s);
+                    v["score"] = json!(score);
+                    v
+                })
+                .collect();
+            json!({ "count": results.len(), "ms": ms(t), "results": results })
+        }
         "callers" => {
             let mut results = Vec::new();
             for &s in syms {

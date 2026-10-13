@@ -235,13 +235,8 @@ impl Server {
 
     fn workspace_symbols(&mut self, params: &Value) -> Value {
         let query = params["query"].as_str().unwrap_or("");
-        let g = self.g();
-        let syms: Vec<u32> = g
-            .prefix(query)
-            .flat_map(|n| g.syms_named(n).iter().copied())
-            .filter(|&s| g.syms[s as usize].kind != kind::FILE && g.syms[s as usize].flags & flag::DECL == 0)
-            .take(200)
-            .collect();
+        // Fragments in any order, initials, letters in order.
+        let syms: Vec<u32> = si_core::search::search(self.g(), query, 200).into_iter().map(|h| h.1).collect();
         json!(syms.into_iter().map(|s| self.symbol_info(s)).collect::<Vec<_>>())
     }
 

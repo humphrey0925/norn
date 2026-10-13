@@ -100,6 +100,11 @@ def main():
         found = c.request("workspace/symbol", {"query": "bfd_cache_"})
         assert any(s["name"] == "bfd_cache_init" for s in found), found
         print(f"workspace symbols bfd_cache_*: {len(found)}")
+        # Fragments in any order, and initials.
+        for query, want in [("init cache", "bfd_cache_init"), ("bci", "bfd_cache_init"), ("mem bread", "memory_bread")]:
+            names = [x["name"] for x in c.request("workspace/symbol", {"query": query})]
+            assert want in names[:10], (query, names[:10])
+        print("fuzzy search: 'init cache', 'bci', 'mem bread' find what they should")
 
         # Call hierarchy through a function pointer: cache_bread is only ever
         # stored in the `bread` member of `cache_iovec` and called through it.

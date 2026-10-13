@@ -7,6 +7,7 @@ pub mod link;
 pub mod mask;
 pub mod model;
 pub mod packed;
+pub mod search;
 pub mod session;
 pub mod sqlite;
 
