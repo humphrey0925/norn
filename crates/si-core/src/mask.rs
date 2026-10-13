@@ -812,6 +812,14 @@ impl<'a> Lexer<'a> {
                 return;
             }
             (self.c.i, self.c.line) = save;
+            // Without arguments it is not a use of the macro: the name is
+            // something else here (`static int dump;` beside a
+            // `#define dump(a, b)`), and stays for the parser.
+            if a < self.hidden_until {
+                tok.member = matches!(before_byte, b'.' | b'>');
+                self.out.events.push(Event::Ref(tok));
+            }
+            return;
         }
         self.out.events.push(Event::Ref(tok));
         blank(&mut self.out.masked, a, end);
@@ -1326,6 +1334,17 @@ mod tests {
         // With nothing configured only `#if 0` is passed over.
         let plain = masked(src, &MacroSets::default());
         assert!(plain.contains("wide") && plain.contains("win") && !plain.contains("dead"));
+    }
+
+    #[test]
+    fn a_function_like_macro_without_arguments_is_just_a_name() {
+        let t = transparent("#define dump(a, b)
+");
+        let m = masked("static int dump = 1;
+void f (void) { dump (1, 2); }
+", &t);
+        assert!(m.contains("static int dump = 1;"), "{m}");
+        assert!(!m.contains("dump (1, 2)"), "{m}");
     }
 
     #[test]

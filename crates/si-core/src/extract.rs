@@ -544,7 +544,9 @@ impl<'a> Walk<'a> {
         for _ in 0..32 {
             let k = n.kind_id();
             if k == self.ids.identifier || k == self.ids.type_identifier || k == self.ids.field_identifier {
-                return Some((n, is_fn));
+                // A name the parser made up to get past an error (where a
+                // macro stood, say) has no text, and names nothing.
+                return (!n.byte_range().is_empty()).then_some((n, is_fn));
             }
             let inner = n.child_by_field_id(self.ids.f_declarator.get()).or_else(|| n.named_child(0))?;
             if k == self.ids.function_declarator {
@@ -1031,7 +1033,7 @@ impl<'a> Walk<'a> {
         }
         if k == ids.struct_specifier || k == ids.union_specifier || k == ids.enum_specifier {
             if node.child_by_field_id(ids.f_body).is_some() {
-                if let Some(name) = node.child_by_field_id(ids.f_name) {
+                if let Some(name) = node.child_by_field_id(ids.f_name).filter(|n| !n.byte_range().is_empty()) {
                     let kind = if k == ids.struct_specifier {
                         kind::STRUCT
                     } else if k == ids.union_specifier {
@@ -1052,7 +1054,7 @@ impl<'a> Walk<'a> {
             return true;
         }
         if k == ids.enumerator {
-            if let Some(name) = node.child_by_field_id(ids.f_name) {
+            if let Some(name) = node.child_by_field_id(ids.f_name).filter(|n| !n.byte_range().is_empty()) {
                 self.push_def(name, node, kind::ENUM_CONST, 0);
             }
             return true;

@@ -235,7 +235,8 @@ impl Server {
         let Some(file) = self.relative(&path) else { return json!([]) };
         let g = self.g();
         let Some(f) = (0..g.files.len() as u32).find(|&f| g.file_path(f) == file) else { return json!([]) };
-        let syms: Vec<u32> = g.file_syms(f).skip(1).collect();
+        // (An editor refuses the whole list over one symbol without a name.)
+        let syms: Vec<u32> = g.file_syms(f).skip(1).filter(|&s| !g.sym_name(s).trim().is_empty()).collect();
         json!(syms.into_iter().map(|s| self.symbol_info(s)).collect::<Vec<_>>())
     }
 
