@@ -39,8 +39,9 @@ fn read_message(input: &mut impl BufRead) -> Option<Value> {
 }
 
 fn write_message(out: &mut impl Write, msg: &Value) {
+    // In one write: the progress thread writes to the same stream.
     let body = msg.to_string();
-    let _ = write!(out, "Content-Length: {}\r\n\r\n{}", body.len(), body);
+    let _ = out.write_all(format!("Content-Length: {}\r\n\r\n{}", body.len(), body).as_bytes());
     let _ = out.flush();
 }
 
@@ -604,8 +605,28 @@ impl Server {
 pub fn run(root: Option<&Path>, open: &dyn Fn(&Path) -> (Session, si_core::session::Update)) {
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
+    let mut out = std::io::stdout();
+    // Indexing holds this thread; another says how far it has got
+    // (`si/progress`), and that it is over.
+    std::thread::spawn(|| {
+        use si_core::progress::{now, Phase};
+        let mut last = (Phase::Idle, 0, 0);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let at = now();
+            if at == last || (at.0 == Phase::Idle && last.0 == Phase::Idle) {
+                continue;
+            }
+            last = at;
+            let phase = match at.0 {
+                Phase::Idle => "done",
+                Phase::Parsing => "parsing",
+                Phase::Linking => "linking",
+            };
+            let params = json!({ "phase": phase, "done": at.1, "total": at.2 });
+            write_message(&mut std::io::stdout(), &json!({ "jsonrpc": "2.0", "method": "si/progress", "params": params }));
+        }
+    });
     let mut server: Option<Server> = None;
     while let Some(msg) = read_message(&mut input) {
         let method = msg["method"].as_str().unwrap_or("").to_string();

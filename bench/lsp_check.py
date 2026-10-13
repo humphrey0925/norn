@@ -37,11 +37,16 @@ class Client:
     def request(self, method, params):
         self.id += 1
         self.send({"jsonrpc": "2.0", "id": self.id, "method": method, "params": params})
-        length = 0
-        while (line := self.p.stdout.readline().strip()):
-            if line.lower().startswith(b"content-length:"):
-                length = int(line.split(b":")[1])
-        reply = json.loads(self.p.stdout.read(length))
+        while True:
+            length = 0
+            while (line := self.p.stdout.readline().strip()):
+                if line.lower().startswith(b"content-length:"):
+                    length = int(line.split(b":")[1])
+            reply = json.loads(self.p.stdout.read(length))
+            # Progress while indexing comes between a request and its reply.
+            if "id" in reply:
+                break
+            self.notes = getattr(self, "notes", []) + [reply]
         assert reply.get("id") == self.id and "error" not in reply, reply
         return reply["result"]
 

@@ -315,6 +315,7 @@ class ScopeTree implements vscode.TreeDataProvider<string> {
 
   constructor(
     private readonly afterSync: (r: Synced, what: string) => void,
+    private readonly busy: <T>(viewId: string, what: string, work: () => Promise<T>) => Promise<T>,
     private readonly onDraft: (pending: boolean) => void,
   ) {}
 
@@ -423,7 +424,7 @@ class ScopeTree implements vscode.TreeDataProvider<string> {
   }
 
   async apply(next: { include: string[]; exclude: string[] }, what: string) {
-    const r = await ask<Synced>("si/setScope", { include: next.include, exclude: next.exclude });
+    const r = await this.busy("si.scope", "indexing", () => ask<Synced>("si/setScope", { include: next.include, exclude: next.exclude }));
     if (!r || r.error) {
       void vscode.window.showErrorMessage(r?.error ?? "SI is not running.");
       return;
@@ -457,7 +458,10 @@ class ConditionsTree implements vscode.TreeDataProvider<ConditionRow> {
   readonly onDidChangeTreeData = this.changed.event;
   settings: ConditionSettings = { defines: {}, undefines: [], assumeUndefined: [], conditionFiles: [] };
 
-  constructor(private readonly afterSync: (r: Synced, what: string) => void) {}
+  constructor(
+    private readonly afterSync: (r: Synced, what: string) => void,
+    private readonly busy: <T>(viewId: string, what: string, work: () => Promise<T>) => Promise<T>,
+  ) {}
 
   async load() {
     const s = await ask<ConditionSettings>("si/conditions", {});
@@ -506,9 +510,9 @@ class ConditionsTree implements vscode.TreeDataProvider<ConditionRow> {
   }
 
   async apply(next: ConditionSettings, what: string) {
-    const r = await ask<Synced & { conditions?: ConditionSettings }>("si/setConditions", {
+    const r = await this.busy("si.conditions", "indexing", () => ask<Synced & { conditions?: ConditionSettings }>("si/setConditions", {
       defines: next.defines, undefines: next.undefines, assumeUndefined: next.assumeUndefined, conditionFiles: next.conditionFiles,
-    });
+    }));
     if (!r || r.error) {
       void vscode.window.showErrorMessage(r?.error ?? "SI is not running.");
       return;
@@ -898,6 +902,22 @@ export async function activate(context: vscode.ExtensionContext) {
       : undefined;
   }
 
+  /** What the server says while it indexes: files parsed so far, then linking. */
+  function progress(p: { phase: "parsing" | "linking" | "done"; done: number; total: number }) {
+    if (p.phase === "done") {
+      void refreshStatus();
+    } else if (p.phase === "linking") {
+      status.text = "$(sync~spin) SI linking";
+    } else {
+      status.text = `$(sync~spin) SI parsing ${p.done.toLocaleString()} / ${p.total.toLocaleString()} files`;
+    }
+  }
+  /** Run something that indexes, with the views it comes from showing that they are busy. */
+  async function busy<T>(viewId: string, what: string, work: () => Promise<T>): Promise<T> {
+    status.text = `$(sync~spin) SI ${what}`;
+    return vscode.window.withProgress({ location: { viewId } }, work);
+  }
+
   function afterSync(r: Synced, what: string) {
     fileSymbols.refresh();
     search.refresh();
@@ -912,7 +932,7 @@ export async function activate(context: vscode.ExtensionContext) {
     );
   }
   let scopeView: vscode.TreeView<string> | undefined;
-  const scopeTree = new ScopeTree(afterSync, (pending) => {
+  const scopeTree = new ScopeTree(afterSync, busy, (pending) => {
     void vscode.commands.executeCommand("setContext", "si.scopePending", pending);
     if (scopeView) {
       scopeView.message = pending ? "Not applied yet. Press Apply (the check mark) to index this selection." : undefined;
@@ -927,11 +947,10 @@ export async function activate(context: vscode.ExtensionContext) {
   });
   /** A folder from the scope tree (its path) or from the Explorer (a URI). */
   const folderOf = (arg: unknown): string | undefined => (typeof arg === "string" ? arg : arg instanceof vscode.Uri ? scopeTree.relative(arg) : undefined);
-  const conditions = new ConditionsTree(afterSync);
+  const conditions = new ConditionsTree(afterSync, busy);
   const validName = (v: string) => (/^[A-Za-z_][A-Za-z0-9_]*(\s*=.*)?$/.test(v.trim()) ? undefined : "A macro name, optionally followed by =value");
   async function sync() {
-    status.text = "$(sync~spin) SI syncing";
-    const r = await ask<Synced>("si/sync", {});
+    const r = await busy("si.scope", "syncing", () => ask<Synced>("si/sync", {}));
     if (r) {
       scopeTree.scope = { include: r.include, exclude: r.exclude, config: r.config };
       await conditions.load();
@@ -1011,6 +1030,7 @@ export async function activate(context: vscode.ExtensionContext) {
       synchronize: { fileEvents: vscode.workspace.createFileSystemWatcher("**/*.{c,h}") },
     };
     client = new LanguageClient("si", "SI", serverOptions, clientOptions);
+    client.onNotification("si/progress", progress);
     try {
       await client.start();
     } catch (e) {

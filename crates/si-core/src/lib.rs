@@ -8,6 +8,7 @@ pub mod link;
 pub mod mask;
 pub mod model;
 pub mod packed;
+pub mod progress;
 pub mod scope;
 pub mod search;
 pub mod session;
@@ -83,11 +84,14 @@ pub fn prescan_under(files: &[PathBuf], conditions: &cond::Conditions) -> MacroS
 
 pub fn extract_file(ex: &mut extract::Extractor, root: &Path, path: &Path, transparent: &MacroSets) -> FileFacts {
     let src = std::fs::read(path).unwrap_or_default();
-    ex.extract(&rel_path(root, path), &src, transparent)
+    let facts = ex.extract(&rel_path(root, path), &src, transparent);
+    progress::tick();
+    facts
 }
 
 /// Extract all files on the current rayon pool; output order matches `files`.
 pub fn extract_all(root: &Path, files: &[PathBuf], transparent: &MacroSets) -> Vec<FileFacts> {
+    progress::parsing(files.len());
     files.par_iter().map_init(extract::Extractor::new, |ex, p| extract_file(ex, root, p, transparent)).collect()
 }
 

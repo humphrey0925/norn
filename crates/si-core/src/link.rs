@@ -320,6 +320,7 @@ pub fn link_with(files: &[FileFacts], options: &Options) -> (Graph, LinkStats) {
 /// Link, reusing the macro expansions `cache` holds from the last link of
 /// these files where they are still good.
 pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::expand::Cache) -> (Graph, LinkStats) {
+    crate::progress::linking();
     let mut stats = LinkStats::default();
 
     // 0. Which file includes which, then macro expansion: it needs the
@@ -666,6 +667,7 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
     g.inc = inc;
     stats.csr_ms = ms(t);
 
+    crate::progress::idle();
     (g, stats)
 }
 

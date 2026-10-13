@@ -361,6 +361,7 @@ impl Session {
             })
             .collect();
         let (root, files, sets) = (&self.root, &self.files, &self.sets);
+        crate::progress::parsing(stale.len());
         let fresh: Vec<FileFacts> =
             stale.par_iter().map_init(Extractor::new, |ex, &i| crate::extract_file(ex, root, &files[i], sets)).collect();
         up.extracted = fresh.len();
