@@ -432,7 +432,7 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "vsce package --allow-missing-repository --skip-license -o ../out/si-code-index.vsix",
+    "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license -o ../out/si-code-index.vsix",
     "test": "tsc -p ./ && node ./out/test/runTest.js"
   },
   "dependencies": {
