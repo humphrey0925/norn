@@ -1145,8 +1145,19 @@ class Lenses implements vscode.CodeLensProvider {
 /** The server that comes inside the extension, when it has one for this
  *  kind of machine. */
 function bundledServer(): string | undefined {
-  const exe = path.join(home.fsPath, "bin", `${process.platform}-${process.arch}`, process.platform === "win32" ? "si.exe" : "si");
+  const exe = bundledPath();
   return fs.existsSync(exe) ? exe : undefined;
+}
+
+/** Where that server is, or would be. (Windows on Arm runs the x64 one.) */
+function bundledPath(): string {
+  const machine = process.platform === "win32" ? "win32-x64" : `${process.platform}-${process.arch}`;
+  return path.join(home.fsPath, "bin", machine, process.platform === "win32" ? "si.exe" : "si");
+}
+
+/** This extension's version, for messages that may be read back to us. */
+function version(): string {
+  return (vscode.extensions.all.find((e) => e.extensionUri.toString() === home.toString())?.packageJSON as { version?: string } | undefined)?.version ?? "?";
 }
 
 /** Which server to start: the one `si.serverPath` names when it names
@@ -1199,7 +1210,8 @@ export async function activate(context: vscode.ExtensionContext) {
     status.text = s ? `$(symbol-namespace) SI ${s.files.toLocaleString()} files · ${s.symbols.toLocaleString()} symbols` : "$(warning) SI not running";
     status.tooltip = s
       ? `Click to sync the index with the disk.\nAt start: ${s.loaded.toLocaleString()} files read from the saved index, ${s.parsed.toLocaleString()} parsed
-` + (s.cache ? `Index kept in ${s.cache}` : "Index not kept (si.cache.enabled is off)")
+` + (s.cache ? `Index kept in ${s.cache}` : "Index not kept (si.cache.enabled is off)") + `
+SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : serverPath()}`
       : undefined;
   }
 
@@ -1403,7 +1415,23 @@ export async function activate(context: vscode.ExtensionContext) {
     }
     // A path that is not there is the usual reason for not starting: say so
     // plainly instead of leaving a spawn error in the log.
-    if (/[\/]/.test(command) && !fs.existsSync(command)) {
+    // The extension was packaged with a server and it is not there now:
+    // removed after installing, which security software does to programs
+    // it does not know.
+    const packaged = fs.existsSync(path.join(home.fsPath, "bin"));
+    if (command === "si" && packaged && !builtIn) {
+      status.text = "$(warning) SI not running";
+      status.tooltip = `SI ${version()}: built-in server missing at ${bundledPath()}`;
+      const pick = await vscode.window.showErrorMessage(
+        `SI ${version()}: the built-in server is missing (${bundledPath()}). Security software may have removed it. Reinstall the extension, or set si.serverPath to si-windows-x64.exe from the release.`,
+        "Open Settings",
+      );
+      if (pick) {
+        void vscode.commands.executeCommand("workbench.action.openSettings", "si.serverPath");
+      }
+      return;
+    }
+    if (/[\\/]/.test(command) && !fs.existsSync(command)) {
       status.text = "$(warning) SI not running";
       const pick = await vscode.window.showErrorMessage(`si executable not found: ${command}`, "Open Settings");
       if (pick) {
@@ -1422,7 +1450,9 @@ export async function activate(context: vscode.ExtensionContext) {
       await client.start();
     } catch (e) {
       status.text = "$(warning) SI not running";
-      void vscode.window.showErrorMessage(`Could not start si (${command}). Set si.serverPath to the si executable. ${e instanceof Error ? e.message : ""}`);
+      status.tooltip = `SI ${version()}: could not start ${command}`;
+      const why = command === "si" ? "No server came with this build of the extension and si is not on PATH: set si.serverPath to the si executable." : command === builtIn ? "The built-in server would not start; it may be blocked by security software." : "Check si.serverPath.";
+      void vscode.window.showErrorMessage(`SI ${version()} could not start its server (${command}). ${why} ${e instanceof Error ? e.message : ""}`);
       return;
     }
     await refreshStatus();
