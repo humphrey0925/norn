@@ -33,9 +33,21 @@ interface Entry {
   certain?: boolean;
 }
 
-type Mode = "callees" | "callers" | "references";
+type Mode = "callees" | "callers" | "references" | "assignments";
 
 let client: LanguageClient | undefined;
+/** The extension's own folder: where the icon font is. */
+let home: vscode.Uri;
+
+/** The symbol icons VS Code itself uses, for the views drawn here. */
+function codicons(w: vscode.Webview): { roots: vscode.Uri[]; link: string; csp: string } {
+  const dist = vscode.Uri.joinPath(home, "node_modules", "@vscode", "codicons", "dist");
+  return {
+    roots: [dist],
+    link: `<link rel="stylesheet" href="${w.asWebviewUri(vscode.Uri.joinPath(dist, "codicon.css"))}">`,
+    csp: `font-src ${w.cspSource}; style-src ${w.cspSource} 'unsafe-inline';`,
+  };
+}
 /** The text editor that last had focus: what the views are about. */
 let current: vscode.TextEditor | undefined;
 
@@ -87,6 +99,7 @@ class Node {
     readonly target?: { uri: string; line: number; character: number },
     readonly children?: Node[],
     readonly detail?: string,
+    readonly icon?: string,
   ) {}
 }
 
@@ -105,15 +118,17 @@ class Relation implements vscode.WebviewViewProvider {
   resolveWebviewView(view: vscode.WebviewView) {
     this.view = view;
     const w = view.webview;
-    w.options = { enableScripts: true, localResourceRoots: [this.media] };
+    const icons = codicons(w);
+    w.options = { enableScripts: true, localResourceRoots: [this.media, ...icons.roots] };
     const file = (name: string) => w.asWebviewUri(vscode.Uri.joinPath(this.media, name));
     w.html = `<!doctype html><html><head><meta charset="utf-8">
-      <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${w.cspSource} 'unsafe-inline'; script-src ${w.cspSource};">
-      <link rel="stylesheet" href="${file("relation.css")}"></head><body>
+      <meta http-equiv="Content-Security-Policy" content="default-src 'none'; ${icons.csp} script-src ${w.cspSource};">
+      ${icons.link}<link rel="stylesheet" href="${file("relation.css")}"></head><body>
       <div id="bar" role="tablist">
         <button role="tab" data-mode="callees">Calls</button>
         <button role="tab" data-mode="callers">Called by</button>
         <button role="tab" data-mode="references">References</button>
+        <button role="tab" data-mode="assignments" title="Where a function pointer is assigned, or where a function is stored">Assignments</button>
         <span id="views"><button data-view="tree">Tree</button><button data-view="graph">Graph</button></span>
       </div>
       <div id="message"></div><div id="root"></div>
@@ -156,6 +171,16 @@ class Relation implements vscode.WebviewViewProvider {
     }
     if (this.mode === "references") {
       void w.postMessage({ type: "refs", ...(await this.references(at)) });
+      return;
+    }
+    if (this.mode === "assignments") {
+      const r = await ask<{ target: Entry | null; by: string; rows: unknown[] }>("si/assignments", at);
+      const message = !r?.target
+        ? ""
+        : r.by === "member"
+          ? `${r.rows.length} assignments to ${r.target.name}`
+          : `${r.target.name} is stored in ${r.rows.length} places`;
+      void w.postMessage({ type: "assignments", target: r?.target ?? null, by: r?.by ?? "member", rows: r?.rows ?? [], message });
       return;
     }
     const r = await ask<{ root: Entry | null; entries: Entry[] }>("si/relation", { ...at, direction: this.mode });
@@ -210,12 +235,12 @@ class FileSymbols implements vscode.TreeDataProvider<Node> {
       [22, "Enumerators", "symbol-enum-member"], [5, "Typedefs", "symbol-class"], [13, "Variables", "symbol-variable"], [8, "Members", "symbol-field"],
     ];
     this.groups = [];
-    for (const [kind, title] of order) {
+    for (const [kind, title, icon] of order) {
       const kids = symbols
         .filter((s) => s.kind === kind)
-        .map((s) => new Node(s.name, undefined, { uri, line: s.location.range.start.line, character: s.location.range.start.character }, undefined, String(s.location.range.start.line + 1)));
+        .map((s) => new Node(s.name, undefined, { uri, line: s.location.range.start.line, character: s.location.range.start.character }, undefined, String(s.location.range.start.line + 1), icon));
       if (kids.length) {
-        this.groups.push(new Node(title, undefined, undefined, kids, String(kids.length)));
+        this.groups.push(new Node(title, undefined, undefined, kids, String(kids.length), icon));
       }
     }
     this.changed.fire(undefined);
@@ -231,6 +256,9 @@ class FileSymbols implements vscode.TreeDataProvider<Node> {
   getTreeItem(node: Node): vscode.TreeItem {
     const item = new vscode.TreeItem(node.label, node.children ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
     item.description = node.detail;
+    if (node.icon) {
+      item.iconPath = new vscode.ThemeIcon(node.icon);
+    }
     if (node.target) {
       item.command = { command: "si.open", title: "Open", arguments: [node.target, false] };
     }
@@ -419,7 +447,13 @@ const STYLE = `
   .name { font-family: var(--vscode-editor-font-family); overflow: hidden; text-overflow: ellipsis; }
   .name b { color: var(--vscode-list-highlightForeground); font-weight: 600; }
   .dim { color: var(--vscode-descriptionForeground); font-size: 0.9em; margin-left: auto; overflow: hidden; text-overflow: ellipsis; }
-  .kind { color: var(--vscode-descriptionForeground); font-size: 0.85em; flex: none; width: 4.5em; }
+  .codicon { flex: none; align-self: center; font-size: 14px !important; }
+  .k-function { color: var(--vscode-symbolIcon-functionForeground, var(--vscode-charts-purple)); }
+  .k-macro { color: var(--vscode-symbolIcon-constantForeground, var(--vscode-charts-orange)); }
+  .k-field { color: var(--vscode-symbolIcon-fieldForeground, var(--vscode-charts-blue)); }
+  .k-global { color: var(--vscode-symbolIcon-variableForeground, var(--vscode-charts-blue)); }
+  .k-struct, .k-union, .k-enum, .k-typedef { color: var(--vscode-symbolIcon-structForeground, var(--vscode-charts-yellow)); }
+  .k-enum_const { color: var(--vscode-symbolIcon-enumeratorMemberForeground, var(--vscode-charts-blue)); }
   .head { padding: 4px 8px; border-bottom: 1px solid var(--vscode-panel-border); cursor: pointer; display: flex; gap: 10px; flex-wrap: wrap; }
   .head strong { font-family: var(--vscode-editor-font-family); }
   pre { margin: 0; padding: 4px 0; font-family: var(--vscode-editor-font-family); font-size: var(--vscode-editor-font-size); line-height: 1.5; }
@@ -429,18 +463,20 @@ const STYLE = `
   .empty { padding: 8px; color: var(--vscode-descriptionForeground); }
 `;
 
-function page(body: string, script: string): string {
+function page(w: vscode.Webview, body: string, script: string): string {
   const nonce = Math.random().toString(36).slice(2);
+  const icons = codicons(w);
+  w.options = { enableScripts: true, localResourceRoots: icons.roots };
   return `<!doctype html><html><head><meta charset="utf-8">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
-    <style>${STYLE}</style></head><body>${body}<script nonce="${nonce}">const vscode = acquireVsCodeApi();${script}</script></body></html>`;
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; ${icons.csp} script-src 'nonce-${nonce}';">
+    ${icons.link}<style>${STYLE}</style></head><body>${body}<script nonce="${nonce}">const vscode = acquireVsCodeApi();${script}</script></body></html>`;
 }
 
 /** Fuzzy project symbol search: fragments in any order, initials. */
 class Search implements vscode.WebviewViewProvider {
   resolveWebviewView(view: vscode.WebviewView) {
-    view.webview.options = { enableScripts: true };
     view.webview.html = page(
+      view.webview,
       `<div class="wrap"><input id="q" placeholder="Fragments or initials: init cache, bci" spellcheck="false"></div><div id="list"></div>`,
       `
       const q = document.getElementById("q"), list = document.getElementById("list");
@@ -469,7 +505,7 @@ class Search implements vscode.WebviewViewProvider {
         results = e.data.results;
         const words = e.data.query.toLowerCase().split(/\\s+/).filter(Boolean);
         list.innerHTML = results.length
-          ? results.map((r, i) => '<div class="row" tabindex="0" data-i="' + i + '"><span class="kind">' + esc(r.kindName) + '</span><span class="name">' + mark(r.name, words) + '</span><span class="dim">' + esc(r.file) + ":" + r.line + "</span></div>").join("")
+          ? results.map((r, i) => '<div class="row" tabindex="0" data-i="' + i + '" title="' + esc(r.kindName + " " + r.name + "\\n" + r.file + ":" + r.line) + '"><span class="codicon codicon-' + r.icon + " k-" + r.kind + '"></span><span class="name">' + mark(r.name, words) + '</span><span class="dim">' + esc(r.file.split("/").pop()) + ":" + r.line + "</span></div>").join("")
           : (words.length ? '<div class="empty">No matching symbols</div>' : "");
       });
       q.focus();`,
@@ -480,7 +516,7 @@ class Search implements vscode.WebviewViewProvider {
       } else if (m.query !== undefined) {
         const query = m.query;
         const found = query.trim() ? (await ask<Entry[]>("si/search", { query, limit: 100 })) ?? [] : [];
-        void view.webview.postMessage({ query, results: found.map((e) => ({ ...e, kindName: KIND_NAMES[e.kind] ?? e.kind })) });
+        void view.webview.postMessage({ query, results: found.map((e) => ({ ...e, kindName: KIND_NAMES[e.kind] ?? e.kind, icon: ICONS[e.kind] ?? "symbol-misc" })) });
       }
     });
   }
@@ -494,8 +530,8 @@ class Context implements vscode.WebviewViewProvider {
 
   resolveWebviewView(view: vscode.WebviewView) {
     this.view = view;
-    view.webview.options = { enableScripts: true };
     view.webview.html = page(
+      view.webview,
       `<div id="root"><div class="empty">Put the cursor on a name to see its definition here.</div></div>`,
       `
       const root = document.getElementById("root");
@@ -621,6 +657,7 @@ function serverCommand(): { command: string; args: string[] } {
 }
 
 export async function activate(context: vscode.ExtensionContext) {
+  home = context.extensionUri;
   const relation = new Relation(vscode.Uri.joinPath(context.extensionUri, "media"));
   const fileSymbols = new FileSymbols();
   const contextView = new Context();
@@ -804,6 +841,7 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("si.relation.callers", () => relation.setMode("callers")),
     vscode.commands.registerCommand("si.relation.callees", () => relation.setMode("callees")),
     vscode.commands.registerCommand("si.relation.references", () => relation.setMode("references")),
+    vscode.commands.registerCommand("si.relation.assignments", () => relation.setMode("assignments")),
     vscode.commands.registerCommand("si.relation.lock", () => lock("si.relationLocked", relation, true)),
     vscode.commands.registerCommand("si.relation.unlock", () => lock("si.relationLocked", relation, false)),
     vscode.commands.registerCommand("si.context.lock", () => lock("si.contextLocked", contextView, true)),

@@ -15,7 +15,20 @@ body { padding: 0; margin: 0; color: var(--vscode-foreground); font-family: var(
 .row:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
 .row.top .name { font-weight: 600; }
 .tw { width: 12px; flex: none; color: var(--vscode-descriptionForeground); text-align: center; }
-.k { width: 12px; flex: none; text-align: center; font-family: var(--vscode-editor-font-family); font-weight: 600; font-size: 0.9em; }
+.codicon { flex: none; align-self: center; font-size: 14px !important; }
+.k-struct, .k-union { color: var(--vscode-symbolIcon-structForeground, var(--vscode-charts-yellow)); }
+.k-enum { color: var(--vscode-symbolIcon-enumeratorForeground, var(--vscode-charts-yellow)); }
+.k-enum_const { color: var(--vscode-symbolIcon-enumeratorMemberForeground, var(--vscode-charts-blue)); }
+.k-typedef { color: var(--vscode-symbolIcon-classForeground, var(--vscode-charts-yellow)); }
+.lines { display: inline-flex; gap: 4px; flex: none; }
+.ln[data-line], .ln[data-act] { width: auto; padding: 0 5px; border-radius: 3px; text-align: left; color: var(--vscode-textLink-foreground);
+  background: color-mix(in srgb, var(--vscode-textLink-foreground) 12%, transparent); }
+.ln[data-line]:hover, .ln[data-act]:hover { background: color-mix(in srgb, var(--vscode-textLink-foreground) 28%, transparent); text-decoration: underline; }
+.ln.plain { width: 4em; text-align: right; }
+.glines { font-family: var(--vscode-editor-font-family); font-size: 10.5px; }
+.glines .gl { fill: var(--vscode-textLink-foreground); cursor: pointer; }
+.glines .gl:hover { text-decoration: underline; }
+.glines .sep { fill: var(--vscode-descriptionForeground); }
 .k-function { color: var(--vscode-symbolIcon-functionForeground, var(--vscode-charts-purple)); }
 .k-macro { color: var(--vscode-symbolIcon-constantForeground, var(--vscode-charts-orange)); }
 .k-field { color: var(--vscode-symbolIcon-fieldForeground, var(--vscode-charts-blue)); }
@@ -42,9 +55,8 @@ body { padding: 0; margin: 0; color: var(--vscode-foreground); font-family: var(
 .knob circle { fill: var(--vscode-editor-background); stroke: var(--vscode-descriptionForeground); }
 .knob text { fill: var(--vscode-foreground); font-family: var(--vscode-editor-font-family); font-size: 12px; pointer-events: none; }
 .knob:hover circle { stroke: var(--vscode-focusBorder); fill: var(--vscode-list-hoverBackground); }
-.gn:hover > rect { stroke: var(--vscode-focusBorder); }
-.gn text { text-decoration: none; }
-.gn:hover > text { text-decoration: underline; }
+.gn [data-act="name"]:hover rect { stroke: var(--vscode-focusBorder); }
+.gn [data-act="name"]:hover text { text-decoration: underline; }
 .gn.rootnode rect { fill: var(--vscode-list-activeSelectionBackground); stroke: var(--vscode-focusBorder); }
 .gn.rootnode text { fill: var(--vscode-list-activeSelectionForeground); }
 .gn.slot rect { stroke: var(--vscode-charts-blue); fill: color-mix(in srgb, var(--vscode-charts-blue) 14%, transparent); }
@@ -54,3 +66,4 @@ body { padding: 0; margin: 0; color: var(--vscode-foreground); font-family: var(
 .ge { fill: none; stroke: var(--vscode-descriptionForeground); stroke-width: 1.1; opacity: 0.8; }
 .ge.ptr { stroke: var(--vscode-charts-blue); stroke-dasharray: 4 3; }
 .ge.mac { stroke: var(--vscode-charts-orange); stroke-dasharray: 4 3; }
+#views[hidden] { display: none; }

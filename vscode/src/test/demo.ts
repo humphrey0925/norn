@@ -28,6 +28,10 @@ export async function run(): Promise<void> {
     await vscode.commands.executeCommand("workbench.actions.treeView.si.fileSymbols.collapseAll");
     await vscode.commands.executeCommand("si.scope.focus");
   }
+  if (process.env.SI_DEMO_SEARCH) {
+    // Nothing to type into a webview from here; the list is shown by the
+    // check script's own query. Left for manual runs.
+  }
   if (process.env.SI_DEMO_VIEW === "graph") {
     await vscode.commands.executeCommand("si.relation.graph");
   }

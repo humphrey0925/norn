@@ -393,6 +393,40 @@ impl Server {
         json!({ "root": self.entry(root), "entries": entries })
     }
 
+    /// `si/assignments`: where functions are stored in the member or
+    /// variable under the cursor, or, on a function, where it is stored.
+    /// Each is a place in the source: a line of an initializer or an
+    /// assignment.
+    fn assignments(&mut self, params: &Value) -> Value {
+        let targets = self.targets(params);
+        let g = self.g();
+        let slot_like = |s: u32| matches!(g.syms[s as usize].kind, kind::FIELD | kind::GLOBAL);
+        // On a member or variable: what is stored in it. Else on a function: where it is stored.
+        let slots: Vec<u32> = targets.iter().copied().filter(|&s| slot_like(s)).collect();
+        let functions: Vec<u32> = targets.iter().copied().filter(|&s| g.syms[s as usize].kind == kind::FUNCTION).collect();
+        let by_slot = !slots.is_empty() && self.session.stats.bind_sites.iter().any(|b| slots.contains(&b[2]));
+        let wanted: &[u32] = if by_slot { &slots } else { &functions };
+        let mut sites: Vec<[u32; 4]> =
+            self.session.stats.bind_sites.iter().filter(|b| wanted.contains(&b[if by_slot { 2 } else { 3 }])).copied().collect();
+        sites.sort_unstable();
+        sites.dedup();
+        sites.truncate(LIMIT);
+        let target = wanted.first().or(targets.first()).copied();
+        let mut rows = Vec::new();
+        for [file, line, slot, func] in sites {
+            let (path, inside) = {
+                let g = self.g();
+                let inside = g.symbol_at(file, line).map(|s| g.sym_name(s).to_string());
+                (g.file_path(file).to_string(), inside)
+            };
+            let at = { let g = self.g(); g.sym_name(func).to_string() };
+            let place = self.location(&path, line, &at);
+            rows.push(json!({ "member": self.entry(slot), "function": self.entry(func), "file": path, "line": line,
+                              "uri": place["uri"], "range": place["range"], "inside": inside }));
+        }
+        json!({ "target": target.map(|t| self.entry(t)), "by": if by_slot { "member" } else { "function" }, "rows": rows })
+    }
+
     /// `si/scope`: which folders are indexed, and where that is written.
     fn scope(&self) -> Value {
         let s = self.session.scope();
@@ -432,6 +466,7 @@ impl Server {
             "si/search" => self.search(params),
             "si/context" => self.context(params),
             "si/relation" => self.relation(params),
+            "si/assignments" => self.assignments(params),
             "si/scope" => self.scope(),
             "si/setScope" => {
                 let list = |key: &str| -> Vec<String> {

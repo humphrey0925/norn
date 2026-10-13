@@ -2,7 +2,7 @@
   "name": "si-code-index",
   "displayName": "SI Code Index",
   "description": "Source-Insight-style symbol search, context and relation views for C, backed by the si index.",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "humphrey0925",
   "repository": {
     "type": "git",
@@ -178,6 +178,10 @@
       {
         "command": "si.scope.all",
         "title": "SI: Index the Whole Workspace"
+      },
+      {
+        "command": "si.relation.assignments",
+        "title": "SI: Show Function Pointer Assignments"
       }
     ],
     "menus": {
@@ -347,7 +351,8 @@
     "test": "tsc -p ./ && node ./out/test/runTest.js"
   },
   "dependencies": {
-    "vscode-languageclient": "^9.0.1"
+    "vscode-languageclient": "^9.0.1",
+    "@vscode/codicons": "^0.0.36"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

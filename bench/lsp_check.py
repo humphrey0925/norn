@@ -126,6 +126,13 @@ def main():
         assert ctx["name"] == "bread" and ctx["kind"] == "field", ctx
         hits = c.request("si/search", {"query": "init cache"})
         assert hits[0]["score"] >= hits[-1]["score"] and any(h["name"] == "bfd_cache_init" for h in hits), hits[:3]
+        # Who assigns the member `bread`? And where is cache_bread stored?
+        who = c.request("si/assignments", c.at("bfd/bfdio.c", "bread (abfd, ptr"))
+        stored = {(r["function"]["name"], Path(r["file"]).name) for r in who["rows"]}
+        assert who["by"] == "member" and ("cache_bread", "cache.c") in stored and ("memory_bread", "bfdio.c") in stored, stored
+        where = c.request("si/assignments", c.at("bfd/cache.c", "cache_bread (struct bfd *abfd"))
+        assert where["by"] == "function" and [r["member"]["name"] for r in where["rows"]] == ["bread"], where
+        assert where["rows"][0]["inside"] == "cache_iovec", where["rows"][0]
         print("si/relation, si/context, si/search answer as the views expect")
 
         # Save an edit: a new function calling an existing one.

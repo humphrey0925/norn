@@ -1,20 +1,27 @@
-// The Relation view: callers, callees or references of one function, as a
-// tree or as a graph. The extension answers `expand` with a node's children;
+// The Relation view: what a function calls, what calls it, where a name is
+// referenced, and where a function pointer is assigned, as a tree or (for
+// calls) a graph. The extension answers `expand` with a node's children;
 // everything shown is built from those answers.
 (function () {
   const vscode = acquireVsCodeApi();
   const root = document.getElementById("root");
   const message = document.getElementById("message");
-  const KIND = { function: "ƒ", macro: "#", struct: "S", union: "S", enum: "E", enum_const: "e", typedef: "T", global: "v", field: "·" };
+  const ICON = {
+    function: "symbol-function", macro: "symbol-constant", struct: "symbol-struct", union: "symbol-struct", enum: "symbol-enum",
+    enum_const: "symbol-enum-member", typedef: "symbol-class", global: "symbol-variable", field: "symbol-field",
+  };
 
-  let mode = "callees"; // callees | callers | references
+  let mode = "callees"; // callees | callers | references | assignments
   let view = "tree"; // tree | graph
   let top = null; // the root node
-  let refs = null; // references mode: [{file, uri, items}]
+  let refs = null; // references: [{file, uri, items}]
+  let assigned = null; // assignments: {by, target, rows}
   let nodes = new Map(); // id -> node
   let nextId = 1;
 
   const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const base = (file) => String(file).split("/").pop();
+  const icon = (kind) => '<span class="codicon codicon-' + (ICON[kind] ?? "symbol-misc") + " k-" + kind + '"></span>';
 
   function node(entry, parent, extra) {
     const n = { id: nextId++, entry, parent, children: null, open: false, loading: false, ...extra };
@@ -42,29 +49,26 @@
     return out;
   }
 
-  // Where a click goes: the line the call is on. A caller's call is in the
-  // caller's file; a callee's is in the file of the function making it.
-  function site(n) {
-    if (n.slot) {
-      const owner = owning(n);
-      return owner ? { uri: owner.entry.uri, line: (n.lines?.[0] ?? owner.entry.line) - 1, character: 0 } : null;
-    }
-    const e = n.entry;
-    if (!n.parent) return { uri: e.uri, line: e.range.start.line, character: e.range.start.character };
-    const line = (e.lines?.[0] ?? e.line) - 1;
-    if (mode === "callers") return { uri: e.uri, line, character: 0 };
-    const owner = owning(n);
-    return owner ? { uri: owner.entry.uri, line, character: 0 } : null;
-  }
-
   function owning(n) {
     let p = n.parent;
     while (p && p.slot) p = p.parent;
     return p;
   }
 
+  // The lines a node's calls are on, and the file they are in: a caller's
+  // calls are in the caller's file, a callee's in the file of who calls it.
+  function calls(n) {
+    if (!n.parent) return { uri: null, lines: [] };
+    const lines = (n.slot ? n.lines : n.entry.lines) ?? [];
+    if (!n.slot && mode === "callers") return { uri: n.entry.uri, lines };
+    const owner = owning(n);
+    return { uri: owner ? owner.entry.uri : null, lines };
+  }
+
   function definition(n) {
-    return n.entry ? { uri: n.entry.uri, line: n.entry.range.start.line, character: n.entry.range.start.character } : site(n);
+    if (n.entry) return { uri: n.entry.uri, line: n.entry.range.start.line, character: n.entry.range.start.character };
+    const c = calls(n);
+    return c.uri && c.lines.length ? { uri: c.uri, line: c.lines[0] - 1, character: 0 } : null;
   }
 
   function badges(n) {
@@ -79,11 +83,7 @@
   }
 
   function toggle(n) {
-    if (n.slot) {
-      n.open = !n.open;
-      return render();
-    }
-    if (n.children) {
+    if (n.slot || n.children) {
       n.open = !n.open;
       return render();
     }
@@ -92,20 +92,26 @@
     vscode.postMessage({ expand: n.entry.data, id: n.id });
   }
 
+  // Each line a call is on is a link of its own.
+  function lineLinks(n) {
+    const c = calls(n);
+    if (!c.uri || !c.lines.length) return "";
+    return '<span class="lines">' + c.lines.map((l) => '<span class="ln" data-line="' + l + '" title="Go to the call on line ' + l + '">' + l + "</span>").join("") + "</span>";
+  }
+
   // ---------------------------------------------------------------- tree
 
   function treeRows(n, depth, out) {
     const leaf = n.children && n.children.length === 0;
     const twisty = leaf ? "" : n.open ? "▾" : "▸";
     const e = n.entry;
-    const where = n.slot ? (n.lines?.length ? "line " + n.lines.join(", ") : "") : e.file + ":" + e.line;
-    const calls = !n.slot && n.parent && e.lines?.length ? ' <span class="at">· line ' + e.lines.slice(0, 4).join(", ") + (e.lines.length > 4 ? "…" : "") + "</span>" : "";
+    const where = n.slot ? "" : '<span class="loc" title="' + esc(e.file + ":" + e.line) + '">' + esc(base(e.file)) + ":" + e.line + "</span>";
     out.push(
       '<div class="row' + (n.parent ? "" : " top") + '" data-id="' + n.id + '" style="padding-left:' + (8 + depth * 16) + 'px" tabindex="0">' +
         '<span class="tw" data-act="toggle">' + (n.loading ? "…" : twisty) + "</span>" +
-        '<span class="k k-' + (n.slot ? "field" : e.kind) + '">' + (n.slot ? "·" : KIND[e.kind] ?? "?") + "</span>" +
+        icon(n.slot ? "field" : e.kind) +
         '<span class="name" data-act="name" title="' + (n.slot ? "Go to the call" : "Go to this function") + '">' + esc(n.slot ?? e.name) + "</span>" + badges(n) +
-        '<span class="loc" title="Go to the call">' + esc(where) + calls + "</span>" +
+        lineLinks(n) + where +
         "</div>",
     );
     if (n.open && n.children) for (const c of n.children) treeRows(c, depth + 1, out);
@@ -114,17 +120,39 @@
   function renderRefs() {
     const out = [];
     refs.forEach((g, gi) => {
-      out.push('<div class="row top" style="padding-left:8px"><span class="tw">▾</span><span class="name">' + esc(g.file) + '</span><span class="loc">' + g.items.length + "</span></div>");
+      out.push('<div class="row top" style="padding-left:8px" title="' + esc(g.file) + '"><span class="tw">▾</span><span class="codicon codicon-file"></span><span class="name">' + esc(base(g.file)) + '</span><span class="loc">' + g.items.length + "</span></div>");
       g.items.forEach((it, ii) => {
-        out.push('<div class="row" data-ref="' + gi + "," + ii + '" style="padding-left:28px" tabindex="0"><span class="ln">' + (it.line + 1) + '</span><span class="name text">' + esc(it.text) + "</span></div>");
+        out.push('<div class="row" data-ref="' + gi + "," + ii + '" style="padding-left:28px" tabindex="0"><span class="ln plain">' + (it.line + 1) + '</span><span class="name text">' + esc(it.text) + "</span></div>");
       });
     });
     root.innerHTML = out.join("") || '<div class="empty">No references</div>';
   }
 
+  // Where functions are stored in a member or variable (or, for a function,
+  // which members it is stored in): one row for each place.
+  function renderAssigned() {
+    if (!assigned || !assigned.rows.length) {
+      root.innerHTML = '<div class="empty">' + (assigned && assigned.target ? "Nothing is stored here that the index can see." : "Put the cursor on a function pointer member, a variable, or a function.") + "</div>";
+      return;
+    }
+    const out = [];
+    assigned.rows.forEach((r, i) => {
+      const [shown, other] = assigned.by === "member" ? [r.function, r.member] : [r.member, r.function];
+      out.push(
+        '<div class="row" data-assign="' + i + '" style="padding-left:8px" tabindex="0">' + icon(shown.kind) +
+          '<span class="name" data-act="name" title="Go to ' + esc(shown.name) + '">' + esc(shown.name) + "</span>" +
+          '<span class="loc">' + (assigned.by === "member" ? "stored in " : "holds ") + esc(other.name) + "</span>" +
+          '<span class="lines"><span class="ln" data-act="site" title="Go to where it is assigned">' + esc(base(r.file)) + ":" + r.line + "</span></span>" +
+          (r.inside ? '<span class="loc">in ' + esc(r.inside) + "</span>" : "") +
+          "</div>",
+      );
+    });
+    root.innerHTML = out.join("");
+  }
+
   // ---------------------------------------------------------------- graph
 
-  const ROW = 34, GAP = 48, H = 24;
+  const ROW = 46, GAP = 48, H = 24;
 
   function width(n) {
     const text = n.slot ?? n.entry.name;
@@ -167,25 +195,34 @@
       const more = leaf ? "" :
         '<g class="knob" data-act="toggle"><title>' + (n.open ? "Collapse" : "Expand") + '</title><circle cx="' + kx + '" cy="' + ky + '" r="7"></circle>' +
         '<text x="' + kx + '" y="' + (ky + 4) + '" text-anchor="middle">' + (n.loading ? "…" : n.open ? "−" : "+") + "</text></g>";
+      // Under the node, the lines its calls are on, each a link.
+      const c = calls(n);
+      const shownLines = c.uri ? c.lines.slice(0, 6) : [];
+      const under = shownLines.length
+        ? '<text class="glines" x="' + (nx + 4) + '" y="' + (ny + H + 12) + '">' +
+          shownLines.map((l) => '<tspan class="gl" data-line="' + l + '">' + l + "</tspan>").join('<tspan class="sep"> · </tspan>') +
+          (c.lines.length > shownLines.length ? '<tspan class="sep"> …</tspan>' : "") + "</text>"
+        : "";
       shapes.push(
-        '<g class="gn ' + cls + (e && e.certain === false ? " amb" : "") + '" data-id="' + n.id + '"><title>' + esc(n.slot ? "struct member (function pointer)" : e.file + ":" + e.line) + "</title>" +
+        '<g class="gn ' + cls + (e && e.certain === false ? " amb" : "") + '" data-id="' + n.id + '">' +
+          '<g data-act="name"><title>' + esc(n.slot ? "struct member (function pointer)" : e.file + ":" + e.line) + "</title>" +
           '<rect x="' + nx + '" y="' + ny + '" width="' + w + '" height="' + H + '" rx="' + (n.slot ? 12 : 3) + '"></rect>' +
-          '<text x="' + (nx + 10) + '" y="' + (ny + 16) + '">' + esc(n.slot ?? e.name) + "</text>" + more + "</g>",
+          '<text x="' + (nx + 10) + '" y="' + (ny + 16) + '">' + esc(n.slot ?? e.name) + "</text></g>" + under + more + "</g>",
       );
       // Edges leave from beyond the knob.
       n.box = { x: mode === "callers" ? nx - (leaf ? 0 : 20) : nx, y: ny + H / 2, w: w + (leaf ? 0 : 20) };
       if (n.open && n.children)
-        for (const c of n.children) {
-          draw(c);
-          const a = n.box, b = c.box;
+        for (const ch of n.children) {
+          draw(ch);
+          const a = n.box, b = ch.box;
           const from = mode === "callers" ? a.x : a.x + a.w, to = mode === "callers" ? b.x + b.w : b.x, mid = (from + to) / 2;
-          const kind = c.slot || n.slot ? "ptr" : c.entry.viaMacro ? "mac" : c.entry.pointer ? "ptr" : "";
+          const kind = ch.slot || n.slot ? "ptr" : ch.entry.viaMacro ? "mac" : ch.entry.pointer ? "ptr" : "";
           edges.push('<path class="ge ' + kind + '" d="M' + from + " " + a.y + " C" + mid + " " + a.y + " " + mid + " " + b.y + " " + to + " " + b.y + '"></path>');
         }
     })(top);
     root.innerHTML =
       '<div class="graph"><svg width="' + Math.max(total, 200) + '" height="' + (row * ROW + 12) + '">' + edges.join("") + shapes.join("") + "</svg></div>" +
-      '<div class="hint">Click a name to go to the function (Ctrl+click opens beside); the knob beside it expands or collapses.</div>';
+      '<div class="hint">Click a name to go to the function, a line number to go to that call (Ctrl+click opens beside); the knob expands or collapses.</div>';
   }
 
   // ---------------------------------------------------------------- common
@@ -193,8 +230,9 @@
   function render() {
     document.querySelectorAll("[data-mode]").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.mode === mode)));
     document.querySelectorAll("[data-view]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.view === view)));
-    document.getElementById("views").hidden = mode === "references";
+    document.getElementById("views").hidden = mode === "references" || mode === "assignments";
     if (mode === "references") return refs ? renderRefs() : (root.innerHTML = "");
+    if (mode === "assignments") return renderAssigned();
     if (!top) {
       root.innerHTML = '<div class="empty">Put the cursor on a function to see what it calls and what calls it.</div>';
       return;
@@ -216,26 +254,37 @@
     }
   });
 
-  function act(e, dbl) {
+  function act(e) {
     const beside = e.ctrlKey || e.metaKey;
+    const open = (t) => t && vscode.postMessage({ open: t, beside });
     const ref = e.target.closest("[data-ref]");
     if (ref) {
       const [g, i] = ref.dataset.ref.split(",").map(Number);
-      return vscode.postMessage({ open: { uri: refs[g].uri, line: refs[g].items[i].line, character: refs[g].items[i].character }, beside });
+      return open({ uri: refs[g].uri, line: refs[g].items[i].line, character: refs[g].items[i].character });
+    }
+    const what = e.target.closest("[data-act]")?.dataset.act;
+    const row = e.target.closest("[data-assign]");
+    if (row) {
+      const r = assigned.rows[+row.dataset.assign];
+      const shown = assigned.by === "member" ? r.function : r.member;
+      // The name is the symbol; anything else on the row is the assignment.
+      if (what === "name") return open({ uri: shown.uri, line: shown.range.start.line, character: shown.range.start.character });
+      return open({ uri: r.uri, line: r.range.start.line, character: r.range.start.character });
     }
     const el = e.target.closest("[data-id]");
     if (!el) return;
     const n = nodes.get(+el.dataset.id);
-    const what = e.target.closest("[data-act]")?.dataset.act;
-    if (dbl) return;
     if (what === "toggle") return toggle(n);
-    // The name is the function: go to it. The rest of a row in the tree is
-    // the call: go to the line it is made on.
-    const t = view === "graph" || what === "name" ? definition(n) : site(n);
-    if (t) vscode.postMessage({ open: t, beside });
+    // One line of several: that call.
+    const line = e.target.closest("[data-line]");
+    if (line) return open({ uri: calls(n).uri, line: +line.dataset.line - 1, character: 0 });
+    // The name is the function: go to it. The rest of a row is the call:
+    // go to (the first of) the lines it is made on.
+    if (what === "name" || view === "graph") return open(definition(n));
+    const c = calls(n);
+    open(c.uri && c.lines.length ? { uri: c.uri, line: c.lines[0] - 1, character: 0 } : definition(n));
   }
-  root.addEventListener("click", (e) => act(e, false));
-  root.addEventListener("dblclick", (e) => act(e, true));
+  root.addEventListener("click", act);
   root.addEventListener("keydown", (e) => {
     const el = e.target.closest("[data-id]");
     if (!el) return;
@@ -243,7 +292,7 @@
     if (e.key === "ArrowRight" && !n.open) toggle(n);
     else if (e.key === "ArrowLeft" && n.open) toggle(n);
     else if (e.key === "Enter") {
-      const t = site(n);
+      const t = definition(n);
       if (t) vscode.postMessage({ open: t, beside: e.ctrlKey || e.metaKey });
     }
   });
@@ -270,6 +319,11 @@
     } else if (d.type === "refs") {
       mode = "references";
       refs = d.groups;
+      top = null;
+      message.textContent = d.message ?? "";
+    } else if (d.type === "assignments") {
+      mode = "assignments";
+      assigned = d;
       top = null;
       message.textContent = d.message ?? "";
     } else if (d.type === "view") {

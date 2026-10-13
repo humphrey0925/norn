@@ -626,9 +626,12 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
                     }
                 }
             }
+            // Every place a function is stored is kept (for "who assigns
+            // this member"); the graph needs each pair only once.
             bound.sort_unstable();
-            bound.dedup_by_key(|e| (e[0], e[1]));
+            bound.dedup();
             let sites = bound.iter().map(|e| [fi as u32, e[2] >> 4, e[0], e[1]]).collect();
+            bound.dedup_by_key(|e| (e[0], e[1]));
             edges.extend(bound);
             handed.sort_unstable();
             handed.dedup();
