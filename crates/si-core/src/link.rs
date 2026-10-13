@@ -357,6 +357,18 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
             }
             format!("{n} files: names {} MB, refs {} MB, defs {} MB, sites {} MB, other {} MB", mb(names), mb(refs), mb(defs), mb(sites), mb(other))
         };
+        // Of the names: how much is text kept for expanding (the arguments
+        // of macro uses, initializers, macro bodies), and how much names proper.
+        let (mut args, mut inits, mut bodies, mut all, mut count) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        for f in files.iter() {
+            let len = |i: u32| if i == NONE { 0 } else { f.name(i as usize).len() };
+            args += f.sites.iter().map(|s| len(s.args)).sum::<usize>();
+            inits += f.inits.iter().map(|i| len(i.text)).sum::<usize>();
+            bodies += f.macros.iter().map(|m| len(m.text) + len(m.guard)).sum::<usize>();
+            all += (0..f.n_names()).map(|i| f.name(i).len()).sum::<usize>();
+            count += f.n_names();
+        }
+        eprintln!("names     {count} in all, {} MB of text: use arguments {} MB, initializers {} MB, macro bodies {} MB, the rest {} MB", mb(all), mb(args), mb(inits), mb(bodies), mb(all.saturating_sub(args + inits + bodies)));
         eprintln!("facts     {}", part(&mut files.iter()));
         eprintln!("expanded  {}", part(&mut cache.expanded.iter().flatten()));
     }
