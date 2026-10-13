@@ -209,6 +209,10 @@ fn hides(toks: &[T], is_param: impl Fn(&T) -> bool) -> bool {
             (")", K::Punct) => paren -= 1,
             ("{", K::Punct) => brace += 1,
             ("}", K::Punct) => brace -= 1,
+            // Several values in a row (`#define ROW(n, f, a) n, a, f`): a
+            // row of a table, or arguments. Which place each one takes is
+            // only visible in the expansion.
+            (",", K::Punct) if paren == 0 && brace == 0 => return true,
             _ => {}
         }
         if t.k != K::Ident || !is_param(t) {

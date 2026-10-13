@@ -424,12 +424,23 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
     // Struct layouts by name, and typedef names for struct tags.
     let mut records: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
     let mut aliases: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let mut renames: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
     for (fi, f) in files.iter().enumerate() {
         for (i, r) in f.records.iter().enumerate() {
             records.entry(remap[fi][r.name as usize]).or_default().push((fi as u32, i as u32));
         }
         for &(alias, tag) in &f.aliases {
             aliases.entry(remap[fi][alias as usize]).or_default().push(remap[fi][tag as usize]);
+        }
+        // A macro that only names a struct (`#define ROW_STRUCT command`)
+        // is another name for it: `struct ROW_STRUCT table[]`. Which
+        // struct depends on who defines the macro, so the file is kept.
+        for m in f.macros.iter().filter(|m| !m.function_like) {
+            let body = f.name(m.text as usize).trim();
+            let ident = !body.is_empty() && body.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') && !body.as_bytes()[0].is_ascii_digit();
+            if let Some(tag) = g.name_id(body).filter(|_| ident) {
+                renames.entry(remap[fi][m.name as usize]).or_default().push((fi as u32, tag));
+            }
         }
     }
 
@@ -550,10 +561,31 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
                     in_sight(g.syms_named(remap[fi][b.slot as usize]), syms, base..end, closure, |s| s.kind == kind::GLOBAL, &mut slots);
                 } else {
                     // Positional: the member is the struct's `index`-th.
+                    // The struct may be named through a macro, and then it
+                    // is the one the macro names where this is read: in the
+                    // translation unit itself first, else here, else any
+                    // that has a member at that place.
+                    let mut ty = remap[fi][b.slot as usize];
+                    if b.index != NONE && !records.contains_key(&ty) && !aliases.contains_key(&ty) {
+                        if let Some(named) = renames.get(&ty) {
+                            let has = |tag: u32| {
+                                layout(tag, fi as u32, closure, &records, &aliases, files).is_some_and(|(_, fields)| fields.get(b.index as usize).is_some_and(|f| *f != NONE))
+                            };
+                            let pick = named
+                                .iter()
+                                .find(|(file, tag)| *file == b.unit && has(*tag))
+                                .or_else(|| named.iter().find(|(file, tag)| *file == fi as u32 && has(*tag)))
+                                .or_else(|| named.iter().find(|(_, tag)| b.unit == NONE && has(*tag)));
+                            match pick {
+                                Some(&(_, tag)) => ty = tag,
+                                None => continue,
+                            }
+                        }
+                    }
                     let (name, home) = if b.index == NONE {
                         (remap[fi][b.slot as usize], None)
                     } else {
-                        let layout = layout(remap[fi][b.slot as usize], fi as u32, closure, &records, &aliases, files);
+                        let layout = layout(ty, fi as u32, closure, &records, &aliases, files);
                         match layout.and_then(|(rf, fields)| Some((rf, *fields.get(b.index as usize)?))) {
                             Some((rf, field)) if field != NONE => (remap[rf as usize][field as usize], Some(rf)),
                             _ => continue,
@@ -565,7 +597,7 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
                     // The very member at that position, when the struct's
                     // layout says which definition it is.
                     let exact = (b.index != NONE)
-                        .then(|| record_of(remap[fi][b.slot as usize], fi as u32, closure, &records, &aliases))
+                        .then(|| record_of(ty, fi as u32, closure, &records, &aliases))
                         .flatten()
                         .and_then(|(rf, ri)| {
                             let def = *files[rf as usize].records[ri as usize].defs.get(b.index as usize)?;
@@ -823,6 +855,40 @@ int c (int x) { return x; }
         let through_pointer: Vec<&str> =
             crate::callers_through_macros(&g, g.find("a")[0]).iter().filter(|c| c.pointer).map(|c| g.sym_name(c.caller)).collect();
         assert_eq!(through_pointer, ["go"]);
+    }
+
+    #[test]
+    fn a_table_whose_rows_and_type_come_through_macros_is_followed() {
+        // The shape of a generated command table: a list that two files
+        // include, each with its own idea of what a row is and of what
+        // struct it is a row of.
+        let g = expanded(&[
+            ("cmd.h", "struct command { const char *name; int arity; void (*proc) (void); int flags; };
+struct doc { const char *name; const char *summary; };
+void get_cmd (void);
+void set_cmd (void);
+"),
+            ("table.h", "struct ROW_STRUCT table[] = {
+{ROW (\"get\", \"reads, one\", get_cmd, 2)},
+{ROW (\"set\", \"writes\", set_cmd, 3), .flags = 1},
+};
+"),
+            ("server.c", "#include \"cmd.h\"
+void get_cmd (void) {}
+void set_cmd (void) {}
+#define ROW(name, summary, function, arity) name, arity, function
+#define ROW_STRUCT command
+#include \"table.h\"
+void run (struct command *c) { c->proc (); }
+"),
+            ("help.c", "#include \"cmd.h\"
+#define ROW(name, summary, function, arity) name, summary
+#define ROW_STRUCT doc
+#include \"table.h\"
+"),
+        ]);
+        let proc = |f: &str| (f.to_string(), "proc".to_string());
+        assert_eq!(callees(&g, "run"), [proc("get_cmd"), proc("set_cmd")]);
     }
 
     #[test]

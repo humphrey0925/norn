@@ -109,6 +109,8 @@ impl Ids {
 
 /// Longest initializer kept as text for expansion.
 const MAX_INIT_TEXT: usize = 256 << 10;
+/// An array initializer longer than this is expanded a row at a time.
+const ROWS_APART: usize = 8 << 10;
 
 /// Reusable per-thread extractor (a tree-sitter parser is not `Sync`).
 pub struct Extractor {
@@ -777,12 +779,47 @@ impl<'a> Walk<'a> {
             };
             if self.site_starts.get(at).is_some_and(|&p| p < end) || directive() {
                 // Macros or `#if` inside: positions are only known after
-                // expansion, one branch at a time.
-                if end - start <= MAX_INIT_TEXT {
+                // expansion, one branch at a time. A long table (more
+                // than an expansion holds in one go) is read row by row
+                // instead, when no `#if` runs across its rows.
+                let by_row = array && (end - start > MAX_INIT_TEXT || end - start > ROWS_APART && !directive());
+                if !by_row && end - start <= MAX_INIT_TEXT {
                     let text = String::from_utf8_lossy(&self.orig[start..end]);
                     let text = self.out.push_name(&text);
                     let line = value.start_position().row as u32 + 1;
                     self.out.inits.push(InitSite { type_name, text, line, scope, array });
+                } else if by_row {
+                    // A table too long to expand as one text (a generated
+                    // list of commands): row by row, each a struct of its own.
+                    let mut c = value.walk();
+                    let rows: Vec<Node<'a>> = value.named_children(&mut c).filter(|r| !r.is_extra()).collect();
+                    for row in rows {
+                        let (a, e) = (row.start_byte(), row.end_byte());
+                        let at = self.site_starts.partition_point(|&p| p < a);
+                        if self.site_starts.get(at).is_some_and(|&p| p < e) {
+                            // A row with a macro in it, or that is one
+                            // (`ROW (a, b)` for `{ a, b }`), or `[i] = ...`:
+                            // an array of that one element.
+                            if e - a <= MAX_INIT_TEXT {
+                                let text = format!("{{{}}}", String::from_utf8_lossy(&self.orig[a..e]));
+                                let text = self.out.push_name(&text);
+                                let line = row.start_position().row as u32 + 1;
+                                self.out.inits.push(InitSite { type_name, text, line, scope, array: true });
+                            }
+                        } else if row.kind_id() == ids.initializer_list {
+                            self.init_list(row, type_name, false, var, scope);
+                        } else if row.kind_id() == ids.initializer_pair {
+                            // `[i] = { ... }` or `[i] = f`.
+                            match row.child_by_field_id(ids.f_value) {
+                                Some(v) if v.kind_id() == ids.initializer_list => self.init_list(v, type_name, false, var, scope),
+                                Some(v) if var != NONE => self.bind(v, var, NONE, true, scope, NONE),
+                                _ => {}
+                            }
+                        } else if var != NONE {
+                            // An array of function pointers.
+                            self.bind(row, var, NONE, true, scope, NONE);
+                        }
+                    }
                 }
             } else {
                 self.init_list(value, type_name, array, var, scope);
