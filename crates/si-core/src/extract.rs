@@ -781,8 +781,9 @@ impl<'a> Walk<'a> {
                 // Macros or `#if` inside: positions are only known after
                 // expansion, one branch at a time. A long table (more
                 // than an expansion holds in one go) is read row by row
-                // instead, when no `#if` runs across its rows.
-                let by_row = array && (end - start > MAX_INIT_TEXT || end - start > ROWS_APART && !directive());
+                // instead: rows under an `#if` are rows all the same, each
+                // read on its own, and an `#if` inside a row goes with it.
+                let by_row = array && end - start > ROWS_APART;
                 if !by_row && end - start <= MAX_INIT_TEXT {
                     let text = String::from_utf8_lossy(&self.orig[start..end]);
                     let text = self.out.push_name(&text);
@@ -796,7 +797,8 @@ impl<'a> Walk<'a> {
                     for row in rows {
                         let (a, e) = (row.start_byte(), row.end_byte());
                         let at = self.site_starts.partition_point(|&p| p < a);
-                        if self.site_starts.get(at).is_some_and(|&p| p < e) {
+                        let split = self.orig[a..e].split(|&b| b == b'\n').any(|l| l.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'#'));
+                        if split || self.site_starts.get(at).is_some_and(|&p| p < e) {
                             // A row with a macro in it, or that is one
                             // (`ROW (a, b)` for `{ a, b }`), or `[i] = ...`:
                             // an array of that one element.

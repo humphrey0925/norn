@@ -892,6 +892,64 @@ void run (struct command *c) { c->proc (); }
     }
 
     #[test]
+    fn a_row_macro_that_fills_a_struct_inside_the_row_is_followed() {
+        // The shape of a configuration table: every row a macro, the
+        // functions in a struct that is a member of the row, by name.
+        let g = expanded(&[(
+            "config.c",
+            "struct iface { void (*init) (void); int (*set) (int); int (*get) (void); };
+struct data { int *addr; int (*check) (int); };
+struct config { const char *name; struct iface interface; struct data data; };
+void bool_init (void) {}
+int bool_set (int v) { return v; }
+int bool_get (void) { return 0; }
+int port_ok (int v) { return v; }
+int port;
+#define COMMON(n) .name = (n),
+#define IFACE(i, s, g) .interface = { .init = (i), .set = (s), .get = (g) },
+#define BOOL(n, where, valid) { COMMON (n) IFACE (bool_init, bool_set, bool_get) .data = { .addr = &(where), .check = (valid) } }
+struct config table[] = {
+  BOOL (\"port\", port, port_ok),
+  BOOL (\"other\", port, 0),
+};
+int apply (struct config *c, int v) { c->interface.init (); return c->interface.set (v) + c->data.check (v); }
+",
+        )]);
+        let via = |f: &str, m: &str| (f.to_string(), m.to_string());
+        assert_eq!(callees(&g, "apply"), [via("bool_init", "init"), via("bool_set", "set"), via("port_ok", "check")]);
+    }
+
+    #[test]
+    fn rows_under_a_condition_in_a_long_table_are_rows_all_the_same() {
+        // Long enough to be read a row at a time, with an `#if` across rows
+        // and one inside a row.
+        let mut table = String::from("struct command { const char *name; int arity; void (*proc) (void); };\n");
+        let mut names = Vec::new();
+        for i in 0..400 {
+            table += &format!("void cmd_{i} (void) {{}}\n");
+        }
+        table += "#define ROW(n, f, a) n, a, f\nstruct command table[] = {\n";
+        for i in 0..400 {
+            if i == 100 {
+                table += "#ifdef WITH_EXTRA\n";
+            }
+            if i == 110 {
+                table += "#endif\n";
+            }
+            if i == 300 {
+                table += "{ROW (\"split\",\n#if BIG\n cmd_300,\n#else\n cmd_301,\n#endif\n 1)},\n";
+            } else if i != 301 {
+                table += &format!("{{ROW (\"command number {i} of the table\", cmd_{i}, {i})}},\n");
+            }
+            names.push((format!("cmd_{i}"), "proc".to_string()));
+        }
+        table += "};\nvoid run (struct command *c) { c->proc (); }\n";
+        let g = expanded(&[("t.c", &table)]);
+        names.sort();
+        assert_eq!(callees(&g, "run"), names);
+    }
+
+    #[test]
     fn members_of_the_same_name_in_different_structs_are_told_apart() {
         let g = graph(&[
             ("t.h", "struct reader { int (*run) (int); };

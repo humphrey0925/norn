@@ -940,11 +940,15 @@ enum Place {
 
 /// The names in an expanded initializer of a struct (or, with `array`, of an
 /// array of structs), each with the member it initializes. A name inside
-/// nested braces belongs to the member the braces initialize.
+/// nested braces belongs to the member the braces initialize, unless a
+/// designator in there says which member of that one it is
+/// (`.interface = { .set = fn }` stores into `set`).
 fn init_names(toks: &[T], array: bool) -> Vec<(Place, String)> {
     let level = if array { 2 } else { 1 };
     let (mut depth, mut paren, mut index) = (0i32, 0i32, 0u32);
     let mut designated: Option<String> = None;
+    // The designator in force at each level of braces below the struct's own.
+    let mut inner: Vec<Option<String>> = Vec::new();
     let mut out = Vec::new();
     for (i, t) in toks.iter().enumerate() {
         let prev = i.checked_sub(1).map(|j| &toks[j]);
@@ -956,17 +960,35 @@ fn init_names(toks: &[T], array: bool) -> Vec<(Place, String)> {
                     if depth == level {
                         index = 0;
                         designated = None;
+                        inner.clear();
+                    } else if depth > level {
+                        inner.push(None);
                     }
                 }
-                "}" => depth -= 1,
+                "}" => {
+                    if depth > level {
+                        inner.pop();
+                    }
+                    depth -= 1;
+                }
                 "(" => paren += 1,
                 ")" => paren -= 1,
                 "," if paren == 0 && depth == level => {
                     index += 1;
                     designated = None;
                 }
+                "," if paren == 0 && depth > level => {
+                    if let Some(d) = inner.last_mut() {
+                        *d = None;
+                    }
+                }
                 "." if depth == level && prev.is_some_and(|p| p.is(",") || p.is("{")) => {
                     designated = next.filter(|n| n.k == K::Ident).map(|n| n.text.to_string());
+                }
+                "." if depth > level && prev.is_some_and(|p| p.is(",") || p.is("{")) => {
+                    if let Some(d) = inner.last_mut() {
+                        *d = next.filter(|n| n.k == K::Ident).map(|n| n.text.to_string());
+                    }
                 }
                 _ => {}
             }
@@ -978,7 +1000,11 @@ fn init_names(toks: &[T], array: bool) -> Vec<(Place, String)> {
         if prev.is_some_and(|p| p.is(".") || p.is("->")) || next.is_some_and(|n| n.is("(")) {
             continue;
         }
-        let place = designated.clone().map_or(Place::Index(index), Place::Member);
+        // The innermost designator says the member; else the struct's own place.
+        let place = match inner.iter().rev().flatten().next() {
+            Some(member) => Place::Member(member.clone()),
+            None => designated.clone().map_or(Place::Index(index), Place::Member),
+        };
         out.push((place, t.text.to_string()));
     }
     out
