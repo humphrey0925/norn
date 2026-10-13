@@ -1399,7 +1399,11 @@ fn expand_file(
     for d in out.records.iter_mut().flat_map(|r| r.defs.iter_mut()).filter(|d| **d != NONE) {
         *d = new_index[*d as usize];
     }
-    out.sites.clear();
+    // The uses are expanded: the link has no use for them, nor for the
+    // initializers that were read.
+    out.sites = Vec::new();
+    out.inits = Vec::new();
+    out.shrink();
     let added = ((out.defs.len() - n_defs) as u64, (out.refs.len() - n_refs) as u64);
     Some((out, added.0, added.1))
 }

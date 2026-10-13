@@ -284,6 +284,36 @@ impl FileFacts {
         &self.name_buf[self.name_off[i] as usize..self.name_off[i + 1] as usize]
     }
 
+    /// Give back what the vectors hold beyond what is in them: they grew
+    /// by doubling, and in a large tree the slack of every file adds up.
+    pub fn shrink(&mut self) {
+        self.name_buf.shrink_to_fit();
+        self.name_off.shrink_to_fit();
+        self.defs.shrink_to_fit();
+        self.refs.shrink_to_fit();
+        self.includes.shrink_to_fit();
+        self.include_conditional.shrink_to_fit();
+        self.macros.shrink_to_fit();
+        self.sites.shrink_to_fit();
+        self.binds.shrink_to_fit();
+        self.inits.shrink_to_fit();
+        self.records.shrink_to_fit();
+        self.aliases.shrink_to_fit();
+        self.field_types.shrink_to_fit();
+        self.param_calls.shrink_to_fit();
+        self.arg_passes.shrink_to_fit();
+        self.hints.shrink_to_fit();
+        self.hint_path.shrink_to_fit();
+        self.ref_hints.shrink_to_fit();
+        self.typed.shrink_to_fit();
+        self.defined_names.shrink_to_fit();
+    }
+
+    /// What the names (and the texts kept as names) take.
+    pub fn names_bytes(&self) -> usize {
+        self.name_buf.capacity() + self.name_off.capacity() * 4
+    }
+
     pub fn heap_bytes(&self) -> usize {
         self.path.capacity()
             + self.name_buf.capacity()

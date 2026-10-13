@@ -257,7 +257,9 @@ impl Extractor {
         w.flush_events(usize::MAX);
         w.flush_local_calls();
         w.out.walk_ns = t.elapsed().as_nanos() as u64;
-        w.out
+        let mut out = w.out;
+        out.shrink();
+        out
     }
 }
 

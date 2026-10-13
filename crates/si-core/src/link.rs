@@ -320,6 +320,13 @@ pub fn link_with(files: &[FileFacts], options: &Options) -> (Graph, LinkStats) {
 /// Link, reusing the macro expansions `cache` holds from the last link of
 /// these files where they are still good.
 pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::expand::Cache) -> (Graph, LinkStats) {
+    let linked = link_all(files, options, cache);
+    // Now that everything the link worked with is let go.
+    crate::trim_memory();
+    linked
+}
+
+fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::Cache) -> (Graph, LinkStats) {
     crate::progress::linking();
     let mut stats = LinkStats::default();
 
@@ -331,6 +338,28 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
     let t = Instant::now();
     (stats.sites, stats.expanded_defs, stats.expanded_refs) = crate::expand::expand(files, &includes, &sure_includes, cache);
     stats.expand_ms = ms(t);
+    crate::trim_memory();
+    if std::env::var_os("SI_MEM_PROFILE").is_some() {
+        let mb = |n: usize| n >> 20;
+        let part = |fs: &mut dyn Iterator<Item = &FileFacts>| {
+            let (mut names, mut refs, mut defs, mut sites, mut other, mut n) = (0, 0, 0, 0, 0, 0);
+            for f in fs {
+                n += 1;
+                names += f.names_bytes();
+                refs += f.refs.capacity() * std::mem::size_of::<crate::model::Ref>();
+                defs += f.defs.capacity() * std::mem::size_of::<crate::model::Def>();
+                sites += f.sites.capacity() * std::mem::size_of::<crate::model::Site>() + f.inits.capacity() * std::mem::size_of::<crate::model::InitSite>();
+                other += f.macros.capacity() * std::mem::size_of::<crate::model::MacroBody>()
+                    + f.binds.capacity() * std::mem::size_of::<crate::model::Bind>()
+                    + f.hints.capacity() * std::mem::size_of::<crate::model::MemberHint>()
+                    + (f.ref_hints.capacity() + f.typed.capacity() + f.field_types.capacity() + f.aliases.capacity()) * 8
+                    + (f.hint_path.capacity() + f.includes.capacity() + f.defined_names.capacity()) * 4;
+            }
+            format!("{n} files: names {} MB, refs {} MB, defs {} MB, sites {} MB, other {} MB", mb(names), mb(refs), mb(defs), mb(sites), mb(other))
+        };
+        eprintln!("facts     {}", part(&mut files.iter()));
+        eprintln!("expanded  {}", part(&mut cache.expanded.iter().flatten()));
+    }
     let crate::expand::Cache { expanded, names: name_cache, made, .. } = cache;
     let files: Vec<&FileFacts> = files.iter().zip(expanded.iter()).map(|(f, e)| e.as_ref().unwrap_or(f)).collect();
     let files = &files[..];

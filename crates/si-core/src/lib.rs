@@ -146,7 +146,9 @@ pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions)
 /// `conditions` come back with what the sources settle added.
 pub fn prescan_under(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions) -> MacroSets {
     let defines = settle(root, files, conditions);
-    MacroSets::from_defines(defines.into_iter().flatten()).with_conditions(conditions.clone())
+    let sets = MacroSets::from_defines(defines.into_iter().flatten()).with_conditions(conditions.clone());
+    trim_memory();
+    sets
 }
 
 pub fn extract_file(ex: &mut extract::Extractor, root: &Path, path: &Path, transparent: &MacroSets) -> FileFacts {
@@ -164,6 +166,19 @@ pub fn extract_all(root: &Path, files: &[PathBuf], transparent: &MacroSets) -> V
 
 /// Route tree-sitter's C allocations through mimalloc. The platform heap
 /// (notably on Windows) serializes on a lock under many parser threads.
+/// Hand back to the system what was freed. A phase of indexing leaves
+/// behind gigabytes it no longer needs (every file's definitions, the
+/// macro table, the edges before they are packed), which the allocator
+/// would keep at hand: the next phase would then be counted on top of it.
+/// Only does anything when the process allocates with mimalloc, as `si`
+/// does; with another allocator its heap is empty.
+pub fn trim_memory() {
+    // Each thread has a heap of its own, and it is the worker threads that
+    // did the allocating.
+    rayon::broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
+    unsafe { libmimalloc_sys::mi_collect(true) }
+}
+
 pub fn use_mimalloc_for_parser() {
     use libmimalloc_sys::{mi_calloc, mi_free, mi_malloc, mi_realloc};
     unsafe { tree_sitter::set_allocator(Some(mi_malloc), Some(mi_calloc), Some(mi_realloc), Some(mi_free)) }
