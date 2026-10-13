@@ -18,8 +18,9 @@ program: `main` and other names that several programs define have several.
   files     {file: {"tus": n, "inactive": [[first, last], ...]}}
 
 An indirect call (`icalls`) goes through a struct field (`kind` "field",
-with the record and field names), a parameter, a variable, or something
-else. `binds` are the places a function is stored in a field: by an
+with the record and field names), a variable at file scope ("global", with
+an empty record and the variable's name), a parameter, a local variable
+("var"), or something else. A store into a global has an empty record too. `binds` are the places a function is stored in a field: by an
 initializer, positional or designated, or by an assignment. Joining the two
 on (record, field) gives the calls a field-based, type-aware analysis finds;
 it is an upper bound on what runs, not a record of it.
@@ -86,6 +87,10 @@ def slot_of(field):
     return (field.semantic_parent.spelling, field.spelling)
 
 
+def is_global(var):
+    return var.semantic_parent is not None and var.semantic_parent.kind == CursorKind.TRANSLATION_UNIT
+
+
 def target_of(call):
     """What an indirect call goes through: (kind, record, name)."""
     kids = list(call.get_children())
@@ -99,7 +104,7 @@ def target_of(call):
             if d is not None and d.kind == CursorKind.PARM_DECL:
                 return ("param", "", d.spelling)
             if d is not None and d.kind == CursorKind.VAR_DECL:
-                return ("var", "", d.spelling)
+                return ("global" if is_global(d) else "var", "", d.spelling)
             return OTHER
         if c.kind not in WRAPPERS:
             return OTHER
@@ -171,10 +176,13 @@ def binds_in(root, out):
                 lhs = kids[0]
                 while lhs.kind == CursorKind.PAREN_EXPR:
                     lhs = next(lhs.get_children())
-                f = lhs.referenced if lhs.kind == CursorKind.MEMBER_REF_EXPR else None
+                f = lhs.referenced if lhs.kind in (CursorKind.MEMBER_REF_EXPR, CursorKind.DECL_REF_EXPR) else None
                 # An assignment has the type of its left side; a comparison does not.
-                if f is not None and f.kind == CursorKind.FIELD_DECL and c.type.spelling == kids[0].type.spelling:
-                    bind(slot_of(f), kids[1], out)
+                if f is not None and c.type.spelling == kids[0].type.spelling:
+                    if f.kind == CursorKind.FIELD_DECL:
+                        bind(slot_of(f), kids[1], out)
+                    elif f.kind == CursorKind.VAR_DECL and is_global(f):
+                        bind(("", f.spelling), kids[1], out)
         stack.extend(c.get_children())
 
 
@@ -211,6 +219,15 @@ def one(entry):
         if file is None:
             continue
         binds_in(c, binds)
+        if c.kind == CursorKind.VAR_DECL:
+            # `handler_t hook = default_handler;` and arrays of functions.
+            for init in c.get_children():
+                if init.kind not in (CursorKind.TYPE_REF, CursorKind.INIT_LIST_EXPR, CursorKind.INTEGER_LITERAL):
+                    bind(("", c.spelling), init, binds)
+                elif init.kind == CursorKind.INIT_LIST_EXPR and init.type.get_canonical().kind != cindex.TypeKind.RECORD:
+                    for element in init.get_children():
+                        if element.kind != CursorKind.INIT_LIST_EXPR:
+                            bind(("", c.spelling), element, binds)
         if c.kind != CursorKind.FUNCTION_DECL or not c.is_definition():
             continue
         defs.add((c.get_usr(), c.spelling, file, c.location.line, c.storage_class == cindex.StorageClass.STATIC))

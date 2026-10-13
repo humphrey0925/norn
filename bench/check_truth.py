@@ -182,8 +182,9 @@ def score(truth_path, index, corpus, cbm=False):
         cf = GENERATED.get(cf, cf)
         if cf not in si_files:
             continue
-        sites[how if how != "field" or stored.get((record, member)) else "field, nothing stored"] += 1
-        if how == "field":
+        slot = how in ("field", "global")
+        sites[how if not slot or stored.get((record, member)) else how + ", nothing stored"] += 1
+        if slot:
             callers_ind.add((cf, cn))
             want_ind.update((cf, cn, ef, en) for ef, en in stored.get((record, member), ()))
     # Where si says a function is stored. A store in a file clang did not
@@ -197,8 +198,7 @@ def score(truth_path, index, corpus, cbm=False):
             site_file, site_line, member, fn_name, fn_file, what = line.split("\t")
             if t.active(site_file, int(site_line)) and (fn_file, fn_name) in truth_names:
                 compiled_stores.add((member, fn_file, fn_name))
-                if what == "field":  # the truth has no stores into variables
-                    pairs.add((member, fn_name))
+                pairs.add((member, fn_name))
         right_pairs = pairs & truth_pairs
         stores = {"si_stores_in_compiled_lines": len(pairs), "right": len(right_pairs),
                   "precision": len(right_pairs) / max(1, len(pairs)),
