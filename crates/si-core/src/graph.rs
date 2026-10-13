@@ -110,7 +110,8 @@ impl Graph {
         &self.inc[self.in_off[sym as usize] as usize..self.in_off[sym as usize + 1] as usize]
     }
 
-    fn file_syms(&self, file: u32) -> std::ops::Range<u32> {
+    /// The symbols of a file, the file itself first, in line order.
+    pub fn file_syms(&self, file: u32) -> std::ops::Range<u32> {
         let start = self.files[file as usize].sym_start;
         let end = self.files.get(file as usize + 1).map_or(self.syms.len() as u32, |f| f.sym_start);
         start..end

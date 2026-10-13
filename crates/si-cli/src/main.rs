@@ -11,6 +11,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+mod lsp;
 mod mem;
 
 #[global_allocator]
@@ -89,6 +90,13 @@ enum Cmd {
     /// queries, `{"op":"update","files":[...]}` after files change.
     Live {
         root: PathBuf,
+        #[arg(long, value_name = "FROM=TO")]
+        include_alias: Vec<String>,
+    },
+    /// Language Server over stdin/stdout, for editors. The root is the
+    /// workspace the editor names unless one is given here.
+    Lsp {
+        root: Option<PathBuf>,
         #[arg(long, value_name = "FROM=TO")]
         include_alias: Vec<String>,
     },
@@ -535,6 +543,9 @@ fn main() {
         Cmd::BenchIncr { root, n, seed } => bench_incr(root, *n, *seed),
         Cmd::Sample { dir, n, seed } => sample(dir, *n, *seed),
         Cmd::Serve { dir } => return serve(dir),
+        Cmd::Lsp { root, include_alias } => {
+            return lsp::run(root.as_deref(), &si_core::link::Options { include_aliases: aliases(include_alias) })
+        }
         Cmd::Live { root, include_alias } => return live(root, &si_core::link::Options { include_aliases: aliases(include_alias) }),
         Cmd::Symbols { dir } => return symbols(dir),
         Cmd::Calls { dir } => return calls(dir),
