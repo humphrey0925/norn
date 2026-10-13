@@ -1,0 +1,921 @@
+//! Macro expansion at link time, for the uses that hide names from the
+//! parser: `NAME (aout, final_link)` is `aout_32_final_link` in one
+//! translation unit and `aout_64_final_link` in another, and
+//! `START_RELOC_NUMBERS (elf_avr_reloc_type)` declares an enum or a function.
+//!
+//! There is no build configuration, so nothing says which `#define` of a
+//! name is in force. Every definition that can share a translation unit with
+//! the use is tried, and each distinct result is recorded: a function written
+//! once under a pasted name becomes one definition per result, each with its
+//! own copy of the references in its body.
+//!
+//! Only *expanding* macros are expanded (see `mask::MacroSets`), and only the
+//! names an expansion makes are taken from it; what is written at the use is
+//! indexed by the ordinary extraction.
+
+use crate::mask::is_keyword;
+use crate::model::{flag, kind, refkind, site, Def, FileFacts, Ref, Site, NONE};
+use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::sync::Arc;
+
+/// Distinct expansions kept for one use.
+const MAX_VARIANTS: usize = 24;
+/// Definitions of one name tried at one use.
+const MAX_CANDIDATES: usize = 16;
+/// Macro invocations and tokens allowed in one expansion.
+const MAX_STEPS: u32 = 500;
+/// Expansions in a row that may bring no new name before the rest are left untried.
+const BLIND_RUNS: usize = 3;
+/// Uses of one macro in one file that may come to nothing before the rest
+/// are skipped.
+const BARREN_USES: u32 = 16;
+const MAX_TOKENS: usize = 20_000;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum K {
+    Ident,
+    Punct,
+    /// Number or literal.
+    Other,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Origin {
+    /// Written at the use.
+    Site,
+    /// From a macro body.
+    Body,
+    /// Made by `##`.
+    Pasted,
+}
+
+#[derive(Clone, Debug)]
+struct T {
+    /// Shared: tokens are copied far more often than they are made.
+    text: Arc<str>,
+    k: K,
+    origin: Origin,
+    /// A macro name met inside its own expansion: never expanded again.
+    noexpand: bool,
+}
+
+impl T {
+    fn is(&self, s: &str) -> bool {
+        self.k == K::Punct && &*self.text == s
+    }
+}
+
+fn is_ident_text(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty() && (b[0].is_ascii_alphabetic() || b[0] == b'_') && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+}
+
+fn tokenize(s: &[u8], origin: Origin) -> Vec<T> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    let n = s.len();
+    let at = |k: usize| *s.get(k).unwrap_or(&0);
+    while i < n {
+        let b = s[i];
+        let start = i;
+        let k = match b {
+            b' ' | b'\t' | b'\r' | b'\n' | 0x0c => {
+                i += 1;
+                continue;
+            }
+            b'\\' if matches!(at(i + 1), b'\n' | b'\r') => {
+                i += 1;
+                continue;
+            }
+            b'/' if at(i + 1) == b'*' => {
+                i += 2;
+                while i < n && !(s[i] == b'*' && at(i + 1) == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(n);
+                continue;
+            }
+            b'/' if at(i + 1) == b'/' => {
+                while i < n && s[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            _ if b.is_ascii_alphabetic() || b == b'_' => {
+                while i < n && (s[i].is_ascii_alphanumeric() || s[i] == b'_') {
+                    i += 1;
+                }
+                K::Ident
+            }
+            _ if b.is_ascii_digit() => {
+                while i < n && (s[i].is_ascii_alphanumeric() || s[i] == b'_' || s[i] == b'.') {
+                    i += 1;
+                }
+                K::Other
+            }
+            b'"' | b'\'' => {
+                i += 1;
+                while i < n && s[i] != b && s[i] != b'\n' {
+                    i += 1 + (s[i] == b'\\' && i + 1 < n) as usize;
+                }
+                i = (i + 1).min(n);
+                K::Other
+            }
+            _ => {
+                let two = [b, at(i + 1)];
+                i += if at(i + 1) == b'.' && at(i + 2) == b'.' && b == b'.' {
+                    3
+                } else if matches!(&two, b"##" | b"->" | b"==" | b"!=" | b"<=" | b">=" | b"&&" | b"||" | b"<<" | b">>") {
+                    2
+                } else {
+                    1
+                };
+                K::Punct
+            }
+        };
+        out.push(T { text: String::from_utf8_lossy(&s[start..i]).into(), k, origin, noexpand: false });
+    }
+    out
+}
+
+/// May a declared name follow this token (`int x`, `char *x`)?
+fn decl_prev(t: &T) -> bool {
+    match t.k {
+        K::Ident => !matches!(
+            &*t.text,
+            "return" | "goto" | "case" | "sizeof" | "else" | "do" | "if" | "while" | "for" | "switch" | "typeof"
+                | "__typeof__" | "defined" | "break" | "continue"
+        ),
+        _ => t.is("*"),
+    }
+}
+
+fn is_tag(t: &T) -> bool {
+    t.k == K::Ident && matches!(&*t.text, "enum" | "struct" | "union")
+}
+
+/// Does a macro with this body put names in its expansion that are not
+/// written at its uses? True when it pastes tokens, calls one of its
+/// parameters (which may then be such a macro), or declares one.
+pub fn hides_names(body: &[u8], params: &[&[u8]]) -> bool {
+    hides(&tokenize(body, Origin::Body), |t| params.contains(&t.text.as_bytes()))
+}
+
+fn hides(toks: &[T], is_param: impl Fn(&T) -> bool) -> bool {
+    let n = toks.len();
+    let (mut paren, mut brace) = (0i32, 0i32);
+    for i in 0..n {
+        let t = &toks[i];
+        let prev = i.checked_sub(1).map(|j| &toks[j]);
+        let next = toks.get(i + 1);
+        match (&*t.text, t.k) {
+            // `, ## __VA_ARGS__` only drops a comma.
+            ("##", K::Punct) if !prev.is_some_and(|p| p.is(",")) => return true,
+            ("(", K::Punct) => paren += 1,
+            (")", K::Punct) => paren -= 1,
+            ("{", K::Punct) => brace += 1,
+            ("}", K::Punct) => brace -= 1,
+            _ => {}
+        }
+        if t.k != K::Ident || !is_param(t) {
+            continue;
+        }
+        let next_is = |s: &str| next.is_some_and(|x| x.is(s));
+        if next_is("(") {
+            return true;
+        }
+        if paren != 0 || brace != 0 {
+            continue;
+        }
+        if prev.is_some_and(is_tag) && next_is("{") {
+            return true;
+        }
+        if prev.is_some_and(decl_prev) && (next.is_none() || ["=", ";", "[", ","].iter().any(|s| next_is(s))) {
+            return true;
+        }
+        if i == 0 && (next_is("=") && toks[n - 1].is(",") || n == 2 && next_is(",")) {
+            return true;
+        }
+    }
+    false
+}
+
+struct Parsed {
+    params: Vec<Arc<str>>,
+    variadic: bool,
+    function_like: bool,
+    body: Vec<T>,
+    /// See [`hides_names`].
+    hides: bool,
+    /// For each body token, the parameter it names, or `NONE`.
+    param_at: Vec<u32>,
+}
+
+/// `text` is what follows the macro's name in its `#define`.
+fn parse(text: &str, function_like: bool) -> Parsed {
+    let mut toks = tokenize(text.as_bytes(), Origin::Body);
+    let mut params: Vec<Arc<str>> = Vec::new();
+    let mut variadic = false;
+    if function_like {
+        let close = toks.iter().position(|t| t.is(")")).unwrap_or(toks.len());
+        for t in &toks[..close] {
+            if t.k == K::Ident {
+                params.push(t.text.clone());
+            } else if t.is("...") {
+                variadic = true;
+            }
+        }
+        // `...` alone is `__VA_ARGS__`; `args...` names the rest `args`.
+        if variadic && !toks[..close].iter().rev().nth(1).is_some_and(|t| t.k == K::Ident) {
+            params.push("__VA_ARGS__".into());
+        }
+        toks.drain(..(close + 1).min(toks.len()));
+    }
+    let param_at =
+        toks.iter().map(|t| params.iter().position(|p| t.k == K::Ident && *p == t.text).map_or(NONE, |i| i as u32)).collect();
+    let hides = hides(&toks, |t| params.contains(&t.text));
+    Parsed { params, variadic, function_like, body: toks, hides, param_at }
+}
+
+struct Table<'a> {
+    files: &'a [FileFacts],
+    by_name: FxHashMap<&'a str, Vec<(u32, u32)>>,
+    parsed: Vec<Vec<Parsed>>,
+}
+
+type Choice = FxHashMap<Box<str>, usize>;
+
+enum Item {
+    Tok(T),
+    /// The expansion of the innermost active macro ends here.
+    End,
+}
+
+/// Expands token lists as seen from one file.
+struct Engine<'a> {
+    table: &'a Table<'a>,
+    /// Files that can be in a translation unit with this one.
+    visible: Vec<bool>,
+    cands: FxHashMap<Box<str>, Vec<&'a Parsed>>,
+    /// Which definition to use for each name with several.
+    choice: Choice,
+    /// Names with several definitions met in this run, with how many.
+    met: Vec<(Box<str>, usize)>,
+    active: Vec<Arc<str>>,
+    steps: u32,
+    hiding: FxHashMap<Box<str>, bool>,
+}
+
+impl<'a> Engine<'a> {
+    fn candidates(&mut self, name: &str) -> &[&'a Parsed] {
+        if !self.cands.contains_key(name) {
+            let all = self.table.by_name.get(name).map_or(&[][..], |v| &v[..]);
+            let mut seen: Vec<(&str, u32, u32)> = all
+                .iter()
+                .filter(|(f, _)| self.visible[*f as usize])
+                .map(|&(f, i)| (self.table.files[f as usize].name(self.table.files[f as usize].macros[i as usize].text as usize), f, i))
+                .collect();
+            if seen.is_empty() {
+                seen = all
+                    .iter()
+                    .map(|&(f, i)| {
+                        (self.table.files[f as usize].name(self.table.files[f as usize].macros[i as usize].text as usize), f, i)
+                    })
+                    .collect();
+            }
+            // The same text is the same definition; the order must not depend
+            // on which file was read first.
+            seen.sort_unstable();
+            seen.dedup_by(|a, b| a.0.split_whitespace().eq(b.0.split_whitespace()));
+            seen.truncate(MAX_CANDIDATES);
+            let list = seen.iter().map(|&(_, f, i)| &self.table.parsed[f as usize][i as usize]).collect();
+            self.cands.insert(name.into(), list);
+        }
+        &self.cands[name]
+    }
+
+    /// Can a use of `name` here expand to names not written at the use? The
+    /// set of expanding macros is by name over the whole corpus; this asks
+    /// the definitions this file can see.
+    fn hides(&mut self, name: &str) -> bool {
+        if let Some(&known) = self.hiding.get(name) {
+            return known;
+        }
+        self.hiding.insert(name.into(), false);
+        let cands = self.candidates(name).to_vec();
+        let found = cands.iter().any(|p| p.hides || p.body.iter().any(|t| t.k == K::Ident && self.hides(&t.text)));
+        self.hiding.insert(name.into(), found);
+        found
+    }
+
+    fn pick(&mut self, name: &str) -> Option<&'a Parsed> {
+        let n = self.candidates(name).len();
+        if n == 0 {
+            return None;
+        }
+        let i = match self.choice.get(name) {
+            Some(&i) => i.min(n - 1),
+            None => {
+                self.choice.insert(name.into(), 0);
+                0
+            }
+        };
+        if n > 1 && !self.met.iter().any(|m| &*m.0 == name) {
+            self.met.push((name.into(), n));
+        }
+        Some(self.cands[name][i])
+    }
+
+    fn expand(&mut self, input: Vec<T>) -> Vec<T> {
+        let mut out = Vec::new();
+        let mut stack: Vec<Item> = input.into_iter().rev().map(Item::Tok).collect();
+        while let Some(item) = stack.pop() {
+            let mut t = match item {
+                Item::End => {
+                    self.active.pop();
+                    continue;
+                }
+                Item::Tok(t) => t,
+            };
+            if t.k != K::Ident || t.noexpand || self.steps > MAX_STEPS || out.len() + stack.len() > MAX_TOKENS {
+                out.push(t);
+                continue;
+            }
+            if self.active.contains(&t.text) {
+                t.noexpand = true;
+                out.push(t);
+                continue;
+            }
+            let Some(m) = self.pick(&t.text) else {
+                out.push(t);
+                continue;
+            };
+            let mut args: Vec<Vec<T>> = Vec::new();
+            if m.function_like {
+                // The argument list may begin after the end of the expansion
+                // that produced the name.
+                let next = stack.iter().rev().find_map(|i| match i {
+                    Item::Tok(t) => Some(t.is("(")),
+                    Item::End => None,
+                });
+                if next != Some(true) {
+                    out.push(t);
+                    continue;
+                }
+                let mut depth = 0;
+                while let Some(item) = stack.pop() {
+                    let a = match item {
+                        Item::End => {
+                            self.active.pop();
+                            continue;
+                        }
+                        Item::Tok(a) => a,
+                    };
+                    if a.is("(") {
+                        depth += 1;
+                        if depth == 1 {
+                            args.push(Vec::new());
+                            continue;
+                        }
+                    } else if a.is(")") {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else if a.is(",") && depth == 1 {
+                        args.push(Vec::new());
+                        continue;
+                    }
+                    if let Some(last) = args.last_mut() {
+                        last.push(a);
+                    }
+                }
+            }
+            self.steps += 1;
+            let body = self.substitute(m, args);
+            self.active.push(t.text);
+            stack.push(Item::End);
+            stack.extend(body.into_iter().rev().map(Item::Tok));
+        }
+        out
+    }
+
+    fn substitute(&mut self, m: &Parsed, mut args: Vec<Vec<T>>) -> Vec<T> {
+        let np = m.params.len();
+        if m.variadic && np > 0 && args.len() > np {
+            // Everything past the named parameters is one argument, commas and all.
+            let rest = args.split_off(np);
+            let comma = T { text: ",".into(), k: K::Punct, origin: Origin::Site, noexpand: false };
+            for a in rest {
+                args[np - 1].push(comma.clone());
+                args[np - 1].extend(a);
+            }
+        }
+        args.resize(np, Vec::new());
+        let mut expanded: Vec<Option<Vec<T>>> = vec![None; np];
+        let empty = || T { text: "".into(), k: K::Other, origin: Origin::Body, noexpand: false };
+        let mut res: Vec<T> = Vec::with_capacity(m.body.len());
+        let mut i = 0;
+        while i < m.body.len() {
+            let t = &m.body[i];
+            let p = m.param_at[i];
+            if t.is("#") && m.function_like && m.param_at.get(i + 1).is_some_and(|&p| p != NONE) {
+                res.push(T { text: "\"\"".into(), k: K::Other, origin: Origin::Body, noexpand: false });
+                i += 2;
+                continue;
+            }
+            if p == NONE {
+                res.push(t.clone());
+            } else {
+                let p = p as usize;
+                let pasted = i > 0 && m.body[i - 1].is("##") || m.body.get(i + 1).is_some_and(|n| n.is("##"));
+                if pasted {
+                    // Operands of `##` are not expanded first.
+                    if args[p].is_empty() {
+                        res.push(empty());
+                    } else {
+                        res.extend(args[p].iter().cloned());
+                    }
+                } else {
+                    if expanded[p].is_none() {
+                        let depth = self.active.len();
+                        let e = self.expand(args[p].clone());
+                        self.active.truncate(depth);
+                        expanded[p] = Some(e);
+                    }
+                    res.extend(expanded[p].iter().flatten().cloned());
+                }
+            }
+            i += 1;
+        }
+        // Paste.
+        let mut out: Vec<T> = Vec::with_capacity(res.len());
+        let mut i = 0;
+        while i < res.len() {
+            if res[i].is("##") && res[i].origin == Origin::Body && !out.is_empty() && i + 1 < res.len() {
+                let right = res[i + 1].clone();
+                let left = out.pop().unwrap();
+                if left.is(",") {
+                    // GNU `, ## args`: the comma goes when there are none.
+                    if !right.text.is_empty() {
+                        out.push(left);
+                        out.push(right);
+                    }
+                } else {
+                    let text = format!("{}{}", left.text, right.text);
+                    let k = if is_ident_text(&text) { K::Ident } else { K::Other };
+                    out.push(T { text: text.into(), k, origin: Origin::Pasted, noexpand: false });
+                }
+                i += 2;
+                continue;
+            }
+            out.push(res[i].clone());
+            i += 1;
+        }
+        out.retain(|t| !t.text.is_empty());
+        out
+    }
+
+    /// Every distinct expansion of `toks`, with the choices that gave it.
+    /// Names in `pinned` keep the definition chosen there. Stops once a few
+    /// expansions in a row hold nothing `novel`.
+    fn variants(&mut self, toks: &[T], pinned: &Choice, mut novel: impl FnMut(&[T]) -> bool) -> Vec<(Vec<T>, Choice)> {
+        let mut results: Vec<(Vec<T>, Choice)> = Vec::new();
+        let mut free: Vec<(Box<str>, usize)> = Vec::new();
+        let mut choice = pinned.clone();
+        let mut stale = 0;
+        for _ in 0..MAX_VARIANTS * 2 {
+            if stale >= BLIND_RUNS {
+                break;
+            }
+            stale += 1;
+            self.choice = choice.clone();
+            self.met.clear();
+            self.active.clear();
+            self.steps = 0;
+            let out = self.expand(toks.to_vec());
+            for m in self.met.drain(..) {
+                if !pinned.contains_key(&m.0) && !free.iter().any(|f| f.0 == m.0) {
+                    free.push(m);
+                }
+            }
+            if !results.iter().any(|r| r.0.len() == out.len() && r.0.iter().zip(&out).all(|(a, b)| a.text == b.text)) {
+                if novel(&out) {
+                    stale = 0;
+                }
+                results.push((out, self.choice.clone()));
+            }
+            if results.len() >= MAX_VARIANTS {
+                break;
+            }
+            // Next combination, the most recently met name turning fastest.
+            let mut k = free.len();
+            loop {
+                if k == 0 {
+                    return results;
+                }
+                k -= 1;
+                let c = choice.get(&free[k].0).copied().unwrap_or(0) + 1;
+                if c < free[k].1 {
+                    choice.insert(free[k].0.clone(), c);
+                    for f in &free[k + 1..] {
+                        choice.remove(&f.0);
+                    }
+                    break;
+                }
+            }
+        }
+        results
+    }
+}
+
+#[derive(Default)]
+struct Found {
+    /// The expansion is this one name.
+    single: Option<String>,
+    /// Declared in the expansion: name, kind, flags.
+    decls: Vec<(String, u8, u8)>,
+    /// Pasted names used in the expansion.
+    refs: Vec<(String, u8)>,
+}
+
+impl Found {
+    /// Add this expansion's names to `known`; was any of them new?
+    fn novel(self, known: &mut FxHashSet<String>) -> bool {
+        let names = self.single.into_iter().chain(self.decls.into_iter().map(|d| d.0)).chain(self.refs.into_iter().map(|r| r.0));
+        names.fold(false, |new, n| known.insert(n) || new)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.single.is_none() && self.decls.is_empty() && self.refs.is_empty()
+    }
+
+    /// What a definition whose name is this use is really called.
+    fn def_name(&self) -> Option<&str> {
+        self.single.as_deref().or(self.decls.iter().rev().find(|d| d.1 != kind::ENUM_CONST).map(|d| &*d.0))
+    }
+}
+
+/// Read the names out of one expansion of the use `s` of `macro_name`.
+fn recognise(toks: &[T], s: &Site, macro_name: &str) -> Found {
+    let mut found = Found::default();
+    let n = toks.len();
+    if n == 1 {
+        if toks[0].k == K::Ident && &*toks[0].text != macro_name && !is_keyword(toks[0].text.as_bytes()) {
+            found.single = Some(toks[0].text.to_string());
+            let kind = if s.flags & site::CALLED != 0 { refkind::CALL } else { refkind::USE };
+            found.refs.push((toks[0].text.to_string(), kind));
+        }
+        return found;
+    }
+    let in_fn = s.flags & site::IN_FN != 0;
+    let top = s.flags & site::TOP != 0;
+    let init = s.flags & site::INIT != 0;
+    let (mut paren, mut brace) = (0i32, 0i32);
+    let mut storage = 0u8;
+    for i in 0..n {
+        let t = &toks[i];
+        if t.k == K::Punct {
+            match &*t.text {
+                "(" => paren += 1,
+                ")" => paren -= 1,
+                "{" => brace += 1,
+                "}" => brace -= 1,
+                ";" if paren == 0 && brace == 0 => storage = 0,
+                _ => {}
+            }
+            continue;
+        }
+        if t.k != K::Ident {
+            continue;
+        }
+        match &*t.text {
+            "static" => storage |= flag::STATIC,
+            "extern" => storage |= flag::DECL,
+            _ => {}
+        }
+        if is_keyword(t.text.as_bytes()) {
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|j| &toks[j]);
+        let next = toks.get(i + 1);
+        let next_is = |s: &str| next.is_some_and(|x| x.is(s));
+        let name = || t.text.to_string();
+        if !in_fn && prev.is_some_and(is_tag) && next_is("{") {
+            let k = match &*prev.unwrap().text {
+                "enum" => kind::ENUM,
+                "struct" => kind::STRUCT,
+                _ => kind::UNION,
+            };
+            found.decls.push((name(), k, 0));
+            continue;
+        }
+        if !in_fn && paren == 0 && brace == 0 && prev.is_some_and(decl_prev) {
+            if next_is("(") {
+                let mut depth = 0;
+                let close = toks[i + 1..].iter().position(|x| {
+                    depth += x.is("(") as i32 - x.is(")") as i32;
+                    depth == 0
+                });
+                let after = close.and_then(|c| toks.get(i + 2 + c));
+                let defined = match after {
+                    Some(a) => a.is("{"),
+                    None => s.flags & site::BRACE_FOLLOWS != 0,
+                };
+                found.decls.push((name(), kind::FUNCTION, storage & flag::STATIC | if defined { 0 } else { flag::DECL }));
+                continue;
+            }
+            if top && (next.is_none() || ["=", ";", "[", ","].iter().any(|s| next_is(s))) {
+                found.decls.push((name(), kind::GLOBAL, storage));
+                continue;
+            }
+        }
+        if !in_fn && !init && i == 0 && (next_is("=") && toks[n - 1].is(",") || n == 2 && next_is(",") && !top) {
+            found.decls.push((name(), kind::ENUM_CONST, 0));
+            continue;
+        }
+        if t.origin == Origin::Pasted && !prev.is_some_and(|p| p.is(".") || p.is("->")) {
+            found.refs.push((name(), if next_is("(") { refkind::CALL } else { refkind::USE }));
+        }
+    }
+    found
+}
+
+/// Files that can be in a translation unit with `file`: whatever includes it,
+/// directly or not, and everything those include.
+fn visible(file: u32, fwd: &[Vec<u32>], rev: &[Vec<u32>]) -> Vec<bool> {
+    let mut up = vec![false; fwd.len()];
+    let mut all = vec![false; fwd.len()];
+    let mut stack = vec![file];
+    up[file as usize] = true;
+    while let Some(f) = stack.pop() {
+        stack.extend(rev[f as usize].iter().copied().filter(|&r| !std::mem::replace(&mut up[r as usize], true)));
+    }
+    stack.extend((0..fwd.len() as u32).filter(|&f| up[f as usize]));
+    for &f in &stack {
+        all[f as usize] = true;
+    }
+    while let Some(f) = stack.pop() {
+        stack.extend(fwd[f as usize].iter().copied().filter(|&t| !std::mem::replace(&mut all[t as usize], true)));
+    }
+    all
+}
+
+struct Names {
+    ids: FxHashMap<String, u32>,
+}
+
+impl Names {
+    fn id(&mut self, f: &mut FileFacts, s: &str) -> u32 {
+        if let Some(&id) = self.ids.get(s) {
+            return id;
+        }
+        let id = f.push_name(s);
+        self.ids.insert(s.to_string(), id);
+        id
+    }
+}
+
+fn site_tokens(f: &FileFacts, s: &Site) -> Vec<T> {
+    let mut toks = tokenize(f.name(s.name as usize).as_bytes(), Origin::Site);
+    if s.args != NONE {
+        toks.extend(tokenize(f.name(s.args as usize).as_bytes(), Origin::Site));
+    }
+    toks
+}
+
+fn expand_file(fi: usize, f: &FileFacts, table: &Table, fwd: &[Vec<u32>], rev: &[Vec<u32>]) -> Option<(FileFacts, u64, u64)> {
+    if f.sites.is_empty() {
+        return None;
+    }
+    let mut eng = Engine {
+        table,
+        visible: visible(fi as u32, fwd, rev),
+        cands: FxHashMap::default(),
+        choice: Choice::default(),
+        met: Vec::new(),
+        active: Vec::new(),
+        steps: 0,
+        hiding: FxHashMap::default(),
+    };
+    let mut out = f.clone();
+    let mut names = Names { ids: (0..f.n_names()).map(|i| (f.name(i).to_string(), i as u32)).collect() };
+    let (n_defs, n_refs) = (f.defs.len(), f.refs.len());
+
+    // 1. Definitions written under a macro's name: one per expansion.
+    let mut variants: FxHashMap<u32, Vec<(u32, Choice)>> = FxHashMap::default();
+    let live: Vec<&Site> = f.sites.iter().filter(|s| eng.hides(f.name(s.name as usize))).collect();
+    // A macro whose first uses here all expand to nothing of interest (a
+    // table row, typically) is not tried again in this file.
+    let mut barren: FxHashMap<u32, u32> = FxHashMap::default();
+    for s in live.iter().filter(|s| s.def != NONE) {
+        let toks = site_tokens(f, s);
+        let mut named: Vec<(String, Choice)> = Vec::new();
+        let mut known = FxHashSet::default();
+        let novel = |exp: &[T]| recognise(exp, s, f.name(s.name as usize)).novel(&mut known);
+        for (exp, choice) in eng.variants(&toks, &Choice::default(), novel) {
+            let found = recognise(&exp, s, f.name(s.name as usize));
+            if let Some(n) = found.def_name() {
+                if !named.iter().any(|x| x.0 == n) {
+                    named.push((n.to_string(), choice));
+                }
+            }
+        }
+        let base = out.defs[s.def as usize];
+        for (i, (n, choice)) in named.into_iter().enumerate() {
+            let name = names.id(&mut out, &n);
+            let idx = if i == 0 {
+                out.defs[s.def as usize].name = name;
+                s.def
+            } else {
+                out.defs.push(Def { name, ..base });
+                (out.defs.len() - 1) as u32
+            };
+            variants.entry(s.def).or_default().push((idx, choice));
+        }
+    }
+
+    // 2. Each of those has the whole body.
+    for r in &f.refs {
+        if let Some(v) = variants.get(&r.scope) {
+            out.refs.extend(v[1..].iter().map(|&(scope, _)| Ref { scope, ..*r }));
+        }
+    }
+
+    // 3. Every other use: the names its expansions make.
+    // A prototype and the definition it announces are two things.
+    let key = |d: &Def| (d.name, d.line, d.kind, d.flags & flag::DECL);
+    let mut seen_defs: FxHashSet<(u32, u32, u8, u8)> = out.defs.iter().map(key).collect();
+    let mut seen_refs: FxHashSet<(u32, u32, u32, u8)> = FxHashSet::default();
+    let here = [(0, Choice::default())];
+    for s in live.iter().filter(|s| s.def == NONE) {
+        if barren.get(&s.name).is_some_and(|&n| n >= BARREN_USES) {
+            continue;
+        }
+        let mut fruitful = false;
+        let toks = site_tokens(f, s);
+        let scopes = match variants.get(&s.scope) {
+            Some(v) => &v[..],
+            None => &here[..],
+        };
+        for (i, (scope, pinned)) in scopes.iter().enumerate() {
+            let scope = if variants.contains_key(&s.scope) { *scope } else { s.scope };
+            let mut known = FxHashSet::default();
+            let novel = |exp: &[T]| recognise(exp, s, f.name(s.name as usize)).novel(&mut known);
+            for (exp, _) in eng.variants(&toks, pinned, novel) {
+                let found = recognise(&exp, s, f.name(s.name as usize));
+                fruitful |= !found.is_empty();
+                for (n, kind) in found.refs {
+                    let name = names.id(&mut out, &n);
+                    if seen_refs.insert((name, s.line, scope, kind)) {
+                        out.refs.push(Ref { name, line: s.line, scope, kind });
+                    }
+                }
+                for (n, kind, flags) in found.decls {
+                    let name = names.id(&mut out, &n);
+                    let def = Def { name, line: s.line, end_line: s.line, kind, flags };
+                    if i == 0 && seen_defs.insert(key(&def)) {
+                        out.defs.push(def);
+                    }
+                }
+            }
+        }
+        let n = barren.entry(s.name).or_default();
+        *n = if fruitful { 0 } else { *n + 1 };
+    }
+
+    // Keep the definitions in line order, as the link expects.
+    let mut order: Vec<u32> = (1..out.defs.len() as u32).collect();
+    order.sort_by_key(|&i| out.defs[i as usize].line);
+    let mut new_index = vec![0u32; out.defs.len()];
+    let mut defs = vec![out.defs[0]];
+    for &old in &order {
+        new_index[old as usize] = defs.len() as u32;
+        defs.push(out.defs[old as usize]);
+    }
+    out.defs = defs;
+    for r in &mut out.refs {
+        r.scope = new_index[r.scope as usize];
+    }
+    out.sites.clear();
+    let added = ((out.defs.len() - n_defs) as u64, (out.refs.len() - n_refs) as u64);
+    Some((out, added.0, added.1))
+}
+
+/// Expand the macro uses recorded in `files`. Returns a replacement for each
+/// file that had any, and (uses, definitions added, references added).
+pub fn expand(files: &[FileFacts], includes: &[Vec<u32>]) -> (Vec<Option<FileFacts>>, (u64, u64, u64)) {
+    let sites: u64 = files.iter().map(|f| f.sites.len() as u64).sum();
+    if sites == 0 {
+        return (files.iter().map(|_| None).collect(), (0, 0, 0));
+    }
+    let mut by_name: FxHashMap<&str, Vec<(u32, u32)>> = FxHashMap::default();
+    for (fi, f) in files.iter().enumerate() {
+        for (i, m) in f.macros.iter().enumerate() {
+            by_name.entry(f.name(m.name as usize)).or_default().push((fi as u32, i as u32));
+        }
+    }
+    let parsed: Vec<Vec<Parsed>> = files
+        .par_iter()
+        .map(|f| f.macros.iter().map(|m| parse(f.name(m.text as usize), m.function_like)).collect())
+        .collect();
+    let table = Table { files, by_name, parsed };
+    let mut rev: Vec<Vec<u32>> = vec![Vec::new(); files.len()];
+    for (from, tos) in includes.iter().enumerate() {
+        for &to in tos {
+            rev[to as usize].push(from as u32);
+        }
+    }
+    let done: Vec<Option<(FileFacts, u64, u64)>> =
+        files.par_iter().enumerate().map(|(fi, f)| expand_file(fi, f, &table, includes, &rev)).collect();
+    let (mut defs, mut refs) = (0, 0);
+    let out = done
+        .into_iter()
+        .map(|d| {
+            d.map(|(f, nd, nr)| {
+                defs += nd;
+                refs += nr;
+                f
+            })
+        })
+        .collect();
+    (out, (sites, defs, refs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn texts(toks: &[T]) -> String {
+        toks.iter().map(|t| &*t.text).collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn what_hides_names() {
+        let p: [&[u8]; 2] = [b"x", b"y"];
+        for (body, want) in [
+            ("x ## _ ## y", true),
+            ("static const char *x (unsigned long rtype) { switch (rtype) {", true),
+            ("enum x {", true),
+            ("x = y,", true),
+            ("x,", true),
+            ("x (a) x (b)", true),
+            ("struct mutex x = INIT (x)", true),
+            ("((x) > (y) ? (x) : (y))", false),
+            ("printf (x, ## y)", false),
+            ("return x;", false),
+            ("do { x = y; } while (0)", false),
+            ("case y: return #x;", false),
+        ] {
+            assert_eq!(hides_names(body.as_bytes(), &p), want, "{body}");
+        }
+    }
+
+    #[test]
+    fn pasting_stringifying_and_rescanning() {
+        let macros = [
+            ("CAT", "(a,b) XCAT (a, b)", true),
+            ("XCAT", "(a,b) a ## b", true),
+            ("SIZE", " 32", false),
+            ("NAME", "(x) CAT (x, SIZE)", true),
+            ("STR", "(x) #x", true),
+            ("LOG", "(fmt, ...) printf (fmt, ## __VA_ARGS__)", true),
+            ("SELF", " SELF + 1", false),
+        ];
+        let mut f = FileFacts::new("a.c".into());
+        for (name, text, function_like) in macros {
+            let (name, text) = (f.push_name(name), f.push_name(text));
+            f.macros.push(crate::model::MacroBody { name, text, function_like });
+        }
+        let files = [f];
+        let parsed = vec![files[0].macros.iter().map(|m| parse(files[0].name(m.text as usize), m.function_like)).collect()];
+        let mut by_name: FxHashMap<&str, Vec<(u32, u32)>> = FxHashMap::default();
+        for (i, m) in files[0].macros.iter().enumerate() {
+            by_name.entry(files[0].name(m.name as usize)).or_default().push((0, i as u32));
+        }
+        let table = Table { files: &files, by_name, parsed };
+        let mut eng = Engine {
+            table: &table,
+            visible: vec![true],
+            cands: FxHashMap::default(),
+            choice: Choice::default(),
+            met: Vec::new(),
+            active: Vec::new(),
+            steps: 0,
+            hiding: FxHashMap::default(),
+        };
+        for (src, want) in [
+            ("NAME (elf)", "elf32"),
+            ("XCAT (elf, SIZE)", "elfSIZE"),
+            ("STR (a b)", "\"\""),
+            ("LOG (\"x\")", "printf ( \"x\" )"),
+            ("LOG (\"x\", 1, 2)", "printf ( \"x\" , 1 , 2 )"),
+            ("SELF", "SELF + 1"),
+            ("CAT", "CAT"),
+        ] {
+            let v = eng.variants(&tokenize(src.as_bytes(), Origin::Site), &Choice::default(), |_| true);
+            assert_eq!(texts(&v[0].0), want, "{src}");
+        }
+    }
+}

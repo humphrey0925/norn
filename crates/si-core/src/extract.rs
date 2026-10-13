@@ -1,7 +1,7 @@
 //! Single-file extraction: lexical mask, tree-sitter parse, one preorder walk. O(tokens).
 
-use crate::mask::{self, Event, Tok, Transparent};
-use crate::model::{flag, kind, refkind, Def, FileFacts, Ref};
+use crate::mask::{self, Event, Tok, MacroSets};
+use crate::model::{flag, kind, refkind, site, Def, FileFacts, MacroBody, Ref, Site, NONE};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::num::NonZeroU16;
 use tree_sitter::{Language, Node, Parser};
@@ -80,6 +80,9 @@ struct Walk<'a> {
     skip: FxHashSet<usize>,
     locals: FxHashSet<&'a [u8]>,
     scope: Option<Scope>,
+    /// Name position of each expanding-macro use, and the definition it
+    /// turned out to name.
+    site_defs: FxHashMap<usize, u32>,
 }
 
 impl Default for Extractor {
@@ -97,7 +100,7 @@ impl Extractor {
     }
 
     /// The facts depend on the file's content and on `transparent`.
-    pub fn extract(&mut self, path: &str, src: &[u8], transparent: &Transparent) -> FileFacts {
+    pub fn extract(&mut self, path: &str, src: &[u8], transparent: &MacroSets) -> FileFacts {
         let mut out = FileFacts::new(path.to_string());
         out.hash = xxhash_rust::xxh3::xxh3_64(src);
         out.bytes = src.len() as u32;
@@ -135,6 +138,14 @@ impl Extractor {
             skip: FxHashSet::default(),
             locals: FxHashSet::default(),
             scope: None,
+            site_defs: lexed
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Site(s) => Some((s.name.start as usize, NONE)),
+                    _ => None,
+                })
+                .collect(),
         };
         let mut cursor = root.walk();
         'outer: loop {
@@ -172,6 +183,9 @@ impl<'a> Walk<'a> {
 
     fn push_def(&mut self, name: Node, span: Node, kind: u8, flags: u8) -> u32 {
         self.skip.insert(name.start_byte());
+        if let Some(slot) = self.site_defs.get_mut(&name.start_byte()) {
+            *slot = self.out.defs.len() as u32;
+        }
         let name = self.intern(self.text(name));
         self.out.defs.push(Def {
             name,
@@ -203,6 +217,24 @@ impl<'a> Walk<'a> {
                     for t in &m.refs {
                         self.push_tok_ref(t, scope);
                     }
+                    if m.keep {
+                        let text = String::from_utf8_lossy(&self.orig[m.name.end as usize..m.end as usize]);
+                        let text = self.out.push_name(&text);
+                        self.out.macros.push(MacroBody { name, text, function_like: m.name.call });
+                    }
+                }
+                Event::Site(s) => {
+                    let name = self.intern(self.tok_text(&s.name));
+                    let args = if s.args_end == 0 {
+                        NONE
+                    } else {
+                        let text = String::from_utf8_lossy(&self.orig[s.name.end as usize..s.args_end as usize]);
+                        self.out.push_name(&text)
+                    };
+                    let flags = s.flags | if self.in_fn() { site::IN_FN } else { 0 };
+                    let def = self.site_defs[&(s.name.start as usize)];
+                    let scope = self.scope.map_or(0, |s| s.def);
+                    self.out.sites.push(Site { name, args, line: s.name.line, scope, def, flags });
                 }
                 Event::Ref(t) => {
                     if !(self.in_fn() && self.locals.contains(self.tok_text(t))) {

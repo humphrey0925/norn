@@ -23,6 +23,11 @@ pub struct LinkStats {
     pub includes_found: u64,
     pub includes_missing: u64,
     pub include_ms: f64,
+    /// Uses of expanding macros, and what expanding them added.
+    pub sites: u64,
+    pub expanded_defs: u64,
+    pub expanded_refs: u64,
+    pub expand_ms: f64,
     pub intern_ms: f64,
     pub syms_ms: f64,
     pub resolve_ms: f64,
@@ -152,13 +157,25 @@ impl Closure {
 pub fn link(files: &[FileFacts]) -> (Graph, LinkStats) {
     let mut stats = LinkStats::default();
 
+    // 0. Which file includes which, then macro expansion: it needs the
+    //    definitions other files give, and adds definitions and references.
+    let t = Instant::now();
+    let includes = include_edges(files, &mut stats);
+    stats.include_ms = ms(t);
+    let t = Instant::now();
+    let (expanded, counts) = crate::expand::expand(files, &includes);
+    (stats.sites, stats.expanded_defs, stats.expanded_refs) = counts;
+    stats.expand_ms = ms(t);
+    let files: Vec<&FileFacts> = files.iter().zip(&expanded).map(|(f, e)| e.as_ref().unwrap_or(f)).collect();
+    let files = &files[..];
+
     // 1. Intern every file-local name into one global table, then sort it so
     //    that a name id is its lexicographic rank.
     let t = Instant::now();
     let mut map: FxHashMap<&str, u32> = FxHashMap::default();
     let mut names: Vec<&str> = Vec::new();
     let mut remap: Vec<Vec<u32>> = Vec::with_capacity(files.len());
-    for f in files {
+    for &f in files {
         let mut r = Vec::with_capacity(f.n_names());
         for i in 0..f.n_names() {
             let s = f.name(i);
@@ -220,10 +237,6 @@ pub fn link(files: &[FileFacts]) -> (Graph, LinkStats) {
         *slot += 1;
     }
     stats.syms_ms = ms(t);
-
-    let t = Instant::now();
-    let includes = include_edges(files, &mut stats);
-    stats.include_ms = ms(t);
 
     // 3. Resolve references. Each file is independent given the symbol table.
     //    A name means, in order: a definition in this file; one in a file it
@@ -321,11 +334,11 @@ pub fn link(files: &[FileFacts]) -> (Graph, LinkStats) {
 mod tests {
     use super::*;
     use crate::extract::Extractor;
-    use crate::mask::Transparent;
+    use crate::mask::MacroSets;
 
     fn graph(files: &[(&str, &str)]) -> Graph {
         let mut ex = Extractor::new();
-        let t = Transparent::default();
+        let t = MacroSets::default();
         let facts: Vec<FileFacts> = files.iter().map(|(path, src)| ex.extract(path, src.as_bytes(), &t)).collect();
         link(&facts).0
     }

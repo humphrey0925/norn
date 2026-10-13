@@ -1,5 +1,6 @@
 //! Code-intelligence core: per-file extraction, global link, pluggable stores.
 
+pub mod expand;
 pub mod extract;
 pub mod graph;
 pub mod link;
@@ -8,7 +9,7 @@ pub mod model;
 pub mod packed;
 pub mod sqlite;
 
-use mask::Transparent;
+use mask::MacroSets;
 use model::FileFacts;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -31,20 +32,21 @@ pub fn rel_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/")
 }
 
-/// Corpus-wide pre-pass: which macros can be dropped before parsing.
-pub fn prescan(files: &[PathBuf]) -> Transparent {
+/// Corpus-wide pre-pass: which macros can be dropped before parsing, and
+/// which have to be expanded.
+pub fn prescan(files: &[PathBuf]) -> MacroSets {
     let defines: Vec<Vec<mask::Define>> =
         files.par_iter().map(|p| mask::defines(&std::fs::read(p).unwrap_or_default())).collect();
-    Transparent::from_defines(defines.into_iter().flatten())
+    MacroSets::from_defines(defines.into_iter().flatten())
 }
 
-pub fn extract_file(ex: &mut extract::Extractor, root: &Path, path: &Path, transparent: &Transparent) -> FileFacts {
+pub fn extract_file(ex: &mut extract::Extractor, root: &Path, path: &Path, transparent: &MacroSets) -> FileFacts {
     let src = std::fs::read(path).unwrap_or_default();
     ex.extract(&rel_path(root, path), &src, transparent)
 }
 
 /// Extract all files on the current rayon pool; output order matches `files`.
-pub fn extract_all(root: &Path, files: &[PathBuf], transparent: &Transparent) -> Vec<FileFacts> {
+pub fn extract_all(root: &Path, files: &[PathBuf], transparent: &MacroSets) -> Vec<FileFacts> {
     files.par_iter().map_init(extract::Extractor::new, |ex, p| extract_file(ex, root, p, transparent)).collect()
 }
 

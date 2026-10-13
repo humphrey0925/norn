@@ -18,7 +18,7 @@
 //! Blanking overwrites bytes with spaces and keeps newlines, so every byte
 //! offset and line number in the masked text matches the original.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// An identifier occurrence found lexically.
 #[derive(Clone, Copy, Debug)]
@@ -36,6 +36,22 @@ pub struct Macro {
     pub end_line: u32,
     /// References in the body, parameters excluded.
     pub refs: Vec<Tok>,
+    /// End of the directive: the parameter list and body are the text from
+    /// the end of the name to here.
+    pub end: u32,
+    /// Whether expansion may need this body (see [`MacroSets`]).
+    pub keep: bool,
+}
+
+/// A use of an *expanding* macro: one whose expansion holds names that are
+/// not written at the use.
+#[derive(Clone, Copy, Debug)]
+pub struct SiteTok {
+    pub name: Tok,
+    /// End of the argument list, or 0 if the name stands alone.
+    pub args_end: u32,
+    /// `model::site` bits known lexically.
+    pub flags: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +59,7 @@ pub enum Event {
     Macro(Macro),
     /// A reference that was blanked out of the parser's view.
     Ref(Tok),
+    Site(SiteTok),
 }
 
 impl Event {
@@ -50,6 +67,7 @@ impl Event {
         match self {
             Event::Macro(m) => m.name.start as usize,
             Event::Ref(t) => t.start as usize,
+            Event::Site(s) => s.name.start as usize,
         }
     }
 }
@@ -73,25 +91,49 @@ pub struct Define {
     pub name: Vec<u8>,
     pub function_like: bool,
     pub deps: Option<Vec<Vec<u8>>>,
+    /// The body makes or declares names (`a ## b`, `int name;`, `X (a)`).
+    pub hides: bool,
+    /// Names the body refers to.
+    pub refs: Vec<Vec<u8>>,
 }
 
-/// Macros that can be deleted from the token stream without changing how the
-/// surrounding code parses. Value: whether the macro takes arguments.
+/// What the corpus-wide pre-pass learns about macros, by name.
+///
+/// * *Transparent* macros can be deleted from the token stream without
+///   changing how the surrounding code parses.
+/// * *Expanding* macros have to be expanded where they are used, because the
+///   expansion holds names that are written nowhere: pasted (`a ## b`),
+///   declared from an argument (`int name;`), or made by a macro passed in.
+///   A macro that uses an expanding macro is one too.
+/// * *Kept* macros are those an expansion can reach; only their bodies are
+///   carried in the facts.
+///
+/// Values: whether the macro takes arguments.
 #[derive(Default)]
-pub struct Transparent(FxHashMap<Vec<u8>, bool>);
+pub struct MacroSets {
+    transparent: FxHashMap<Vec<u8>, bool>,
+    expanding: FxHashMap<Vec<u8>, bool>,
+    kept: FxHashSet<Vec<u8>>,
+}
 
 const ATTRIBUTE_KEYWORDS: [&[u8]; 5] = [b"__attribute__", b"__attribute", b"__declspec", b"__extension__", b"_Noreturn"];
 
-impl Transparent {
+impl MacroSets {
     /// A macro is transparent when every one of its definitions is, which is
     /// a fixed point because attribute macros are defined in terms of others.
     pub fn from_defines(defines: impl IntoIterator<Item = Define>) -> Self {
         let mut by_name: FxHashMap<Vec<u8>, (bool, Vec<Option<Vec<Vec<u8>>>>)> = FxHashMap::default();
+        // name -> (takes arguments, hides names, names its bodies refer to)
+        let mut bodies: FxHashMap<Vec<u8>, (bool, bool, Vec<Vec<u8>>)> = FxHashMap::default();
         for d in defines {
             // `#define inline` and the like: the keyword still matters to us.
             if is_keyword(&d.name) {
                 continue;
             }
+            let b = bodies.entry(d.name.clone()).or_default();
+            b.0 |= d.function_like;
+            b.1 |= d.hides;
+            b.2.extend(d.refs);
             let e = by_name.entry(d.name).or_default();
             e.0 |= d.function_like;
             e.1.push(d.deps);
@@ -110,24 +152,62 @@ impl Transparent {
             }
             set.extend(added);
         }
-        Transparent(set)
+        // Expanding: least fixed point over "uses an expanding macro".
+        let mut users: FxHashMap<&[u8], Vec<&[u8]>> = FxHashMap::default();
+        for (name, (_, _, refs)) in &bodies {
+            for r in refs {
+                users.entry(r).or_default().push(name);
+            }
+        }
+        let mut expanding: FxHashMap<Vec<u8>, bool> = FxHashMap::default();
+        let mut work: Vec<&[u8]> =
+            bodies.iter().filter(|(n, b)| b.1 && !set.contains_key(*n)).map(|(n, _)| &n[..]).collect();
+        while let Some(name) = work.pop() {
+            if expanding.insert(name.to_vec(), bodies[name].0).is_none() {
+                work.extend(users.get(name).into_iter().flatten().filter(|u| !set.contains_key(**u)));
+            }
+        }
+        // Kept: everything those bodies can reach.
+        let mut kept: FxHashSet<Vec<u8>> = FxHashSet::default();
+        let mut work: Vec<&[u8]> = expanding.keys().map(|n| &n[..]).collect();
+        while let Some(name) = work.pop() {
+            if let Some((key, b)) = bodies.get_key_value(name) {
+                if kept.insert(key.clone()) {
+                    work.extend(b.2.iter().map(|r| &r[..]));
+                }
+            }
+        }
+        MacroSets { transparent: set, expanding, kept }
     }
 
+    /// Number of transparent macros.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.transparent.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.transparent.is_empty()
     }
 
+    /// Is `name` a transparent macro?
     pub fn contains(&self, name: &[u8]) -> bool {
-        self.0.contains_key(name)
+        self.transparent.contains_key(name)
+    }
+
+    pub fn expanding_len(&self) -> usize {
+        self.expanding.len()
+    }
+
+    pub fn is_expanding(&self, name: &[u8]) -> bool {
+        self.expanding.contains_key(name)
     }
 
     /// Order-independent digest, so cached facts can be keyed on it.
     pub fn digest(&self) -> u64 {
-        self.0.iter().fold(0, |acc, (k, v)| acc ^ xxhash_rust::xxh3::xxh3_64_with_seed(k, *v as u64))
+        let h = |k: &Vec<u8>, seed: u64| xxhash_rust::xxh3::xxh3_64_with_seed(k, seed);
+        self.transparent.iter().fold(0, |acc, (k, v)| acc ^ h(k, *v as u64))
+            ^ self.expanding.iter().fold(0, |acc, (k, v)| acc ^ h(k, 2 + *v as u64))
+            ^ self.kept.iter().fold(0, |acc, k| acc ^ h(k, 4))
     }
 }
 
@@ -139,7 +219,7 @@ fn is_ident(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-fn is_keyword(s: &[u8]) -> bool {
+pub(crate) fn is_keyword(s: &[u8]) -> bool {
     matches!(
         s,
         b"auto" | b"break" | b"case" | b"char" | b"const" | b"continue" | b"default" | b"do" | b"double" | b"else"
@@ -377,7 +457,7 @@ struct Cond {
 
 struct Lexer<'a> {
     c: Cur<'a>,
-    transparent: &'a Transparent,
+    transparent: &'a MacroSets,
     out: Lexed,
     defines: Option<Vec<Define>>,
     nest: Nest,
@@ -596,7 +676,10 @@ impl<'a> Lexer<'a> {
         let line = self.c.line;
         let (a, e) = self.c.ident();
         self.prev = b'a';
-        let Some(&function_like) = self.transparent.0.get(&s[a..e]) else { return };
+        if let Some(&function_like) = self.transparent.expanding.get(&s[a..e]) {
+            self.site(Tok { start: a as u32, end: e as u32, line, call: false }, function_like);
+        }
+        let Some(&function_like) = self.transparent.transparent.get(&s[a..e]) else { return };
         let mut tok = Tok { start: a as u32, end: e as u32, line, call: false };
         let mut end = e;
         if function_like {
@@ -617,6 +700,37 @@ impl<'a> Lexer<'a> {
         }
         self.out.events.push(Event::Ref(tok));
         blank(&mut self.out.masked, a, end);
+    }
+
+    /// Just past the name of an expanding macro: note the use and its
+    /// arguments. The cursor does not move, so the arguments are still read
+    /// as ordinary code.
+    fn site(&mut self, name: Tok, function_like: bool) {
+        use crate::model::site;
+        let save = (self.c.i, self.c.line);
+        let mut args_end = 0;
+        if function_like {
+            self.c.skip_space(true);
+            if self.c.peek(0) == b'(' && self.c.skip_parens() {
+                args_end = self.c.i as u32;
+            } else {
+                (self.c.i, self.c.line) = save;
+            }
+        }
+        self.c.skip_space(true);
+        let mut flags = match self.c.peek(0) {
+            b'(' => site::CALLED,
+            b'{' => site::BRACE_FOLLOWS,
+            _ => 0,
+        };
+        (self.c.i, self.c.line) = save;
+        if self.nest.braces.is_empty() && self.nest.parens == 0 {
+            flags |= site::TOP;
+        }
+        if self.nest.braces.last().is_some_and(|b| b.0 == Brace::Init) {
+            flags |= site::INIT;
+        }
+        self.out.events.push(Event::Site(SiteTok { name, args_end, flags }));
     }
 
     fn directive(&mut self) {
@@ -718,10 +832,17 @@ impl<'a> Lexer<'a> {
         let mut refs = Vec::new();
         scan_refs(s, body, end, line, &params, &mut refs);
         if let Some(defines) = &mut self.defines {
-            defines.push(Define { name: s[a..e].to_vec(), function_like, deps: transparent_deps(s, body, end, &refs) });
+            defines.push(Define {
+                name: s[a..e].to_vec(),
+                function_like,
+                deps: transparent_deps(s, body, end, &refs),
+                hides: crate::expand::hides_names(&s[body..end], &params),
+                refs: refs.iter().map(|t| s[t.start as usize..t.end as usize].to_vec()).collect(),
+            });
         }
         let name = Tok { start: a as u32, end: e as u32, line, call: function_like };
-        self.out.events.push(Event::Macro(Macro { name, end_line, refs }));
+        let keep = self.transparent.kept.contains(&s[a..e]);
+        self.out.events.push(Event::Macro(Macro { name, end_line, refs, end: end as u32, keep }));
     }
 }
 
@@ -755,7 +876,7 @@ fn transparent_deps(s: &[u8], start: usize, end: usize, refs: &[Tok]) -> Option<
     }
 }
 
-fn lexer<'a>(src: &'a [u8], transparent: &'a Transparent, mask: bool) -> Lexer<'a> {
+fn lexer<'a>(src: &'a [u8], transparent: &'a MacroSets, mask: bool) -> Lexer<'a> {
     Lexer {
         c: Cur { s: src, i: 0, line: 1 },
         transparent,
@@ -771,16 +892,16 @@ fn lexer<'a>(src: &'a [u8], transparent: &'a Transparent, mask: bool) -> Lexer<'
 }
 
 /// Mask `src` for parsing and report what was hidden.
-pub fn lex(src: &[u8], transparent: &Transparent) -> Lexed {
+pub fn lex(src: &[u8], transparent: &MacroSets) -> Lexed {
     let mut l = lexer(src, transparent, true);
     l.run();
     l.out
 }
 
-/// The `#define`s of one file, for building the [`Transparent`] set.
+/// The `#define`s of one file, for building the [`MacroSets`] set.
 pub fn defines(src: &[u8]) -> Vec<Define> {
-    static NONE: std::sync::OnceLock<Transparent> = std::sync::OnceLock::new();
-    let mut l = lexer(src, NONE.get_or_init(Transparent::default), false);
+    static NONE: std::sync::OnceLock<MacroSets> = std::sync::OnceLock::new();
+    let mut l = lexer(src, NONE.get_or_init(MacroSets::default), false);
     l.defines = Some(Vec::new());
     l.run();
     l.defines.unwrap_or_default()
@@ -790,11 +911,11 @@ pub fn defines(src: &[u8]) -> Vec<Define> {
 mod tests {
     use super::*;
 
-    fn transparent(src: &str) -> Transparent {
-        Transparent::from_defines(defines(src.as_bytes()))
+    fn transparent(src: &str) -> MacroSets {
+        MacroSets::from_defines(defines(src.as_bytes()))
     }
 
-    fn masked(src: &str, t: &Transparent) -> String {
+    fn masked(src: &str, t: &MacroSets) -> String {
         String::from_utf8(lex(src.as_bytes(), t).masked).unwrap()
     }
 
@@ -822,7 +943,7 @@ mod tests {
         assert_eq!(String::from_utf8(l.masked).unwrap().replace(' ', ""), "intf(bfd*abfd);\n");
         let names: Vec<&str> = l.events.iter().map(|e| match e {
             Event::Ref(t) => &src[t.start as usize..t.end as usize],
-            Event::Macro(_) => "?",
+            Event::Macro(_) | Event::Site(_) => "?",
         }).collect();
         assert_eq!(names, ["UNUSED", "NONNULL", "g"]);
     }
@@ -830,7 +951,7 @@ mod tests {
     #[test]
     fn defines_are_recorded_with_body_references() {
         let src = "#define CALL(x, f) \\\n  do_it (x->field, #f, pre##x, helper) /* c */\nint y;\n";
-        let l = lex(src.as_bytes(), &Transparent::default());
+        let l = lex(src.as_bytes(), &MacroSets::default());
         assert_eq!(String::from_utf8(l.masked).unwrap().trim_start(), "int y;\n");
         let Event::Macro(m) = &l.events[0] else { panic!() };
         assert_eq!((m.name.line, m.end_line, m.name.call), (1, 2, true));
@@ -840,7 +961,7 @@ mod tests {
 
     #[test]
     fn directives_are_hidden_only_where_the_grammar_rejects_them() {
-        let t = Transparent::default();
+        let t = MacroSets::default();
         let src = "#ifdef A\nint a;\n#endif\nint t[] = {\n#ifdef A\n 1,\n#else\n 2,\n#endif\n};\nvoid f () {\n#ifdef A\n g (1\n#if B\n , 2\n#endif\n );\n#endif\n}\n";
         let m = masked(src, &t);
         let kept: Vec<&str> = m.lines().filter(|l| l.starts_with('#')).collect();
@@ -861,7 +982,7 @@ mod tests {
 #endif
 }
 ";
-        let m = masked(src, &Transparent::default());
+        let m = masked(src, &MacroSets::default());
         let kept: Vec<&str> = m.lines().filter(|l| l.starts_with('#')).collect();
         assert_eq!(kept, ["#ifdef B", "#endif"], "{m}");
     }
@@ -869,13 +990,13 @@ mod tests {
     #[test]
     fn alternative_branches_do_not_unbalance_nesting() {
         let src = "#if A\nvoid f (int a\n#else\nvoid f (long a\n#endif\n ) { }\n#ifdef B\nint b;\n#endif\n";
-        let m = masked(src, &Transparent::default());
+        let m = masked(src, &MacroSets::default());
         assert!(m.contains("#ifdef B"), "{m}");
     }
 
     #[test]
     fn continued_strings_become_adjacent_literals() {
-        let t = Transparent::default();
+        let t = MacroSets::default();
         for (src, want) in [
             ("f (\"ab\\\ncd\\n\");", "f (\"ab\"\n\"d\\n\");"),
             ("f (\"ab\\\n\");", "f (\"ab\"\n );"),
@@ -890,13 +1011,13 @@ mod tests {
     #[test]
     fn table_rows_in_column_zero_stay_inside_the_initializer() {
         let src = "T t[] = {\n{\n#ifdef A\n 1,\n#endif\n 2},\n};\nvoid f ()\n{\n#ifdef A\n g ();\n#endif\n}\n";
-        let m = masked(src, &Transparent::default());
+        let m = masked(src, &MacroSets::default());
         assert_eq!(m.lines().filter(|l| l.starts_with('#')).count(), 2, "{m}");
     }
 
     #[test]
     fn operator_arguments_become_zero() {
-        let t = Transparent::default();
+        let t = MacroSets::default();
         for (src, want) in [
             ("BOP (LSHIFT, <<);", "BOP (LSHIFT, 0 );"),
             ("BOPN ('<', <);", "BOPN ('<', 0);"),
@@ -916,7 +1037,7 @@ void f ()
 }
 struct s { int a; };
 ";
-        let l = lex(src.as_bytes(), &Transparent::default());
+        let l = lex(src.as_bytes(), &MacroSets::default());
         let got: Vec<(&str, u32)> = l.blocks.iter().map(|&(a, e, line)| (&src[a as usize..e as usize], line)).collect();
         assert_eq!(got, [("{
   if (x) { g (); }
@@ -926,7 +1047,7 @@ struct s { int a; };
     #[test]
     fn includes_are_collected() {
         let src = "#include \"a/b.h\"\n# include <c.h> /* x */\n";
-        let l = lex(src.as_bytes(), &Transparent::default());
+        let l = lex(src.as_bytes(), &MacroSets::default());
         let got: Vec<&str> = l.includes.iter().map(|&(a, e)| &src[a as usize..e as usize]).collect();
         assert_eq!(got, ["a/b.h", "c.h"]);
     }

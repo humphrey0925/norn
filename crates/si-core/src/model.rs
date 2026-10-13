@@ -43,6 +43,45 @@ pub mod refkind {
     pub const USE: u8 = 1;
 }
 
+pub const NONE: u32 = u32::MAX;
+
+/// Where a use of an expanding macro stands.
+pub mod site {
+    /// The whole use is directly followed by `(`.
+    pub const CALLED: u8 = 1;
+    /// Inside a function body.
+    pub const IN_FN: u8 = 2;
+    /// Outside every bracket, lexically.
+    pub const TOP: u8 = 4;
+    /// The whole use is directly followed by `{`.
+    pub const BRACE_FOLLOWS: u8 = 8;
+    /// Inside an initializer's braces.
+    pub const INIT: u8 = 16;
+}
+
+/// The text of a `#define` an expansion may need: `text` is everything after
+/// the name, parameter list included.
+#[derive(Clone, Copy, Debug)]
+pub struct MacroBody {
+    pub name: u32,
+    pub text: u32,
+    pub function_like: bool,
+}
+
+/// A use of an expanding macro, to be expanded at link time, when the
+/// definitions in other files are known.
+#[derive(Clone, Copy, Debug)]
+pub struct Site {
+    pub name: u32,
+    /// The argument list as written, parentheses included, or `NONE`.
+    pub args: u32,
+    pub line: u32,
+    pub scope: u32,
+    /// The definition this use names (`NAME (a, b) (void) { }`), or `NONE`.
+    pub def: u32,
+    pub flags: u8,
+}
+
 /// A definition found in one file. `name` indexes the file-local name table.
 #[derive(Clone, Copy, Debug)]
 pub struct Def {
@@ -83,6 +122,8 @@ pub struct FileFacts {
     pub refs: Vec<Ref>,
     /// `#include` operands as written, as file-local name ids.
     pub includes: Vec<u32>,
+    pub macros: Vec<MacroBody>,
+    pub sites: Vec<Site>,
 }
 
 impl FileFacts {
@@ -111,6 +152,8 @@ impl FileFacts {
             + self.defs.capacity() * std::mem::size_of::<Def>()
             + self.refs.capacity() * std::mem::size_of::<Ref>()
             + self.includes.capacity() * 4
+            + self.macros.capacity() * std::mem::size_of::<MacroBody>()
+            + self.sites.capacity() * std::mem::size_of::<Site>()
     }
 }
 
