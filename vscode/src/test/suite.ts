@@ -95,6 +95,36 @@ export async function run(): Promise<void> {
   await vscode.commands.executeCommand("si.scope.focus");
   await vscode.commands.executeCommand("si.sync");
 
+  // Checking is only a draft: clear everything, and nothing changes until
+  // Apply; then nothing is indexed; pick one folder and apply again.
+  await vscode.commands.executeCommand("si.scope.clearAll");
+  assert.strictEqual(await vscode.commands.executeCommand("si.scope.pending"), true);
+  assert.ok(await has("bfd_cache_init"), "not applied yet");
+  await vscode.commands.executeCommand("si.scope.apply");
+  assert.ok(!(await has("bfd_cache_init")) && !(await has("ATTRIBUTE_UNUSED")), "nothing indexed");
+  await vscode.commands.executeCommand("si.scope.include", vscode.Uri.file(path.join(folder, "bfd")));
+  assert.ok((await has("bfd_cache_init")) && !(await has("ATTRIBUTE_UNUSED")));
+  const picked = JSON.parse(Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(folder, ".si", "config.json")))).toString());
+  assert.deepStrictEqual(picked, { include: ["bfd"], exclude: ["."] });
+  await vscode.commands.executeCommand("si.scope.selectAll");
+  await vscode.commands.executeCommand("si.scope.discard");
+  assert.strictEqual(await vscode.commands.executeCommand("si.scope.pending"), false);
+  await vscode.commands.executeCommand("si.scope.selectAll");
+  await vscode.commands.executeCommand("si.scope.apply");
+  assert.ok(await has("ATTRIBUTE_UNUSED"));
+
+  // The index is kept in the workspace, and git is told to leave it alone.
+  assert.ok((await vscode.workspace.fs.stat(vscode.Uri.file(path.join(folder, ".si", "cache", "manifest")))).size > 0);
+  const ignore = Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(folder, ".si", ".gitignore")))).toString();
+  assert.ok(ignore.includes("/cache/"), ignore);
+
+  // Views dragged elsewhere can be put back with one command.
+  const commands = await vscode.commands.getCommands(true);
+  for (const view of ["si.search", "si.fileSymbols", "si.scope", "si.relation", "si.context"]) {
+    assert.ok(commands.includes(`${view}.resetViewLocation`), `${view} can be reset`);
+  }
+  await vscode.commands.executeCommand("si.resetLayout");
+
   // Saving an edit re-indexes it.
   const edit = new vscode.WorkspaceEdit();
   edit.insert(doc.uri, new vscode.Position(doc.lineCount, 0), "\nint si_probe (void) { return 0; }\n");

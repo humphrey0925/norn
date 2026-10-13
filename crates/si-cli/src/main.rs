@@ -113,8 +113,8 @@ enum Cmd {
 /// Whether and where a live index is kept between runs.
 #[derive(clap::Args, Clone)]
 struct Keep {
-    /// Where to keep the index between runs (default: the user's cache
-    /// directory, by the root's path).
+    /// Where to keep the index between runs (default: `.si/cache` under
+    /// the root).
     #[arg(long)]
     cache_dir: Option<PathBuf>,
     /// Index from scratch every time and keep nothing.

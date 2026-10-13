@@ -281,8 +281,25 @@ class ScopeTree implements vscode.TreeDataProvider<string> {
   private readonly changed = new vscode.EventEmitter<string | undefined>();
   readonly onDidChangeTreeData = this.changed.event;
   scope: ScopeState = { include: [], exclude: [], config: "" };
+  /** Checkboxes changed but not applied yet: nothing is indexed anew until
+   *  Apply, so a selection can be put together first. */
+  draft: { include: string[]; exclude: string[] } | undefined;
 
-  constructor(private readonly afterSync: (r: Synced, what: string) => void) {}
+  constructor(
+    private readonly afterSync: (r: Synced, what: string) => void,
+    private readonly onDraft: (pending: boolean) => void,
+  ) {}
+
+  /** What the checkboxes show: the draft, or what is in force. */
+  private shown(): ScopeState {
+    return this.draft ? { ...this.draft, config: this.scope.config } : this.scope;
+  }
+
+  private setDraft(draft: { include: string[]; exclude: string[] } | undefined) {
+    this.draft = draft;
+    this.onDraft(!!draft);
+    this.changed.fire(undefined);
+  }
 
   private root(): vscode.Uri | undefined {
     return vscode.workspace.workspaceFolders?.[0]?.uri;
@@ -326,28 +343,55 @@ class ScopeTree implements vscode.TreeDataProvider<string> {
     const item = new vscode.TreeItem(path.posix.basename(rel), vscode.TreeItemCollapsibleState.Collapsed);
     item.id = rel;
     item.iconPath = vscode.ThemeIcon.Folder;
-    item.checkboxState = inScope(this.scope, rel) ? vscode.TreeItemCheckboxState.Checked : vscode.TreeItemCheckboxState.Unchecked;
+    const shown = this.shown();
+    item.checkboxState = inScope(shown, rel) ? vscode.TreeItemCheckboxState.Checked : vscode.TreeItemCheckboxState.Unchecked;
     // Say where a rule is written; the folders under it follow it.
-    item.description = this.scope.include.includes(rel) ? "included" : this.scope.exclude.includes(rel) ? "excluded" : undefined;
+    item.description = shown.include.includes(rel) ? "included" : shown.exclude.includes(rel) ? "excluded" : undefined;
     item.contextValue = "folder";
     return item;
   }
 
-  /** Put `rel` in or out, dropping the rules under it that this overrides. */
-  async set(rel: string, wanted: boolean) {
+  /** Check or uncheck `rel` in the draft, dropping the rules under it that
+   *  this overrides. Nothing is indexed until `applyDraft`. */
+  toggle(rel: string, wanted: boolean) {
+    const now = this.shown();
     const keep = (rules: string[]) => rules.filter((r) => !under(r, rel));
-    const next: ScopeState = { ...this.scope, include: keep(this.scope.include), exclude: keep(this.scope.exclude) };
-    const listed = this.scope.include.length > 0;
-    if (inScope(next, rel) !== wanted) {
+    const next = { include: keep(now.include), exclude: keep(now.exclude) };
+    // Folders are being picked one by one (some are listed, or everything
+    // was cleared): unchecking the last of them leaves nothing, not all.
+    const picking = now.include.length > 0 || now.exclude.includes("");
+    if (picking && next.include.length === 0 && !next.exclude.includes("")) {
+      next.exclude.push("");
+    }
+    if (inScope({ ...next, config: "" }, rel) !== wanted) {
       (wanted ? next.include : next.exclude).push(rel);
     }
-    if (listed && next.include.length === 0 && !wanted) {
-      // The last listed folder was unchecked: with nothing listed the
-      // whole workspace would be the project again, which is not what
-      // unchecking asks for. Say so instead of doing it silently.
-      void vscode.window.showWarningMessage(`"${rel}" was the only folder listed, so the whole workspace is indexed again, except "${rel}".`);
+    this.setDraft(next);
+  }
+
+  /** Every folder, or none: the starting points for a selection. */
+  selectAll() {
+    this.setDraft({ include: [], exclude: [] });
+  }
+
+  clearAll() {
+    this.setDraft({ include: [], exclude: [""] });
+  }
+
+  discard() {
+    this.setDraft(undefined);
+  }
+
+  async applyDraft() {
+    if (this.draft) {
+      await this.apply(this.draft, "Applied the scope");
     }
-    await this.apply(next, wanted ? `Added ${rel}` : `Removed ${rel}`);
+  }
+
+  /** Put `rel` in or out right away (from a menu, where that is the whole request). */
+  async set(rel: string, wanted: boolean) {
+    this.toggle(rel, wanted);
+    await this.applyDraft();
   }
 
   async apply(next: { include: string[]; exclude: string[] }, what: string) {
@@ -357,7 +401,7 @@ class ScopeTree implements vscode.TreeDataProvider<string> {
       return;
     }
     this.scope = { include: r.include, exclude: r.exclude, config: r.config };
-    this.changed.fire(undefined);
+    this.setDraft(undefined);
     this.afterSync(r, what);
   }
 }
@@ -609,11 +653,18 @@ export async function activate(context: vscode.ExtensionContext) {
       6000,
     );
   }
-  const scopeTree = new ScopeTree(afterSync);
-  const scopeView = vscode.window.createTreeView("si.scope", { treeDataProvider: scopeTree, manageCheckboxStateManually: true });
-  scopeView.onDidChangeCheckboxState(async (e) => {
+  let scopeView: vscode.TreeView<string> | undefined;
+  const scopeTree = new ScopeTree(afterSync, (pending) => {
+    void vscode.commands.executeCommand("setContext", "si.scopePending", pending);
+    if (scopeView) {
+      scopeView.message = pending ? "Not applied yet. Press Apply (the check mark) to index this selection." : undefined;
+    }
+  });
+  scopeView = vscode.window.createTreeView("si.scope", { treeDataProvider: scopeTree, manageCheckboxStateManually: true });
+  scopeView.onDidChangeCheckboxState((e) => {
+    // Checking only prepares; Apply indexes.
     for (const [rel, state] of e.items) {
-      await scopeTree.set(rel, state === vscode.TreeItemCheckboxState.Checked);
+      scopeTree.toggle(rel, state === vscode.TreeItemCheckboxState.Checked);
     }
   });
   /** A folder from the scope tree (its path) or from the Explorer (a URI). */
@@ -645,7 +696,40 @@ export async function activate(context: vscode.ExtensionContext) {
     }, now ? 0 : 150);
   }
 
+  /** A folder opened for the first time has no scope yet. Indexing all of
+   *  a very large tree is not something to do unasked: offer to choose the
+   *  folders first. Returns false if the user backed out. */
+  async function firstTime(): Promise<boolean> {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root || fs.existsSync(path.join(root, ".si", "config.json"))) {
+      return true;
+    }
+    const all = "Index Everything", choose = "Choose Folders First";
+    const pick = await vscode.window.showInformationMessage(
+      "SI has not indexed this folder before.",
+      { modal: true, detail: "Index every C file in it, or choose which folders to index first? The choice is kept in .si/config.json and can be changed any time in the Index Scope view." },
+      all,
+      choose,
+    );
+    if (!pick) {
+      return false;
+    }
+    fs.mkdirSync(path.join(root, ".si"), { recursive: true });
+    fs.writeFileSync(path.join(root, ".si", "config.json"), JSON.stringify({ include: [], exclude: pick === choose ? ["."] : [] }, null, 2) + "\n");
+    if (pick === choose) {
+      void vscode.commands.executeCommand("si.scope.focus");
+    }
+    return true;
+  }
+
   async function start(rebuild = false) {
+    if (!(await firstTime())) {
+      status.text = "$(circle-slash) SI not started";
+      status.tooltip = "Click to choose what to index.";
+      status.command = "si.restart";
+      return;
+    }
+    status.command = "si.sync";
     const { command, args } = serverCommand();
     if (rebuild && !args.includes("--no-cache")) {
       args.push("--rebuild");
@@ -745,6 +829,21 @@ export async function activate(context: vscode.ExtensionContext) {
     }),
     scopeView,
     vscode.commands.registerCommand("si.sync", sync),
+    vscode.commands.registerCommand("si.scope.apply", () => scopeTree.applyDraft()),
+    vscode.commands.registerCommand("si.scope.discard", () => scopeTree.discard()),
+    vscode.commands.registerCommand("si.scope.selectAll", () => scopeTree.selectAll()),
+    vscode.commands.registerCommand("si.scope.clearAll", () => scopeTree.clearAll()),
+    vscode.commands.registerCommand("si.resetLayout", async () => {
+      // Put every SI view back where it started, whatever was dragged where.
+      for (const view of ["si.search", "si.fileSymbols", "si.scope", "si.relation", "si.context"]) {
+        try {
+          await vscode.commands.executeCommand(`${view}.resetViewLocation`);
+        } catch {
+          // Already at home.
+        }
+      }
+      await vscode.commands.executeCommand("si.relation.focus");
+    }),
     vscode.commands.registerCommand("si.scope.include", (arg: unknown) => {
       const rel = folderOf(arg);
       return rel !== undefined && rel !== "" ? scopeTree.set(rel, true) : undefined;
@@ -758,6 +857,7 @@ export async function activate(context: vscode.ExtensionContext) {
       return rel ? scopeTree.apply({ include: [rel], exclude: [] }, `Indexing only ${rel}`) : undefined;
     }),
     vscode.commands.registerCommand("si.scope.all", () => scopeTree.apply({ include: [], exclude: [] }, "Indexing the whole workspace")),
+    vscode.commands.registerCommand("si.scope.pending", () => !!scopeTree.draft),
     vscode.commands.registerCommand("si.scope.openConfig", async () => {
       if (!scopeTree.scope.config || !fs.existsSync(scopeTree.scope.config)) {
         // Nothing chosen yet: write the setting out so there is a file to edit.

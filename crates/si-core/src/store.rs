@@ -63,16 +63,23 @@ impl Store {
     }
 
     /// Where the facts of the tree at `root` go when nothing else is said:
-    /// the user's cache directory, by the root's path.
+    /// `.si/cache` in the tree itself, beside the project's settings.
     pub fn default_dir(root: &Path) -> PathBuf {
-        let base = std::env::var_os("LOCALAPPDATA")
-            .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-            .unwrap_or_else(std::env::temp_dir);
-        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        let key = xxhash_rust::xxh3::xxh3_64(root.to_string_lossy().to_lowercase().as_bytes());
-        base.join("si").join("cache").join(format!("{key:016x}"))
+        root.join(".si").join("cache")
+    }
+
+    /// Make the directory, and if it is a `cache` folder under `.si`, tell
+    /// git to leave it alone: the settings beside it are for sharing, the
+    /// cache is not.
+    fn prepare(&self) {
+        let _ = std::fs::create_dir_all(&self.dir);
+        let parent = self.dir.parent().filter(|p| p.file_name().is_some_and(|n| n == ".si"));
+        if let (Some(parent), Some(name)) = (parent, self.dir.file_name().and_then(|n| n.to_str())) {
+            let ignore = parent.join(".gitignore");
+            if !ignore.exists() {
+                let _ = std::fs::write(ignore, format!("# The index si keeps here is rebuilt from the sources.\n/{name}/\n"));
+            }
+        }
     }
 
     pub fn dir(&self) -> &Path {
@@ -90,7 +97,7 @@ impl Store {
     }
 
     pub fn save_manifest(&self, sets: u64, files: Vec<String>) {
-        let _ = std::fs::create_dir_all(&self.dir);
+        self.prepare();
         if let Ok(bytes) = bincode::serialize(&Manifest { format: FORMAT, sets, files }) {
             // Written aside and moved into place: a start never reads half of it.
             let tmp = self.dir.join("manifest.tmp");

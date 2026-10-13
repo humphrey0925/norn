@@ -2,7 +2,7 @@
   "name": "si-code-index",
   "displayName": "SI Code Index",
   "description": "Source-Insight-style symbol search, context and relation views for C, backed by the si index.",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "publisher": "humphrey0925",
   "repository": {
     "type": "git",
@@ -42,27 +42,32 @@
         {
           "type": "webview",
           "id": "si.search",
-          "name": "Project Symbols"
+          "name": "Project Symbols",
+          "contextualTitle": "SI Symbols"
         },
         {
           "id": "si.fileSymbols",
-          "name": "File Symbols"
+          "name": "File Symbols",
+          "contextualTitle": "SI File Symbols"
         },
         {
           "id": "si.scope",
-          "name": "Index Scope"
+          "name": "Index Scope",
+          "contextualTitle": "SI Index Scope"
         }
       ],
       "siPanel": [
         {
           "id": "si.relation",
           "name": "Relation",
-          "type": "webview"
+          "type": "webview",
+          "contextualTitle": "SI Relation"
         },
         {
           "type": "webview",
           "id": "si.context",
-          "name": "Context"
+          "name": "Context",
+          "contextualTitle": "SI Context"
         }
       ]
     },
@@ -142,14 +147,37 @@
         "title": "SI: Index Only This Folder"
       },
       {
-        "command": "si.scope.all",
-        "title": "SI: Index the Whole Workspace",
-        "icon": "$(clear-all)"
-      },
-      {
         "command": "si.scope.openConfig",
         "title": "SI: Open the Scope File (.si/config.json)",
         "icon": "$(go-to-file)"
+      },
+      {
+        "command": "si.scope.apply",
+        "title": "SI: Apply the Scope and Index",
+        "icon": "$(check)"
+      },
+      {
+        "command": "si.scope.discard",
+        "title": "SI: Discard Unapplied Scope Changes",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "si.scope.selectAll",
+        "title": "SI: Check All Folders",
+        "icon": "$(check-all)"
+      },
+      {
+        "command": "si.scope.clearAll",
+        "title": "SI: Uncheck All Folders",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "si.resetLayout",
+        "title": "SI: Reset View Layout (put every SI view back in place)"
+      },
+      {
+        "command": "si.scope.all",
+        "title": "SI: Index the Whole Workspace"
       }
     ],
     "menus": {
@@ -176,23 +204,48 @@
         },
         {
           "command": "si.sync",
-          "when": "view == si.scope || view == si.search || view == si.fileSymbols",
+          "when": "view == si.search || view == si.fileSymbols",
           "group": "navigation@1"
         },
         {
-          "command": "si.scope.openConfig",
-          "when": "view == si.scope",
+          "command": "si.scope.apply",
+          "when": "view == si.scope && si.scopePending",
+          "group": "navigation@1"
+        },
+        {
+          "command": "si.scope.discard",
+          "when": "view == si.scope && si.scopePending",
           "group": "navigation@2"
         },
         {
-          "command": "si.scope.all",
+          "command": "si.scope.selectAll",
           "when": "view == si.scope",
           "group": "navigation@3"
         },
         {
-          "command": "si.rebuild",
+          "command": "si.scope.clearAll",
           "when": "view == si.scope",
           "group": "navigation@4"
+        },
+        {
+          "command": "si.sync",
+          "when": "view == si.scope",
+          "group": "navigation@5"
+        },
+        {
+          "command": "si.scope.openConfig",
+          "when": "view == si.scope",
+          "group": "1_si@1"
+        },
+        {
+          "command": "si.rebuild",
+          "when": "view == si.scope",
+          "group": "1_si@2"
+        },
+        {
+          "command": "si.resetLayout",
+          "when": "view =~ /^si\\\\./",
+          "group": "9_si@1"
         }
       ],
       "view/item/context": [
@@ -282,7 +335,7 @@
         "si.cache.directory": {
           "type": "string",
           "default": "",
-          "description": "Where the index is kept. Empty: the user's cache directory, by the project's path."
+          "description": "Where the index is kept. Empty: .si/cache in the workspace."
         }
       }
     }

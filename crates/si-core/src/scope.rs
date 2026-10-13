@@ -6,10 +6,12 @@
 //! { "include": ["bfd", "include"], "exclude": ["bfd/doc"] }
 //! ```
 //!
-//! Both are folders relative to the root. For a file, the rule on its
-//! longest enclosing folder decides; with no rule above it, it is in when
-//! nothing is listed under `include` (the whole tree is the project) and out
-//! when something is (only those folders are).
+//! Both are folders relative to the root, `.` being the root itself. For a
+//! file, the rule on its longest enclosing folder decides; with no rule
+//! above it, it is in when nothing is listed under `include` (the whole tree
+//! is the project) and out when something is (only those folders are).
+//! `"exclude": ["."]` therefore leaves everything out but what `include`
+//! brings back: the way to start from nothing.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -26,7 +28,9 @@ pub struct Scope {
 const NEVER: [&str; 4] = [".si", ".git", ".svn", ".hg"];
 
 fn clean(folder: &str) -> String {
-    folder.replace('\\', "/").trim_matches('/').to_string()
+    let f = folder.replace('\\', "/");
+    let f = f.trim_matches('/');
+    if f == "." { String::new() } else { f.to_string() }
 }
 
 /// Is `path` the folder `rule` or inside it?
@@ -49,7 +53,12 @@ impl Scope {
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
         let path = Scope::config_path(root);
         std::fs::create_dir_all(path.parent().unwrap())?;
-        std::fs::write(path, serde_json::to_string_pretty(&self.clone().normalized()).unwrap() + "\n")
+        // The root is written as `.`, which reads better than an empty name.
+        let mut written = self.clone().normalized();
+        for list in [&mut written.include, &mut written.exclude] {
+            list.iter_mut().filter(|f| f.is_empty()).for_each(|f| *f = ".".into());
+        }
+        std::fs::write(path, serde_json::to_string_pretty(&written).unwrap() + "\n")
     }
 
     pub fn normalized(mut self) -> Scope {
@@ -107,6 +116,12 @@ mod tests {
         assert!(carve.contains("bfd/doc/keep/a.c") && !carve.contains("bfd/elf.c") && !carve.contains("gas/as.c"));
         // The walk has to go through excluded `bfd` to reach `bfd/doc/keep`.
         assert!(carve.reaches("bfd") && carve.reaches("bfd/doc") && !carve.reaches("gas"));
+
+        // Start from nothing, then bring folders back.
+        let none = scope(&[], &["."]);
+        assert!(!none.contains("x.c") && !none.contains("bfd/elf.c") && !none.reaches("bfd"));
+        let one = scope(&["bfd"], &["."]);
+        assert!(one.contains("bfd/elf.c") && !one.contains("x.c") && !one.contains("gas/as.c") && one.reaches("bfd"));
 
         let without = scope(&[], &["testsuite"]);
         assert!(without.contains("gas/as.c") && !without.contains("testsuite/a.c") && without.reaches("gas"));

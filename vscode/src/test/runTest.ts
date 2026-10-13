@@ -14,6 +14,9 @@ async function main() {
     fs.copyFileSync(path.join(corpus, rel), path.join(work, rel));
   }
   fs.mkdirSync(path.join(work, ".vscode"));
+  // A scope on file: the first-time question is for people, not for a test.
+  fs.mkdirSync(path.join(work, ".si"));
+  fs.writeFileSync(path.join(work, ".si", "config.json"), JSON.stringify({ include: [], exclude: [] }));
   const server = path.join(root, "target", "release", process.platform === "win32" ? "si.exe" : "si");
   fs.writeFileSync(path.join(work, ".vscode", "settings.json"), JSON.stringify({ "si.serverPath": `"${server}"` }));
   try {
