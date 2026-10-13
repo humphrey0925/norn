@@ -371,12 +371,16 @@ impl Session {
             let now = self.conditions.source();
             if before.as_ref() != now {
                 let digest = |s: Option<&std::sync::Arc<crate::cond::Source>>, rel: &str| s.map_or(0, |s| s.file_digest(rel));
-                for p in &self.files {
-                    let rel = crate::rel_path(&self.root, p);
-                    if digest(before.as_ref(), &rel) != digest(now, &rel) {
-                        retold.insert(p.clone());
-                    }
-                }
+                let root = &self.root;
+                retold = self
+                    .files
+                    .par_iter()
+                    .filter(|p| {
+                        let rel = crate::rel_path(root, p);
+                        digest(before.as_ref(), &rel) != digest(now, &rel)
+                    })
+                    .cloned()
+                    .collect();
             }
         }
         // Did any macro change character? Then whoever mentions it is stale.
@@ -606,11 +610,13 @@ mod tests {
     fn a_switch_in_a_configuration_header_decides_branches_everywhere() {
         let d = Dir::new("source-defines");
         d.write("config.h", "#ifndef CONFIG_H\n#define CONFIG_H\n#define USE_NET 1\n#define USE_USB 0\n#endif\n");
-        d.write("a.c", "#include \"config.h\"\n#if USE_NET\nint net_init (void) { return 1; }\n#else\nint net_stub (void) { return 0; }\n#endif\n#if USE_USB\nint usb_init (void) { return 1; }\n#endif\n");
+        d.write("a.c", "#if USE_NET\nint before (void) { return 1; }\n#endif\n#include \"config.h\"\n#if USE_NET\nint net_init (void) { return 1; }\n#else\nint net_stub (void) { return 0; }\n#endif\n#if USE_USB\nint usb_init (void) { return 1; }\n#endif\n");
         let cache = d.0.join("cache-outside-scan");
         let open = |d: &Dir| Session::open_cached(&d.0, Options::default(), cache.clone());
         let (mut s, _) = open(&d);
         assert_eq!((functions(&s, "net_init"), functions(&s, "net_stub"), functions(&s, "usb_init")), (1, 0, 0));
+        // Tested above the include that brings the switch in: not known yet, so kept.
+        assert_eq!(functions(&s, "before"), 1);
         // The switch is thrown in the header: the file that tests it is read again.
         d.write("config.h", "#ifndef CONFIG_H\n#define CONFIG_H\n#define USE_NET 0\n#define USE_USB 1\n#endif\n");
         let up = s.update(&[d.0.join("config.h")]);

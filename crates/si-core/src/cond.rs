@@ -36,7 +36,10 @@
 //! reach anything that undefines it or may define it otherwise: a switch
 //! in a configuration header everything includes is known everywhere, a
 //! macro one `.c` file sets before including a shared header is not known
-//! in that header. `"sourceDefines": false` turns the second off.
+//! in that header. Where the file brings the definition in itself, with an
+//! `#include`, the name is known from the line after that one and not
+//! before. (The order of includes in the files that include it is not
+//! looked at.) `"sourceDefines": false` turns the second off.
 //!
 //! A project may have several such sets, as a build has configurations,
 //! one of them in force:
@@ -433,31 +436,61 @@ pub struct Conditions {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Source {
     files: FxHashMap<String, u32>,
-    /// name -> (value, the files it is known in as a bit set), one entry per value.
-    names: FxHashMap<Vec<u8>, Vec<(Vec<u8>, Vec<u64>)>>,
+    /// name -> one entry per value: the value, the files it is known in,
+    /// and the files that certainly bring a definition of it in (both as
+    /// bit sets).
+    names: FxHashMap<Vec<u8>, Vec<(Vec<u8>, Vec<u64>, Vec<u64>)>>,
+    /// Per file, its includes that are certainly compiled: the line, and
+    /// the file included.
+    includes: Vec<Vec<(u32, u32)>>,
+}
+
+fn bits_of(flags: &[bool]) -> Vec<u64> {
+    let mut bits = vec![0u64; flags.len().div_ceil(64)];
+    for (i, _) in flags.iter().enumerate().filter(|(_, k)| **k) {
+        bits[i / 64] |= 1 << (i % 64);
+    }
+    bits
+}
+
+fn has(bits: &[u64], i: u32) -> bool {
+    bits.get(i as usize / 64).is_some_and(|w| w & (1u64 << (i % 64)) != 0)
 }
 
 impl Source {
     pub fn new(paths: &[String]) -> Source {
-        Source { files: paths.iter().enumerate().map(|(i, p)| (p.clone(), i as u32)).collect(), names: FxHashMap::default() }
+        Source {
+            files: paths.iter().enumerate().map(|(i, p)| (p.clone(), i as u32)).collect(),
+            names: FxHashMap::default(),
+            includes: vec![Vec::new(); paths.len()],
+        }
     }
 
-    /// `name` has `value` in the files of `known` (one flag per file).
-    pub fn add(&mut self, name: &[u8], value: &[u8], known: &[bool]) {
-        let mut bits = vec![0u64; known.len().div_ceil(64)];
-        for (i, _) in known.iter().enumerate().filter(|(_, k)| **k) {
-            bits[i / 64] |= 1 << (i % 64);
-        }
-        self.names.entry(name.to_vec()).or_default().push((value.to_vec(), bits));
+    /// `name` has `value` in the files of `known`; those of `brings`
+    /// certainly include a definition of it (one flag per file).
+    pub fn add(&mut self, name: &[u8], value: &[u8], known: &[bool], brings: &[bool]) {
+        self.names.entry(name.to_vec()).or_default().push((value.to_vec(), bits_of(known), bits_of(brings)));
+    }
+
+    /// `file` includes `target` on `line`, for certain.
+    pub fn include(&mut self, file: u32, line: u32, target: u32) {
+        self.includes[file as usize].push((line, target));
     }
 
     pub fn file(&self, path: &str) -> Option<u32> {
         self.files.get(path).copied()
     }
 
-    fn get(&self, file: u32, name: &[u8]) -> Option<&[u8]> {
-        let (word, bit) = (file as usize / 64, 1u64 << (file % 64));
-        self.names.get(name)?.iter().find(|(_, bits)| bits.get(word).is_some_and(|w| w & bit != 0)).map(|(v, _)| &v[..])
+    /// The line of `file` after which the entry's name is known there: the
+    /// first of its own includes that brings a definition in, or 0 when it
+    /// brings none in itself (the files that include it do).
+    fn from_line(&self, file: u32, brings: &[u64]) -> u32 {
+        self.includes[file as usize].iter().filter(|(_, t)| has(brings, *t)).map(|(l, _)| *l).min().unwrap_or(0)
+    }
+
+    fn get(&self, file: u32, line: u32, name: &[u8]) -> Option<&[u8]> {
+        let (value, _, brings) = self.names.get(name)?.iter().find(|(_, known, _)| has(known, file))?;
+        (line > self.from_line(file, brings)).then_some(&value[..])
     }
 
     pub fn is_empty(&self) -> bool {
@@ -466,22 +499,22 @@ impl Source {
 
     fn digest(&self) -> u64 {
         use xxhash_rust::xxh3::xxh3_64_with_seed as h;
-        let each = |(k, values): (&Vec<u8>, &Vec<(Vec<u8>, Vec<u64>)>)| {
-            values.iter().fold(0, |acc, (v, bits)| acc ^ h(bytemuck::cast_slice(bits), h(v, h(k, 15))))
+        let each = |(k, values): (&Vec<u8>, &Vec<(Vec<u8>, Vec<u64>, Vec<u64>)>)| {
+            values.iter().fold(0, |acc, (v, known, brings)| acc ^ h(bytemuck::cast_slice(brings), h(bytemuck::cast_slice(known), h(v, h(k, 15)))))
         };
-        self.names.iter().map(each).fold(self.files.len() as u64, |a, b| a ^ b)
+        let lines = self.includes.iter().enumerate().fold(0, |acc, (f, list)| acc ^ list.iter().fold(0, |a, (l, t)| a ^ h(&t.to_le_bytes(), ((f as u64) << 32) | *l as u64)));
+        self.names.iter().map(each).fold(self.files.len() as u64 ^ lines, |a, b| a ^ b)
     }
 
     /// What `file` is told: other facts come of it when this changes.
     pub fn file_digest(&self, path: &str) -> u64 {
         use xxhash_rust::xxh3::xxh3_64_with_seed as h;
         let Some(file) = self.file(path) else { return 0 };
-        let (word, bit) = (file as usize / 64, 1u64 << (file % 64));
         let mut d = 0;
         for (k, values) in &self.names {
-            for (v, bits) in values {
-                if bits.get(word).is_some_and(|w| w & bit != 0) {
-                    d ^= h(v, h(k, 16));
+            for (v, known, brings) in values {
+                if has(known, file) {
+                    d ^= h(v, h(k, 16 + self.from_line(file, brings) as u64));
                 }
             }
         }
@@ -494,7 +527,7 @@ impl Source {
         let mut out: Vec<_> = self
             .names
             .iter()
-            .flat_map(|(k, values)| values.iter().map(move |(v, bits)| (text(k), text(v), bits.iter().map(|w| w.count_ones() as usize).sum())))
+            .flat_map(|(k, values)| values.iter().map(move |(v, bits, _)| (text(k), text(v), bits.iter().map(|w| w.count_ones() as usize).sum())))
             .collect();
         out.sort();
         out
@@ -510,14 +543,15 @@ pub type Local = FxHashMap<Vec<u8>, Option<Option<Vec<u8>>>>;
 struct View<'a> {
     c: &'a Conditions,
     local: &'a Local,
-    /// The file, as [`Source`] numbers it.
-    file: Option<u32>,
+    /// The file, as [`Source`] numbers it, and the line.
+    at: Option<(u32, u32)>,
 }
 
 impl View<'_> {
     /// From the sources, where the settings say nothing of the name.
     fn sourced(&self, name: &[u8]) -> Option<&[u8]> {
-        self.c.source.as_ref()?.get(self.file?, name)
+        let (file, line) = self.at?;
+        self.c.source.as_ref()?.get(file, line, name)
     }
 
     fn defined(&self, name: &[u8]) -> Tri {
@@ -757,10 +791,10 @@ impl Conditions {
     }
 
     /// The same at a place in a file, after what the file said of macros
-    /// above it.
-    pub fn eval_in(&self, local: &Local, file: Option<u32>, expr: &[u8]) -> Tri {
+    /// above it. `at` is the file (as the [`Source`] numbers it) and line.
+    pub fn eval_in(&self, local: &Local, at: Option<(u32, u32)>, expr: &[u8]) -> Tri {
         let toks = tokens(expr);
-        let mut p = Parser { c: View { c: self, local, file }, toks: &toks, at: 0 };
+        let mut p = Parser { c: View { c: self, local, at }, toks: &toks, at: 0 };
         let v = p.or();
         if p.at != toks.len() {
             return Tri::Unknown;
@@ -768,8 +802,8 @@ impl Conditions {
         truth(v)
     }
 
-    pub fn defined_in(&self, local: &Local, file: Option<u32>, name: &[u8]) -> Tri {
-        View { c: self, local, file }.defined(name)
+    pub fn defined_in(&self, local: &Local, at: Option<(u32, u32)>, name: &[u8]) -> Tri {
+        View { c: self, local, at }.defined(name)
     }
 }
 
@@ -1099,14 +1133,20 @@ mod tests {
     fn what_the_sources_define_is_known_where_it_can_be() {
         let files = ["a.c".to_string(), "b.c".to_string(), "cfg.h".to_string()];
         let mut source = Source::new(&files);
-        source.add(b"USE_NET", b"1", &[true, true, true]);
-        source.add(b"LEVEL", b"DEFAULT_LEVEL", &[true, false, false]);
-        source.add(b"DEFAULT_LEVEL", b"3", &[true, false, false]);
-        source.add(b"HAVE_X", b"", &[true, true, false]);
+        // cfg.h defines USE_NET; a.c includes it on line 5, b.c gets it from elsewhere.
+        source.add(b"USE_NET", b"1", &[true, true, true], &[true, false, true]);
+        source.include(0, 5, 2);
+        let no = [false; 3];
+        source.add(b"LEVEL", b"DEFAULT_LEVEL", &[true, false, false], &no);
+        source.add(b"DEFAULT_LEVEL", b"3", &[true, false, false], &no);
+        source.add(b"HAVE_X", b"", &[true, true, false], &no);
         let mut c = Conditions::default();
         c.set_source(Some(std::sync::Arc::new(source)));
         let none = Local::default();
-        let (a, b) = (c.source().unwrap().file("a.c"), c.source().unwrap().file("b.c"));
+        let place = |file: &str, line: u32| c.source().unwrap().file(file).map(|f| (f, line));
+        let (a, b) = (place("a.c", 9), place("b.c", 9));
+        // Known from the line after the include that brings it in, where the file does that itself.
+        assert_eq!((c.eval_in(&none, place("a.c", 5), b"USE_NET"), c.eval_in(&none, place("a.c", 6), b"USE_NET"), c.eval_in(&none, place("b.c", 1), b"USE_NET")), (Tri::Unknown, Tri::True, Tri::True));
         assert_eq!((c.eval_in(&none, a, b"USE_NET"), c.eval_in(&none, a, b"defined(HAVE_X) && LEVEL >= 3"), c.eval_in(&none, a, b"OTHER")), (Tri::True, Tri::True, Tri::Unknown));
         // Known in one file is not known in another, or where no file is said.
         assert_eq!((c.eval_in(&none, b, b"LEVEL >= 3"), c.eval_in(&none, b, b"USE_NET"), c.eval(b"USE_NET")), (Tri::Unknown, Tri::True, Tri::Unknown));

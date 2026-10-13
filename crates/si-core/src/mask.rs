@@ -128,6 +128,8 @@ pub struct Define {
     pub include: bool,
     /// Not a definition but a name some `#if` of the file tests.
     pub test: bool,
+    /// The line, for an `#include` that is certainly compiled (else 0).
+    pub line: u32,
 }
 
 impl Define {
@@ -146,6 +148,7 @@ impl Define {
             undef: false,
             include: false,
             test: false,
+            line: 0,
         }
     }
 }
@@ -188,6 +191,7 @@ pub fn source_of(per_file: &[Vec<Define>], paths: &[String]) -> crate::cond::Sou
                     up[t as usize].push(f as u32);
                     if d.certain {
                         up_certain[t as usize].push(f as u32);
+                        source.include(f as u32, d.line, t);
                     }
                 }
             }
@@ -232,7 +236,7 @@ pub fn source_of(per_file: &[Vec<Define>], paths: &[String]) -> crate::cond::Sou
         }
         seen
     };
-    let found: Vec<(&[u8], &[u8], Vec<bool>)> = said
+    let found: Vec<(&[u8], &[u8], Vec<bool>, Vec<bool>)> = said
         .par_iter()
         .flat_map_iter(|(name, s)| {
             let mut values: Vec<&[u8]> = s.sure.iter().map(|x| x.0).collect();
@@ -254,14 +258,14 @@ pub fn source_of(per_file: &[Vec<Define>], paths: &[String]) -> crate::cond::Sou
                 let unknown = reach(&bad, &down);
                 known.iter_mut().zip(&unknown).for_each(|(k, u)| *k &= !u);
                 if known.iter().any(|k| *k) {
-                    out.push((*name, value, known));
+                    out.push((*name, value, known, sure));
                 }
             }
             out
         })
         .collect();
-    for (name, value, known) in found {
-        source.add(name, value, &known);
+    for (name, value, known, brings) in found {
+        source.add(name, value, &known, &brings);
     }
     source
 }
@@ -1080,6 +1084,9 @@ impl<'a> Lexer<'a> {
     fn directive(&mut self) {
         let s = self.c.s;
         let start = self.c.i;
+        // Where this is, for what is known of macros here.
+        let here = self.file.map(|f| (f, self.c.line));
+        let line = self.c.line;
         self.c.i += 1;
         self.c.skip_space(false);
         let (a, e) = self.c.ident();
@@ -1116,7 +1123,7 @@ impl<'a> Lexer<'a> {
                     let conditional = self.conds.iter().any(|c| !c.include_guard && c.compiled != Tri::True);
                     self.out.includes.push((open as u32 + 1, (open + 1 + len) as u32, conditional));
                     if let Some(defines) = &mut self.defines {
-                        defines.push(Define { include: true, ..Define::note(&s[open + 1..open + 1 + len], !conditional) });
+                        defines.push(Define { include: true, line: if conditional { 0 } else { line }, ..Define::note(&s[open + 1..open + 1 + len], !conditional) });
                     }
                 }
             }
@@ -1145,12 +1152,12 @@ impl<'a> Lexer<'a> {
                     let mut c = Cur { s: &s[..span.1], i: e, line: 0 };
                     c.skip_space(false);
                     let (a, e) = c.ident();
-                    self.conditions.defined_in(&self.local, self.file, &s[a..e])
+                    self.conditions.defined_in(&self.local, here, &s[a..e])
                 };
                 let holds = match word {
                     b"ifdef" => named(),
                     b"ifndef" => named().not(),
-                    _ => self.conditions.eval_in(&self.local, self.file, &s[e..span.1]),
+                    _ => self.conditions.eval_in(&self.local, here, &s[e..span.1]),
                 };
                 self.conds.push(Cond {
                     nest: self.nest.clone(),
@@ -1177,7 +1184,7 @@ impl<'a> Lexer<'a> {
                     // This branch is compiled only if none before it was,
                     // and (for `#elif`) its own condition holds.
                     if word != b"endif" {
-                        let own = if word == b"elif" { self.conditions.eval_in(&self.local, self.file, &s[e..span.1]) } else if word == b"else" { Tri::True } else { Tri::Unknown };
+                        let own = if word == b"elif" { self.conditions.eval_in(&self.local, here, &s[e..span.1]) } else if word == b"else" { Tri::True } else { Tri::Unknown };
                         c.compiled = c.taken.not().and(own);
                         skip = c.compiled == Tri::False;
                         c.taken = c.taken.or(own);
@@ -1323,6 +1330,7 @@ impl<'a> Lexer<'a> {
                 undef: false,
                 include: false,
                 test: false,
+                line: 0,
             });
         }
         let keep = self.transparent.kept.contains(&s[a..e]);
@@ -1611,7 +1619,7 @@ mod tests {
         let files: Vec<(&str, &str)> = vec![
             // A switch in a header everything includes...
             ("cfg.h", "#ifndef CFG_H\n#define CFG_H\n#define USE_NET 1\n#define LEVEL 2\n#endif\n"),
-            ("a.c", "#include \"cfg.h\"\n#include \"shared.h\"\n#if USE_NET\n#endif\n"),
+            ("a.c", "#if USE_NET\n#endif\n#include \"cfg.h\"\n#include \"shared.h\"\n#if USE_NET\n#endif\n"),
             // ...a macro one file sets before a shared header, which another does not...
             ("b.c", "#include \"cfg.h\"\n#define NO_RELOCS\n#include \"shared.h\"\n#include \"mine.h\"\n"),
             ("shared.h", "#ifdef NO_RELOCS\n#endif\n#if LEVEL > 1\n#endif\n#ifdef WIN\n#endif\n#if SIZE == 64\n#endif\n"),
@@ -1631,7 +1639,12 @@ mod tests {
         let mut c = Conditions::default();
         c.set_source(Some(std::sync::Arc::new(source_of(&defines, &paths))));
         let none = crate::cond::Local::default();
-        let known = |file: &str, expr: &str| c.eval_in(&none, c.source().unwrap().file(file), expr.as_bytes());
+        let at = |file: &str, line: u32, expr: &str| c.eval_in(&none, c.source().unwrap().file(file).map(|f| (f, line)), expr.as_bytes());
+        let known = |file: &str, expr: &str| at(file, 99, expr);
+        // a.c tests USE_NET on line 1 and includes cfg.h on line 3: not known before that.
+        assert_eq!((at("a.c", 1, "USE_NET"), at("a.c", 3, "USE_NET"), at("a.c", 5, "USE_NET")), (Tri::Unknown, Tri::Unknown, Tri::True));
+        // shared.h gets it from whoever includes it: known from its first line.
+        assert_eq!(at("shared.h", 1, "LEVEL > 1"), Tri::True);
         // Everything includes cfg.h: its switches are known wherever they are tested.
         assert_eq!((known("a.c", "USE_NET"), known("shared.h", "LEVEL > 1"), known("mine.h", "LEVEL == 2")), (Tri::True, Tri::True, Tri::True));
         // Only b.c defines NO_RELOCS: not known in the header a.c includes too, known in b.c's own.
