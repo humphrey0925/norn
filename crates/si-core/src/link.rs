@@ -331,40 +331,20 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
     let t = Instant::now();
     (stats.sites, stats.expanded_defs, stats.expanded_refs) = crate::expand::expand(files, &includes, &sure_includes, cache);
     stats.expand_ms = ms(t);
-    let files: Vec<&FileFacts> = files.iter().zip(&cache.expanded).map(|(f, e)| e.as_ref().unwrap_or(f)).collect();
+    let crate::expand::Cache { expanded, names: name_cache, made, .. } = cache;
+    let files: Vec<&FileFacts> = files.iter().zip(expanded.iter()).map(|(f, e)| e.as_ref().unwrap_or(f)).collect();
     let files = &files[..];
 
-    // 1. Intern every file-local name into one global table, then sort it so
-    //    that a name id is its lexicographic rank.
+    // 1. Every file-local name under one global number, a name's number
+    //    being its lexicographic rank. The table is kept between links:
+    //    only the files that changed are read for their names.
     let t = Instant::now();
-    let mut map: FxHashMap<&str, u32> = FxHashMap::default();
-    let mut names: Vec<&str> = Vec::new();
-    let mut remap: Vec<Vec<u32>> = Vec::with_capacity(files.len());
-    for &f in files {
-        let mut r = Vec::with_capacity(f.n_names());
-        for i in 0..f.n_names() {
-            let s = f.name(i);
-            let id = *map.entry(s).or_insert_with(|| {
-                names.push(s);
-                (names.len() - 1) as u32
-            });
-            r.push(id);
-        }
-        remap.push(r);
-    }
-    drop(map);
-    let mut order: Vec<u32> = (0..names.len() as u32).collect();
-    order.par_sort_unstable_by(|&a, &b| names[a as usize].cmp(names[b as usize]));
-    let mut rank = vec![0u32; names.len()];
-    for (new, &old) in order.iter().enumerate() {
-        rank[old as usize] = new as u32;
-    }
-    remap.par_iter_mut().for_each(|r| r.iter_mut().for_each(|x| *x = rank[*x as usize]));
+    let (remap, names) = name_cache.table(files, made);
     let mut g = Graph::default();
     g.str_off.reserve(names.len() + 1);
     g.str_off.push(0);
-    for &old in &order {
-        g.str_bytes.extend_from_slice(names[old as usize].as_bytes());
+    for name in &names {
+        g.str_bytes.extend_from_slice(name.as_bytes());
         g.str_off.push(g.str_bytes.len() as u32);
     }
     stats.intern_ms = ms(t);

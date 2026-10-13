@@ -3,7 +3,9 @@
 //! Parsing is what indexing costs; the link over ready facts is quick. So
 //! what is saved is each file's facts, one small file per source file, and a
 //! start reads those back and parses only the sources that changed since.
-//! The graph is linked afresh each time.
+//! The graph is linked afresh each time; what the link spends most of its
+//! time on in a tree full of macros, expanding them, is kept as well (each
+//! file's expansion beside its facts), so that a start does not do it over.
 //!
 //! A saved file is trusted when the source's size and modification time are
 //! what they were; when they are not, the content hash decides. Facts also
@@ -18,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped whenever what extraction records, or how it is laid out, changes:
 /// facts written by another version are not read.
-const FORMAT: u32 = 5;
+const FORMAT: u32 = 6;
 
 /// Size and modification time of a source file when its facts were made.
 pub type Stamp = (u64, u64);
@@ -128,5 +130,54 @@ impl Store {
 
     pub fn remove(&self, rel: &str) {
         let _ = std::fs::remove_file(self.file(rel));
+        let _ = std::fs::remove_file(self.expansion_file(rel));
+    }
+
+    fn expansion_file(&self, rel: &str) -> PathBuf {
+        let mut path = self.file(rel).into_os_string();
+        path.push(".x");
+        path.into()
+    }
+
+    /// A file's macro expansion (see `expand::Cache`), or that it has none.
+    pub fn save_expansion(&self, rel: &str, expanded: Option<&FileFacts>) {
+        let path = self.expansion_file(rel);
+        match expanded.and_then(|f| bincode::serialize(f).ok()) {
+            Some(bytes) => {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(path, bytes);
+            }
+            None => {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    pub fn load_expansion(&self, rel: &str) -> Option<FileFacts> {
+        bincode::deserialize(&std::fs::read(self.expansion_file(rel)).ok()?).ok()
+    }
+
+    /// The one-line-per-file part of the expansions, written after them:
+    /// what it lists is on disk.
+    pub fn save_expansions(&self, index: &crate::expand::CacheIndex) {
+        self.prepare();
+        if let Ok(bytes) = bincode::serialize(&(FORMAT, index)) {
+            let tmp = self.dir.join("expansions.tmp");
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, self.dir.join("expansions"));
+            }
+        }
+    }
+
+    pub fn expansions(&self) -> Option<crate::expand::CacheIndex> {
+        let (format, index): (u32, crate::expand::CacheIndex) = bincode::deserialize(&std::fs::read(self.dir.join("expansions")).ok()?).ok()?;
+        (format == FORMAT).then_some(index)
+    }
+
+    /// Before expansions are written over: the list no longer vouches for them.
+    pub fn invalidate_expansions(&self) {
+        let _ = std::fs::remove_file(self.dir.join("expansions"));
     }
 }

@@ -468,6 +468,8 @@ fn bench_incr(root: &Path, n: usize, seed: u64) -> Value {
     let mut ex = si_core::extract::Extractor::new();
     let mut rng = Rng(seed | 1);
     let (mut extract_ns, mut link_ns, mut total_ns) = (Vec::new(), Vec::new(), Vec::new());
+    // Where the last relink spent its time, in milliseconds.
+    let mut steps = Value::Null;
     for _ in 0..n {
         let i = rng.below(files.len());
         let t0 = Instant::now();
@@ -475,8 +477,10 @@ fn bench_incr(root: &Path, n: usize, seed: u64) -> Value {
         let t1 = Instant::now();
         // The content is the same, but an edit would not be: expand it again.
         cache.forget(i);
-        let (g, _) = si_core::link::link_cached(&facts, &options, &mut cache);
+        let (g, stats) = si_core::link::link_cached(&facts, &options, &mut cache);
         let t2 = Instant::now();
+        steps = json!({ "includes": stats.include_ms, "expand": stats.expand_ms, "intern": stats.intern_ms, "syms": stats.syms_ms,
+                        "resolve": stats.resolve_ms, "csr": stats.csr_ms });
         assert_eq!(g.out.len(), edges, "relink of unchanged content must be stable");
         extract_ns.push((t1 - t0).as_nanos() as u64);
         link_ns.push((t2 - t1).as_nanos() as u64);
@@ -486,7 +490,7 @@ fn bench_incr(root: &Path, n: usize, seed: u64) -> Value {
     json!({
         "files": files.len(), "edges": edges, "threads": rayon::current_num_threads(),
         "reextract_one_file": summary(extract_ns), "full_relink": summary(link_ns), "total": summary(total_ns),
-        "mem": { "rss_bytes": rss, "peak_rss_bytes": peak_rss },
+        "mem": { "rss_bytes": rss, "peak_rss_bytes": peak_rss }, "last_relink_ms": steps,
     })
 }
 

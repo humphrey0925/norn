@@ -1346,9 +1346,156 @@ pub struct Cache {
     hashes: Vec<u64>,
     pub(crate) expanded: Vec<Option<FileFacts>>,
     added: Vec<(u64, u64)>,
+    /// Files expanded anew since this was last asked (`take_changed`).
+    changed: Vec<usize>,
+    /// Counts the times expansions were made; `made[i]` is the count when
+    /// file `i` was last expanded, so that with the file's hash it says
+    /// whether what the link sees of the file is what it saw before.
+    epoch: u64,
+    pub(crate) made: Vec<u64>,
+    /// The link's table of names, kept from one link to the next.
+    pub(crate) names: NameCache,
+}
+
+/// Every name of every file under one number, kept between links: giving
+/// millions of names their numbers again at every edit is most of what a
+/// link costs in a large tree, and an edit changes one file's.
+#[derive(Default)]
+pub(crate) struct NameCache {
+    /// The names' text, in a few large blocks rather than one allocation
+    /// each: there are millions. A block is never moved or freed while
+    /// this lives, which is what lets `ids` and `strings` point into them.
+    blocks: Vec<Vec<u8>>,
+    ids: FxHashMap<&'static str, u32>,
+    strings: Vec<&'static str>,
+    /// How many files use each name.
+    uses: Vec<u32>,
+    /// Per file: its hash and expansion count when read, and its names.
+    files: Vec<(u64, u64, Vec<u32>)>,
+    /// The names in use in lexicographic order, and each name's place in it.
+    order: Vec<u32>,
+    rank: Vec<u32>,
+    stale: bool,
+}
+
+impl NameCache {
+    /// A copy of `name` that lives as long as this does.
+    fn keep(&mut self, name: &str) -> &'static str {
+        const BLOCK: usize = 4 << 20;
+        if self.blocks.last().is_none_or(|b| b.capacity() - b.len() < name.len()) {
+            self.blocks.push(Vec::with_capacity(BLOCK.max(name.len())));
+        }
+        let block = self.blocks.last_mut().unwrap();
+        let at = block.len();
+        block.extend_from_slice(name.as_bytes());
+        // SAFETY: the bytes are a copy of a `str`; the block was made with
+        // room for them, so the push did not move it, and blocks are only
+        // dropped with `self`, together with `ids` and `strings` (which
+        // hold these references and hand them out no longer than `&self`).
+        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(block.as_ptr().add(at), name.len())) }
+    }
+
+    /// The table for `files` as they are now: for each file, the global
+    /// number of each of its names, a name's number being its
+    /// lexicographic rank; and the names in that order.
+    pub(crate) fn table(&mut self, files: &[&FileFacts], made: &[u64]) -> (Vec<Vec<u32>>, Vec<&str>) {
+        if self.files.len() != files.len() {
+            *self = NameCache { files: vec![(0, 0, Vec::new()); files.len()], stale: true, ..NameCache::default() };
+        }
+        for (i, f) in files.iter().enumerate() {
+            let at = made.get(i).copied().unwrap_or(0);
+            let known = &self.files[i];
+            if known.0 == f.hash && known.1 == at && known.2.len() == f.n_names() && at != 0 {
+                continue;
+            }
+            for &id in &self.files[i].2 {
+                self.uses[id as usize] -= 1;
+                self.stale |= self.uses[id as usize] == 0;
+            }
+            let mut ids = Vec::with_capacity(f.n_names());
+            for n in 0..f.n_names() {
+                let name = f.name(n);
+                let id = match self.ids.get(name) {
+                    Some(&id) => id,
+                    None => {
+                        let id = self.strings.len() as u32;
+                        let kept = self.keep(name);
+                        self.ids.insert(kept, id);
+                        self.strings.push(kept);
+                        self.uses.push(0);
+                        id
+                    }
+                };
+                self.stale |= self.uses[id as usize] == 0;
+                self.uses[id as usize] += 1;
+                ids.push(id);
+            }
+            self.files[i] = (f.hash, at, ids);
+        }
+        if std::mem::take(&mut self.stale) {
+            let (strings, uses) = (&self.strings, &self.uses);
+            self.order = (0..strings.len() as u32).filter(|&id| uses[id as usize] > 0).collect();
+            self.order.par_sort_unstable_by(|&a, &b| strings[a as usize].cmp(strings[b as usize]));
+            self.rank = vec![NONE; strings.len()];
+            for (place, &id) in self.order.iter().enumerate() {
+                self.rank[id as usize] = place as u32;
+            }
+        }
+        let rank = &self.rank;
+        let remap = self.files.par_iter().map(|(_, _, ids)| ids.iter().map(|&id| rank[id as usize]).collect()).collect();
+        (remap, self.order.iter().map(|&id| self.strings[id as usize]).collect())
+    }
+}
+
+/// What of a [`Cache`] is one line per file: kept on disk between runs,
+/// beside each file's expansion.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct CacheIndex {
+    pub environment: u64,
+    pub hashes: Vec<u64>,
+    pub added: Vec<(u64, u64)>,
+    /// Whether the file has an expansion saved.
+    pub has: Vec<bool>,
 }
 
 impl Cache {
+    pub fn index(&self) -> CacheIndex {
+        CacheIndex {
+            environment: self.environment,
+            hashes: self.hashes.clone(),
+            added: self.added.clone(),
+            has: self.expanded.iter().map(Option::is_some).collect(),
+        }
+    }
+
+    /// A cache as it was saved: `expanded` holds each file's expansion, or
+    /// `Err` where one that should be there could not be read (that file
+    /// is then expanded again).
+    pub fn restored(index: CacheIndex, expanded: Vec<Result<Option<FileFacts>, ()>>) -> Cache {
+        let mut hashes = index.hashes;
+        let expanded = expanded
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| {
+                e.unwrap_or_else(|()| {
+                    hashes[i] = !hashes[i];
+                    None
+                })
+            })
+            .collect();
+        let made = vec![1; hashes.len()];
+        Cache { environment: index.environment, hashes, expanded, added: index.added, changed: Vec::new(), epoch: 1, made, names: NameCache::default() }
+    }
+
+    /// The files expanded anew since the last call, for saving.
+    pub fn take_changed(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.changed)
+    }
+
+    pub fn expansion(&self, i: usize) -> Option<&FileFacts> {
+        self.expanded.get(i)?.as_ref()
+    }
+
     /// Expand file `i` again at the next link even if its hash is the same.
     pub fn forget(&mut self, i: usize) {
         if let Some(h) = self.hashes.get_mut(i) {
@@ -1389,6 +1536,10 @@ pub fn expand(files: &[FileFacts], includes: &[Vec<u32>], sure_includes: &[Vec<u
             hashes: files.iter().map(|f| !f.hash).collect(),
             expanded: files.iter().map(|_| None).collect(),
             added: vec![(0, 0); files.len()],
+            changed: Vec::new(),
+            epoch: cache.epoch,
+            made: vec![0; files.len()],
+            names: std::mem::take(&mut cache.names),
         };
     }
     let stale: Vec<usize> = (0..files.len()).filter(|&i| cache.hashes[i] != files[i].hash).collect();
@@ -1428,9 +1579,12 @@ pub fn expand(files: &[FileFacts], includes: &[Vec<u32>], sure_includes: &[Vec<u
             };
         }
     }
-    for i in stale {
+    cache.epoch += 1;
+    for &i in &stale {
         cache.hashes[i] = files[i].hash;
+        cache.made[i] = cache.epoch;
     }
+    cache.changed.extend(stale);
     let (defs, refs) = cache.added.iter().fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
     (sites, defs, refs)
 }

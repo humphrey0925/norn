@@ -237,6 +237,7 @@ impl Session {
         });
         session.store = Some(store);
         session.save_manifest();
+        session.save_expansions();
         let up = Update { extracted: session.files.len(), extract_ms: ms(t), ..Update::default() };
         (session, up)
     }
@@ -274,13 +275,27 @@ impl Session {
         if sets.digest() != manifest.sets {
             return None;
         }
+        // The macro expansions of the last link, where they were saved for
+        // these very files: the link then only expands what changed.
+        let cache = match store.expansions().filter(|x| x.hashes.len() == files.len()) {
+            Some(index) => {
+                let expanded = manifest
+                    .files
+                    .par_iter()
+                    .zip(&index.has)
+                    .map(|(rel, &has)| if has { store.load_expansion(rel).map(Some).ok_or(()) } else { Ok(None) })
+                    .collect();
+                Cache::restored(index, expanded)
+            }
+            None => Cache::default(),
+        };
         Some(Session {
             root: root.to_path_buf(),
             files,
             defines,
             facts,
             sets,
-            cache: Cache::default(),
+            cache,
             options: options.clone(),
             store: None,
             stamps,
@@ -290,6 +305,23 @@ impl Session {
             graph: Graph::default(),
             stats: LinkStats::default(),
         })
+    }
+
+    /// Keep the expansions the last link made anew.
+    fn save_expansions(&mut self) {
+        let Some(store) = &self.store else { return };
+        let changed = self.cache.take_changed();
+        if changed.is_empty() {
+            return;
+        }
+        store.invalidate_expansions();
+        let (root, files, cache) = (&self.root, &self.files, &self.cache);
+        changed.par_iter().for_each(|&i| {
+            if let Some(path) = files.get(i) {
+                store.save_expansion(&crate::rel_path(root, path), cache.expansion(i));
+            }
+        });
+        store.save_expansions(&cache.index());
     }
 
     fn save_manifest(&self) {
@@ -408,6 +440,9 @@ impl Session {
             stale.par_iter().map_init(Extractor::new, |ex, &i| crate::extract_file(ex, root, &files[i], sets)).collect();
         up.extracted = fresh.len();
         for (&i, f) in stale.iter().zip(fresh) {
+            // Read again, perhaps under other conditions with the very
+            // same text: what the link kept of the file no longer holds.
+            self.cache.forget(i);
             self.facts[i] = f;
             self.stamps[i] = stamp(&self.files[i]);
         }
@@ -427,6 +462,7 @@ impl Session {
         let t = Instant::now();
         (self.graph, self.stats) = link_cached(&self.facts, &self.options, &mut self.cache);
         up.link_ms = ms(t);
+        self.save_expansions();
         up
     }
 }
