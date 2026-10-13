@@ -26,7 +26,11 @@ A call through a local variable is followed one step back, to what the
 function assigns to that variable: a member or a global (an `icalls` row of
 that kind, as if the call went through it directly) or a function (a store
 into a slot named after the function and the variable, and a call through
-it). `binds` are the places a function is stored in a field: by an
+it).
+
+A call through a parameter goes through the slot `<param USR>`, member the
+parameter's position; every call of that function with a function as that
+argument is a store into it. `binds` are the places a function is stored in a field: by an
 initializer, positional or designated, or by an assignment. Joining the two
 on (record, field) gives the calls a field-based, type-aware analysis finds;
 it is an upper bound on what runs, not a record of it.
@@ -257,10 +261,17 @@ def calls_in(fn, caller, out, icalls, binds, stats):
                 d = callee.get_definition()
                 home = rel(d.location.file.name) if d is not None and d.location.file else None
                 out.add((*caller, callee.get_usr(), callee.spelling, home, site(loc), loc.line))
+                for i, arg in enumerate(c.get_arguments()):
+                    bind((f"<param {callee.get_usr()}>", str(i)), arg, binds)
             else:
                 stats["indirect"] += 1
                 where = (site(c.location), c.location.line)
-                icalls.add((*caller, *target_of(c), *where))
+                target = target_of(c)
+                if target[0] == "param":
+                    names = [a.spelling for a in fn.get_arguments()]
+                    if target[2] in names:
+                        target = ("param", f"<param {fn.get_usr()}>", str(names.index(target[2])))
+                icalls.add((*caller, *target, *where))
                 var = local_var(c)
                 for source in local_sources(fn, var) if var is not None else ():
                     if source[0] == "func":

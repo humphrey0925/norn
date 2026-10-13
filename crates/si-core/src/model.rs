@@ -127,6 +127,25 @@ pub struct Bind {
     pub unit: u32,
 }
 
+/// A call a function makes through one of its parameters.
+#[derive(Clone, Copy, Debug)]
+pub struct ParamCall {
+    /// The function, as a definition of this file.
+    pub scope: u32,
+    /// The parameter's position.
+    pub index: u32,
+    pub line: u32,
+}
+
+/// A name passed as an argument in a call by name: if the callee calls
+/// through that parameter and the name is a function, that is who it calls.
+#[derive(Clone, Copy, Debug)]
+pub struct ArgPass {
+    pub callee: u32,
+    pub index: u32,
+    pub func: u32,
+}
+
 /// A braced initializer with macro uses in it, kept as text: which member
 /// each element initializes is only known once the macros are expanded.
 #[derive(Clone, Copy, Debug)]
@@ -197,6 +216,8 @@ pub struct FileFacts {
     /// Members declared with a typedef name, as (definition, type name):
     /// whether they can hold a function depends on the typedef.
     pub field_types: Vec<(u32, u32)>,
+    pub param_calls: Vec<ParamCall>,
+    pub arg_passes: Vec<ArgPass>,
 }
 
 impl FileFacts {

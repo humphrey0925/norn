@@ -355,12 +355,20 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
         }
     }
 
+    // Functions that call through a parameter: symbol -> (position, line).
+    let mut through_param: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+    for (fi, f) in files.iter().enumerate() {
+        for c in &f.param_calls {
+            through_param.entry(g.files[fi].sym_start + c.scope).or_default().push((c.index, c.line));
+        }
+    }
+
     // 3. Resolve references. Each file is independent given the symbol table.
     //    A name means, in order: a definition in this file; one in a file it
     //    includes; anything with external visibility.
     let t = Instant::now();
     let syms = &g.syms;
-    let per_file: Vec<(Vec<[u32; 3]>, [u64; 4], Vec<[u32; 4]>)> = files
+    let per_file: Vec<(Vec<[u32; 3]>, [u64; 4], Vec<[u32; 4]>, Vec<[u32; 3]>)> = files
         .par_iter()
         .enumerate()
         .map_init(|| Closure::new(files.len()), |closure, (fi, f)| {
@@ -375,11 +383,16 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
                 // A member name can only mean a member, and nothing else can.
                 let member = matches!(r.kind, refkind::MEMBER | refkind::ICALL);
                 let through = r.kind == refkind::ICALL;
+                // `#define error(...) (error (__VA_ARGS__), flag ())`: a macro
+                // is not expanded inside itself, so there the name is the
+                // function.
+                let from = &syms[(base + r.scope) as usize];
+                let own_name = from.kind == kind::MACRO && from.name == remap[fi][r.name as usize];
                 let want = |s: &Sym| {
                     if member {
                         s.kind == kind::FIELD && (!through || s.flags & flag::CALLABLE != 0)
                     } else {
-                        s.kind != kind::FILE && s.kind != kind::FIELD
+                        s.kind != kind::FILE && s.kind != kind::FIELD && !(own_name && s.kind == kind::MACRO)
                     }
                 };
                 in_sight(cands, syms, base..end, closure, want, &mut tmp);
@@ -462,15 +475,45 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
                     bound.extend(tmp.iter().map(|&to| [slot, to, meta]));
                 }
             }
+            // Callbacks: a function passed where the callee calls its
+            // parameter is called by the callee.
+            let mut handed: Vec<[u32; 3]> = Vec::new();
+            if !through_param.is_empty() {
+                let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
+                for a in &f.arg_passes {
+                    in_sight(g.syms_named(remap[fi][a.callee as usize]), syms, base..end, closure, |s| s.kind == kind::FUNCTION, &mut slots);
+                    if slots.iter().any(is_def) {
+                        slots.retain(is_def);
+                    }
+                    for &callee in slots.iter().take(MAX_MEMBER_CANDIDATES) {
+                        for &(_, line) in through_param.get(&callee).into_iter().flatten().filter(|p| p.0 == a.index) {
+                            in_sight(g.syms_named(remap[fi][a.func as usize]), syms, base..end, closure, |s| s.kind == kind::FUNCTION, &mut tmp);
+                            if tmp.iter().any(is_def) {
+                                tmp.retain(is_def);
+                            }
+                            tmp.truncate(MAX_CANDIDATES);
+                            let meta = pack_meta(line, slots.len() > 1 || tmp.len() > 1, refkind::PCALL);
+                            handed.extend(tmp.iter().map(|&to| [callee, to, meta]));
+                        }
+                    }
+                }
+            }
             bound.sort_unstable();
             bound.dedup_by_key(|e| (e[0], e[1]));
             let sites = bound.iter().map(|e| [fi as u32, e[2] >> 4, e[0], e[1]]).collect();
             edges.extend(bound);
-            (edges, counts, sites)
+            handed.sort_unstable();
+            handed.dedup();
+            (edges, counts, sites, handed)
         })
         .collect();
     let mut edges: Vec<[u32; 3]> = Vec::with_capacity(per_file.iter().map(|p| p.0.len()).sum());
-    for (e, c, sites) in &per_file {
+    // The same callback is handed over in many places.
+    let mut handed: Vec<[u32; 3]> = per_file.iter().flat_map(|p| p.3.iter().copied()).collect();
+    handed.sort_unstable();
+    handed.dedup();
+    edges.extend(handed);
+    for (e, c, sites, _) in &per_file {
         stats.bind_sites.extend_from_slice(sites);
         edges.extend_from_slice(e);
         stats.resolved += c[0];

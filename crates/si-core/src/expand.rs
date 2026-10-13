@@ -106,6 +106,12 @@ fn tokenize(s: &[u8], origin: Origin) -> Vec<T> {
                 i += 1;
                 continue;
             }
+            // `a/**/b`: how tokens were pasted before `##`.
+            b'/' if origin == Origin::Body && s[i..].starts_with(b"/**/") && !out.is_empty() => {
+                i += 4;
+                out.push(T { text: "##".into(), k: K::Punct, origin, noexpand: false });
+                continue;
+            }
             b'/' if at(i + 1) == b'*' => {
                 i += 2;
                 while i < n && !(s[i] == b'*' && at(i + 1) == b'/') {
@@ -650,8 +656,9 @@ struct Found {
     single: Option<String>,
     /// Declared in the expansion: name, kind, flags.
     decls: Vec<(String, u8, u8)>,
-    /// Pasted names used in the expansion.
-    refs: Vec<(String, u8)>,
+    /// Names the expansion uses that are not written at the use: name,
+    /// kind, and the function the expansion defines around it, if any.
+    refs: Vec<(String, u8, Option<String>)>,
 }
 
 impl Found {
@@ -679,7 +686,7 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str) -> Found {
         if toks[0].k == K::Ident && &*toks[0].text != macro_name && !is_keyword(toks[0].text.as_bytes()) && &*toks[0].text != "NULL" {
             found.single = Some(toks[0].text.to_string());
             let kind = if s.flags & site::CALLED != 0 { refkind::CALL } else { refkind::USE };
-            found.refs.push((toks[0].text.to_string(), kind));
+            found.refs.push((toks[0].text.to_string(), kind, None));
         }
         return found;
     }
@@ -702,7 +709,7 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str) -> Found {
         && &*toks[0].text != "NULL";
     if renamed {
         found.single = Some(toks[0].text.to_string());
-        found.refs.push((toks[0].text.to_string(), refkind::CALL));
+        found.refs.push((toks[0].text.to_string(), refkind::CALL, None));
         return found;
     }
     let in_fn = s.flags & site::IN_FN != 0;
@@ -710,6 +717,8 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str) -> Found {
     let init = s.flags & site::INIT != 0;
     let (mut paren, mut brace) = (0i32, 0i32);
     let mut storage = 0u8;
+    // The function whose body, written in the expansion, is being read.
+    let mut owner: Option<String> = None;
     for i in 0..n {
         let t = &toks[i];
         if t.k == K::Punct {
@@ -717,7 +726,12 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str) -> Found {
                 "(" => paren += 1,
                 ")" => paren -= 1,
                 "{" => brace += 1,
-                "}" => brace -= 1,
+                "}" => {
+                    brace -= 1;
+                    if brace == 0 {
+                        owner = None;
+                    }
+                }
                 ";" if paren == 0 && brace == 0 => storage = 0,
                 _ => {}
             }
@@ -754,9 +768,9 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str) -> Found {
                     k += 1;
                 }
                 if toks.get(k).is_some_and(|x| x.is("(")) {
-                    found.refs.push((name(), refkind::ICALL));
+                    found.refs.push((name(), refkind::ICALL, owner.clone()));
                 } else if t.origin == Origin::Pasted {
-                    found.refs.push((name(), refkind::MEMBER));
+                    found.refs.push((name(), refkind::MEMBER, owner.clone()));
                 }
             }
             continue;
@@ -783,6 +797,10 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str) -> Found {
                     None => s.flags & site::BRACE_FOLLOWS != 0,
                 };
                 found.decls.push((name(), kind::FUNCTION, storage & flag::STATIC | if defined { 0 } else { flag::DECL }));
+                // A body written out in the expansion: what it calls, it calls.
+                if after.is_some_and(|a| a.is("{")) {
+                    owner = Some(name());
+                }
                 continue;
             }
             if top && (next.is_none() || ["=", ";", "[", ","].iter().any(|s| next_is(s))) {
@@ -794,8 +812,10 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str) -> Found {
             found.decls.push((name(), kind::ENUM_CONST, 0));
             continue;
         }
-        if t.origin == Origin::Pasted {
-            found.refs.push((name(), if next_is("(") { refkind::CALL } else { refkind::USE }));
+        if owner.is_some() && brace > 0 && next_is("(") {
+            found.refs.push((name(), refkind::CALL, owner.clone()));
+        } else if t.origin == Origin::Pasted {
+            found.refs.push((name(), if next_is("(") { refkind::CALL } else { refkind::USE }, owner.clone()));
         }
     }
     found
@@ -1136,19 +1156,26 @@ fn expand_file(fi: usize, f: &FileFacts, table: &Table, fwd: &[Vec<u32>], rev: &
     let key = |d: &Def| (d.name, d.line, d.kind, d.flags & flag::DECL);
     let mut seen_defs: FxHashSet<(u32, u32, u8, u8)> = out.defs.iter().map(key).collect();
     let mut seen_refs: FxHashSet<(u32, u32, u32, u8)> = FxHashSet::default();
+    // Definitions added by expansions: (name, line) -> index.
+    let mut made_here: FxHashMap<(u32, u32), u32> = FxHashMap::default();
     let mut seen_binds: FxHashSet<Bind> = FxHashSet::default();
     for m in made {
-        for (n, kind) in m.found.refs {
-            let name = names.id(&mut out, &n);
-            if seen_refs.insert((name, m.line, m.scope, kind)) {
-                out.refs.push(Ref { name, line: m.line, scope: m.scope, kind });
-            }
-        }
         for (n, kind, flags) in m.found.decls {
             let name = names.id(&mut out, &n);
             let def = Def { name, line: m.line, end_line: m.line, kind, flags };
             if m.first && seen_defs.insert(key(&def)) {
+                made_here.insert((name, m.line), out.defs.len() as u32);
                 out.defs.push(def);
+            }
+        }
+        for (n, kind, owner) in m.found.refs {
+            let name = names.id(&mut out, &n);
+            // Inside a function the expansion defines, that function is the scope.
+            let scope = owner
+                .and_then(|o| made_here.get(&(names.id(&mut out, &o), m.line)).copied())
+                .unwrap_or(m.scope);
+            if seen_refs.insert((name, m.line, scope, kind)) {
+                out.refs.push(Ref { name, line: m.line, scope, kind });
             }
         }
         if let Some((type_name, stored)) = m.stored {
@@ -1233,6 +1260,9 @@ fn expand_file(fi: usize, f: &FileFacts, table: &Table, fwd: &[Vec<u32>], rev: &
     }
     for t in &mut out.field_types {
         t.0 = new_index[t.0 as usize];
+    }
+    for c in &mut out.param_calls {
+        c.scope = new_index[c.scope as usize];
     }
     out.sites.clear();
     let added = ((out.defs.len() - n_defs) as u64, (out.refs.len() - n_refs) as u64);

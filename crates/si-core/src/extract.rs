@@ -1,7 +1,9 @@
 //! Single-file extraction: lexical mask, tree-sitter parse, one preorder walk. O(tokens).
 
 use crate::mask::{self, Event, Tok, MacroSets};
-use crate::model::{flag, kind, refkind, site, Bind, Def, FileFacts, InitSite, MacroBody, Record, Ref, Site, NONE};
+use crate::model::{
+    flag, kind, refkind, site, ArgPass, Bind, Def, FileFacts, InitSite, MacroBody, ParamCall, Record, Ref, Site, NONE,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::num::NonZeroU16;
 use tree_sitter::{Language, Node, Parser};
@@ -44,6 +46,8 @@ struct Ids {
     f_consequence: u16,
     f_alternative: u16,
     f_designator: NonZeroU16,
+    f_parameters: u16,
+    f_arguments: u16,
     f_declarator: NonZeroU16,
     f_name: u16,
     f_body: u16,
@@ -92,6 +96,8 @@ impl Ids {
             f_consequence: f("consequence").get(),
             f_alternative: f("alternative").get(),
             f_designator: f("designator"),
+            f_parameters: f("parameters").get(),
+            f_arguments: f("arguments").get(),
             f_declarator: f("declarator"),
             f_name: f("name").get(),
             f_body: f("body").get(),
@@ -141,6 +147,8 @@ struct Walk<'a> {
     /// local), and the calls made through locals.
     local_sources: FxHashMap<&'a [u8], Vec<(bool, u32)>>,
     local_calls: Vec<(&'a [u8], u32)>,
+    /// The parameters of the function being read, by position.
+    params: FxHashMap<&'a [u8], u32>,
 }
 
 impl Default for Extractor {
@@ -207,6 +215,7 @@ impl Extractor {
             site_starts: Vec::new(),
             local_sources: FxHashMap::default(),
             local_calls: Vec::new(),
+            params: FxHashMap::default(),
         };
         w.site_starts = w.site_defs.keys().copied().collect();
         w.site_starts.sort_unstable();
@@ -274,12 +283,39 @@ impl<'a> Walk<'a> {
     fn flush_local_calls(&mut self) {
         let scope = self.scope.map_or(0, |s| s.def);
         for (local, line) in std::mem::take(&mut self.local_calls) {
+            if let Some(&index) = self.params.get(local) {
+                self.out.param_calls.push(ParamCall { scope, index, line });
+            }
             for &(member, name) in self.local_sources.get(local).into_iter().flatten() {
                 let kind = if member { refkind::ICALL } else { refkind::PCALL };
                 self.out.refs.push(Ref { name, line, scope, kind });
             }
         }
         self.local_sources.clear();
+        self.params.clear();
+    }
+
+    /// The names of a function's own parameters, in order.
+    fn note_params(&mut self, declarator: Node<'a>) {
+        let ids = self.ids;
+        // Down to the declarator that holds the parameter list of the
+        // function itself: the one whose own declarator is the name.
+        let mut n = declarator;
+        for _ in 0..32 {
+            let Some(inner) = n.child_by_field_id(ids.f_declarator.get()).or_else(|| n.named_child(0)) else { return };
+            if n.kind_id() == ids.function_declarator && inner.kind_id() == ids.identifier {
+                break;
+            }
+            n = inner;
+        }
+        let Some(list) = n.child_by_field_id(ids.f_parameters) else { return };
+        let mut c = list.walk();
+        let params: Vec<Node<'a>> = list.named_children(&mut c).filter(|p| p.kind_id() == ids.parameter_declaration).collect();
+        for (i, p) in params.into_iter().enumerate() {
+            if let Some((name, _)) = p.child_by_field_id(ids.f_declarator.get()).and_then(|d| self.decl_name(d)) {
+                self.params.insert(self.text(name), i as u32);
+            }
+        }
     }
 
     /// Note what `value` is, as something assigned to the local `local`.
@@ -333,9 +369,12 @@ impl<'a> Walk<'a> {
                         let text = String::from_utf8_lossy(&self.orig[s.name.end as usize..s.args_end as usize]);
                         self.out.push_name(&text)
                     };
-                    let flags = s.flags | if self.in_fn() { site::IN_FN } else { 0 };
+                    // Outside every bracket is outside every function, whatever
+                    // the parser made of the lines before.
+                    let top = s.flags & site::TOP != 0;
+                    let flags = s.flags | if self.in_fn() && !top { site::IN_FN } else { 0 };
                     let def = self.site_defs[&(s.name.start as usize)];
-                    let scope = self.scope.map_or(0, |s| s.def);
+                    let scope = if top && def == NONE { 0 } else { self.scope.map_or(0, |s| s.def) };
                     self.out.sites.push(Site { name, args, line: s.name.line, scope, def, flags });
                     let (open, close) = (s.init.0 as usize, s.init.1 as usize);
                     if close > open && close - open <= MAX_INIT_TEXT {
@@ -636,6 +675,19 @@ impl<'a> Walk<'a> {
                         self.local_calls.push((self.text(f), f.start_position().row as u32 + 1));
                     } else {
                         self.push_ref(f, refkind::CALL);
+                        // Names handed over: callbacks, if the callee calls them.
+                        let callee = self.intern(self.text(f));
+                        if let Some(args) = node.child_by_field_id(ids.f_arguments) {
+                            let mut c = args.walk();
+                            let list: Vec<Node<'a>> = args.named_children(&mut c).filter(|a| !a.is_extra()).collect();
+                            for (i, a) in list.into_iter().enumerate() {
+                                let a = self.strip(a);
+                                if a.kind_id() == ids.identifier && !(self.in_fn() && self.locals.contains(self.text(a))) {
+                                    let func = self.intern(self.text(a));
+                                    self.out.arg_passes.push(ArgPass { callee, index: i as u32, func });
+                                }
+                            }
+                        }
                     }
                 }
                 Some(f) => {
@@ -683,9 +735,7 @@ impl<'a> Walk<'a> {
             let typedef_name = node.child_by_field_id(ids.f_type).filter(|t| t.kind_id() == ids.type_identifier);
             for d in self.declarators(node) {
                 if let Some((name, _)) = self.decl_name(d) {
-                    if self.in_fn() {
-                        self.skip.insert(name.start_byte());
-                    } else if self.declares_function(d) {
+                    if self.declares_function(d) {
                         self.push_def(name, node, kind::FIELD, flag::CALLABLE);
                     } else {
                         let def = self.push_def(name, node, kind::FIELD, 0);
@@ -711,6 +761,9 @@ impl<'a> Walk<'a> {
                 let flags = self.storage_flags(node);
                 let def = self.push_def(name, node, kind::FUNCTION, flags);
                 self.locals.clear();
+                if let Some(d) = node.child_by_field_id(ids.f_declarator.get()) {
+                    self.note_params(d);
+                }
                 // Error recovery can end the node early; the body's matching
                 // brace is where the function really ends.
                 let mut end = node.end_byte();
@@ -804,7 +857,7 @@ impl<'a> Walk<'a> {
                         kind::ENUM
                     };
                     self.push_def(name, node, kind, 0);
-                    if k != ids.enum_specifier && !self.in_fn() {
+                    if k != ids.enum_specifier {
                         let record = self.intern(self.text(name));
                         let fields = self.member_names(node.child_by_field_id(ids.f_body).unwrap());
                         self.out.records.push(Record { name: record, fields });

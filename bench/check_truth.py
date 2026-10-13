@@ -37,7 +37,7 @@ def si_index(index):
     calls, indirect = [], []
     for sf, sl, cn, cf, _cl, en, ef, _el, how, decl, via, path in si_lines("calls", index):
         if path == "indirect":
-            indirect.append((sf, int(sl), cn, cf, en, ef, via, decl))
+            indirect.append((sf, int(sl), cn, cf, en, ef, via, decl, how))
         else:
             calls.append((sf, int(sl), cn, cf, en, ef, how, decl))
     return files, defs, calls, indirect
@@ -182,7 +182,7 @@ def score(truth_path, index, corpus, cbm=False):
         cf = GENERATED.get(cf, cf)
         if cf not in si_files:
             continue
-        slot = how in ("field", "global", "local")
+        slot = how in ("field", "global", "local", "param")
         sites[how if not slot or stored.get((record, member)) else how + ", nothing stored"] += 1
         if slot:
             callers_ind.add((cf, cn))
@@ -203,11 +203,11 @@ def score(truth_path, index, corpus, cbm=False):
         stores = {"si_stores_in_compiled_lines": len(pairs), "right": len(right_pairs),
                   "precision": len(right_pairs) / max(1, len(pairs)),
                   "truth_stores": len(truth_pairs), "recall": len(right_pairs) / max(1, len(truth_pairs))}
-    got_ind, judged_ind = set(), set()
+    got_ind, judged_ind, judged_sure = set(), set(), set()
     if cbm:
         # It has one kind of call edge; any of them may be one of these.
         got_ind = {(cf, cn, ef, en) for _sf, _sl, cn, cf, en, ef, _how, _decl in call_rows}
-    for site_file, site_line, cn, cf, en, ef, via, decl in indirect_rows:
+    for site_file, site_line, cn, cf, en, ef, via, decl, how in indirect_rows:
         if decl == "decl":
             continue
         got_ind.add((cf, cn, ef, en))
@@ -215,10 +215,15 @@ def score(truth_path, index, corpus, cbm=False):
         if (cf, cn) in callers_ind and (ef, en) in truth_names and t.active(site_file, site_line):
             if compiled_stores is None or via == "*" or (via, ef, en) in compiled_stores:
                 judged_ind.add((cf, cn, ef, en))
+                if how == "certain":
+                    judged_sure.add((cf, cn, ef, en))
     indirect = {"truth_call_sites": dict(sites), "truth_edges": len(want_ind), "found": len(want_ind & got_ind),
                 "recall": len(want_ind & got_ind) / max(1, len(want_ind)),
                 "si_edges": len(got_ind), "si_judged": len(judged_ind), "right": len(judged_ind & want_ind),
-                "precision": len(judged_ind & want_ind) / max(1, len(judged_ind)), "stores": stores}
+                "precision": len(judged_ind & want_ind) / max(1, len(judged_ind)),
+                # Those si is sure of: one member of that name, one function.
+                "si_judged_certain": len(judged_sure), "right_certain": len(judged_sure & want_ind),
+                "precision_certain": len(judged_sure & want_ind) / max(1, len(judged_sure)), "stores": stores}
 
     detail = {"missed_indirect": sorted(want_ind - got_ind), "wrong_indirect": sorted(judged_ind - want_ind),
               "missed_defs": sorted(missed), "generated_defs": sorted(generated), "extra_defs": sorted(extra),

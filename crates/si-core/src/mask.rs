@@ -825,7 +825,25 @@ impl<'a> Lexer<'a> {
                 _ => self.c.line > last_line,
             };
         if alone {
-            blank(&mut self.out.masked, name.start as usize, args_end as usize);
+            // With the storage class before it, which would otherwise be
+            // left to open the next declaration.
+            let s = self.c.s;
+            let mut start = name.start as usize;
+            loop {
+                let mut k = start;
+                while k > 0 && matches!(s[k - 1], b' ' | b'\t') {
+                    k -= 1;
+                }
+                let word_end = k;
+                while k > 0 && is_ident(s[k - 1]) {
+                    k -= 1;
+                }
+                if !matches!(&s[k..word_end], b"static" | b"extern" | b"inline" | b"const") {
+                    break;
+                }
+                start = k;
+            }
+            blank(&mut self.out.masked, start, args_end as usize);
             self.hidden_until = args_end as usize;
         }
         let mut flags = match self.c.peek(0) {
