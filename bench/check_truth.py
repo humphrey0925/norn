@@ -82,11 +82,21 @@ class Truth:
         return i < 0 or line > info["inactive"][i][1]
 
 
-def score(truth_path, index, corpus, cbm=False):
+def score(truth_path, index, corpus, cbm=False, loaded=None, callers=None):
+    """`loaded`: (files, defs, call rows, indirect rows) of some other tool, in
+    the shape si_index returns; it is then scored as codebase-memory-mcp is (one
+    kind of call edge, no stores). `callers`: score calls only from these
+    (file, function) pairs, for a tool whose calls were sampled."""
     t = Truth(truth_path)
     corpus = Path(corpus)
     # files, (file, name) -> lines, call rows
-    si_files, si_defs, call_rows, indirect_rows = cbm_index(index) if cbm else si_index(index)
+    if loaded is not None:
+        cbm = True
+        si_files, si_defs, call_rows, indirect_rows = loaded
+    else:
+        si_files, si_defs, call_rows, indirect_rows = cbm_index(index) if cbm else si_index(index)
+    if callers is not None:
+        call_rows = [r for r in call_rows if (r[3], r[2]) in callers]
 
     # --- definitions -------------------------------------------------------
     text = {}
@@ -117,7 +127,7 @@ def score(truth_path, index, corpus, cbm=False):
                     extra.append((file, line, name))
     defs = {"truth": len(want), "truth_outside_corpus": outside, "found": hit, "recall": hit / len(want),
             "missed_written": len(missed), "missed_macro_generated": len(generated),
-            "si_in_compiled_lines": checked, "si_not_in_truth": len(extra), "precision": 1 - len(extra) / checked}
+            "si_in_compiled_lines": checked, "si_not_in_truth": len(extra), "precision": 1 - len(extra) / max(1, checked)}
 
     # --- calls -------------------------------------------------------------
     want_calls = set()       # (caller file, caller name, callee file, callee name)
@@ -126,7 +136,7 @@ def score(truth_path, index, corpus, cbm=False):
     external = 0
     for cf, cn, _cl, usr, callee_name, home, _site_file, _site_line in t.calls:
         cf = GENERATED.get(cf, cf)
-        if cf not in si_files:
+        if cf not in si_files or (callers is not None and (cf, cn) not in callers):
             continue
         names_called[cf, cn].add(callee_name)
         homes = {GENERATED.get(home, home)} if home else t.homes.get(usr, set())
@@ -162,12 +172,12 @@ def score(truth_path, index, corpus, cbm=False):
     calls = {"truth_edges": len(want_calls), "truth_call_sites_to_undefined": external,
              "truth_edges_decided_by_link": len(per_program),
              "found_certain": len(want_calls & certain), "found_any": len(want_calls & any_),
-             "recall_certain": len(want_calls & certain) / len(want_calls),
-             "recall_any": len(want_calls & any_) / len(want_calls),
+             "recall_certain": len(want_calls & certain) / max(1, len(want_calls)),
+             "recall_any": len(want_calls & any_) / max(1, len(want_calls)),
              "si_certain_judged": len(judged_keys), "right": len(right),
              "wrong_definition_chosen": len(wrong_file), "callee_undefined_in_build": len(undefined),
              "no_such_call": len(phantom),
-             "precision_certain": len(right) / (len(judged_keys) - len(undefined)),
+             "precision_certain": len(right) / max(1, len(judged_keys) - len(undefined)),
              "si_edges_to_prototypes": len(to_decl)}
     # --- calls through struct members -----------------------------------------
     # What clang's types say: a call through member M of struct S may reach
@@ -190,8 +200,8 @@ def score(truth_path, index, corpus, cbm=False):
     # Where si says a function is stored. A store in a file clang did not
     # compile cannot be judged, nor can the calls that only it explains.
     compiled_stores, stores = None, {}
-    binds_file = Path(index) / "binds.tsv"
-    if not cbm and binds_file.exists():
+    binds_file = None if cbm else Path(index) / "binds.tsv"
+    if binds_file and binds_file.exists():
         compiled_stores, pairs, right_pairs = set(), set(), set()
         truth_pairs = {(member, fn_name) for _r, member, _u, fn_name, _h, _sf, _sl in t.raw.get("binds", [])}
         for line in binds_file.read_text(encoding="utf-8").splitlines():
