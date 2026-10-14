@@ -241,6 +241,9 @@ pub struct FileFacts {
     /// For each of them, whether it is under an `#if` (other than the
     /// file's include guard): the file may not be read at all.
     pub include_conditional: Vec<bool>,
+    /// The lines the conditions in force switch off (first, last; from 1):
+    /// not compiled, so not indexed, and nothing is to be found from them.
+    pub inactive: Vec<(u32, u32)>,
     pub macros: Vec<MacroBody>,
     pub sites: Vec<Site>,
     pub binds: Vec<Bind>,
@@ -425,6 +428,7 @@ impl FileFacts {
         exact(&mut self.refs);
         exact(&mut self.includes);
         exact(&mut self.include_conditional);
+        exact(&mut self.inactive);
         exact(&mut self.macros);
         exact(&mut self.sites);
         exact(&mut self.binds);
@@ -471,7 +475,7 @@ impl FileFacts {
             ("calls through", of(&self.param_calls) + of(&self.arg_passes)),
             ("locals", of(&self.locals)),
             ("local uses", of(&self.local_uses)),
-            ("rest", self.path.capacity() + of(&self.includes) + of(&self.include_conditional) + std::mem::size_of::<FileFacts>()),
+            ("rest", self.path.capacity() + of(&self.includes) + of(&self.include_conditional) + of(&self.inactive) + std::mem::size_of::<FileFacts>()),
         ]
     }
 

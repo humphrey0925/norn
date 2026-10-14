@@ -200,6 +200,7 @@ impl Extractor {
             out.includes.push(id);
             out.include_conditional.push(conditional);
         }
+        out.inactive = inactive_lines(src, &lexed.skipped);
         out.mask_ns = t.elapsed().as_nanos() as u64;
         let t = std::time::Instant::now();
         let Some(tree) = self.parser.parse(&lexed.masked, None) else {
@@ -1136,4 +1137,31 @@ impl<'a> Walk<'a> {
         }
         true
     }
+}
+
+/// The lines of `src` that the byte ranges `skipped` cover whole: from the
+/// line after the directive a range starts in, to the line before the one
+/// it ends at (the directive that closes the branch).
+pub(crate) fn inactive_lines(src: &[u8], skipped: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let (mut line, mut at) = (1u32, 0usize);
+    let mut line_of = |pos: usize| {
+        // The ranges come in order: the count goes on from the last one.
+        line += src[at..pos].iter().filter(|&&b| b == b'\n').count() as u32;
+        at = pos;
+        line
+    };
+    for &(from, to) in skipped {
+        let (from, to) = (from as usize, (to as usize).min(src.len()));
+        // A range starts in the opening directive's line, at its newline, or
+        // just past it.
+        let starts_line = from == 0 || src[from - 1] == b'\n';
+        let first = line_of(from) + u32::from(!starts_line);
+        let ends_file = to == src.len();
+        let last = line_of(to) - u32::from(!ends_file);
+        if first <= last {
+            out.push((first, last));
+        }
+    }
+    out
 }

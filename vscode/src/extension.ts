@@ -188,8 +188,10 @@ class Relation implements vscode.WebviewViewProvider {
       return;
     }
     if (this.mode === "assignments") {
-      const r = await ask<{ target: Entry | null; by: string; rows: unknown[] }>("si/assignments", at);
-      const message = !r?.target
+      const r = await ask<{ target: Entry | null; by: string; rows: unknown[]; inactive?: [number, number] }>("si/assignments", at);
+      const message = r?.inactive
+        ? switchedOff(r.inactive)
+        : !r?.target
         ? ""
         : r.by === "member"
           ? `${r.rows.length} assignments to ${r.target.name}`
@@ -197,7 +199,7 @@ class Relation implements vscode.WebviewViewProvider {
       void w.postMessage({ type: "assignments", target: r?.target ?? null, by: r?.by ?? "member", rows: r?.rows ?? [], message });
       return;
     }
-    const r = await ask<{ root: Entry | null; entries: Entry[] }>("si/relation", { ...at, direction: this.mode });
+    const r = await ask<{ root: Entry | null; entries: Entry[]; inactive?: [number, number] }>("si/relation", { ...at, direction: this.mode });
     if (at !== this.at) {
       return; // the cursor has moved on
     }
@@ -205,7 +207,7 @@ class Relation implements vscode.WebviewViewProvider {
     // member or variable holds the functions stored in it.
     const callable = r?.root?.kind === "function" || r?.root?.kind === "macro";
     const what = this.mode === "callers" ? (callable ? "called by" : "used by") : callable ? "calls" : "holds";
-    const message = r?.root ? `${r.root.name} ${what} ${r.entries.length}` : "The cursor is not on a symbol";
+    const message = r?.inactive ? switchedOff(r.inactive) : r?.root ? `${r.root.name} ${what} ${r.entries.length}` : "The cursor is not on a symbol";
     void w.postMessage({ type: "root", mode: this.mode, root: r?.root ?? null, entries: r?.entries ?? [], message });
   }
 
@@ -522,6 +524,13 @@ interface ConditionState {
 
 /** The configuration of the C/C++ extension that is kept in step. */
 const CPP_CONFIGURATION = "Norn";
+
+/** What the views say on a line the compile conditions switch off: it is
+ *  not compiled, so the names in it mean nothing the index can tell. */
+export function switchedOff([first, last]: [number, number]): string {
+  const lines = first === last ? `line ${first}` : `lines ${first}–${last}`;
+  return `Not compiled: ${lines} switched off by the compile conditions in force (#if / #ifdef).`;
+}
 
 /** Give the C/C++ extension (ms-vscode.cpptools) the conditions in force:
  *  a configuration called "Norn" in `.vscode/c_cpp_properties.json` with the
@@ -1248,8 +1257,8 @@ class Context implements vscode.WebviewViewProvider {
     if (parts.length) {
       return parts;
     }
-    const entry = await ask<Entry | null>("si/context", { textDocument: { uri: uri.toString() }, position: { line: at.line, character: at.character } });
-    if (!entry) {
+    const entry = await ask<(Entry & { inactive?: undefined }) | { inactive: [number, number] } | null>("si/context", { textDocument: { uri: uri.toString() }, position: { line: at.line, character: at.character } });
+    if (!entry || entry.inactive) {
       return [];
     }
     const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(entry.uri));
@@ -1279,9 +1288,14 @@ class Context implements vscode.WebviewViewProvider {
       return;
     }
     this.last = key;
-    const entry = await ask<Entry | null>("si/context", at);
+    const entry = await ask<(Entry & { inactive?: undefined }) | { inactive: [number, number] } | null>("si/context", at);
     if (key !== this.last) {
       return; // the cursor has moved on
+    }
+    if (entry?.inactive) {
+      void this.view.webview.postMessage({ type: "show", entry: null, message: switchedOff(entry.inactive) });
+      this.shown = undefined;
+      return;
     }
     if (!entry) {
       // Nothing here: what was shown stays, as a file being read should.

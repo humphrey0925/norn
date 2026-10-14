@@ -702,7 +702,29 @@ impl Server {
         self.location(file, line, name)
     }
 
+    /// The lines switched off by the conditions in force that a
+    /// `textDocument` position is on, if it is on such a line: nothing
+    /// there is compiled, so nothing is to be found from it.
+    fn inactive_at(&mut self, params: &Value) -> Option<(u32, u32)> {
+        let file = self.relative(&uri_to_path(params["textDocument"]["uri"].as_str()?))?;
+        let line = params["position"]["line"].as_u64()? as u32 + 1;
+        self.session.facts_of(&file)?.inactive.iter().copied().find(|&(a, b)| a <= line && line <= b)
+    }
+
     fn request(&mut self, method: &str, params: &Value) -> Option<Value> {
+        // Asked from a line the conditions switch off: what a name there
+        // means is not what the same name means where it is compiled.
+        let from_position = matches!(
+            method,
+            "textDocument/definition" | "textDocument/declaration" | "textDocument/references" | "textDocument/prepareCallHierarchy" | "si/context" | "si/relation" | "si/assignments"
+        );
+        if let Some((first, last)) = from_position.then(|| self.inactive_at(params)).flatten() {
+            return Some(match method {
+                "textDocument/references" => json!([]),
+                "si/context" | "si/relation" | "si/assignments" => json!({ "inactive": [first, last] }),
+                _ => Value::Null,
+            });
+        }
         Some(match method {
             "textDocument/definition" | "textDocument/declaration" => self.definition(params),
             "textDocument/references" => self.references(params),

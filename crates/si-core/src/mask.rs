@@ -99,6 +99,10 @@ pub struct Lexed {
     /// byte, last line). These are function bodies, and stay right where the
     /// parser's error recovery cuts a function short.
     pub blocks: Vec<(u32, u32, u32)>,
+    /// The branches the conditions in force switch off, as byte ranges:
+    /// from the end of the directive that opens one to the start of the
+    /// one that ends it. Nothing in them is indexed.
+    pub skipped: Vec<(u32, u32)>,
 }
 
 /// A `#define` reduced to what decides transparency: `deps` is `Some` when
@@ -1443,6 +1447,7 @@ impl<'a> Lexer<'a> {
             }
         }
         blank(&mut self.out.masked, from, self.c.i);
+        self.out.skipped.push((from as u32, self.c.i as u32));
         self.line_start = true;
     }
 

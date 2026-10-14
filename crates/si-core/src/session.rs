@@ -972,6 +972,8 @@ mod tests {
         let up = s.set_conditions(&settings).unwrap();
         assert_eq!((up.extracted, s.conditions_known()), (1, 3));
         assert_eq!((functions(&s, "net_init"), functions(&s, "net_stub"), functions(&s, "helper")), (1, 0, 1));
+        // The lines switched off are known, to find nothing from them.
+        assert_eq!(s.facts_of("a.c").map(|f| f.inactive.clone()), Some(vec![(4, 4)]));
         // The scope, written to the same file, leaves the conditions alone.
         s.set_scope(Scope::default()).unwrap();
         assert_eq!(s.condition_settings(), settings);
@@ -985,6 +987,7 @@ mod tests {
         other.undefines.push("CONFIG_NET".into());
         s.set_conditions(&other).unwrap();
         assert_eq!((functions(&s, "net_init"), functions(&s, "net_stub")), (0, 1));
+        assert_eq!(s.facts_of("a.c").map(|f| f.inactive.clone()), Some(vec![(2, 2)]));
         drop(s);
         // Conditions changed while nothing was running: the save is rebuilt.
         Settings::default().save(&d.0).unwrap();
