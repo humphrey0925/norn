@@ -433,14 +433,30 @@ impl FileFacts {
         self.names.buf.capacity() + (self.names.off.capacity() + self.names.ids.capacity()) * 4
     }
 
+    /// What each part of the facts takes, in bytes, by name.
+    pub fn parts(&self) -> [(&'static str, usize); 12] {
+        fn of<T>(v: &Vec<T>) -> usize {
+            v.capacity() * std::mem::size_of::<T>()
+        }
+        let records = of(&self.records) + self.records.iter().map(|r| of(&r.fields) + of(&r.types) + of(&r.defs)).sum::<usize>();
+        [
+            ("names", self.names_bytes()),
+            ("refs", of(&self.refs)),
+            ("defs", of(&self.defs)),
+            ("sites", of(&self.sites) + of(&self.inits)),
+            ("macros", of(&self.macros) + of(&self.defined_names)),
+            ("binds", of(&self.binds)),
+            ("records", records + of(&self.aliases) + of(&self.field_types) + of(&self.typed)),
+            ("hints", of(&self.hints) + of(&self.hint_path) + of(&self.ref_hints)),
+            ("calls through", of(&self.param_calls) + of(&self.arg_passes)),
+            ("locals", of(&self.locals)),
+            ("local uses", of(&self.local_uses)),
+            ("rest", self.path.capacity() + of(&self.includes) + of(&self.include_conditional) + std::mem::size_of::<FileFacts>()),
+        ]
+    }
+
     pub fn heap_bytes(&self) -> usize {
-        self.path.capacity()
-            + self.names_bytes()
-            + self.defs.capacity() * std::mem::size_of::<Def>()
-            + self.refs.capacity() * std::mem::size_of::<Ref>()
-            + self.includes.capacity() * 4
-            + self.macros.capacity() * std::mem::size_of::<MacroBody>()
-            + self.sites.capacity() * std::mem::size_of::<Site>()
+        self.parts().iter().map(|p| p.1).sum()
     }
 }
 

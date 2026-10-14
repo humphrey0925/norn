@@ -44,23 +44,27 @@ fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
 
-/// Counting sort of `edges` by `key`, producing a CSR adjacency list.
-fn csr(n: usize, edges: &[[u32; 3]], key: usize, other: usize) -> (Vec<u32>, Vec<EdgeHalf>) {
-    let mut off = vec![0u32; n + 1];
-    for e in edges {
-        off[e[key] as usize + 1] += 1;
+/// The adjacency lists the other way round: for each symbol, the edges
+/// that end at it, in the order of where they start. `next` is scratch,
+/// as long as `off`.
+fn transposed(n: usize, off: &[u32], adj: &[EdgeHalf], mut next: Vec<u32>) -> (Vec<u32>, Vec<EdgeHalf>) {
+    let mut back_off = vec![0u32; n + 1];
+    for e in adj {
+        back_off[e.other as usize + 1] += 1;
     }
     for i in 0..n {
-        off[i + 1] += off[i];
+        back_off[i + 1] += back_off[i];
     }
-    let mut next = off.clone();
-    let mut adj = vec![EdgeHalf { other: 0, meta: 0 }; edges.len()];
-    for e in edges {
-        let slot = &mut next[e[key] as usize];
-        adj[*slot as usize] = EdgeHalf { other: e[other], meta: e[2] };
-        *slot += 1;
+    next.copy_from_slice(&back_off);
+    let mut back = vec![EdgeHalf { other: 0, meta: 0 }; adj.len()];
+    for from in 0..n {
+        for e in &adj[off[from] as usize..off[from + 1] as usize] {
+            let slot = &mut next[e.other as usize];
+            back[*slot as usize] = EdgeHalf { other: from as u32, meta: e.meta };
+            *slot += 1;
+        }
     }
-    (off, adj)
+    (back_off, back)
 }
 
 fn dir_of(path: &str) -> &str {
@@ -338,24 +342,23 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     let t = Instant::now();
     (stats.sites, stats.expanded_defs, stats.expanded_refs) = crate::expand::expand(files, &includes, &sure_includes, cache);
     stats.expand_ms = ms(t);
+    crate::mem_mark("expanded");
     crate::trim_memory();
+    crate::mem_mark("expanded, trimmed");
     if std::env::var_os("SI_MEM_PROFILE").is_some() {
         let mb = |n: usize| n >> 20;
         let part = |fs: &mut dyn Iterator<Item = &FileFacts>| {
-            let (mut names, mut refs, mut defs, mut sites, mut other, mut n) = (0, 0, 0, 0, 0, 0);
+            let (mut sums, mut n) = (Vec::new(), 0);
             for f in fs {
                 n += 1;
-                names += f.names_bytes();
-                refs += f.refs.capacity() * std::mem::size_of::<crate::model::Ref>();
-                defs += f.defs.capacity() * std::mem::size_of::<crate::model::Def>();
-                sites += f.sites.capacity() * std::mem::size_of::<crate::model::Site>() + f.inits.capacity() * std::mem::size_of::<crate::model::InitSite>();
-                other += f.macros.capacity() * std::mem::size_of::<crate::model::MacroBody>()
-                    + f.binds.capacity() * std::mem::size_of::<crate::model::Bind>()
-                    + f.hints.capacity() * std::mem::size_of::<crate::model::MemberHint>()
-                    + (f.ref_hints.capacity() + f.typed.capacity() + f.field_types.capacity() + f.aliases.capacity()) * 8
-                    + (f.hint_path.capacity() + f.includes.capacity() + f.defined_names.capacity()) * 4;
+                let parts = f.parts();
+                sums.resize(parts.len(), ("", 0usize));
+                for (sum, part) in sums.iter_mut().zip(parts) {
+                    *sum = (part.0, sum.1 + part.1);
+                }
             }
-            format!("{n} files: names {} MB, refs {} MB, defs {} MB, sites {} MB, other {} MB", mb(names), mb(refs), mb(defs), mb(sites), mb(other))
+            let all: usize = sums.iter().map(|s| s.1).sum();
+            format!("{n} files, {} MB: {}", mb(all), sums.iter().map(|s| format!("{} {}", s.0, mb(s.1))).collect::<Vec<_>>().join(", "))
         };
         // Of the names: how much is text kept for expanding (the arguments
         // of macro uses, initializers, macro bodies), and how much names proper.
@@ -379,15 +382,19 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     // 1. Every file-local name under its number in the graph, which is
     //    its lexicographic rank among the names in use.
     let t = Instant::now();
+    crate::mem_mark("before names");
     let (remap, names) = name_cache.table(files);
+    crate::mem_mark("names numbered");
     let mut g = Graph::default();
-    g.str_off.reserve(names.len() + 1);
+    g.str_off.reserve_exact(names.len() + 1);
     g.str_off.push(0);
+    g.str_bytes.reserve_exact(names.iter().map(|n| n.len()).sum());
     for name in &names {
         g.str_bytes.extend_from_slice(name.as_bytes());
         g.str_off.push(g.str_bytes.len() as u32);
     }
     stats.intern_ms = ms(t);
+    crate::mem_mark("names");
 
     // 2. Symbol table (each file's symbols contiguous) and name -> symbols index.
     let t = Instant::now();
@@ -422,6 +429,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         *slot += 1;
     }
     stats.syms_ms = ms(t);
+    crate::mem_mark("symbols");
 
     // Which members can hold a function: those declared as function
     // pointers, and those of a typedef type that is one (or that is not
@@ -691,33 +699,50 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
             (edges, counts, sites, handed)
         })
         .collect();
-    let mut edges: Vec<[u32; 3]> = Vec::with_capacity(per_file.iter().map(|p| p.0.len()).sum());
     // The same callback is handed over in many places.
     let mut handed: Vec<[u32; 3]> = per_file.iter().flat_map(|p| p.3.iter().copied()).collect();
     handed.sort_unstable();
     handed.dedup();
-    edges.extend(handed);
-    for (e, c, sites, _) in &per_file {
+    for (_, c, sites, _) in &per_file {
         stats.bind_sites.extend_from_slice(sites);
-        edges.extend_from_slice(e);
         stats.resolved += c[0];
         stats.ambiguous += c[1];
         stats.unresolved += c[2];
         stats.capped += c[3];
     }
-    drop(per_file);
     stats.refs = stats.resolved + stats.ambiguous + stats.unresolved;
-    stats.edges = edges.len() as u64;
+    stats.edges = (handed.len() + per_file.iter().map(|p| p.0.len()).sum::<usize>()) as u64;
     stats.resolve_ms = ms(t);
+    drop((remap, names));
+    crate::mem_mark("resolved");
 
-    // 4. Forward and reverse adjacency.
+    // 4. Forward and reverse adjacency. The edges are never all in one
+    //    list: each file's are put in their place and let go, and the
+    //    reverse is made from the forward one.
     let t = Instant::now();
-    let ((out_off, out), (in_off, inc)) = rayon::join(|| csr(n_syms, &edges, 0, 1), || csr(n_syms, &edges, 1, 0));
+    let mut out_off = vec![0u32; n_syms + 1];
+    for e in std::iter::once(&handed).chain(per_file.iter().map(|p| &p.0)).flatten() {
+        out_off[e[0] as usize + 1] += 1;
+    }
+    for i in 0..n_syms {
+        out_off[i + 1] += out_off[i];
+    }
+    let mut next = out_off.clone();
+    let mut out = vec![EdgeHalf { other: 0, meta: 0 }; stats.edges as usize];
+    for list in std::iter::once(handed).chain(per_file.into_iter().map(|p| p.0)) {
+        for e in &list {
+            let slot = &mut next[e[0] as usize];
+            out[*slot as usize] = EdgeHalf { other: e[1], meta: e[2] };
+            *slot += 1;
+        }
+    }
+    let (in_off, inc) = transposed(n_syms, &out_off, &out, next);
     g.out_off = out_off;
     g.out = out;
     g.in_off = in_off;
     g.inc = inc;
     stats.csr_ms = ms(t);
+    crate::mem_mark("packed");
 
     crate::progress::idle();
     (g, stats)

@@ -162,7 +162,9 @@ pub fn extract_file(ex: &mut extract::Extractor, root: &Path, path: &Path, trans
 /// Extract all files on the current rayon pool; output order matches `files`.
 pub fn extract_all(root: &Path, files: &[PathBuf], transparent: &MacroSets) -> Vec<FileFacts> {
     progress::parsing(files.len());
-    files.par_iter().map_init(extract::Extractor::new, |ex, p| extract_file(ex, root, p, transparent)).collect()
+    let facts = files.par_iter().map_init(extract::Extractor::new, |ex, p| extract_file(ex, root, p, transparent)).collect();
+    mem_mark("extracted");
+    facts
 }
 
 /// Route tree-sitter's C allocations through mimalloc. The platform heap
@@ -178,6 +180,17 @@ pub fn trim_memory() {
     // did the allocating.
     rayon::broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
     unsafe { libmimalloc_sys::mi_collect(true) }
+}
+
+/// With `SI_MEM_PROFILE` set, say what the process holds at this point.
+pub fn mem_mark(what: &str) {
+    if std::env::var_os("SI_MEM_PROFILE").is_none() {
+        return;
+    }
+    let (mut rss, mut peak, mut commit, mut zero) = (0usize, 0usize, 0usize, 0usize);
+    let z: *mut usize = &mut zero;
+    unsafe { libmimalloc_sys::mi_process_info(z, z, z, &mut rss, &mut peak, &mut commit, z, z) };
+    eprintln!("mem       {what}: resident {} MB, committed {} MB, peak {} MB", rss >> 20, commit >> 20, peak >> 20);
 }
 
 pub fn use_mimalloc_for_parser() {
