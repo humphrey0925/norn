@@ -9,7 +9,7 @@
 //! no lock: the text of a name is written before its number is handed out,
 //! and nothing is ever moved or freed.
 
-use rustc_hash::FxHashMap;
+use hashbrown::HashTable;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::sync::Mutex;
 
@@ -22,7 +22,11 @@ const CHUNK: usize = 1 << CHUNK_BITS;
 pub const LIMIT: u32 = 1 << 31;
 
 struct Shard {
-    ids: FxHashMap<&'static str, u32>,
+    /// The numbers given, to be found by the hash of their text. Only the
+    /// numbers: the text is where [`text`] finds it, and a table that also
+    /// held where and how long (and so was three times the size) would be,
+    /// for the kernel's four million names, 0.2 GB that says nothing new.
+    ids: HashTable<u32>,
     /// Where the block being filled has room, and how much.
     free: *mut u8,
     left: usize,
@@ -61,10 +65,12 @@ fn chunk(id: u32) -> &'static [AtomicPtr<u8>] {
 
 /// The number of `name`: the same for the same text, whoever asks.
 pub fn id(name: &str) -> u32 {
-    let shard = xxhash_rust::xxh3::xxh3_64(name.as_bytes()) as usize % SHARDS;
-    let mut shard = SHARDS_[shard].lock().unwrap_or_else(|e| e.into_inner());
-    let shard = shard.get_or_insert_with(|| Shard { ids: FxHashMap::default(), free: std::ptr::null_mut(), left: 0 });
-    if let Some(&id) = shard.ids.get(name) {
+    let hash = hash(name);
+    // The shard by bits the table does not look at: it places by the low
+    // ones and tells apart by the top seven.
+    let mut shard = SHARDS_[(hash >> 32) as usize % SHARDS].lock().unwrap_or_else(|e| e.into_inner());
+    let shard = shard.get_or_insert_with(|| Shard { ids: HashTable::new(), free: std::ptr::null_mut(), left: 0 });
+    if let Some(&id) = shard.ids.find(hash, |&id| text(id) == name) {
         return id;
     }
     let need = 4 + name.len();
@@ -82,17 +88,23 @@ pub fn id(name: &str) -> u32 {
         at
     };
     // SAFETY: `at` has room for `need` bytes that nobody else has been
-    // shown; they are leaked, so the `str` made of them lives forever.
-    let kept: &'static str = unsafe {
+    // shown; they are leaked, so the `str` that `text` makes of them lives
+    // forever.
+    unsafe {
         std::ptr::copy_nonoverlapping((name.len() as u32).to_le_bytes().as_ptr(), at, 4);
         std::ptr::copy_nonoverlapping(name.as_ptr(), at.add(4), name.len());
-        std::str::from_utf8_unchecked(std::slice::from_raw_parts(at.add(4), name.len()))
-    };
+    }
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     assert!(id < LIMIT, "too many names");
     chunk(id)[id as usize & (CHUNK - 1)].store(at, Ordering::Release);
-    shard.ids.insert(kept, id);
+    // (When the table grows it asks each number in it for its hash again:
+    // every one of them has its text in place by then.)
+    shard.ids.insert_unique(hash, id, |&id| self::hash(text(id)));
     id
+}
+
+fn hash(name: &str) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(name.as_bytes())
 }
 
 /// The text of a number [`id`] gave.

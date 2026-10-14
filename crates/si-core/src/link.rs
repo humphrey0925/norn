@@ -327,6 +327,7 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
     let linked = link_all(files, options, cache);
     // Now that everything the link worked with is let go.
     crate::trim_memory();
+    crate::mem_mark("linked, trimmed");
     linked
 }
 

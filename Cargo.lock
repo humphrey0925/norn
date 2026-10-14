@@ -501,6 +501,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "bytemuck",
+ "hashbrown 0.17.1",
  "libmimalloc-sys",
  "rayon",
  "rusqlite",

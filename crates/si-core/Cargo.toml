@@ -8,6 +8,7 @@ tree-sitter = "0.25"
 tree-sitter-c = "0.24"
 rayon = "1"
 rustc-hash = "2"
+hashbrown = { version = "0.17", default-features = false, features = ["inline-more"] }
 bytemuck = { version = "1", features = ["derive"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 walkdir = "2"

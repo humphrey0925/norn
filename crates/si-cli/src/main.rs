@@ -461,9 +461,10 @@ fn bench_incr(root: &Path, n: usize, seed: u64) -> Value {
     let mut facts = si_core::extract_all(root, &files, &transparent);
     let options = si_core::link::Options::default();
     let mut cache = si_core::expand::Cache::default();
-    let (g, _) = si_core::link::link_cached(&facts, &options, &mut cache);
+    // The graph is held from one link to the next, as a session holds it:
+    // the memory reported at the end is that of an index in use.
+    let (mut g, _) = si_core::link::link_cached(&facts, &options, &mut cache);
     let edges = g.out.len();
-    drop(g);
 
     let mut ex = si_core::extract::Extractor::new();
     let mut rng = Rng(seed | 1);
@@ -477,7 +478,9 @@ fn bench_incr(root: &Path, n: usize, seed: u64) -> Value {
         let t1 = Instant::now();
         // The content is the same, but an edit would not be: expand it again.
         cache.forget(i);
-        let (g, stats) = si_core::link::link_cached(&facts, &options, &mut cache);
+        drop(std::mem::take(&mut g));
+        let stats;
+        (g, stats) = si_core::link::link_cached(&facts, &options, &mut cache);
         let t2 = Instant::now();
         steps = json!({ "includes": stats.include_ms, "expand": stats.expand_ms, "intern": stats.intern_ms, "syms": stats.syms_ms,
                         "resolve": stats.resolve_ms, "csr": stats.csr_ms });
