@@ -504,6 +504,8 @@ interface ConditionSettings {
 interface ConditionState {
   configurations: Record<string, Partial<ConditionSettings>>;
   active: string | null;
+  /** The sets are the tree's own build descriptions, followed unasked. */
+  automatic?: boolean;
   available: { name: string; source: string }[];
   effective: { name: string; value: string | null; source: string }[];
   /** Where the build looks for headers, as far as a build description says. */
@@ -648,8 +650,11 @@ class ConditionsTree implements vscode.TreeDataProvider<ConditionRow> {
     if (row.type === "config") {
       const names = Object.keys(this.state.configurations);
       const item = new vscode.TreeItem(this.state.active ?? "No configuration");
-      item.description = names.length > 1 ? `configuration in force · ${names.length} in all` : "configuration in force";
-      item.tooltip = "The set of compile conditions in force. Click to switch, add or remove sets.";
+      const how = this.state.automatic ? "found in the project, in force" : "configuration in force";
+      item.description = names.length > 1 ? `${how} · ${names.length} in all` : how;
+      item.tooltip = this.state.automatic
+        ? "The project's own build configuration, followed without being asked. Click to switch to another, or to set conditions of your own."
+        : "The set of compile conditions in force. Click to switch, add or remove sets.";
       item.iconPath = new vscode.ThemeIcon("list-selection");
       item.command = { command: "si.conditions.switch", title: "Switch Configuration" };
       item.contextValue = "config";
@@ -1402,7 +1407,8 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
     }
     if (s.active || s.available.length) {
       configStatus.text = `$(list-selection) ${s.active ?? "No configuration"}`;
-      configStatus.tooltip = `SI compile conditions: ${s.active ? `${s.active} (${s.known.toLocaleString()} macros settled)` : "none in force"}. Click to switch.`;
+      const found = s.automatic ? ", found in the project" : "";
+      configStatus.tooltip = `SI compile conditions: ${s.active ? `${s.active}${found} (${s.known.toLocaleString()} macros settled)` : "none in force"}. Click to switch.`;
       configStatus.show();
     } else {
       configStatus.hide();

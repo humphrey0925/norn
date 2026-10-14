@@ -2,7 +2,7 @@
   "name": "si-code-index",
   "displayName": "SI Code Index",
   "description": "Source-Insight-style symbol search, context and relation views for C, backed by the si index.",
-  "version": "0.15.2",
+  "version": "0.16.0",
   "publisher": "humphrey0925",
   "repository": {
     "type": "git",

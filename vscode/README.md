@@ -43,8 +43,12 @@ Source-Insight-style views for C in VS Code, backed by the `si` index.
   value, under what says so.
   - A set can *follow* a build configuration found in the workspace: a
     DS-5 / Arm Development Studio / Eclipse CDT `.cproject`, or the
-    `c_cpp_properties.json` of VS Code's C/C++ extension. Its defines are
-    then read from there, and Sync picks up changes made there.
+    `c_cpp_properties.json` of VS Code's C/C++ extension, or a
+    `compile_commands.json` (what every command in it defines). Its
+    defines are then read from there, and Sync picks up changes made there.
+  - Nothing has to be set up for that: while the project has no sets of
+    its own, the build configurations found in it are its sets, the first
+    one in force (the status bar says which, and a click switches).
   - Macros can also be set by hand (they have the last word), read from a
     header of `#define` lines or a Kconfig `.config`, and names with a
     prefix, or all names, can be assumed not defined unless the build or

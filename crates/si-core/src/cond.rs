@@ -109,10 +109,42 @@ pub struct Project {
 }
 
 impl Project {
+    /// What the tree's own build descriptions say, when nobody has said
+    /// anything: a set for each configuration found, the first in force.
+    /// Nothing is written; it is found again each time, until the project
+    /// is given sets of its own (or told to have none).
+    fn found(root: &Path) -> Project {
+        let mut project = Project::default();
+        for (name, entry) in discover(root) {
+            let mut unique = name.clone();
+            for n in 2.. {
+                if !project.configurations.contains_key(&unique) {
+                    break;
+                }
+                unique = format!("{name} {n}");
+            }
+            project.active.get_or_insert_with(|| unique.clone());
+            project.configurations.insert(unique, Settings { condition_files: vec![entry], ..Settings::default() });
+        }
+        project
+    }
+
     pub fn load(root: &Path) -> Project {
+        Project::load_told(root).0
+    }
+
+    /// The project's sets, and whether they are the tree's own build
+    /// descriptions followed unasked rather than anything written.
+    pub fn load_told(root: &Path) -> (Project, bool) {
         let path = crate::scope::Scope::config_path(root);
-        let Some(bytes) = std::fs::read(path).ok() else { return Project::default() };
+        let found = || {
+            let found = Project::found(root);
+            let any = !found.configurations.is_empty();
+            (found, any)
+        };
+        let Some(bytes) = std::fs::read(path).ok() else { return found() };
         let mut project: Project = serde_json::from_slice(&bytes).unwrap_or_default();
+        let said = serde_json::from_slice::<serde_json::Value>(&bytes).is_ok_and(|v| v.get("configurations").is_some_and(|c| !c.is_null()));
         // Written before there were configurations: one set, at the top.
         if project.configurations.is_empty() {
             let one: Settings = serde_json::from_slice(&bytes).unwrap_or_default();
@@ -121,10 +153,13 @@ impl Project {
                 project.active = Some(DEFAULT.to_string());
             }
         }
+        if project.configurations.is_empty() && !said {
+            return found();
+        }
         if project.active.as_ref().is_some_and(|a| !project.configurations.contains_key(a)) {
             project.active = None;
         }
-        project
+        (project, false)
     }
 
     pub fn current(&self) -> Settings {
@@ -178,10 +213,10 @@ pub fn effective(settings: &Settings, root: &Path) -> Vec<Effective> {
 /// entries: `(name, entry)`.
 pub fn discover(root: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for file in [".cproject", ".vscode/c_cpp_properties.json"] {
+    for file in [".cproject", ".vscode/c_cpp_properties.json", "compile_commands.json", "build/compile_commands.json"] {
         let Ok(text) = std::fs::read(root.join(file)) else { continue };
         let text = String::from_utf8_lossy(&text);
-        let names = if file.ends_with(".cproject") { cproject(&text) } else { cpp_properties(&text) };
+        let names = builds_of(file, &text).unwrap_or_default();
         // (The configuration written for the C/C++ extension is our own
         // conditions on their way out, not a build's to follow.)
         let theirs = names.into_iter().filter(|c| c.name != WRITTEN);
@@ -256,6 +291,91 @@ fn split_entry(entry: &str) -> (&str, Option<&str>) {
         Some((path, name)) if !name.contains(['/', '\\']) => (path, Some(name)),
         _ => (entry, None),
     }
+}
+
+/// The configurations in a build description, by what the file is called;
+/// `None` for a file that is none.
+fn builds_of(path: &str, text: &str) -> Option<Vec<Build>> {
+    match path.rsplit(['/', '\\']).next().unwrap_or(path) {
+        ".cproject" => Some(cproject(text)),
+        "c_cpp_properties.json" => Some(cpp_properties(text)),
+        "compile_commands.json" => Some(compile_commands(text)),
+        _ => None,
+    }
+}
+
+/// A compilation database: the commands the build ran, file by file. What
+/// every one of them defines is what the build defines.
+fn compile_commands(text: &str) -> Vec<Build> {
+    let Ok(serde_json::Value::Array(entries)) = serde_json::from_str::<serde_json::Value>(text) else { return Vec::new() };
+    let mut common: Option<Build> = None;
+    for entry in &entries {
+        let words: Vec<String> = match (entry.get("arguments").and_then(|a| a.as_array()), entry.get("command").and_then(|c| c.as_str())) {
+            (Some(args), _) => args.iter().filter_map(|a| a.as_str()).map(str::to_string).collect(),
+            (None, Some(line)) => words(line),
+            _ => continue,
+        };
+        let mut one = Build::default();
+        let mut words = words.iter();
+        while let Some(word) = words.next() {
+            for (flag, define) in [("-D", true), ("-U", false), ("/D", true), ("/U", false)] {
+                let Some(rest) = word.strip_prefix(flag) else { continue };
+                // `-D NAME` as well as `-DNAME`.
+                let value = if rest.is_empty() { words.next().map_or("", String::as_str) } else { rest };
+                if !value.is_empty() {
+                    if define { &mut one.defines } else { &mut one.undefines }.push(value.to_string());
+                }
+                break;
+            }
+        }
+        common = Some(match common {
+            None => one,
+            Some(mut c) => {
+                c.defines.retain(|d| one.defines.contains(d));
+                c.undefines.retain(|u| one.undefines.contains(u));
+                c
+            }
+        });
+    }
+    common.into_iter().map(|c| Build { name: "compile_commands".to_string(), ..c }).collect()
+}
+
+/// A command line in words, as a shell would split it: quotes group, and
+/// are not part of the word.
+fn words(line: &str) -> Vec<String> {
+    let (mut out, mut word, mut quote, mut any) = (Vec::new(), String::new(), None, false);
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match (c, quote) {
+            ('\\', _) => {
+                // `\"` is a quote in the word; any other backslash is itself
+                // (a Windows path).
+                match chars.clone().next() {
+                    Some('"') => {
+                        word.push('"');
+                        chars.next();
+                    }
+                    _ => word.push(c),
+                }
+                any = true;
+            }
+            ('"' | '\'', None) => (quote, any) = (Some(c), true),
+            (c, Some(q)) if c == q => quote = None,
+            (c, None) if c.is_whitespace() => {
+                if std::mem::take(&mut any) {
+                    out.push(std::mem::take(&mut word));
+                }
+            }
+            _ => {
+                word.push(c);
+                any = true;
+            }
+        }
+    }
+    if any {
+        out.push(word);
+    }
+    out
 }
 
 /// One configuration of a build description.
@@ -661,12 +781,7 @@ impl Conditions {
         let (path, wanted) = split_entry(entry);
         let Ok(text) = std::fs::read(root.join(path)) else { return };
         let text = String::from_utf8_lossy(&text);
-        let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
-        let builds = match file {
-            ".cproject" => cproject(&text),
-            "c_cpp_properties.json" => cpp_properties(&text),
-            _ => return self.read_file(&text),
-        };
+        let Some(builds) = builds_of(path, &text) else { return self.read_file(&text) };
         let Some(b) = builds.iter().find(|b| wanted.is_none_or(|w| b.name == w)) else { return };
         for d in &b.defines {
             // `-DNAME` is `#define NAME 1`.
@@ -1126,6 +1241,30 @@ mod tests {
         assert_eq!((Project::load(&dir), Settings::load(&dir)), (p, settings));
         let written = std::fs::read_to_string(dir.join(".si/config.json")).unwrap();
         assert!(written.contains("\"include\"") && !written.contains("\n  \"defines\""), "{written}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_build_description_in_the_tree_is_followed_unasked() {
+        let dir = std::env::temp_dir().join(format!("si-cond-found-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".si")).unwrap();
+        // Nothing in the tree: nothing in force.
+        assert_eq!(Project::load(&dir), Project::default());
+        let commands = r#"[
+            {"directory": "/b", "file": "a.c", "command": "cc -DNDEBUG -D LEVEL=3 -DONLY_A -I inc \"-DNAME=\\\"x y\\\"\" -c a.c"},
+            {"directory": "/b", "file": "b.c", "arguments": ["cc", "-DNDEBUG", "-D", "LEVEL=3", "-DNAME=\"x y\"", "-UOLD", "-c", "b.c"]}
+        ]"#;
+        std::fs::write(dir.join("compile_commands.json"), commands).unwrap();
+        // The scope written, and no conditions: the build's are followed.
+        std::fs::write(dir.join(".si/config.json"), r#"{"include":["src"]}"#).unwrap();
+        let p = Project::load(&dir);
+        assert_eq!(p.active.as_deref(), Some("compile_commands"));
+        let c = Conditions::from_settings(&Settings::load(&dir), &dir);
+        assert_eq!((c.defined(b"NDEBUG"), c.eval(b"LEVEL == 3"), c.defined(b"ONLY_A"), c.defined(b"NAME")), (Tri::True, Tri::True, Tri::Unknown, Tri::True));
+        // Once the project says what it has, even nothing, that stands.
+        Project::default().save(&dir).unwrap();
+        assert_eq!(Project::load(&dir), Project::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
