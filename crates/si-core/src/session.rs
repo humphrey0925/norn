@@ -650,7 +650,18 @@ impl Session {
             let there = in_list != Some(false) && path.is_file() && self.scope.contains(&crate::rel_path(&self.root, &path));
             match (self.files.binary_search(&path), there) {
                 (Ok(i), true) => {
-                    let defines = Packed::of(&mask::defines(&std::fs::read(&path).unwrap_or_default(), &self.conditions));
+                    let src = std::fs::read(&path).unwrap_or_default();
+                    // Said to have changed and the same as indexed: touched
+                    // only (Windows tells of a file read as one changed, when
+                    // the time it was last read is updated).
+                    if xxhash_rust::xxh3::xxh3_64(&src) == self.facts[i].hash && !self.facts[i].path.is_empty() {
+                        touched.remove(&path);
+                        if std::mem::replace(&mut self.stamps[i], stamp(&path)) != self.stamps[i] && self.store.is_some() {
+                            self.unsaved.push(path);
+                        }
+                        continue;
+                    }
+                    let defines = Packed::of(&mask::defines(&src, &self.conditions));
                     defines_changed |= defines != self.defines[i];
                     self.defines[i] = defines;
                     up.changed += 1;
@@ -873,6 +884,19 @@ mod tests {
         drop(s);
         let (s, up) = open(&d);
         assert_eq!((up.loaded, up.extracted, functions(&s, "fresh")), (3, 0, 1));
+    }
+
+    #[test]
+    fn a_file_said_to_change_that_did_not_is_not_parsed_again() {
+        let d = Dir::new("touched");
+        let a = d.write("a.c", "int a (void) { return 0; }\n");
+        let mut s = Session::open(&d.0, Options::default());
+        // What Windows reports of a file that was only read.
+        let up = s.update(std::slice::from_ref(&a));
+        assert_eq!((up.changed, up.extracted), (0, 0));
+        d.write("a.c", "int a (void) { return 1; }\nint b (void) { return a (); }\n");
+        let up = s.update(&[a]);
+        assert_eq!((up.changed, up.extracted, functions(&s, "b")), (1, 1, 1));
     }
 
     #[test]
