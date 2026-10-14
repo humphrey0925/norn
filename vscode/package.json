@@ -2,7 +2,7 @@
   "name": "si-code-index",
   "displayName": "SI Code Index",
   "description": "Source-Insight-style symbol search, context and relation views for C, backed by the si index.",
-  "version": "0.18.0",
+  "version": "0.18.1",
   "publisher": "humphrey0925",
   "repository": {
     "type": "git",
@@ -544,10 +544,12 @@
     "keybindings": []
   },
   "scripts": {
-    "compile": "tsc -p ./",
+    "compile": "tsc -p ./ && npm run bundle",
+    "bundle": "esbuild src/extension.ts --bundle --platform=node --target=node18 --format=cjs --external:vscode --main-fields=module,main --minify-whitespace --minify-syntax --outfile=out/extension.js --log-level=warning",
+    "vscode:prepublish": "npm run compile",
     "watch": "tsc -watch -p ./",
     "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license -o ../out/si-code-index.vsix",
-    "test": "tsc -p ./ && node ./out/test/runTest.js"
+    "test": "npm run compile && node ./out/test/runTest.js"
   },
   "dependencies": {
     "@vscode/codicons": "^0.0.36",
@@ -558,6 +560,7 @@
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
     "@vscode/test-electron": "^2.4.0",
+    "esbuild": "^0.25.0",
     "typescript": "^5.4.0"
   }
 }

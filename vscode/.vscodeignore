@@ -4,3 +4,4 @@ tsconfig.json
 .gitignore
 .vscode-test/**
 out/test/**
+node_modules/**
