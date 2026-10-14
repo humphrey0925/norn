@@ -35,7 +35,7 @@ import compare_clangd
 import run
 
 ROOT = Path(__file__).resolve().parent.parent
-TRUTH = {"c-only": "truth.json", "git-c": "truth-git.json", "redis": "truth-redis-src.json"}
+TRUTH = {"c-only": "truth.json", "git-c": "truth-git.json", "redis": "truth-redis-src.json", "linux": "truth-linux.json"}
 WSL_TOOLS = ("ctags", "cscope", "gtags")
 ALL_TOOLS = ("si", "cbm", "clangd", *WSL_TOOLS)
 SKIP_DIRS = (".git", ".si", ".norn")

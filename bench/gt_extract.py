@@ -45,6 +45,7 @@ import ctypes
 import json
 import multiprocessing
 import os
+import shlex
 import sys
 
 from clang import cindex
@@ -75,7 +76,9 @@ def rel(path):
 
 
 def flags(entry):
-    out, args = [], iter(entry["arguments"][1:])
+    # bear writes `arguments`; the kernel's gen_compile_commands.py, `command`.
+    words = entry["arguments"] if "arguments" in entry else shlex.split(entry["command"])
+    out, args = [], iter(words[1:])
     for a in args:
         if a in DROP_WITH_VALUE:
             next(args)
