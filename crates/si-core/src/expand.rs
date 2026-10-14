@@ -1367,7 +1367,14 @@ fn expand_file(
                     let mut known = FxHashSet::default();
                     let novel = |exp: &[T]| recognise(exp, s, macro_name).novel(&mut known);
                     for (exp, _) in engines[*ei].variants(&toks, pinned, novel) {
-                        let found = recognise(&exp, s, macro_name);
+                        let mut found = recognise(&exp, s, macro_name);
+                        // A use that names a definition: what else it makes,
+                        // and what that calls; not its own name (a call of
+                        // itself, from its own body).
+                        if s.def != NONE {
+                            found.single = None;
+                            found.refs.retain(|r| r.2.is_some());
+                        }
                         // A macro that declares a whole initialized object.
                         let stored = declared_initializer(&exp)
                             .filter(|_| s.flags & site::TOP != 0)
@@ -1385,7 +1392,10 @@ fn expand_file(
         }
         made
     };
-    let rest: Vec<&Site> = live.iter().copied().filter(|s| s.def == NONE).collect();
+    // (A use that names a definition may make other things beside it:
+    // `SYSCALL_DEFINE2(open, ...) { }` makes `__x64_sys_open` and others
+    // that call the one with the body. What it names is made twice, once.)
+    let rest: Vec<&Site> = live.to_vec();
     let made: Vec<Made> = if rest.len() <= PARALLEL_USES {
         read(&mut engines, &rest)
     } else {

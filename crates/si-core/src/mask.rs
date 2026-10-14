@@ -67,6 +67,9 @@ pub struct SiteTok {
     pub init: (u32, u32),
     pub init_type: (u32, u32),
     pub init_array: bool,
+    /// Where the parser sees the name of the definition this use makes,
+    /// when not at the use (see `Lexer::site`); 0 when at it.
+    pub def_at: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1025,6 +1028,37 @@ impl Nest {
 }
 
 /// `buf` is empty when only the report is wanted.
+/// Is there nothing that could be a type before `at`: the start of the
+/// file, a `;` or `}`, past comments and preprocessor lines?
+fn typeless_before(s: &[u8], at: usize) -> bool {
+    let mut i = at;
+    loop {
+        while i > 0 && s[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        if i == 0 {
+            return true;
+        }
+        // A comment ends here: before it.
+        if i >= 2 && &s[i - 2..i] == b"*/" {
+            match s[..i - 2].windows(2).rposition(|w| w == b"/*") {
+                Some(open) => {
+                    i = open;
+                    continue;
+                }
+                None => return false,
+            }
+        }
+        // A preprocessor line ends here: before it.
+        let line_start = s[..i].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+        if s[line_start..i].trim_ascii_start().first() == Some(&b'#') {
+            i = line_start;
+            continue;
+        }
+        return matches!(s[i - 1], b';' | b'}');
+    }
+}
+
 fn blank(buf: &mut [u8], start: usize, end: usize) {
     if buf.is_empty() {
         return;
@@ -1472,7 +1506,23 @@ impl<'a> Lexer<'a> {
         if self.nest.braces.last().is_some_and(|b| b.0 == Brace::Init) {
             flags |= site::INIT;
         }
-        self.out.events.push(Event::Site(SiteTok { name, args_end, flags, init, init_type: before, init_array }));
+        // `SYSCALL_DEFINE2(open, ...)` then a body, and no type before it:
+        // the parser makes no function of that. It is shown the name as a
+        // type and a declarator in the place of the arguments
+        // (`SYSCALL_DEFINE2 f(        )`), which the expansion then names.
+        let mut def_at = 0;
+        if top && flags & site::BRACE_FOLLOWS != 0 && args_end != 0 && typeless_before(self.c.s, name.start as usize) {
+            let s = self.c.s;
+            let open = (name.end as usize..args_end as usize).find(|&i| s[i] == b'(');
+            if let Some(open) = open.filter(|&o| o + 3 < args_end as usize) {
+                let close = args_end as usize - 1;
+                blank(&mut self.out.masked, open, close);
+                self.put(open + 1, b'f');
+                self.put(open + 2, b'(');
+                def_at = open as u32 + 1;
+            }
+        }
+        self.out.events.push(Event::Site(SiteTok { name, args_end, flags, init, init_type: before, init_array, def_at }));
     }
 
     fn directive(&mut self) {

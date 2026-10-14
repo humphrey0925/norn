@@ -232,7 +232,7 @@ impl Extractor {
                 .events
                 .iter()
                 .filter_map(|e| match e {
-                    Event::Site(s) => Some((s.name.start as usize, NONE)),
+                    Event::Site(s) => Some((site_def_at(s), NONE)),
                     _ => None,
                 })
                 .collect(),
@@ -525,7 +525,7 @@ impl<'a> Walk<'a> {
                     // the parser made of the lines before.
                     let top = s.flags & site::TOP != 0;
                     let flags = s.flags | if self.in_fn() && !top { site::IN_FN } else { 0 };
-                    let def = self.site_defs[&(s.name.start as usize)];
+                    let def = self.site_defs[&site_def_at(s)];
                     let scope = if top && def == NONE { 0 } else { self.scope.map_or(0, |s| s.def) };
                     self.out.sites.push(Site { name, args, line: s.name.line, scope, def, flags });
                     let (open, close) = (s.init.0 as usize, s.init.1 as usize);
@@ -1192,4 +1192,9 @@ pub(crate) fn undecided_lines(src: &[u8], undecided: &[(u32, u32, u32)]) -> Vec<
         .collect();
     out.sort_unstable();
     out
+}
+
+/// Where the parser sees the name of the definition a macro use makes.
+fn site_def_at(s: &mask::SiteTok) -> usize {
+    if s.def_at != 0 { s.def_at as usize } else { s.name.start as usize }
 }

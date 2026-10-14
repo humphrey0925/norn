@@ -891,6 +891,23 @@ mod tests {
     }
 
     #[test]
+    fn a_body_after_a_macro_with_no_type_before_it_is_the_function_it_makes() {
+        let d = Dir::new("syscall");
+        d.write(
+            "sys.h",
+            "#define SYSCALL_DEFINE1(name, t, a) \\\n\tstatic long __do_sys_##name(t a); \\\n\tlong __x64_sys_##name(t a) { return __do_sys_##name(a); } \\\n\tstatic long __do_sys_##name(t a)\n",
+        );
+        d.write("open.c", "#include \"sys.h\"\nstatic int helper (int a) { return a; }\n/* opens */\nSYSCALL_DEFINE1(open, int, flags)\n{\n\treturn helper (flags);\n}\n");
+        let s = Session::open(&d.0, Options::default());
+        let g = &s.graph;
+        let calls = |from: &str| -> Vec<&str> {
+            let f = (0..g.syms.len() as u32).find(|&x| g.sym_name(x) == from && g.syms[x as usize].flags & crate::model::flag::DECL == 0).unwrap();
+            crate::callees_through_slots(g, f).iter().map(|c| g.sym_name(c.caller)).collect()
+        };
+        assert_eq!((calls("__x64_sys_open"), calls("__do_sys_open")), (vec!["__do_sys_open"], vec!["helper"]));
+    }
+
+    #[test]
     fn a_macro_is_only_seen_where_its_definition_can_be_read() {
         let d = Dir::new("scoped");
         for dir in ["include/linux", "tools/include/linux", "tools/prog", "drivers", "arch/parisc"] {
