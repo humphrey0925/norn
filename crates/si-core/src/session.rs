@@ -48,7 +48,21 @@ pub struct Session {
     all_stale: bool,
     pub graph: Graph,
     pub stats: LinkStats,
+    /// Files whose facts are still to be saved, after an index from
+    /// nothing: saving is done a few at a time when nothing else is
+    /// asked (`save_some`), the manifest last.
+    unsaved: Vec<PathBuf>,
+    unsaved_manifest: bool,
+    /// The graph is not the one saved.
+    graph_unsaved: bool,
+    /// What the saved graph was made of (`state_digest`), for a session
+    /// that is only that graph (`early`); else 0.
+    early: u64,
 }
+
+/// A graph larger than this is saved when the index is first made and
+/// when the session ends, not after every change.
+const SMALL_GRAPH: usize = 256 << 20;
 
 /// A file's `#define`s as the session keeps them: in bytes, as they are
 /// saved (but with every length and line in as few bytes as it needs).
@@ -94,6 +108,9 @@ pub struct Update {
     pub macros_reclassified: usize,
     pub extract_ms: f64,
     pub link_ms: f64,
+    /// At opening: the graph the caller holds is this session's (see
+    /// `Session::open_deferred`).
+    pub graph_kept: bool,
 }
 
 fn ms(t: Instant) -> f64 {
@@ -131,6 +148,10 @@ impl Session {
             all_stale: false,
             graph,
             stats,
+            unsaved: Vec::new(),
+            unsaved_manifest: false,
+            graph_unsaved: false,
+            early: 0,
         }
     }
 
@@ -168,7 +189,7 @@ impl Session {
     /// such as its functions' parameters and local variables.
     pub fn facts_of(&self, rel: &str) -> Option<&FileFacts> {
         let path = self.root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
-        self.files.binary_search(&path).ok().map(|i| &self.facts[i])
+        self.files.binary_search(&path).ok().and_then(|i| self.facts.get(i))
     }
 
     /// How many macros the conditions settle, one way or the other.
@@ -255,36 +276,184 @@ impl Session {
     /// was saved there is read back, and only the sources that changed
     /// since (or that a change of macros touches) are parsed again.
     pub fn open_cached(root: &Path, options: Options, dir: PathBuf) -> (Session, Update) {
+        let (mut session, up) = Session::open_deferred(root, options, dir, None);
+        while session.save_some(usize::MAX) {}
+        (session, up)
+    }
+
+    /// The same, with the saving left for later (`save_some`): the index
+    /// is of use before it is saved. `have` is the digest of a saved
+    /// graph the caller already holds (see `early`): if it is still the
+    /// graph of the tree, none is made or read here, and the update says
+    /// so (`graph_kept`) for the caller to hand its own over (`adopt`).
+    pub fn open_deferred(root: &Path, options: Options, dir: PathBuf, have: Option<u64>) -> (Session, Update) {
         let t = Instant::now();
+        let profile = |what: &str| {
+            if std::env::var_os("SI_START_PROFILE").is_some() {
+                eprintln!("start     {what}: {:.0} ms", ms(t));
+            }
+        };
         let store = Store::new(dir);
         if let Some(mut session) = Session::restore(root, &options, &store) {
             let loaded = session.files.len();
-            session.store = Some(store);
             // What the tree looks like now, against what was saved.
+            session.store = Some(store);
             let paths = session.out_of_date();
-            if std::env::var_os("SI_START_PROFILE").is_some() {
-                eprintln!("start     tree checked: {:.0} ms", ms(t));
+            profile("tree checked");
+            // Nothing changed, and the graph that was saved is the graph
+            // of these very facts: linking would only make it again.
+            let digest = session.state_digest();
+            if paths.is_empty() {
+                let mut up = Update { loaded, extract_ms: ms(t), ..Update::default() };
+                if have == Some(digest) {
+                    up.graph_kept = true;
+                    profile("graph kept");
+                    return (session, up);
+                }
+                let saved = session.store.as_ref().and_then(|s| s.load_graph()).filter(|g| g.0 == digest);
+                if let Some((_, graph, binds)) = saved {
+                    session.graph = graph;
+                    session.stats.bind_sites = binds;
+                    profile("graph read");
+                    return (session, up);
+                }
             }
             let mut up = session.update(&paths);
-            if std::env::var_os("SI_START_PROFILE").is_some() {
-                eprintln!("start     linked: {:.0} ms", ms(t));
-            }
+            profile("linked");
             up.loaded = loaded;
             up.extract_ms = ms(t) - up.link_ms;
             return (session, up);
         }
-        // Nothing usable saved: index everything, and save it.
+        // Nothing usable saved: index everything; it is saved afterwards.
         let mut session = Session::open(root, options);
         store.invalidate();
-        let s = &session;
-        (0..s.files.len()).into_par_iter().for_each(|i| {
-            store.save(&crate::rel_path(root, &s.files[i]), s.stamps[i], &s.defines[i].get(), &s.facts[i]);
-        });
+        session.unsaved = session.files.clone();
+        session.unsaved_manifest = true;
+        session.graph_unsaved = true;
         session.store = Some(store);
-        session.save_manifest();
-        session.save_expansions();
         let up = Update { extracted: session.files.len(), extract_ms: ms(t), ..Update::default() };
         (session, up)
+    }
+
+    /// The graph the last session saved, and nothing else: enough to
+    /// answer what is where and who calls whom while the index itself is
+    /// read and checked against the tree (`open_deferred`), which takes
+    /// far longer in a large one. It is the graph as it was saved: files
+    /// changed since are as they were. `None` if there is none saved.
+    pub fn early(root: &Path, dir: PathBuf) -> Option<Session> {
+        let store = Store::new(dir);
+        let manifest = store.manifest()?;
+        let (digest, graph, binds) = store.load_graph()?;
+        let mut session = Session::empty(root);
+        session.files = manifest.files.iter().map(|rel| root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR))).collect();
+        session.graph = graph;
+        session.stats.bind_sites = binds;
+        session.early = digest;
+        Some(session)
+    }
+
+    /// A session of nothing, to stand in until there is one.
+    pub fn empty(root: &Path) -> Session {
+        Session {
+            root: root.to_path_buf(),
+            files: Vec::new(),
+            defines: Vec::new(),
+            facts: Vec::new(),
+            sets: MacroSets::default(),
+            cache: Cache::default(),
+            options: Options::default(),
+            store: None,
+            stamps: Vec::new(),
+            scope: Scope::load(root),
+            conditions: Conditions::default(),
+            all_stale: false,
+            graph: Graph::default(),
+            stats: LinkStats::default(),
+            unsaved: Vec::new(),
+            unsaved_manifest: false,
+            graph_unsaved: false,
+            early: 1,
+        }
+    }
+
+    /// Set for a session that is only a saved graph, or nothing at all:
+    /// it answers, and is not to be changed.
+    pub fn is_early(&self) -> bool {
+        self.early != 0
+    }
+
+    /// The digest of the saved graph an early session holds.
+    pub fn early_digest(&self) -> Option<u64> {
+        (self.early > 1).then_some(self.early)
+    }
+
+    /// Take over the graph of `early`, which is this session's too
+    /// (`Update::graph_kept`).
+    pub fn adopt(&mut self, early: &mut Session) {
+        self.graph = std::mem::take(&mut early.graph);
+        self.stats.bind_sites = std::mem::take(&mut early.stats.bind_sites);
+    }
+
+    /// What the graph is made of: the sets every file was read under,
+    /// and each file's path and content.
+    fn state_digest(&self) -> u64 {
+        use xxhash_rust::xxh3::xxh3_64_with_seed as mix;
+        let mut h = self.sets.digest() ^ self.files.len() as u64;
+        for (from, to) in &self.options.include_aliases {
+            h = mix(to.as_bytes(), mix(from.as_bytes(), h));
+        }
+        for (path, facts) in self.files.iter().zip(&self.facts) {
+            h = mix(facts.path.as_bytes(), h ^ facts.hash);
+            debug_assert!(path.ends_with(std::path::Path::new(&facts.path.replace('/', std::path::MAIN_SEPARATOR_STR))));
+        }
+        // (0 and 1 say other things in `early`.)
+        h.max(2)
+    }
+
+    /// Whether anything is still to be saved.
+    pub fn unsaved(&self) -> bool {
+        self.store.is_some() && (!self.unsaved.is_empty() || self.unsaved_manifest || self.graph_unsaved && self.graph_due())
+    }
+
+    fn graph_due(&self) -> bool {
+        // A large graph is not written again after every change.
+        self.graph.heap_bytes() <= SMALL_GRAPH || self.store.as_ref().is_some_and(|s| s.graph_digest().is_none())
+    }
+
+    /// Save some of what is not saved yet: the facts of `at_most` files,
+    /// or, those done, what vouches for them, or the graph. Returns
+    /// whether more is left.
+    pub fn save_some(&mut self, at_most: usize) -> bool {
+        if self.store.is_none() {
+            return false;
+        }
+        if !self.unsaved.is_empty() {
+            let batch = self.unsaved.split_off(self.unsaved.len().saturating_sub(at_most));
+            let (s, store) = (&*self, self.store.as_ref().unwrap());
+            batch.par_iter().for_each(|path| {
+                if let Ok(i) = s.files.binary_search(path) {
+                    store.save(&crate::rel_path(&s.root, path), s.stamps[i], &s.defines[i].get(), &s.facts[i]);
+                }
+            });
+        } else if self.unsaved_manifest {
+            self.unsaved_manifest = false;
+            self.save_manifest();
+            self.save_expansions();
+        } else if self.graph_unsaved && self.graph_due() {
+            self.save_graph();
+        }
+        self.unsaved()
+    }
+
+    /// Save the graph, if it is not the one saved and everything it is
+    /// the graph of is: at the end of a session, whatever its size.
+    pub fn save_graph(&mut self) {
+        if self.graph_unsaved && self.unsaved.is_empty() && !self.unsaved_manifest {
+            if let Some(store) = &self.store {
+                store.save_graph(self.state_digest(), &self.graph, &self.stats.bind_sites);
+                self.graph_unsaved = false;
+            }
+        }
     }
 
     /// The session as it was last saved, not yet linked; `None` if the save
@@ -362,6 +531,10 @@ impl Session {
             all_stale: false,
             graph: Graph::default(),
             stats: LinkStats::default(),
+            unsaved: Vec::new(),
+            unsaved_manifest: false,
+            graph_unsaved: false,
+            early: 0,
         })
     }
 
@@ -529,7 +702,11 @@ impl Session {
             stale.par_iter().for_each(|&i| {
                 store.save(&crate::rel_path(&s.root, &s.files[i]), s.stamps[i], &s.defines[i].get(), &s.facts[i]);
             });
-            self.save_manifest();
+            // (While the first save of everything is still on its way,
+            // the manifest waits for it.)
+            if self.unsaved.is_empty() && !self.unsaved_manifest {
+                self.save_manifest();
+            }
         }
         up.extract_ms = ms(t);
 
@@ -539,7 +716,10 @@ impl Session {
         self.graph = Graph::default();
         (self.graph, self.stats) = link_cached(&self.facts, &self.options, &mut self.cache);
         up.link_ms = ms(t);
-        self.save_expansions();
+        self.graph_unsaved = true;
+        if !self.unsaved_manifest {
+            self.save_expansions();
+        }
         up
     }
 }

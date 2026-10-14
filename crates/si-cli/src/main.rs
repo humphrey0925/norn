@@ -141,6 +141,30 @@ impl Keep {
     }
 }
 
+impl Keep {
+    /// What the last session saved to answer with at once.
+    fn early(&self, root: &Path) -> Option<si_core::session::Session> {
+        if self.no_cache || self.rebuild {
+            return None;
+        }
+        let dir = self.cache_dir.clone().unwrap_or_else(|| si_core::store::Store::default_dir(root));
+        si_core::session::Session::early(root, dir)
+    }
+
+    /// As `open`, with the saving left to be done after (`save_some`).
+    fn open_deferred(&self, root: &Path, options: &si_core::link::Options, have: Option<u64>) -> (si_core::session::Session, si_core::session::Update) {
+        use si_core::session::Session;
+        if self.no_cache {
+            return self.open(root, options);
+        }
+        let dir = self.cache_dir.clone().unwrap_or_else(|| si_core::store::Store::default_dir(root));
+        if self.rebuild {
+            si_core::store::Store::new(dir.clone()).invalidate();
+        }
+        Session::open_deferred(root, options.clone(), dir, have)
+    }
+}
+
 fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
@@ -625,7 +649,8 @@ fn main() {
         Cmd::Lsp { root, include_alias, keep } => {
             let options = si_core::link::Options { include_aliases: aliases(include_alias) };
             let keep = keep.clone();
-            return lsp::run(root.as_deref(), &move |dir: &Path| keep.open(dir, &options));
+            let early = keep.clone();
+            return lsp::run(root.as_deref(), move |dir: &Path| early.early(dir), move |dir: &Path, have| keep.open_deferred(dir, &options, have));
         }
         Cmd::Live { root, include_alias, keep } => {
             return live(root, keep, &si_core::link::Options { include_aliases: aliases(include_alias) })

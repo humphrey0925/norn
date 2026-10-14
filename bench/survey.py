@@ -45,6 +45,9 @@ class Server:
         self.p = subprocess.Popen([str(SI), "lsp", *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.id, self.root, self.high = 0, Path(root).resolve(), 0
         self.request("initialize", {"rootUri": self.root.as_uri(), "capabilities": {}})
+        # The server answers before the index is there: wait for it.
+        while self.request("si/status", {}).get("loading"):
+            time.sleep(0.02)
 
     def send(self, msg):
         body = json.dumps(msg).encode()

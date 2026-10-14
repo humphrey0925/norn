@@ -133,6 +133,15 @@ struct Server {
     /// Every symbol worth listing, by name without regard to case; made
     /// when first asked for and dropped when the index changes.
     listing: [Option<Vec<u32>>; 2],
+    /// The index is still being read or made: the session answers with
+    /// what was saved (or nothing), and what would change it waits.
+    loading: bool,
+    waiting: Vec<Value>,
+}
+
+/// What changes the index, and so has to wait for there to be one.
+fn changes(method: &str) -> bool {
+    matches!(method, "si/setConditions" | "si/setScope" | "si/sync" | "textDocument/didSave" | "workspace/didChangeWatchedFiles")
 }
 
 impl Server {
@@ -700,7 +709,7 @@ impl Server {
                         v["conditions"] = self.conditions();
                         v
                     }
-                    Err(e) => json!({ "error": format!("could not save the conditions: {e}") }),
+                    Err(e) => json!({ "error": format!("could not save the conditions in {}: {e}", si_core::scope::Scope::config_path(&self.root).display()) }),
                 }
             }
             "si/scope" => self.scope(),
@@ -719,9 +728,17 @@ impl Server {
                 self.synced(up)
             }
             "si/status" => json!({ "files": self.session.files(), "symbols": self.g().syms.len(), "edges": self.g().out.len(),
-                                   "loaded": self.opened.0, "parsed": self.opened.1,
+                                   "loaded": self.opened.0, "parsed": self.opened.1, "loading": self.loading,
                                    "cache": self.session.cache_dir().map(|d| d.to_string_lossy().into_owned()) }),
-            "shutdown" => Value::Null,
+            "shutdown" => {
+                // The graph as it is now, for the next start to begin with.
+                // And whatever of a first index is not saved yet.
+                if !self.loading {
+                    while self.session.save_some(4096) {}
+                    self.session.save_graph();
+                }
+                Value::Null
+            }
             _ => return None,
         })
     }
@@ -756,11 +773,26 @@ impl Server {
     }
 }
 
-pub fn run(root: Option<&Path>, open: &dyn Fn(&Path) -> (Session, si_core::session::Update)) {
-    let stdin = std::io::stdin();
-    let mut input = stdin.lock();
+/// What the main loop waits for.
+enum Event {
+    Message(Value),
+    /// The index, read or made.
+    Opened(Box<(Session, si_core::session::Update)>),
+    /// The editor is gone.
+    Closed,
+}
+
+/// `early` gives what the last session left to answer with at once (see
+/// `Session::early`), `open` the index itself, which is read or made on a
+/// thread of its own while requests are already answered.
+pub fn run(
+    root: Option<&Path>,
+    early: impl Fn(&Path) -> Option<Session>,
+    open: impl Fn(&Path, Option<u64>) -> (Session, si_core::session::Update) + Send + Sync + 'static,
+) {
+    let open = std::sync::Arc::new(open);
     let mut out = std::io::stdout();
-    // Indexing holds this thread; another says how far it has got
+    // Indexing takes its time; a thread says how far it has got
     // (`si/progress`), and that it is over.
     std::thread::spawn(|| {
         use si_core::progress::{now, Phase};
@@ -781,42 +813,112 @@ pub fn run(root: Option<&Path>, open: &dyn Fn(&Path) -> (Session, si_core::sessi
             write_message(&mut std::io::stdout(), &json!({ "jsonrpc": "2.0", "method": "si/progress", "params": params }));
         }
     });
+    let (events, inbox) = std::sync::mpsc::channel::<Event>();
+    {
+        let events = events.clone();
+        std::thread::spawn(move || {
+            let stdin = std::io::stdin();
+            let mut input = stdin.lock();
+            while let Some(msg) = read_message(&mut input) {
+                if events.send(Event::Message(msg)).is_err() {
+                    return;
+                }
+            }
+            let _ = events.send(Event::Closed);
+        });
+    }
     let mut server: Option<Server> = None;
-    while let Some(msg) = read_message(&mut input) {
+    let handle = |server: &mut Option<Server>, msg: Value, out: &mut std::io::Stdout| -> bool {
         let method = msg["method"].as_str().unwrap_or("").to_string();
         let (id, params) = (msg.get("id").cloned(), &msg["params"]);
         if method == "initialize" {
             let from_client = params["rootUri"].as_str().map(uri_to_path).or(params["rootPath"].as_str().map(PathBuf::from));
             let dir = root.map(Path::to_path_buf).or(from_client).unwrap_or_else(|| PathBuf::from("."));
-            let (session, opened) = open(&dir);
-            let opened = (opened.loaded, opened.extracted);
-            server = Some(Server { session, opened, root: dir, open: HashMap::new(), lines: HashMap::new(), listing: [None, None] });
+            // What was saved answers at once; the index follows.
+            let session = early(&dir).unwrap_or_else(|| Session::empty(&dir));
+            let have = session.early_digest();
+            let (open, events, at) = (open.clone(), events.clone(), dir.clone());
+            std::thread::spawn(move || {
+                let _ = events.send(Event::Opened(Box::new(open(&at, have))));
+            });
+            *server = Some(Server { session, opened: (0, 0), root: dir, open: HashMap::new(), lines: HashMap::new(), listing: [None, None], loading: true, waiting: Vec::new() });
             let capabilities = json!({
                 "textDocumentSync": { "openClose": true, "change": 1, "save": true },
                 "definitionProvider": true, "declarationProvider": true, "referencesProvider": true,
                 "documentSymbolProvider": true, "workspaceSymbolProvider": true, "callHierarchyProvider": true,
             });
             let result = json!({ "capabilities": capabilities, "serverInfo": { "name": "si", "version": env!("CARGO_PKG_VERSION") } });
-            write_message(&mut out, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));
-            continue;
+            write_message(out, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+            return true;
         }
         if method == "exit" {
-            break;
+            return false;
         }
-        match (&mut server, id) {
+        match (server, id) {
+            (Some(s), _) if s.loading && changes(&method) => s.waiting.push(msg.clone()),
             (Some(s), Some(id)) => {
                 let reply = match s.request(&method, params) {
                     Some(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
                     None => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": format!("{method} is not supported") } }),
                 };
-                write_message(&mut out, &reply);
+                write_message(out, &reply);
             }
             (Some(s), None) => s.notification(&method, params),
             (None, Some(id)) => {
                 let error = json!({ "code": -32002, "message": "not initialized" });
-                write_message(&mut out, &json!({ "jsonrpc": "2.0", "id": id, "error": error }));
+                write_message(out, &json!({ "jsonrpc": "2.0", "id": id, "error": error }));
             }
             (None, None) => {}
+        }
+        true
+    };
+    loop {
+        // With nothing asked, what is not saved yet is, a little at a time.
+        let saving = server.as_ref().is_some_and(|s| !s.loading && s.session.unsaved());
+        let event = if saving {
+            match inbox.try_recv() {
+                Ok(event) => event,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if let Some(s) = &mut server {
+                        s.session.save_some(256);
+                    }
+                    continue;
+                }
+                Err(_) => break,
+            }
+        } else {
+            match inbox.recv() {
+                Ok(event) => event,
+                Err(_) => break,
+            }
+        };
+        match event {
+            Event::Closed => break,
+            Event::Message(msg) => {
+                if !handle(&mut server, msg, &mut out) {
+                    break;
+                }
+            }
+            Event::Opened(opened) => {
+                let (mut session, up) = *opened;
+                let Some(s) = &mut server else { continue };
+                if up.graph_kept {
+                    session.adopt(&mut s.session);
+                }
+                s.session = session;
+                // (What stood in for it is gone: give its memory back.)
+                si_core::trim_memory();
+                s.opened = (up.loaded, up.extracted);
+                s.loading = false;
+                s.lines.clear();
+                s.listing = [None, None];
+                let ready = json!({ "files": s.session.files(), "symbols": s.g().syms.len(), "edges": s.g().out.len(), "loaded": up.loaded, "parsed": up.extracted });
+                write_message(&mut out, &json!({ "jsonrpc": "2.0", "method": "si/ready", "params": ready }));
+                // What was asked of the index while there was none.
+                for msg in std::mem::take(&mut s.waiting) {
+                    handle(&mut server, msg, &mut out);
+                }
+            }
         }
     }
 }

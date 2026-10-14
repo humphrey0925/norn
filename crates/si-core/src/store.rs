@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped whenever what extraction records, or how it is laid out, changes:
 /// facts written by another version are not read.
-const FORMAT: u32 = 9;
+const FORMAT: u32 = 10;
 
 /// Size and modification time of a source file when its facts were made.
 pub type Stamp = (u64, u64);
@@ -111,6 +111,57 @@ impl Store {
                 let _ = std::fs::rename(&tmp, self.dir.join("manifest"));
             }
         }
+    }
+
+    /// The graph, with what it is the graph of (a digest the session
+    /// makes) and where functions are stored in members and variables,
+    /// which the link finds and the graph does not hold.
+    pub fn save_graph(&self, digest: u64, graph: &crate::graph::Graph, binds: &[[u32; 4]]) {
+        self.prepare();
+        let tmp = self.dir.join("graph.tmp");
+        let write = || -> std::io::Result<()> {
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp)?);
+            use std::io::Write;
+            w.write_all(&(FORMAT as u64).to_le_bytes())?;
+            w.write_all(&digest.to_le_bytes())?;
+            crate::graph::write_vec(&mut w, binds)?;
+            graph.write_tables(&mut w)?;
+            crate::graph::write_vec(&mut w, &graph.out_off)?;
+            crate::graph::write_vec(&mut w, &graph.out)?;
+            crate::graph::write_vec(&mut w, &graph.in_off)?;
+            crate::graph::write_vec(&mut w, &graph.inc)?;
+            w.flush()
+        };
+        if write().is_ok() {
+            let _ = std::fs::rename(&tmp, self.dir.join("graph"));
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// The digest of the saved graph, if there is one of this version.
+    pub fn graph_digest(&self) -> Option<u64> {
+        use std::io::Read;
+        let mut head = [0u8; 16];
+        std::fs::File::open(self.dir.join("graph")).ok()?.read_exact(&mut head).ok()?;
+        (u64::from_le_bytes(head[..8].try_into().unwrap()) == FORMAT as u64).then(|| u64::from_le_bytes(head[8..].try_into().unwrap()))
+    }
+
+    pub fn load_graph(&self) -> Option<(u64, crate::graph::Graph, Vec<[u32; 4]>)> {
+        use std::io::Read;
+        let mut r = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(self.dir.join("graph")).ok()?);
+        let mut head = [0u8; 16];
+        r.read_exact(&mut head).ok()?;
+        if u64::from_le_bytes(head[..8].try_into().unwrap()) != FORMAT as u64 {
+            return None;
+        }
+        let binds = crate::graph::read_vec(&mut r).ok()?;
+        let mut graph = crate::graph::Graph::read_tables(&mut r).ok()?;
+        graph.out_off = crate::graph::read_vec(&mut r).ok()?;
+        graph.out = crate::graph::read_vec(&mut r).ok()?;
+        graph.in_off = crate::graph::read_vec(&mut r).ok()?;
+        graph.inc = crate::graph::read_vec(&mut r).ok()?;
+        Some((u64::from_le_bytes(head[8..].try_into().unwrap()), graph, binds))
     }
 
     /// No manifest: whatever is saved is no longer vouched for.

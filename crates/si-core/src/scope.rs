@@ -39,7 +39,44 @@ pub fn write_settings(root: &Path, settings: serde_json::Value) -> std::io::Resu
             all[key] = value.clone();
         }
     }
-    std::fs::write(path, serde_json::to_string_pretty(&all).unwrap() + "\n")
+    write_over(&path, (serde_json::to_string_pretty(&all).unwrap() + "\n").as_bytes())
+}
+
+/// Write `bytes` as the whole of the file at `path`, which is ours to
+/// write: over a file that is marked read-only (as version control marks
+/// what is not checked out) or hidden (which Windows refuses to replace,
+/// though not to rewrite), and again a moment later if something else has
+/// it just then (a virus scanner, a sync client).
+fn write_over(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let once = || -> std::io::Result<()> {
+        if !path.exists() {
+            return std::fs::write(path, bytes);
+        }
+        // Opened as it is and emptied, not made anew.
+        let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+        file.set_len(0)?;
+        file.write_all(bytes)
+    };
+    let mut last = Ok(());
+    for attempt in 0..5 {
+        last = once();
+        match &last {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                if let Ok(meta) = std::fs::metadata(path) {
+                    let mut permissions = meta.permissions();
+                    if permissions.readonly() {
+                        #[allow(clippy::permissions_set_readonly_false)]
+                        permissions.set_readonly(false);
+                        let _ = std::fs::set_permissions(path, permissions);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(40 << attempt));
+            }
+            _ => break,
+        }
+    }
+    last
 }
 
 /// Folders that are never part of a project: ours, and version control's.

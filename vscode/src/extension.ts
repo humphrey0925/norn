@@ -1363,8 +1363,11 @@ export async function activate(context: vscode.ExtensionContext) {
   const selector: vscode.DocumentSelector = [{ scheme: "file", pattern: "**/*.{c,h}" }];
 
   async function refreshStatus() {
-    const s = await ask<{ files: number; symbols: number; loaded: number; parsed: number; cache: string | null }>("si/status", {});
-    status.text = s ? `$(symbol-namespace) SI ${s.files.toLocaleString()} files · ${s.symbols.toLocaleString()} symbols` : "$(warning) SI not running";
+    const s = await ask<{ files: number; symbols: number; loaded: number; parsed: number; cache: string | null; loading?: boolean }>("si/status", {});
+    // (While the index is read or made the server answers from what the
+    // last session saved; the status says so until `si/ready`.)
+    const loading = s?.loading ? (s.symbols ? "$(sync~spin) " : "$(sync~spin) indexing · ") : "";
+    status.text = s ? `$(symbol-namespace) SI ${loading}${s.files.toLocaleString()} files · ${s.symbols.toLocaleString()} symbols` : "$(warning) SI not running";
     status.tooltip = s
       ? `Click to sync the index with the disk.\nAt start: ${s.loaded.toLocaleString()} files read from the saved index, ${s.parsed.toLocaleString()} parsed
 ` + (s.cache ? `Index kept in ${s.cache}` : "Index not kept (si.cache.enabled is off)") + `
@@ -1618,6 +1621,17 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
     };
     client = new LanguageClient("si", "SI", serverOptions, clientOptions);
     client.onNotification("si/progress", progress);
+    // The index is there (the server answers before it is, from what the
+    // last session saved if anything): everything shown is asked for again.
+    client.onNotification("si/ready", async () => {
+      await refreshStatus();
+      await scopeTree.load();
+      await conditions.load();
+      fileSymbols.refresh();
+      search.refresh();
+      lenses.refresh();
+      follow(vscode.window.activeTextEditor ?? current, true);
+    });
     try {
       await client.start();
     } catch (e) {
