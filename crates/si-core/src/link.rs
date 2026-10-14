@@ -146,9 +146,19 @@ fn include_edges(files: &[FileFacts], aliases: &[(String, String)], stats: &mut 
                     let holds = up.is_empty() || dir == up || dir.starts_with(up) && dir.as_bytes().get(up.len()) == Some(&b'/');
                     holds.then(|| up.split('/').filter(|s| !s.is_empty()).count())
                 };
+                // Where none is above the includer (`asm/barrier.h` from
+                // `include/linux/`: each architecture's, and a test
+                // program's), the folders made to be looked up from, by
+                // their name (`arch/x86/include/`), before the others
+                // (`tools/virtio/`).
+                let include_folder = |id: u32| {
+                    let p = files[id as usize].path.as_str();
+                    let root = p[..p.len() - tail.len()].trim_end_matches('/');
+                    root.rsplit('/').next().is_some_and(|last| last == "include")
+                };
                 let shared = |id: u32| {
                     let other = dir_of(&files[id as usize].path);
-                    (above(id), dir.split('/').zip(other.split('/')).take_while(|(a, b)| a == b).count())
+                    (above(id), include_folder(id), dir.split('/').zip(other.split('/')).take_while(|(a, b)| a == b).count())
                 };
                 match cands.iter().map(|&c| shared(c)).max() {
                     Some(best) => out.extend(cands.iter().copied().filter(|&c| shared(c) == best)),
@@ -246,7 +256,13 @@ fn in_sight(
     }
     if !out.is_empty() && out.iter().all(|&c| syms[c as usize].flags & flag::DECL != 0) {
         let n = out.len();
-        out.extend(cands.iter().filter(external).filter(|&&c| syms[c as usize].flags & flag::DECL == 0));
+        // A `static` one in a header the file does not include is no one's
+        // definition of this prototype, unless there is no other.
+        let definition = |c: &&u32| syms[**c as usize].flags & flag::DECL == 0;
+        out.extend(cands.iter().filter(external).filter(definition).filter(|&&c| syms[c as usize].flags & flag::STATIC == 0));
+        if out.len() == n {
+            out.extend(cands.iter().filter(external).filter(definition));
+        }
         if out.len() > n {
             out.drain(..n);
         }
