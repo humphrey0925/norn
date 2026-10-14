@@ -244,6 +244,10 @@ pub struct FileFacts {
     /// The lines the conditions in force switch off (first, last; from 1):
     /// not compiled, so not indexed, and nothing is to be found from them.
     pub inactive: Vec<(u32, u32)>,
+    /// The lines that may or may not be compiled, the conditions in force
+    /// cannot tell: (first, last, the line of the `#if` that decides).
+    /// Indexed, and what is found in them is only as sure as that `#if`.
+    pub undecided: Vec<(u32, u32, u32)>,
     pub macros: Vec<MacroBody>,
     pub sites: Vec<Site>,
     pub binds: Vec<Bind>,
@@ -429,6 +433,7 @@ impl FileFacts {
         exact(&mut self.includes);
         exact(&mut self.include_conditional);
         exact(&mut self.inactive);
+        exact(&mut self.undecided);
         exact(&mut self.macros);
         exact(&mut self.sites);
         exact(&mut self.binds);
@@ -475,7 +480,7 @@ impl FileFacts {
             ("calls through", of(&self.param_calls) + of(&self.arg_passes)),
             ("locals", of(&self.locals)),
             ("local uses", of(&self.local_uses)),
-            ("rest", self.path.capacity() + of(&self.includes) + of(&self.include_conditional) + of(&self.inactive) + std::mem::size_of::<FileFacts>()),
+            ("rest", self.path.capacity() + of(&self.includes) + of(&self.include_conditional) + of(&self.inactive) + of(&self.undecided) + std::mem::size_of::<FileFacts>()),
         ]
     }
 

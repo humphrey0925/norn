@@ -47,6 +47,7 @@ body { padding: 0; margin: 0; color: var(--vscode-foreground); font-family: var(
 .badge.ptr { color: var(--vscode-charts-blue); background: color-mix(in srgb, var(--vscode-charts-blue) 16%, transparent); }
 .badge.mac { color: var(--vscode-charts-orange); background: color-mix(in srgb, var(--vscode-charts-orange) 16%, transparent); }
 .badge.amb { color: var(--vscode-charts-yellow); background: color-mix(in srgb, var(--vscode-charts-yellow) 16%, transparent); }
+.badge.cond { color: var(--vscode-charts-orange); background: color-mix(in srgb, var(--vscode-charts-orange) 16%, transparent); font-family: var(--vscode-editor-font-family); }
 
 .graph { overflow: auto; padding: 6px 4px; }
 .graph svg { display: block; }

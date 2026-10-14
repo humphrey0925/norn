@@ -1,6 +1,6 @@
 # Norn 安裝與使用指南
 
-適用版本：Norn 0.19.5（VS Code 擴充套件，Windows x64）
+適用版本：Norn 0.19.6（VS Code 擴充套件，Windows x64）
 
 Norn 讓你在大型 C 專案裡立刻查到每個函式和變數在哪定義、誰呼叫它、它又呼叫誰。它不需要先把專案編譯過，開啟資料夾就自動建立索引，連透過巨集和函式指標的呼叫也追得到。
 
@@ -43,11 +43,11 @@ Norn 不連網，也不會把任何資料傳出去。
 
 ### 2.1 取得安裝檔
 
-下載 `norn-0.19.5-windows-x64.7z` 並解壓縮，裡面有三個檔案：
+下載 `norn-0.19.6-windows-x64.7z` 並解壓縮，裡面有三個檔案：
 
 | 檔案 | 用途 |
 |---|---|
-| `norn-0.19.5.vsix` | VS Code 擴充套件，安裝這個就夠了 |
+| `norn-0.19.6.vsix` | VS Code 擴充套件，安裝這個就夠了 |
 | `norn-windows-x64.exe` | 同一個索引程式的命令列版本，給腳本或其他工具用；擴充套件不需要它 |
 | `README.md` | 簡短說明 |
 
@@ -60,12 +60,12 @@ Norn 不連網，也不會把任何資料傳出去。
 1. 開啟 VS Code，按左側活動列的「擴充功能」（或 `Ctrl+Shift+X`）。
 2. 按擴充功能面板右上角的「…」。
 3. 選「從 VSIX 安裝…」（Install from VSIX…）。
-4. 選擇 `norn-0.19.5.vsix`。
+4. 選擇 `norn-0.19.6.vsix`。
 
 **從命令列安裝**
 
 ```
-code --install-extension norn-0.19.5.vsix
+code --install-extension norn-0.19.6.vsix
 ```
 
 ### 2.3 確認安裝成功
@@ -268,6 +268,8 @@ Norn 會**自動採用專案裡找得到的建置設定**，往下找三層資�
 完全找不到建置設定時，Norn 仍會盡量判斷：原始碼自己定義的巨集照樣生效；判斷不出來的分支兩邊都保留，相關的呼叫標示為不確定。
 
 確定被關掉的分支（例如 `#if 0`，或條件中的巨集已確定為 0 或未定義）不會被索引。游標放在這些行上時，Relation 和 Context 會顯示「Not compiled: line N switched off by the compile conditions in force」，跳到定義、找參考也不會有結果；因為那一行的名稱在目前的條件下不代表任何東西。（0.19.5 起。之前的版本會用游標下的名稱去查有編譯到的地方，看起來像被關掉的程式碼也有關係。）
+
+判斷不出來的分支裡的呼叫仍會出現在 Relation，但會加上橘色標記「under #if (OPTION_A)」，指出是哪一個 `#if` 決定它會不會被編譯；函式上方的摘要也會註明，例如「3 callers (1 only if an undecided #if)」。看到這個標記，代表 Norn 不知道那個巨集的值：在 Compile Conditions 裡定義或取消定義它（例如 `OPTION_A=0`），那個分支就會確定下來，呼叫隨之出現或消失。（0.19.6 起。）
 
 > Makefile 和 CMakeLists.txt 只會讀取「寫明的」定義：不在任何 `ifdef` / `if()` 裡、值不是變數算出來的 `-D`。Norn 不會執行它們，所以讀到的會比實際建置少。有專案檔或 `compile_commands.json` 時會優先採用。
 

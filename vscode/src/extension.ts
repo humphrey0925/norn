@@ -1339,11 +1339,16 @@ class Lenses implements vscode.CodeLensProvider {
   async resolveCodeLens(lens: vscode.CodeLens): Promise<vscode.CodeLens> {
     const at = (lens as vscode.CodeLens & { norn: ReturnType<typeof positionParams> }).norn;
     const [callers, callees] = await Promise.all([
-      ask<{ entries: Entry[] }>("si/relation", { ...at, direction: "callers" }),
+      ask<{ entries: (Entry & { onlyIf?: unknown[] })[] }>("si/relation", { ...at, direction: "callers" }),
       ask<{ entries: Entry[] }>("si/relation", { ...at, direction: "callees" }),
     ]);
     const indirect = (callees?.entries ?? []).filter((e) => e.through || e.pointer).length;
     const parts = [`${callers?.entries.length ?? 0} callers`, `${callees?.entries.length ?? 0} calls`];
+    // Callers whose every call is under an #if the conditions do not decide.
+    const maybe = (callers?.entries ?? []).filter((e) => e.onlyIf?.length).length;
+    if (maybe) {
+      parts[0] += ` (${maybe} only if an undecided #if)`;
+    }
     if (indirect) {
       parts.push(`${indirect} through function pointers`);
     }

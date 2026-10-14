@@ -967,13 +967,16 @@ mod tests {
         // Nothing configured: both branches, as before.
         let (mut s, _) = open(&d);
         assert_eq!((functions(&s, "net_init"), functions(&s, "net_stub")), (1, 1));
+        // Each only as sure as the directive that opens it.
+        let facts = s.facts_of("a.c").unwrap();
+        assert_eq!((facts.undecided.clone(), facts.inactive.clone()), (vec![(2, 2, 1), (4, 4, 3)], vec![]));
         // Configured from a file: only the branch that is compiled.
         let settings = Settings { condition_files: vec!["dot-config".into()], ..Settings::default() };
         let up = s.set_conditions(&settings).unwrap();
         assert_eq!((up.extracted, s.conditions_known()), (1, 3));
         assert_eq!((functions(&s, "net_init"), functions(&s, "net_stub"), functions(&s, "helper")), (1, 0, 1));
         // The lines switched off are known, to find nothing from them.
-        assert_eq!(s.facts_of("a.c").map(|f| f.inactive.clone()), Some(vec![(4, 4)]));
+        assert_eq!(s.facts_of("a.c").map(|f| (f.inactive.clone(), f.undecided.clone())), Some((vec![(4, 4)], vec![])));
         // The scope, written to the same file, leaves the conditions alone.
         s.set_scope(Scope::default()).unwrap();
         assert_eq!(s.condition_settings(), settings);

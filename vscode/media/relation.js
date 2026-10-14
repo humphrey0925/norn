@@ -78,6 +78,11 @@
     if (e.pointer) b += '<span class="badge ptr">through a pointer</span>';
     if (e.viaMacro) b += '<span class="badge mac">via macro ' + esc(e.viaMacro) + "</span>";
     if (e.certain === false) b += '<span class="badge amb">uncertain</span>';
+    // Every one of its lines is under an #if the conditions cannot decide.
+    if (e.onlyIf && e.onlyIf.length) {
+      const why = e.onlyIf.map((c) => "line " + c.line + ": " + c.text).join("\n");
+      b += '<span class="badge cond" title="Compiled only if ' + esc(why) + '\nNorn cannot tell whether this is compiled: define or undefine the macro in Compile Conditions to decide.">under' + esc(e.onlyIf.map((c) => c.text).join(", ")) + "</span>";
+    }
     return b;
   }
 
@@ -245,8 +250,8 @@
         : "";
       const full = n.slot ?? e.name;
       shapes.push(
-        '<g class="gn ' + cls + (e && e.certain === false ? " amb" : "") + '" data-id="' + n.id + '">' +
-          '<g data-act="name"><title>' + esc(n.slot ? full + "\nstruct member (function pointer)" : full + "\n" + e.file + ":" + e.line) + "</title>" +
+        '<g class="gn ' + cls + (e && (e.certain === false || (e.onlyIf && e.onlyIf.length)) ? " amb" : "") + '" data-id="' + n.id + '">' +
+          '<g data-act="name"><title>' + esc(n.slot ? full + "\nstruct member (function pointer)" : full + "\n" + e.file + ":" + e.line + (e.onlyIf && e.onlyIf.length ? "\nunder " + e.onlyIf.map((c) => c.text).join(", ") : "")) + "</title>" +
           '<rect x="' + nx + '" y="' + ny + '" width="' + w + '" height="' + H + '" rx="' + (n.slot ? 12 : 3) + '"></rect>' +
           '<text x="' + (nx + PAD) + '" y="' + (ny + 16) + '">' + esc(label(n)) + "</text></g>" + under + more + "</g>",
       );

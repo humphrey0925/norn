@@ -103,6 +103,11 @@ pub struct Lexed {
     /// from the end of the directive that opens one to the start of the
     /// one that ends it. Nothing in them is indexed.
     pub skipped: Vec<(u32, u32)>,
+    /// The branches that may or may not be compiled (the conditions in
+    /// force cannot tell), as (from, to, directive): from the end of the
+    /// directive that opens one to the start of the one that ends it, and
+    /// where that opening directive starts. What is in them is indexed.
+    pub undecided: Vec<(u32, u32, u32)>,
 }
 
 /// A `#define` reduced to what decides transparency: `deps` is `Some` when
@@ -878,6 +883,9 @@ struct Cond {
     /// Whether the branch being read is compiled: yes, or not known. (One
     /// that is not is never read.)
     compiled: Tri,
+    /// Where the branch being read began (the end of its directive) and its
+    /// directive did, while it is one not known to be compiled.
+    undecided: Option<(usize, usize)>,
 }
 
 struct Lexer<'a> {
@@ -1341,12 +1349,18 @@ impl<'a> Lexer<'a> {
                     include_guard: false,
                     taken: holds,
                     compiled: holds,
+                    undecided: (holds == Tri::Unknown).then_some((span.1, start)),
                 });
                 hide = cuts;
                 skip = holds == Tri::False;
             }
             b"elif" | b"else" | b"elifdef" | b"elifndef" | b"endif" => {
                 if let Some(c) = self.conds.last_mut() {
+                    // The branch read so far ends here. (An include guard
+                    // is no condition: what it holds is the file.)
+                    if let Some((from, directive)) = c.undecided.take().filter(|_| !c.include_guard) {
+                        self.out.undecided.push((from as u32, start as u32, directive as u32));
+                    }
                     if cuts && !c.hidden {
                         c.hidden = true;
                         for &(a, e) in &c.spans {
@@ -1370,6 +1384,7 @@ impl<'a> Lexer<'a> {
                         }
                         c.compiled = c.taken.not().and(own);
                         skip = c.compiled == Tri::False;
+                        c.undecided = (c.compiled == Tri::Unknown).then_some((span.1, start));
                         c.taken = c.taken.or(own);
                     }
                     // `#else` of a lone `#if` is its negation; after an

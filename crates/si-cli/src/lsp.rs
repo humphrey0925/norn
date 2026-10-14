@@ -466,6 +466,25 @@ impl Server {
         }
     }
 
+    /// The `#if`s that decide whether what is on `lines` of `file` is
+    /// compiled at all, as {line, text}, when every one of those lines is
+    /// in a branch the conditions in force cannot tell about; nothing when
+    /// one of them is compiled for certain.
+    fn undecided_by(&mut self, file: &str, lines: &[u32]) -> Vec<Value> {
+        let Some(facts) = self.session.facts_of(file) else { return Vec::new() };
+        let mut deciding = Vec::new();
+        for &line in lines {
+            // The innermost branch around the line: the last to start.
+            match facts.undecided.iter().rev().find(|&&(a, b, _)| a <= line && line <= b) {
+                Some(&(_, _, directive)) => deciding.push(directive),
+                None => return Vec::new(),
+            }
+        }
+        deciding.sort_unstable();
+        deciding.dedup();
+        deciding.into_iter().map(|line| json!({ "line": line, "text": self.line_text(file, line).trim().to_string() })).collect()
+    }
+
     /// `si/relation`: the callers or callees of the function under the
     /// cursor (or the function the cursor is in, or `item`), each saying how
     /// the call comes about: by name, through a macro, through a member or
@@ -554,7 +573,10 @@ impl Server {
             lines.dedup();
             lines.retain(|&l| l != 0);
             let names = { let g = self.g(); (via.map(|m| g.sym_name(m).to_string()), slot.map(|m| g.sym_name(m).to_string())) };
+            // The lines are in the caller's file.
+            let site_file = { let g = self.g(); g.file_path(g.syms[if incoming { other } else { root } as usize].file).to_string() };
             let mut v = self.entry(other);
+            v["onlyIf"] = json!(self.undecided_by(&site_file, &lines));
             v["lines"] = json!(lines);
             v["viaMacro"] = json!(names.0);
             v["through"] = json!(names.1);

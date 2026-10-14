@@ -201,6 +201,7 @@ impl Extractor {
             out.include_conditional.push(conditional);
         }
         out.inactive = inactive_lines(src, &lexed.skipped);
+        out.undecided = undecided_lines(src, &lexed.undecided);
         out.mask_ns = t.elapsed().as_nanos() as u64;
         let t = std::time::Instant::now();
         let Some(tree) = self.parser.parse(&lexed.masked, None) else {
@@ -1163,5 +1164,25 @@ pub(crate) fn inactive_lines(src: &[u8], skipped: &[(u32, u32)]) -> Vec<(u32, u3
             out.push((first, last));
         }
     }
+    out
+}
+
+/// The same for the branches that may or may not be compiled, each with
+/// the line of the directive that opens it; in order of where they start.
+pub(crate) fn undecided_lines(src: &[u8], undecided: &[(u32, u32, u32)]) -> Vec<(u32, u32, u32)> {
+    let breaks: Vec<usize> = src.iter().enumerate().filter(|(_, &b)| b == b'\n').map(|(i, _)| i).collect();
+    // From 1: the number of line breaks before `pos`, and one.
+    let line_of = |pos: usize| breaks.partition_point(|&b| b < pos) as u32 + 1;
+    let mut out: Vec<(u32, u32, u32)> = undecided
+        .iter()
+        .filter_map(|&(from, to, directive)| {
+            let (from, to) = (from as usize, (to as usize).min(src.len()));
+            let starts_line = from == 0 || src[from - 1] == b'\n';
+            let first = line_of(from) + u32::from(!starts_line);
+            let last = line_of(to) - u32::from(to != src.len());
+            (first <= last).then_some((first, last, line_of(directive as usize)))
+        })
+        .collect();
+    out.sort_unstable();
     out
 }
