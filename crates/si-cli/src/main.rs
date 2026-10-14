@@ -18,7 +18,7 @@ mod mem;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
-#[command(name = "si", about = "Source-Insight-style code index")]
+#[command(name = "norn", about = "Norn: a Source-Insight-style code index for C")]
 struct Cli {
     /// Worker threads (0 = all cores).
     #[arg(long, global = true, default_value_t = 0)]

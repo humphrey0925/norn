@@ -1,9 +1,10 @@
 {
-  "name": "si-code-index",
-  "displayName": "SI Code Index",
-  "description": "Source-Insight-style symbol search, context and relation views for C, backed by the si index.",
-  "version": "0.18.1",
+  "name": "norn",
+  "displayName": "Norn",
+  "description": "Norn: Source-Insight-style symbol search, context and relation views for C, from an index that follows macros and function pointers.",
+  "version": "0.19.0",
   "publisher": "humphrey0925",
+  "icon": "media/icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/humphrey0925/si.git"
@@ -25,15 +26,15 @@
       "activitybar": [
         {
           "id": "si",
-          "title": "SI",
-          "icon": "media/si.svg"
+          "title": "Norn",
+          "icon": "media/norn.svg"
         }
       ],
       "panel": [
         {
           "id": "siPanel",
-          "title": "SI",
-          "icon": "media/si.svg"
+          "title": "Norn",
+          "icon": "media/norn.svg"
         }
       ]
     },
@@ -41,471 +42,471 @@
       "si": [
         {
           "type": "webview",
-          "id": "si.search",
+          "id": "norn.search",
           "name": "Project Symbols",
-          "contextualTitle": "SI Symbols"
+          "contextualTitle": "Norn Symbols"
         },
         {
-          "id": "si.fileSymbols",
+          "id": "norn.fileSymbols",
           "name": "File Symbols",
-          "contextualTitle": "SI File Symbols"
+          "contextualTitle": "Norn File Symbols"
         },
         {
-          "id": "si.scope",
+          "id": "norn.scope",
           "name": "Index Scope",
-          "contextualTitle": "SI Index Scope"
+          "contextualTitle": "Norn Index Scope"
         },
         {
-          "id": "si.conditions",
+          "id": "norn.conditions",
           "name": "Compile Conditions",
-          "contextualTitle": "SI Compile Conditions",
+          "contextualTitle": "Norn Compile Conditions",
           "visibility": "collapsed"
         }
       ],
       "siPanel": [
         {
-          "id": "si.relation",
+          "id": "norn.relation",
           "name": "Relation",
           "type": "webview",
-          "contextualTitle": "SI Relation"
+          "contextualTitle": "Norn Relation"
         },
         {
           "type": "webview",
-          "id": "si.context",
+          "id": "norn.context",
           "name": "Context",
-          "contextualTitle": "SI Context"
+          "contextualTitle": "Norn Context"
         }
       ]
     },
     "commands": [
       {
-        "command": "si.relation.callers",
-        "title": "SI: Show Callers",
+        "command": "norn.relation.callers",
+        "title": "Norn: Show Callers",
         "icon": "$(call-incoming)"
       },
       {
-        "command": "si.relation.callees",
-        "title": "SI: Show Calls",
+        "command": "norn.relation.callees",
+        "title": "Norn: Show Calls",
         "icon": "$(call-outgoing)"
       },
       {
-        "command": "si.relation.references",
-        "title": "SI: Show References",
+        "command": "norn.relation.references",
+        "title": "Norn: Show References",
         "icon": "$(references)"
       },
       {
-        "command": "si.relation.lock",
-        "title": "SI: Lock Relation (stop following the cursor)",
+        "command": "norn.relation.lock",
+        "title": "Norn: Lock Relation (stop following the cursor)",
         "icon": "$(unlock)"
       },
       {
-        "command": "si.relation.unlock",
-        "title": "SI: Unlock Relation",
+        "command": "norn.relation.unlock",
+        "title": "Norn: Unlock Relation",
         "icon": "$(lock)"
       },
       {
-        "command": "si.context.lock",
-        "title": "SI: Lock Context (stop following the cursor)",
+        "command": "norn.context.lock",
+        "title": "Norn: Lock Context (stop following the cursor)",
         "icon": "$(unlock)"
       },
       {
-        "command": "si.context.unlock",
-        "title": "SI: Unlock Context",
+        "command": "norn.context.unlock",
+        "title": "Norn: Unlock Context",
         "icon": "$(lock)"
       },
       {
-        "command": "si.openToSide",
+        "command": "norn.openToSide",
         "title": "Open to the Side",
         "icon": "$(split-horizontal)"
       },
       {
-        "command": "si.restart",
-        "title": "SI: Restart Index (parse only what changed)"
+        "command": "norn.restart",
+        "title": "Norn: Restart Index (parse only what changed)"
       },
       {
-        "command": "si.relation.tree",
-        "title": "SI: Show Relation as a Tree"
+        "command": "norn.relation.tree",
+        "title": "Norn: Show Relation as a Tree"
       },
       {
-        "command": "si.relation.graph",
-        "title": "SI: Show Relation as a Graph"
+        "command": "norn.relation.graph",
+        "title": "Norn: Show Relation as a Graph"
       },
       {
-        "command": "si.rebuild",
-        "title": "SI: Discard the Saved Index and Rebuild",
+        "command": "norn.rebuild",
+        "title": "Norn: Discard the Saved Index and Rebuild",
         "icon": "$(debug-restart)"
       },
       {
-        "command": "si.sync",
-        "title": "SI: Sync Index with Disk",
+        "command": "norn.sync",
+        "title": "Norn: Sync Index with Disk",
         "icon": "$(sync)"
       },
       {
-        "command": "si.scope.include",
-        "title": "SI: Index This Folder"
+        "command": "norn.scope.include",
+        "title": "Norn: Index This Folder"
       },
       {
-        "command": "si.scope.exclude",
-        "title": "SI: Exclude This Folder from the Index"
+        "command": "norn.scope.exclude",
+        "title": "Norn: Exclude This Folder from the Index"
       },
       {
-        "command": "si.scope.only",
-        "title": "SI: Index Only This Folder"
+        "command": "norn.scope.only",
+        "title": "Norn: Index Only This Folder"
       },
       {
-        "command": "si.scope.openConfig",
-        "title": "SI: Open the Scope File (.si/config.json)",
+        "command": "norn.scope.openConfig",
+        "title": "Norn: Open the Scope File (.norn/config.json)",
         "icon": "$(go-to-file)"
       },
       {
-        "command": "si.scope.apply",
-        "title": "SI: Apply the Scope and Index",
+        "command": "norn.scope.apply",
+        "title": "Norn: Apply the Scope and Index",
         "icon": "$(check)"
       },
       {
-        "command": "si.scope.discard",
-        "title": "SI: Discard Unapplied Scope Changes",
+        "command": "norn.scope.discard",
+        "title": "Norn: Discard Unapplied Scope Changes",
         "icon": "$(discard)"
       },
       {
-        "command": "si.scope.selectAll",
-        "title": "SI: Check All Folders",
+        "command": "norn.scope.selectAll",
+        "title": "Norn: Check All Folders",
         "icon": "$(check-all)"
       },
       {
-        "command": "si.scope.clearAll",
-        "title": "SI: Uncheck All Folders",
+        "command": "norn.scope.clearAll",
+        "title": "Norn: Uncheck All Folders",
         "icon": "$(clear-all)"
       },
       {
-        "command": "si.resetLayout",
-        "title": "SI: Reset View Layout (put every SI view back in place)"
+        "command": "norn.resetLayout",
+        "title": "Norn: Reset View Layout (put every Norn view back in place)"
       },
       {
-        "command": "si.scope.all",
-        "title": "SI: Index the Whole Workspace"
+        "command": "norn.scope.all",
+        "title": "Norn: Index the Whole Workspace"
       },
       {
-        "command": "si.relation.assignments",
-        "title": "SI: Show Function Pointer Assignments"
+        "command": "norn.relation.assignments",
+        "title": "Norn: Show Function Pointer Assignments"
       },
       {
-        "command": "si.conditions.add",
-        "title": "SI: Add a Compile Condition…",
+        "command": "norn.conditions.add",
+        "title": "Norn: Add a Compile Condition…",
         "icon": "$(add)"
       },
       {
-        "command": "si.conditions.switch",
-        "title": "SI: Switch Compile Configuration…",
+        "command": "norn.conditions.switch",
+        "title": "Norn: Switch Compile Configuration…",
         "icon": "$(list-selection)"
       },
       {
-        "command": "si.conditions.define",
-        "title": "SI: Define a Macro for Conditions…",
+        "command": "norn.conditions.define",
+        "title": "Norn: Define a Macro for Conditions…",
         "icon": "$(add)"
       },
       {
-        "command": "si.conditions.undefine",
-        "title": "SI: Mark a Macro as Not Defined…",
+        "command": "norn.conditions.undefine",
+        "title": "Norn: Mark a Macro as Not Defined…",
         "icon": "$(circle-slash)"
       },
       {
-        "command": "si.conditions.addFile",
-        "title": "SI: Read Conditions from a File (.config, header)…",
+        "command": "norn.conditions.addFile",
+        "title": "Norn: Read Conditions from a File (.config, header)…",
         "icon": "$(file-add)"
       },
       {
-        "command": "si.conditions.assume",
-        "title": "SI: Assume Names Are Not Defined (prefix or *)…",
+        "command": "norn.conditions.assume",
+        "title": "Norn: Assume Names Are Not Defined (prefix or *)…",
         "icon": "$(question)"
       },
       {
-        "command": "si.conditions.remove",
+        "command": "norn.conditions.remove",
         "title": "Remove",
         "icon": "$(trash)"
       },
       {
-        "command": "si.conditions.override",
+        "command": "norn.conditions.override",
         "title": "Set Another Value Here",
         "icon": "$(edit)"
       },
       {
-        "command": "si.conditions.delete",
+        "command": "norn.conditions.delete",
         "title": "Delete Configuration"
       },
       {
-        "command": "si.relation.sync",
-        "title": "SI: Show Relation of the Symbol under the Cursor",
+        "command": "norn.relation.sync",
+        "title": "Norn: Show Relation of the Symbol under the Cursor",
         "icon": "$(target)"
       },
       {
-        "command": "si.context.sync",
-        "title": "SI: Show Context of the Symbol under the Cursor",
+        "command": "norn.context.sync",
+        "title": "Norn: Show Context of the Symbol under the Cursor",
         "icon": "$(target)"
       },
       {
-        "command": "si.relation.target",
-        "title": "SI: Relation target"
+        "command": "norn.relation.target",
+        "title": "Norn: Relation target"
       },
       {
-        "command": "si.conditions.toCpp",
-        "title": "SI: Write Compile Conditions to the C/C++ Extension (c_cpp_properties.json)",
+        "command": "norn.conditions.toCpp",
+        "title": "Norn: Write Compile Conditions to the C/C++ Extension (c_cpp_properties.json)",
         "icon": "$(export)"
       },
       {
-        "command": "si.context.shown",
-        "title": "SI: Context shown"
+        "command": "norn.context.shown",
+        "title": "Norn: Context shown"
       },
       {
-        "command": "si.serverInUse",
-        "title": "SI: Server in use"
+        "command": "norn.serverInUse",
+        "title": "Norn: Server in use"
       },
       {
-        "command": "si.conditions.sourcesOff",
+        "command": "norn.conditions.sourcesOff",
         "title": "Do Not Use the Sources' Own #defines",
         "icon": "$(eye-closed)"
       },
       {
-        "command": "si.conditions.sourcesOn",
+        "command": "norn.conditions.sourcesOn",
         "title": "Use the Sources' Own #defines",
         "icon": "$(eye)"
       },
       {
-        "command": "si.fileSymbols.tree",
-        "title": "SI: File Symbols tree"
+        "command": "norn.fileSymbols.tree",
+        "title": "Norn: File Symbols tree"
       }
     ],
     "menus": {
       "view/title": [
         {
-          "command": "si.relation.lock",
-          "when": "view == si.relation && !si.relationLocked",
+          "command": "norn.relation.lock",
+          "when": "view == norn.relation && !norn.relationLocked",
           "group": "navigation@4"
         },
         {
-          "command": "si.relation.unlock",
-          "when": "view == si.relation && si.relationLocked",
+          "command": "norn.relation.unlock",
+          "when": "view == norn.relation && norn.relationLocked",
           "group": "navigation@4"
         },
         {
-          "command": "si.context.lock",
-          "when": "view == si.context && !si.contextLocked",
+          "command": "norn.context.lock",
+          "when": "view == norn.context && !norn.contextLocked",
           "group": "navigation@1"
         },
         {
-          "command": "si.context.unlock",
-          "when": "view == si.context && si.contextLocked",
+          "command": "norn.context.unlock",
+          "when": "view == norn.context && norn.contextLocked",
           "group": "navigation@1"
         },
         {
-          "command": "si.sync",
-          "when": "view == si.search || view == si.fileSymbols",
+          "command": "norn.sync",
+          "when": "view == norn.search || view == norn.fileSymbols",
           "group": "navigation@1"
         },
         {
-          "command": "si.scope.apply",
-          "when": "view == si.scope && si.scopePending",
+          "command": "norn.scope.apply",
+          "when": "view == norn.scope && norn.scopePending",
           "group": "navigation@1"
         },
         {
-          "command": "si.scope.discard",
-          "when": "view == si.scope && si.scopePending",
+          "command": "norn.scope.discard",
+          "when": "view == norn.scope && norn.scopePending",
           "group": "navigation@2"
         },
         {
-          "command": "si.scope.selectAll",
-          "when": "view == si.scope",
+          "command": "norn.scope.selectAll",
+          "when": "view == norn.scope",
           "group": "navigation@3"
         },
         {
-          "command": "si.scope.clearAll",
-          "when": "view == si.scope",
+          "command": "norn.scope.clearAll",
+          "when": "view == norn.scope",
           "group": "navigation@4"
         },
         {
-          "command": "si.sync",
-          "when": "view == si.scope",
+          "command": "norn.sync",
+          "when": "view == norn.scope",
           "group": "navigation@5"
         },
         {
-          "command": "si.scope.openConfig",
-          "when": "view == si.scope",
+          "command": "norn.scope.openConfig",
+          "when": "view == norn.scope",
           "group": "1_si@1"
         },
         {
-          "command": "si.rebuild",
-          "when": "view == si.scope",
+          "command": "norn.rebuild",
+          "when": "view == norn.scope",
           "group": "1_si@2"
         },
         {
-          "command": "si.resetLayout",
+          "command": "norn.resetLayout",
           "when": "view =~ /^si\\\\./",
           "group": "9_si@1"
         },
         {
-          "command": "si.conditions.add",
-          "when": "view == si.conditions",
+          "command": "norn.conditions.add",
+          "when": "view == norn.conditions",
           "group": "navigation@1"
         },
         {
-          "command": "si.conditions.switch",
-          "when": "view == si.conditions",
+          "command": "norn.conditions.switch",
+          "when": "view == norn.conditions",
           "group": "navigation@2"
         },
         {
-          "command": "si.scope.openConfig",
-          "when": "view == si.conditions",
+          "command": "norn.scope.openConfig",
+          "when": "view == norn.conditions",
           "group": "1_si@1"
         },
         {
-          "command": "si.relation.sync",
-          "when": "view == si.relation",
+          "command": "norn.relation.sync",
+          "when": "view == norn.relation",
           "group": "navigation@3"
         },
         {
-          "command": "si.context.sync",
-          "when": "view == si.context",
+          "command": "norn.context.sync",
+          "when": "view == norn.context",
           "group": "navigation@0"
         },
         {
-          "command": "si.conditions.toCpp",
-          "when": "view == si.conditions",
+          "command": "norn.conditions.toCpp",
+          "when": "view == norn.conditions",
           "group": "1_si@2"
         }
       ],
       "view/item/context": [
         {
-          "command": "si.openToSide",
-          "when": "view == si.fileSymbols",
+          "command": "norn.openToSide",
+          "when": "view == norn.fileSymbols",
           "group": "inline@1"
         },
         {
-          "command": "si.scope.only",
-          "when": "view == si.scope && viewItem == folder",
+          "command": "norn.scope.only",
+          "when": "view == norn.scope && viewItem == folder",
           "group": "si@1"
         },
         {
-          "command": "si.scope.include",
-          "when": "view == si.scope && viewItem == folder",
+          "command": "norn.scope.include",
+          "when": "view == norn.scope && viewItem == folder",
           "group": "si@2"
         },
         {
-          "command": "si.scope.exclude",
-          "when": "view == si.scope && viewItem == folder",
+          "command": "norn.scope.exclude",
+          "when": "view == norn.scope && viewItem == folder",
           "group": "si@3"
         },
         {
-          "command": "si.conditions.remove",
-          "when": "view == si.conditions && viewItem =~ /^(condition|source.file|assume)$/",
+          "command": "norn.conditions.remove",
+          "when": "view == norn.conditions && viewItem =~ /^(condition|source.file|assume)$/",
           "group": "inline@1"
         },
         {
-          "command": "si.conditions.override",
-          "when": "view == si.conditions && viewItem == condition.from",
+          "command": "norn.conditions.override",
+          "when": "view == norn.conditions && viewItem == condition.from",
           "group": "inline@1"
         },
         {
-          "command": "si.conditions.add",
-          "when": "view == si.conditions && viewItem == source.own",
+          "command": "norn.conditions.add",
+          "when": "view == norn.conditions && viewItem == source.own",
           "group": "inline@1"
         },
         {
-          "command": "si.conditions.switch",
-          "when": "view == si.conditions && viewItem == config",
+          "command": "norn.conditions.switch",
+          "when": "view == norn.conditions && viewItem == config",
           "group": "inline@1"
         },
         {
-          "command": "si.conditions.sourcesOff",
-          "when": "view == si.conditions && viewItem == sources.on",
+          "command": "norn.conditions.sourcesOff",
+          "when": "view == norn.conditions && viewItem == sources.on",
           "group": "inline@1"
         },
         {
-          "command": "si.conditions.sourcesOn",
-          "when": "view == si.conditions && viewItem == sources.off",
+          "command": "norn.conditions.sourcesOn",
+          "when": "view == norn.conditions && viewItem == sources.off",
           "group": "inline@1"
         }
       ],
       "commandPalette": [
         {
-          "command": "si.openToSide",
+          "command": "norn.openToSide",
           "when": "false"
         },
         {
-          "command": "si.scope.include",
+          "command": "norn.scope.include",
           "when": "false"
         },
         {
-          "command": "si.scope.exclude",
+          "command": "norn.scope.exclude",
           "when": "false"
         },
         {
-          "command": "si.scope.only",
+          "command": "norn.scope.only",
           "when": "false"
         },
         {
-          "command": "si.conditions.remove",
+          "command": "norn.conditions.remove",
           "when": "false"
         },
         {
-          "command": "si.conditions.override",
+          "command": "norn.conditions.override",
           "when": "false"
         },
         {
-          "command": "si.conditions.delete",
+          "command": "norn.conditions.delete",
           "when": "false"
         },
         {
-          "command": "si.relation.target",
+          "command": "norn.relation.target",
           "when": "false"
         },
         {
-          "command": "si.context.shown",
+          "command": "norn.context.shown",
           "when": "false"
         },
         {
-          "command": "si.serverInUse",
+          "command": "norn.serverInUse",
           "when": "false"
         },
         {
-          "command": "si.conditions.sourcesOff",
+          "command": "norn.conditions.sourcesOff",
           "when": "false"
         },
         {
-          "command": "si.conditions.sourcesOn",
+          "command": "norn.conditions.sourcesOn",
           "when": "false"
         },
         {
-          "command": "si.fileSymbols.tree",
+          "command": "norn.fileSymbols.tree",
           "when": "false"
         }
       ],
       "explorer/context": [
         {
-          "command": "si.scope.include",
+          "command": "norn.scope.include",
           "when": "explorerResourceIsFolder",
           "group": "si@1"
         },
         {
-          "command": "si.scope.exclude",
+          "command": "norn.scope.exclude",
           "when": "explorerResourceIsFolder",
           "group": "si@2"
         },
         {
-          "command": "si.scope.only",
+          "command": "norn.scope.only",
           "when": "explorerResourceIsFolder",
           "group": "si@3"
         }
       ]
     },
     "configuration": {
-      "title": "SI",
+      "title": "Norn",
       "properties": {
-        "si.serverPath": {
+        "norn.serverPath": {
           "type": "string",
           "default": "",
           "description": "Leave empty to use the server that comes with the extension (Windows x64), or si on PATH where there is none. Set it to the full path of another si executable to use that instead, for example D:\\tools\\si-windows-x64.exe (no quotes needed)."
         },
-        "si.includeAliases": {
+        "norn.includeAliases": {
           "type": "array",
           "items": {
             "type": "string"
@@ -513,28 +514,28 @@
           "default": [],
           "description": "Which template a generated header comes from, as FROM=TO, for example bfd.h=bfd-in2.h."
         },
-        "si.codeLens.enabled": {
+        "norn.codeLens.enabled": {
           "type": "boolean",
           "default": true,
           "description": "Show the number of callers and calls above each function definition."
         },
-        "si.cache.enabled": {
+        "norn.cache.enabled": {
           "type": "boolean",
           "default": true,
           "description": "Keep the index on disk, so that the next start parses only the files that changed."
         },
-        "si.cache.directory": {
+        "norn.cache.directory": {
           "type": "string",
           "default": "",
-          "description": "Where the index is kept. Empty: .si/cache in the workspace."
+          "description": "Where the index is kept. Empty: .norn/cache in the workspace."
         },
-        "si.conditions.updateCppProperties": {
+        "norn.conditions.updateCppProperties": {
           "type": "boolean",
           "default": false,
           "scope": "resource",
-          "description": "Keep a configuration named \"SI\" in .vscode/c_cpp_properties.json in step with the compile configuration in force: its defines and, from a DS-5 / Eclipse .cproject, its include paths. Select that configuration in the C/C++ extension to use it."
+          "description": "Keep a configuration named \"Norn\" in .vscode/c_cpp_properties.json in step with the compile configuration in force: its defines and, from a DS-5 / Eclipse .cproject, its include paths. Select that configuration in the C/C++ extension to use it."
         },
-        "si.fileSymbols.showLocals": {
+        "norn.fileSymbols.showLocals": {
           "type": "boolean",
           "default": true,
           "description": "In File Symbols, list each function's parameters and local variables under it."
@@ -548,7 +549,7 @@
     "bundle": "esbuild src/extension.ts --bundle --platform=node --target=node18 --format=cjs --external:vscode --main-fields=module,main --minify-whitespace --minify-syntax --outfile=out/extension.js --log-level=warning",
     "vscode:prepublish": "npm run compile",
     "watch": "tsc -watch -p ./",
-    "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license -o ../out/si-code-index.vsix",
+    "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license -o ../out/norn.vsix",
     "test": "npm run compile && node ./out/test/runTest.js"
   },
   "dependencies": {

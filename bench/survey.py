@@ -18,7 +18,7 @@ from pathlib import Path
 import psutil
 
 ROOT = Path(__file__).resolve().parent.parent
-SI = ROOT / "target" / "release" / ("si.exe" if sys.platform == "win32" else "si")
+SI = ROOT / "target" / "release" / ("norn.exe" if sys.platform == "win32" else "norn")
 NAME = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
 
 

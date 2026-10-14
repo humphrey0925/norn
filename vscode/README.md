@@ -1,6 +1,6 @@
-# SI Code Index
+# Norn
 
-Source-Insight-style views for C in VS Code, backed by the `si` index.
+Source-Insight-style views for C in VS Code, backed by the `norn` index.
 
 - **專案符號**: fuzzy search over every symbol. Fragments in any order
   (`init cache`), initials (`bci`), or letters in order. Ctrl+click opens
@@ -12,10 +12,10 @@ Source-Insight-style views for C in VS Code, backed by the `si` index.
   expandable level by level. Each call says how it comes about: by name,
   through a macro, through a function pointer, or uncertain.
 - A line above each function with its number of callers and callees
-  (`si.codeLens.enabled`).
+  (`norn.codeLens.enabled`).
 
 - **Index Scope**: the folders of the workspace with a checkbox each;
-  checked folders are indexed. The choice is kept in `.si/config.json` in
+  checked folders are indexed. The choice is kept in `.norn/config.json` in
   the workspace and is there the next time. The sync button brings the
   index in line with the disk whenever you want it.
 
@@ -27,7 +27,7 @@ Source-Insight-style views for C in VS Code, backed by the `si` index.
   answers); Ctrl+click goes to its definition, a click marks its other
   occurrences, and a line number opens that line in the editor.
 - **Parameters and local variables** are listed under their function in
-  File Symbols (`si.fileSymbols.showLocals`), and the cursor on one gives
+  File Symbols (`norn.fileSymbols.showLocals`), and the cursor on one gives
   its declaration in Context and by Go to Definition, its uses by Find
   References, and in Relation the function it belongs to with the lines
   it is used on. They are a function's own: Project Symbols does not list
@@ -63,19 +63,19 @@ Source-Insight-style views for C in VS Code, backed by the `si` index.
     prefix, or all names, can be assumed not defined unless the build or
     the sources define them.
   - VS Code's C/C++ extension is given the set in force as it changes:
-    SI is a *configuration provider* for it, so IntelliSense takes each
-    file's defines (and the folders that hold headers) from SI, and is
+    Norn is a *configuration provider* for it, so IntelliSense takes each
+    file's defines (and the folders that hold headers) from Norn, and is
     told the moment a macro is added, a set is switched, or
-    `.si/config.json` or the build's own description is edited. The C/C++
-    extension asks once whether SI may configure the folder (or set
-    `"C_Cpp.default.configurationProvider": "humphrey0925.si-code-index"`).
+    `.norn/config.json` or the build's own description is edited. The C/C++
+    extension asks once whether Norn may configure the folder (or set
+    `"C_Cpp.default.configurationProvider": "humphrey0925.norn"`).
     Nothing is written for this.
   - Without that, the set in force can be passed on to VS Code's C/C++ extension
-    (`si.conditions.updateCppProperties`, or "Write Compile Conditions to
-    the C/C++ Extension" in the view's menu): a configuration named `SI`
+    (`norn.conditions.updateCppProperties`, or "Write Compile Conditions to
+    the C/C++ Extension" in the view's menu): a configuration named `Norn`
     in `.vscode/c_cpp_properties.json` gets its defines and, from a
     `.cproject`, its include paths, and is rewritten when the set changes
-    or another is switched to. Select `SI` in the C/C++ extension once.
+    or another is switched to. Select `Norn` in the C/C++ extension once.
   - What the sources define themselves counts as well, without being
     set: a `#define` settles the name for the rest of its file, and a
     name is known in a file when every source file that file is compiled
@@ -83,7 +83,7 @@ Source-Insight-style views for C in VS Code, backed by the `si` index.
     switch in a configuration header everything includes). "From the
     sources" lists those, with the number of files each is known in, and
     can be turned off there; anything set by hand overrules them.
-  - Kept in `.si/config.json` with the scope.
+  - Kept in `.norn/config.json` with the scope.
 
 Go to definition, find references, workspace symbols and call hierarchy use
 the same index.
@@ -94,14 +94,14 @@ following.
 
 ## Setup
 
-The packaged extension for Windows x64 has the `si` server inside it:
-install the `.vsix` and open a folder. Elsewhere, build `si`
-(`cargo build --release` at the repository root) and point `si.serverPath`
+The packaged extension for Windows x64 has the `norn` server inside it:
+install the `.vsix` and open a folder. Elsewhere, build `norn`
+(`cargo build --release` at the repository root) and point `norn.serverPath`
 at the executable, or put it on `PATH`; a path set there is always used in
 place of the built-in server. The index is built when a folder with C
-files is opened, kept in `.si/cache`, and updated when files are saved.
+files is opened, kept in `.norn/cache`, and updated when files are saved.
 
-`si.includeAliases` tells the index which template a generated header comes
+`norn.includeAliases` tells the index which template a generated header comes
 from, for example `bfd.h=bfd-in2.h`.
 
 ## Development

@@ -15,14 +15,14 @@ async function main() {
   }
   fs.mkdirSync(path.join(work, ".vscode"));
   // A scope on file: the first-time question is for people, not for a test.
-  fs.mkdirSync(path.join(work, ".si"));
-  fs.writeFileSync(path.join(work, ".si", "config.json"), JSON.stringify({ include: [], exclude: [] }));
-  const server = path.join(root, "target", "release", process.platform === "win32" ? "si.exe" : "si");
+  fs.mkdirSync(path.join(work, ".norn"));
+  fs.writeFileSync(path.join(work, ".norn", "config.json"), JSON.stringify({ include: [], exclude: [] }));
+  const server = path.join(root, "target", "release", process.platform === "win32" ? "norn.exe" : "norn");
   // `cpp`: with the C/C++ extension (installed into the test's own
-  // extensions folder: `node out/test/runTest.js cpp`), SI its provider.
+  // extensions folder: `node out/test/runTest.js cpp`), Norn its provider.
   const cpp = process.argv[2] === "cpp";
-  const withCpp = cpp ? { "C_Cpp.default.configurationProvider": "humphrey0925.si-code-index" } : {};
-  fs.writeFileSync(path.join(work, ".vscode", "settings.json"), JSON.stringify({ ...withCpp, ...(process.env.SI_TEST_BUNDLED ? {} : { "si.serverPath": `"${server}"` }), ...(process.env.SI_DEMO_THEME ? { "workbench.colorTheme": process.env.SI_DEMO_THEME } : {}) }));
+  const withCpp = cpp ? { "C_Cpp.default.configurationProvider": "humphrey0925.norn" } : {};
+  fs.writeFileSync(path.join(work, ".vscode", "settings.json"), JSON.stringify({ ...withCpp, ...(process.env.SI_TEST_BUNDLED ? {} : { "norn.serverPath": `"${server}"` }), ...(process.env.SI_DEMO_THEME ? { "workbench.colorTheme": process.env.SI_DEMO_THEME } : {}) }));
   try {
     await runTests({
       extensionDevelopmentPath: path.resolve(__dirname, "../.."),

@@ -847,7 +847,7 @@ pub fn run(
                 "definitionProvider": true, "declarationProvider": true, "referencesProvider": true,
                 "documentSymbolProvider": true, "workspaceSymbolProvider": true, "callHierarchyProvider": true,
             });
-            let result = json!({ "capabilities": capabilities, "serverInfo": { "name": "si", "version": env!("CARGO_PKG_VERSION") } });
+            let result = json!({ "capabilities": capabilities, "serverInfo": { "name": "norn", "version": env!("CARGO_PKG_VERSION") } });
             write_message(out, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));
             return true;
         }

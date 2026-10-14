@@ -80,7 +80,19 @@ fn write_over(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Folders that are never part of a project: ours, and version control's.
-const NEVER: [&str; 4] = [".si", ".git", ".svn", ".hg"];
+const NEVER: [&str; 5] = [".norn", ".si", ".git", ".svn", ".hg"];
+
+/// The folder in a tree where its settings and its saved index are kept:
+/// `.norn`. A tree that has the folder of the name this went by before
+/// (`.si`) and not yet this one has it renamed, or, if that cannot be
+/// done, used where it is.
+pub fn home(root: &Path) -> PathBuf {
+    let (now, before) = (root.join(".norn"), root.join(".si"));
+    if !now.exists() && before.is_dir() && std::fs::rename(&before, &now).is_err() {
+        return before;
+    }
+    now
+}
 
 fn clean(folder: &str) -> String {
     let f = folder.replace('\\', "/");
@@ -95,7 +107,7 @@ fn under(path: &str, rule: &str) -> bool {
 
 impl Scope {
     pub fn config_path(root: &Path) -> PathBuf {
-        root.join(".si").join("config.json")
+        home(root).join("config.json")
     }
 
     /// The scope saved in the tree, or the whole tree if there is none (or
@@ -153,6 +165,17 @@ mod tests {
 
     fn scope(include: &[&str], exclude: &[&str]) -> Scope {
         Scope { include: include.iter().map(|s| s.to_string()).collect(), exclude: exclude.iter().map(|s| s.to_string()).collect() }.normalized()
+    }
+
+    #[test]
+    fn the_folder_of_the_old_name_is_taken_over() {
+        let dir = std::env::temp_dir().join(format!("si-scope-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".si")).unwrap();
+        std::fs::write(dir.join(".si/config.json"), r#"{"include":["src"],"exclude":[]}"#).unwrap();
+        assert_eq!(Scope::load(&dir).include, ["src"]);
+        assert!(dir.join(".norn/config.json").is_file() && !dir.join(".si").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

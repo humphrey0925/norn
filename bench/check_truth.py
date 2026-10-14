@@ -19,7 +19,7 @@ from pathlib import Path
 GENERATED = {"<build>/bfd/bfd.h": "bfd/bfd-in2.h", "<build>/bfd/bfd_stdint.h": "bfd/bfd_stdint.h",
              "<build>/bfd/elf32-target.h": "bfd/elfxx-target.h", "<build>/bfd/elf64-target.h": "bfd/elfxx-target.h"}
 
-SI = Path(__file__).resolve().parent.parent / "target" / "release" / "si.exe"
+SI = Path(__file__).resolve().parent.parent / "target" / "release" / "norn.exe"
 
 
 def si_lines(cmd, index):

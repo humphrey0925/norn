@@ -82,7 +82,7 @@ def start(exe, tree, cache, query):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("tree")
-    ap.add_argument("--exe", default=str(ROOT / "target" / "release" / "si.exe"))
+    ap.add_argument("--exe", default=str(ROOT / "target" / "release" / "norn.exe"))
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--cache", help="keep the save here between invocations (else a temporary one, so the first start is from nothing)")
     ap.add_argument("--query", default="init")

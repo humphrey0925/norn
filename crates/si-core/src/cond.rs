@@ -6,7 +6,7 @@
 //! be false is skipped as the compiler would skip it; one whose condition is
 //! not decided by what is known is still read, both ways.
 //!
-//! They are part of the project's settings in `.si/config.json`:
+//! They are part of the project's settings in `.norn/config.json`:
 //!
 //! ```json
 //! { "defines": { "CONFIG_SMP": "1", "DEBUG": "" },
@@ -86,7 +86,7 @@ impl Settings {
         *self == Settings::default()
     }
 
-    /// As the configuration in force, into `.si/config.json`.
+    /// As the configuration in force, into `.norn/config.json`.
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
         let mut project = Project::load(root);
         let name = project.active.clone().unwrap_or_else(|| DEFAULT.to_string());
@@ -166,7 +166,7 @@ impl Project {
         self.active.as_ref().and_then(|a| self.configurations.get(a)).cloned().unwrap_or_default()
     }
 
-    /// Into `.si/config.json`, beside the scope.
+    /// Into `.norn/config.json`, beside the scope.
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
         let mut written = serde_json::to_value(self).unwrap();
         for old in ["defines", "undefines", "assumeUndefined", "conditionFiles"] {
@@ -231,7 +231,7 @@ pub fn discover(root: &Path) -> Vec<(String, String)> {
         }
         // (The configuration written for the C/C++ extension is our own
         // conditions on their way out, not a build's to follow.)
-        let theirs = names.into_iter().filter(|c| c.name != WRITTEN);
+        let theirs = names.into_iter().filter(|c| c.name != WRITTEN && c.name != WRITTEN_BEFORE);
         // Which folder's, for one that is not the root's (or `.vscode`'s).
         let folder = file.rsplit_once('/').map_or("", |f| f.0);
         let label = |name: &str| if folder.is_empty() || folder == ".vscode" { name.to_string() } else { format!("{name} ({folder})") };
@@ -242,7 +242,9 @@ pub fn discover(root: &Path) -> Vec<(String, String)> {
 
 /// The name of the `c_cpp_properties.json` configuration an editor
 /// extension keeps in step with the conditions in force.
-pub const WRITTEN: &str = "SI";
+pub const WRITTEN: &str = "Norn";
+/// What it was called before, and may still be in a file.
+const WRITTEN_BEFORE: &str = "SI";
 
 /// Where the build looks for headers, for the build descriptions among the
 /// condition files of `settings`: paths under `root` relative to it, with
@@ -1285,15 +1287,15 @@ mod tests {
         assert_eq!(of("N"), Some((Some("2"), ".vscode/c_cpp_properties.json#Win32")));
 
         // Several sets in one project, one in force; an old file is one set.
-        std::fs::create_dir_all(dir.join(".si")).unwrap();
-        std::fs::write(dir.join(".si/config.json"), r#"{"include":["src"],"defines":{"OLD":"1"}}"#).unwrap();
+        std::fs::create_dir_all(dir.join(".norn")).unwrap();
+        std::fs::write(dir.join(".norn/config.json"), r#"{"include":["src"],"defines":{"OLD":"1"}}"#).unwrap();
         let mut p = Project::load(&dir);
         assert_eq!((p.active.as_deref(), p.current().defines.get("OLD").map(String::as_str)), (Some(DEFAULT), Some("1")));
         p.configurations.insert("Debug".into(), settings.clone());
         p.active = Some("Debug".into());
         p.save(&dir).unwrap();
         assert_eq!((Project::load(&dir), Settings::load(&dir)), (p, settings));
-        let written = std::fs::read_to_string(dir.join(".si/config.json")).unwrap();
+        let written = std::fs::read_to_string(dir.join(".norn/config.json")).unwrap();
         assert!(written.contains("\"include\"") && !written.contains("\n  \"defines\""), "{written}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1302,7 +1304,7 @@ mod tests {
     fn a_build_description_in_the_tree_is_followed_unasked() {
         let dir = std::env::temp_dir().join(format!("si-cond-found-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".si")).unwrap();
+        std::fs::create_dir_all(dir.join(".norn")).unwrap();
         // Nothing in the tree: nothing in force.
         assert_eq!(Project::load(&dir), Project::default());
         let commands = r#"[
@@ -1311,7 +1313,7 @@ mod tests {
         ]"#;
         std::fs::write(dir.join("compile_commands.json"), commands).unwrap();
         // The scope written, and no conditions: the build's are followed.
-        std::fs::write(dir.join(".si/config.json"), r#"{"include":["src"]}"#).unwrap();
+        std::fs::write(dir.join(".norn/config.json"), r#"{"include":["src"]}"#).unwrap();
         let p = Project::load(&dir);
         assert_eq!(p.active.as_deref(), Some("compile_commands"));
         let c = Conditions::from_settings(&Settings::load(&dir), &dir);

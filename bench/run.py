@@ -26,7 +26,7 @@ import check_defs
 import check_truth
 
 ROOT = Path(__file__).resolve().parent.parent
-SI = ROOT / "target" / "release" / ("si.exe" if os.name == "nt" else "si")
+SI = ROOT / "target" / "release" / ("norn.exe" if os.name == "nt" else "norn")
 CBM = ROOT / "tools" / "cbm" / ("codebase-memory-mcp.exe" if os.name == "nt" else "codebase-memory-mcp")
 # codebase-memory-mcp only accepts a cache directory owned by the current
 # account, so the benchmark cache lives under the home directory.

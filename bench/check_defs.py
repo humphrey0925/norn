@@ -20,7 +20,7 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SI = ROOT / "target" / "release" / "si.exe"
+SI = ROOT / "target" / "release" / "norn.exe"
 NAME = re.compile(rb"^([A-Za-z_]\w*) ?\(")
 KEYWORDS = {b"if", b"while", b"for", b"switch", b"return", b"sizeof", b"defined"}
 

@@ -27,7 +27,7 @@ export async function run(): Promise<void> {
   const folder = vscode.workspace.workspaceFolders![0].uri.fsPath;
   const doc = await vscode.workspace.openTextDocument(path.join(folder, "bfd", "bfdio.c"));
   const editor = await vscode.window.showTextDocument(doc);
-  const ext = vscode.extensions.all.find((e) => e.packageJSON.name === "si-code-index")!;
+  const ext = vscode.extensions.all.find((e) => e.packageJSON.name === "norn")!;
   await ext.activate();
 
   // The server is up and has indexed the folder.
@@ -59,43 +59,43 @@ export async function run(): Promise<void> {
 
   // With no path set, the server is the one inside the extension.
   if (process.env.SI_TEST_BUNDLED) {
-    const used = await vscode.commands.executeCommand<string>("si.serverInUse");
+    const used = await vscode.commands.executeCommand<string>("norn.serverInUse");
     assert.ok(/[\\/]bin[\\/][a-z0-9]+-[a-z0-9]+[\\/]si(\.exe)?$/.test(used), used);
   }
 
   // The views and their commands exist and run.
   editor.selection = new vscode.Selection(read, read);
-  for (const view of ["si.relation.focus", "si.context.focus", "si.search.focus", "si.fileSymbols.focus"]) {
+  for (const view of ["norn.relation.focus", "norn.context.focus", "norn.search.focus", "norn.fileSymbols.focus"]) {
     await vscode.commands.executeCommand(view);
   }
-  for (const command of ["si.relation.graph", "si.relation.tree", "si.relation.callers", "si.relation.references", "si.relation.assignments", "si.relation.callees", "si.relation.lock", "si.relation.unlock", "si.context.lock", "si.context.unlock"]) {
+  for (const command of ["norn.relation.graph", "norn.relation.tree", "norn.relation.callers", "norn.relation.references", "norn.relation.assignments", "norn.relation.callees", "norn.relation.lock", "norn.relation.unlock", "norn.context.lock", "norn.context.unlock"]) {
     await vscode.commands.executeCommand(command);
   }
 
   // A locked Relation stays where it is when the cursor moves, and moves
   // when asked to.
   type Target = { position: { line: number } } | undefined;
-  const shownAt = async () => (await vscode.commands.executeCommand<Target>("si.relation.target"))?.position.line;
-  await vscode.commands.executeCommand("si.relation.sync");
+  const shownAt = async () => (await vscode.commands.executeCommand<Target>("norn.relation.target"))?.position.line;
+  await vscode.commands.executeCommand("norn.relation.sync");
   const before = await shownAt();
   assert.strictEqual(before, read.line);
-  await vscode.commands.executeCommand("si.relation.lock");
+  await vscode.commands.executeCommand("norn.relation.lock");
   const elsewhere = new vscode.Position(read.line + 40, 2);
   editor.selection = new vscode.Selection(elsewhere, elsewhere);
   await new Promise((r) => setTimeout(r, 500));
   assert.strictEqual(await shownAt(), before, "locked: the cursor moved, the view did not");
-  await vscode.commands.executeCommand("si.relation.sync");
+  await vscode.commands.executeCommand("norn.relation.sync");
   assert.strictEqual(await shownAt(), elsewhere.line, "asked: the locked view shows the cursor's place");
-  await vscode.commands.executeCommand("si.context.sync");
-  await vscode.commands.executeCommand("si.relation.unlock");
+  await vscode.commands.executeCommand("norn.context.sync");
+  await vscode.commands.executeCommand("norn.relation.unlock");
   // Context shows the file of the definition, whole, at its line.
   const setError = doc.positionAt(doc.getText().indexOf("bfd_set_error (bfd_error_invalid_operation)") + 3);
   editor.selection = new vscode.Selection(setError, setError);
-  await vscode.commands.executeCommand("si.context.sync");
+  await vscode.commands.executeCommand("norn.context.sync");
   let shown: { uri: string; line: number; lines: number } | undefined;
   for (let i = 0; i < 40 && !shown?.uri.endsWith("bfd-in2.h"); i++) {
     await new Promise((r) => setTimeout(r, 100));
-    shown = await vscode.commands.executeCommand("si.context.shown");
+    shown = await vscode.commands.executeCommand("norn.context.shown");
   }
   const header = await vscode.workspace.openTextDocument(vscode.Uri.parse(shown!.uri));
   assert.ok(shown!.uri.endsWith("bfd-in2.h") && shown!.lines === header.lineCount && header.lineAt(shown!.line - 1).text.includes("bfd_set_error"), JSON.stringify(shown));
@@ -107,7 +107,7 @@ export async function run(): Promise<void> {
   let listed: Listed[] = [];
   for (let i = 0; i < 40 && !listed.length; i++) {
     await new Promise((r) => setTimeout(r, 100));
-    listed = (await vscode.commands.executeCommand<Listed[]>("si.fileSymbols.tree")) ?? [];
+    listed = (await vscode.commands.executeCommand<Listed[]>("norn.fileSymbols.tree")) ?? [];
   }
   const readFn = listed.find((g) => g.label === "Functions")?.children?.find((f) => f.label === "bfd_read");
   const inside = (readFn?.children ?? []).map((c) => c.label);
@@ -116,11 +116,11 @@ export async function run(): Promise<void> {
   const declared = await vscode.commands.executeCommand<vscode.Location[]>("vscode.executeDefinitionProvider", doc.uri, useOf);
   assert.ok(declared.length === 1 && declared[0].range.start.line < useOf.line && doc.lineAt(declared[0].range.start.line).text.includes("nread"), "a local's definition is its declaration");
   editor.selection = new vscode.Selection(useOf, useOf);
-  await vscode.commands.executeCommand("si.context.sync");
+  await vscode.commands.executeCommand("norn.context.sync");
   let local: { uri: string; line: number } | undefined;
   for (let i = 0; i < 40 && local?.line !== declared[0].range.start.line + 1; i++) {
     await new Promise((r) => setTimeout(r, 100));
-    local = await vscode.commands.executeCommand("si.context.shown");
+    local = await vscode.commands.executeCommand("norn.context.shown");
   }
   assert.strictEqual(local?.line, declared[0].range.start.line + 1, "Context shows the local's declaration");
   editor.selection = new vscode.Selection(read, read);
@@ -129,12 +129,12 @@ export async function run(): Promise<void> {
   // normally stays in the group of the editor the views follow.
   await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
   const target = { uri: vscode.Uri.file(path.join(folder, "bfd", "cache.c")).toString(), line: 373, character: 0 };
-  await vscode.commands.executeCommand("si.open", target, true);
+  await vscode.commands.executeCommand("norn.open", target, true);
   assert.strictEqual(vscode.window.activeTextEditor!.viewColumn, vscode.ViewColumn.Two);
   assert.ok(vscode.window.activeTextEditor!.document.fileName.endsWith("cache.c"));
   assert.strictEqual(vscode.window.activeTextEditor!.selection.active.line, 373);
   await sleep(400); // the views now follow the editor in group two
-  await vscode.commands.executeCommand("si.open", { uri: doc.uri.toString(), line: 10, character: 0 }, false);
+  await vscode.commands.executeCommand("norn.open", { uri: doc.uri.toString(), line: 10, character: 0 }, false);
   assert.strictEqual(vscode.window.activeTextEditor!.viewColumn, vscode.ViewColumn.Two, "opens where the focus was");
 
   // The index scope: a folder excluded is gone from the index, the choice
@@ -144,60 +144,60 @@ export async function run(): Promise<void> {
     return !!s?.some((x) => x.name === name);
   };
   assert.ok(await has("ATTRIBUTE_UNUSED"));
-  await vscode.commands.executeCommand("si.scope.exclude", vscode.Uri.file(path.join(folder, "include")));
+  await vscode.commands.executeCommand("norn.scope.exclude", vscode.Uri.file(path.join(folder, "include")));
   assert.ok(!(await has("ATTRIBUTE_UNUSED")), "include/ left the index");
-  const config = JSON.parse(Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(folder, ".si", "config.json")))).toString());
+  const config = JSON.parse(Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(folder, ".norn", "config.json")))).toString());
   assert.deepStrictEqual(config, { include: [], exclude: ["include"] });
-  await vscode.commands.executeCommand("si.scope.only", vscode.Uri.file(path.join(folder, "bfd")));
+  await vscode.commands.executeCommand("norn.scope.only", vscode.Uri.file(path.join(folder, "bfd")));
   assert.ok((await has("bfd_cache_init")) && !(await has("ATTRIBUTE_UNUSED")));
-  await vscode.commands.executeCommand("si.scope.all");
+  await vscode.commands.executeCommand("norn.scope.all");
   assert.ok(await has("ATTRIBUTE_UNUSED"), "the whole workspace again");
-  await vscode.commands.executeCommand("si.scope.focus");
-  await vscode.commands.executeCommand("si.sync");
+  await vscode.commands.executeCommand("norn.scope.focus");
+  await vscode.commands.executeCommand("norn.sync");
 
   // Checking is only a draft: clear everything, and nothing changes until
   // Apply; then nothing is indexed; pick one folder and apply again.
-  await vscode.commands.executeCommand("si.scope.clearAll");
-  assert.strictEqual(await vscode.commands.executeCommand("si.scope.pending"), true);
+  await vscode.commands.executeCommand("norn.scope.clearAll");
+  assert.strictEqual(await vscode.commands.executeCommand("norn.scope.pending"), true);
   assert.ok(await has("bfd_cache_init"), "not applied yet");
-  await vscode.commands.executeCommand("si.scope.apply");
+  await vscode.commands.executeCommand("norn.scope.apply");
   assert.ok(!(await has("bfd_cache_init")) && !(await has("ATTRIBUTE_UNUSED")), "nothing indexed");
-  await vscode.commands.executeCommand("si.scope.include", vscode.Uri.file(path.join(folder, "bfd")));
+  await vscode.commands.executeCommand("norn.scope.include", vscode.Uri.file(path.join(folder, "bfd")));
   assert.ok((await has("bfd_cache_init")) && !(await has("ATTRIBUTE_UNUSED")));
-  const picked = JSON.parse(Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(folder, ".si", "config.json")))).toString());
+  const picked = JSON.parse(Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(folder, ".norn", "config.json")))).toString());
   assert.deepStrictEqual(picked, { include: ["bfd"], exclude: ["."] });
-  await vscode.commands.executeCommand("si.scope.selectAll");
-  await vscode.commands.executeCommand("si.scope.discard");
-  assert.strictEqual(await vscode.commands.executeCommand("si.scope.pending"), false);
-  await vscode.commands.executeCommand("si.scope.selectAll");
-  await vscode.commands.executeCommand("si.scope.apply");
+  await vscode.commands.executeCommand("norn.scope.selectAll");
+  await vscode.commands.executeCommand("norn.scope.discard");
+  assert.strictEqual(await vscode.commands.executeCommand("norn.scope.pending"), false);
+  await vscode.commands.executeCommand("norn.scope.selectAll");
+  await vscode.commands.executeCommand("norn.scope.apply");
   assert.ok(await has("ATTRIBUTE_UNUSED"));
 
   // Compile conditions: bfdio.c defines FD_CLOEXEC under `#ifndef
   // FD_CLOEXEC`. Told the build defines it, that branch is not indexed.
   assert.ok(await has("FD_CLOEXEC"));
   type Conditions = { defines: Record<string, string>; conditionFiles: string[]; state: { active: string | null; configurations: Record<string, unknown>; available: { name: string; source: string }[]; effective: { name: string; value: string | null; source: string }[] } };
-  const conditionsNow = () => vscode.commands.executeCommand<Conditions>("si.conditions.get");
-  await vscode.commands.executeCommand("si.conditions.define", "FD_CLOEXEC=1");
+  const conditionsNow = () => vscode.commands.executeCommand<Conditions>("norn.conditions.get");
+  await vscode.commands.executeCommand("norn.conditions.define", "FD_CLOEXEC=1");
   assert.ok(!(await has("FD_CLOEXEC")) && (await has("bfd_read")), "the skipped branch left the index");
   let conditions = await conditionsNow();
   assert.deepStrictEqual(conditions.defines, { FD_CLOEXEC: "1" });
   assert.deepStrictEqual([conditions.state.active, conditions.state.effective], ["Default", [{ name: "FD_CLOEXEC", value: "1", source: "" }]]);
   // Another set, in force when made: nothing is said there, both branches are back.
-  await vscode.commands.executeCommand("si.conditions.switch", "Release");
+  await vscode.commands.executeCommand("norn.conditions.switch", "Release");
   assert.ok(await has("FD_CLOEXEC"));
-  await vscode.commands.executeCommand("si.conditions.switch", "Default");
+  await vscode.commands.executeCommand("norn.conditions.switch", "Default");
   assert.ok(!(await has("FD_CLOEXEC")));
-  await vscode.commands.executeCommand("si.conditions.remove", { type: "macro", name: "FD_CLOEXEC", value: "1", source: "" });
+  await vscode.commands.executeCommand("norn.conditions.remove", { type: "macro", name: "FD_CLOEXEC", value: "1", source: "" });
   assert.ok(await has("FD_CLOEXEC"));
   // A set that follows the build's own description: a DS-5 project.
   fs.writeFileSync(path.join(folder, ".cproject"), `<?xml version="1.0"?><cproject><configuration name="Debug"><folderInfo><toolChain><tool>
     <option valueType="definedSymbols"><listOptionValue value="FD_CLOEXEC=1"/><listOptionValue value="BOARD_EVK"/></option>
     <option valueType="includePath"><listOptionValue value="../include"/></option></tool></toolChain></folderInfo></configuration></cproject>`);
-  await vscode.commands.executeCommand("si.sync");
+  await vscode.commands.executeCommand("norn.sync");
   conditions = await conditionsNow();
   assert.deepStrictEqual(conditions.state.available, [{ name: "Debug", source: ".cproject#Debug" }]);
-  await vscode.commands.executeCommand("si.conditions.switch", ".cproject#Debug");
+  await vscode.commands.executeCommand("norn.conditions.switch", ".cproject#Debug");
   conditions = await conditionsNow();
   assert.deepStrictEqual([conditions.state.active, conditions.conditionFiles], ["Debug", [".cproject#Debug"]]);
   assert.deepStrictEqual(conditions.state.effective.map((e) => [e.name, e.value, e.source]), [["BOARD_EVK", "1", ".cproject#Debug"], ["FD_CLOEXEC", "1", ".cproject#Debug"]]);
@@ -210,23 +210,23 @@ export async function run(): Promise<void> {
     "configurations": [ { "name": "Win32", "defines": ["_DEBUG"], "compilerPath": "cl.exe" } ],
     "version": 4
 }`);
-  await vscode.commands.executeCommand("si.conditions.toCpp");
+  await vscode.commands.executeCommand("norn.conditions.toCpp");
   let written = fs.readFileSync(cpp, "utf8");
   assert.ok(written.includes("// theirs") && written.includes('"compilerPath": "cl.exe"'), written);
   let ours = (eval("(" + written + ")") as { configurations: { name: string; defines: string[]; includePath: string[] }[] }).configurations;
-  assert.deepStrictEqual(ours.map((c) => c.name), ["Win32", "SI"]);
+  assert.deepStrictEqual(ours.map((c) => c.name), ["Win32", "Norn"]);
   assert.deepStrictEqual([ours[0].defines, ours[1].defines, ours[1].includePath], [["_DEBUG"], ["BOARD_EVK=1", "FD_CLOEXEC=1"], ["${workspaceFolder}/**", "${workspaceFolder}/include"]]);
   // In step from then on, when that is asked for; and not offered back as a build to follow.
-  await vscode.workspace.getConfiguration("si").update("conditions.updateCppProperties", true, vscode.ConfigurationTarget.Workspace);
-  await vscode.commands.executeCommand("si.conditions.define", "EXTRA=2");
+  await vscode.workspace.getConfiguration("norn").update("conditions.updateCppProperties", true, vscode.ConfigurationTarget.Workspace);
+  await vscode.commands.executeCommand("norn.conditions.define", "EXTRA=2");
   written = fs.readFileSync(cpp, "utf8");
   ours = (eval("(" + written + ")") as typeof ours extends infer T ? { configurations: T } : never).configurations;
   assert.deepStrictEqual(ours[1].defines, ["BOARD_EVK=1", "EXTRA=2", "FD_CLOEXEC=1"]);
   assert.deepStrictEqual((await conditionsNow()).state.available.map((a) => a.source), [".cproject#Debug", ".vscode/c_cpp_properties.json#Win32"]);
-  await vscode.workspace.getConfiguration("si").update("conditions.updateCppProperties", undefined, vscode.ConfigurationTarget.Workspace);
+  await vscode.workspace.getConfiguration("norn").update("conditions.updateCppProperties", undefined, vscode.ConfigurationTarget.Workspace);
   fs.rmSync(cpp);
   for (const name of ["Debug", "Release"]) {
-    await vscode.commands.executeCommand("si.conditions.delete", name);
+    await vscode.commands.executeCommand("norn.conditions.delete", name);
   }
   fs.rmSync(path.join(folder, ".cproject"));
   assert.ok(await has("FD_CLOEXEC"));
@@ -234,31 +234,31 @@ export async function run(): Promise<void> {
   // a header the file includes.
   fs.writeFileSync(path.join(folder, "bfd", "sw.h"), "#ifndef SW_H\n#define SW_H\n#define USE_PROBE 0\n#endif\n");
   fs.writeFileSync(path.join(folder, "bfd", "sw.c"), '#include "sw.h"\n#if USE_PROBE\nint probe_on (void) { return 1; }\n#else\nint probe_off (void) { return 0; }\n#endif\n');
-  await vscode.commands.executeCommand("si.sync");
+  await vscode.commands.executeCommand("norn.sync");
   assert.ok((await has("probe_off")) && !(await has("probe_on")), "the header's switch decides the branch");
   const sourced = (await conditionsNow()).state as unknown as { fromSources: { name: string; value: string; files: number }[] };
   assert.ok(sourced.fromSources.some((e) => e.name === "USE_PROBE" && e.value === "0" && e.files === 2), JSON.stringify(sourced.fromSources.slice(0, 5)));
-  await vscode.commands.executeCommand("si.conditions.sourcesOff");
+  await vscode.commands.executeCommand("norn.conditions.sourcesOff");
   assert.ok((await has("probe_off")) && (await has("probe_on")), "told not to, both branches");
-  await vscode.commands.executeCommand("si.conditions.sourcesOn");
+  await vscode.commands.executeCommand("norn.conditions.sourcesOn");
   assert.ok(!(await has("probe_on")));
-  await vscode.commands.executeCommand("si.conditions.delete", "Default");
+  await vscode.commands.executeCommand("norn.conditions.delete", "Default");
   fs.rmSync(path.join(folder, "bfd", "sw.h"));
   fs.rmSync(path.join(folder, "bfd", "sw.c"));
-  await vscode.commands.executeCommand("si.sync");
-  await vscode.commands.executeCommand("si.conditions.focus");
+  await vscode.commands.executeCommand("norn.sync");
+  await vscode.commands.executeCommand("norn.conditions.focus");
 
   // The index is kept in the workspace, and git is told to leave it alone.
-  assert.ok((await vscode.workspace.fs.stat(vscode.Uri.file(path.join(folder, ".si", "cache", "manifest")))).size > 0);
-  const ignore = Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(folder, ".si", ".gitignore")))).toString();
+  assert.ok((await vscode.workspace.fs.stat(vscode.Uri.file(path.join(folder, ".norn", "cache", "manifest")))).size > 0);
+  const ignore = Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(folder, ".norn", ".gitignore")))).toString();
   assert.ok(ignore.includes("/cache/"), ignore);
 
   // Views dragged elsewhere can be put back with one command.
   const commands = await vscode.commands.getCommands(true);
-  for (const view of ["si.search", "si.fileSymbols", "si.scope", "si.relation", "si.context"]) {
+  for (const view of ["norn.search", "norn.fileSymbols", "norn.scope", "norn.relation", "norn.context"]) {
     assert.ok(commands.includes(`${view}.resetViewLocation`), `${view} can be reset`);
   }
-  await vscode.commands.executeCommand("si.resetLayout");
+  await vscode.commands.executeCommand("norn.resetLayout");
 
   // Saving an edit re-indexes it.
   const edit = new vscode.WorkspaceEdit();

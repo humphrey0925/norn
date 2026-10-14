@@ -71,7 +71,7 @@ impl Store {
     /// Where the facts of the tree at `root` go when nothing else is said:
     /// `.si/cache` in the tree itself, beside the project's settings.
     pub fn default_dir(root: &Path) -> PathBuf {
-        root.join(".si").join("cache")
+        crate::scope::home(root).join("cache")
     }
 
     /// Make the directory, and if it is a `cache` folder under `.si`, tell
@@ -79,11 +79,11 @@ impl Store {
     /// cache is not.
     fn prepare(&self) {
         let _ = std::fs::create_dir_all(&self.dir);
-        let parent = self.dir.parent().filter(|p| p.file_name().is_some_and(|n| n == ".si"));
+        let parent = self.dir.parent().filter(|p| p.file_name().is_some_and(|n| n == ".norn" || n == ".si"));
         if let (Some(parent), Some(name)) = (parent, self.dir.file_name().and_then(|n| n.to_str())) {
             let ignore = parent.join(".gitignore");
             if !ignore.exists() {
-                let _ = std::fs::write(ignore, format!("# The index si keeps here is rebuilt from the sources.\n/{name}/\n"));
+                let _ = std::fs::write(ignore, format!("# The index Norn keeps here is rebuilt from the sources.\n/{name}/\n"));
             }
         }
     }

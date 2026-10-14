@@ -1,4 +1,4 @@
-// SI for VS Code: fuzzy project symbol search, file symbols, a Context view
+// Norn for VS Code: fuzzy project symbol search, file symbols, a Context view
 // that follows the cursor and a Relation view of callers and callees. All of
 // it asks the `si lsp` server; nothing is indexed here.
 //
@@ -251,9 +251,9 @@ class FileSymbols implements vscode.TreeDataProvider<Node> {
       [14, "Macros", "symbol-constant"], [12, "Functions", "symbol-function"], [23, "Structs", "symbol-struct"], [10, "Enums", "symbol-enum"],
       [22, "Enumerators", "symbol-enum-member"], [5, "Typedefs", "symbol-class"], [13, "Variables", "symbol-variable"], [8, "Members", "symbol-field"],
     ];
-    // Under each function, its parameters and local variables (si.fileSymbols.showLocals).
+    // Under each function, its parameters and local variables (norn.fileSymbols.showLocals).
     type LocalRow = { function: string; functionLine: number; name: string; line: number; kind: string; type: string | null; range: Entry["range"] };
-    const wanted = vscode.workspace.getConfiguration("si").get<boolean>("fileSymbols.showLocals", true);
+    const wanted = vscode.workspace.getConfiguration("norn").get<boolean>("fileSymbols.showLocals", true);
     const locals = wanted ? (await ask<LocalRow[]>("si/locals", { textDocument: { uri } })) ?? [] : [];
     if (uri !== this.shown) {
       return; // another file since
@@ -307,7 +307,7 @@ class FileSymbols implements vscode.TreeDataProvider<Node> {
       item.iconPath = new vscode.ThemeIcon(node.icon);
     }
     if (node.target) {
-      item.command = { command: "si.open", title: "Open", arguments: [node.target, false] };
+      item.command = { command: "norn.open", title: "Open", arguments: [node.target, false] };
     }
     return item;
   }
@@ -342,7 +342,7 @@ interface Synced extends ScopeState {
   error?: string;
 }
 
-const NEVER = [".si", ".git", ".svn", ".hg"];
+const NEVER = [".norn", ".git", ".svn", ".hg"];
 
 function under(p: string, rule: string): boolean {
   return rule === "" || p === rule || p.startsWith(rule + "/");
@@ -357,7 +357,7 @@ function inScope(scope: ScopeState, rel: string): boolean {
 }
 
 /** The folders of the workspace, each with a checkbox: checked folders are
- *  indexed. What is chosen is kept in `.si/config.json` in the workspace. */
+ *  indexed. What is chosen is kept in `.norn/config.json` in the workspace. */
 class ScopeTree implements vscode.TreeDataProvider<string> {
   private readonly changed = new vscode.EventEmitter<string | undefined>();
   readonly onDidChangeTreeData = this.changed.event;
@@ -477,9 +477,9 @@ class ScopeTree implements vscode.TreeDataProvider<string> {
   }
 
   async apply(next: { include: string[]; exclude: string[] }, what: string) {
-    const r = await this.busy("si.scope", "indexing", () => ask<Synced>("si/setScope", { include: next.include, exclude: next.exclude }));
+    const r = await this.busy("norn.scope", "indexing", () => ask<Synced>("si/setScope", { include: next.include, exclude: next.exclude }));
     if (!r || r.error) {
-      void vscode.window.showErrorMessage(r?.error ?? "SI is not running.");
+      void vscode.window.showErrorMessage(r?.error ?? "Norn is not running.");
       return;
     }
     this.scope = { include: r.include, exclude: r.exclude, config: r.config };
@@ -521,10 +521,10 @@ interface ConditionState {
 }
 
 /** The configuration of the C/C++ extension that is kept in step. */
-const CPP_CONFIGURATION = "SI";
+const CPP_CONFIGURATION = "Norn";
 
 /** Give the C/C++ extension (ms-vscode.cpptools) the conditions in force:
- *  a configuration called "SI" in `.vscode/c_cpp_properties.json` with the
+ *  a configuration called "Norn" in `.vscode/c_cpp_properties.json` with the
  *  macros that are defined and, where a build description gave them, its
  *  include paths. The rest of the file, and whatever else that
  *  configuration has, is left as written. Returns what was done, or
@@ -588,10 +588,10 @@ function cppConfiguration(root: string, state: ConditionState) {
 export const cppProbe = { asked: 0, defines: [] as string[], includePath: [] as string[] };
 
 /** Become a configuration provider of the C/C++ extension
- *  (ms-vscode.cpptools), if it is here: its IntelliSense then asks SI for
+ *  (ms-vscode.cpptools), if it is here: its IntelliSense then asks Norn for
  *  each file's defines and include paths, and is told the moment the
  *  conditions change. Nothing is written anywhere; the C/C++ extension
- *  asks the user once whether SI may configure the folder. Returns how to
+ *  asks the user once whether Norn may configure the folder. Returns how to
  *  say the conditions changed, or undefined without the extension. */
 async function registerCppProvider(context: vscode.ExtensionContext, root: string, state: () => ConditionState): Promise<(() => void) | undefined> {
   const cpptools = vscode.extensions.getExtension("ms-vscode.cpptools");
@@ -608,7 +608,7 @@ async function registerCppProvider(context: vscode.ExtensionContext, root: strin
     }
     const inside = (uri: vscode.Uri) => uri.scheme === "file" && !path.relative(root, uri.fsPath).startsWith("..");
     const provider = {
-      name: "SI Code Index",
+      name: "Norn",
       extensionId: context.extension.id,
       canProvideConfiguration: async (uri: vscode.Uri) => !!state().active && inside(uri),
       provideConfigurations: async (uris: vscode.Uri[]) => {
@@ -630,8 +630,45 @@ async function registerCppProvider(context: vscode.ExtensionContext, root: strin
       api.didChangeCustomBrowseConfiguration?.(provider);
     };
   } catch (e) {
-    console.warn(`SI: could not register as a configuration provider of the C/C++ extension: ${e instanceof Error ? e.message : e}`);
+    console.warn(`Norn: could not register as a configuration provider of the C/C++ extension: ${e instanceof Error ? e.message : e}`);
     return undefined;
+  }
+}
+
+/** Norn was called SI: what a workspace and a user kept under that name
+ *  is taken over, once. The folder `.si` (settings, and the saved index)
+ *  becomes `.norn`; settings written as `si.*` are written again as
+ *  `norn.*`; and whoever still has the extension of the old name
+ *  installed is told to remove it, since both would index the folder. */
+async function fromSi(context: vscode.ExtensionContext) {
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (root && fs.existsSync(path.join(root, ".si")) && !fs.existsSync(path.join(root, ".norn"))) {
+    try {
+      fs.renameSync(path.join(root, ".si"), path.join(root, ".norn"));
+    } catch {
+      // Left where it is: the server reads it there.
+    }
+  }
+  const properties = Object.keys((context.extension.packageJSON?.contributes?.configuration?.properties ?? {}) as Record<string, unknown>);
+  const all = vscode.workspace.getConfiguration();
+  for (const key of properties.filter((k) => k.startsWith("norn."))) {
+    const [old, now] = [all.inspect("si." + key.slice(5)), all.inspect(key)];
+    const targets: [vscode.ConfigurationTarget, "globalValue" | "workspaceValue" | "workspaceFolderValue"][] = [
+      [vscode.ConfigurationTarget.Global, "globalValue"],
+      [vscode.ConfigurationTarget.Workspace, "workspaceValue"],
+      [vscode.ConfigurationTarget.WorkspaceFolder, "workspaceFolderValue"],
+    ];
+    for (const [target, at] of targets) {
+      if (old?.[at] !== undefined && now?.[at] === undefined) {
+        await all.update(key, old[at], target).then(undefined, () => undefined);
+      }
+    }
+  }
+  if (vscode.extensions.getExtension("humphrey0925.si-code-index") && !context.globalState.get("norn.toldOfOld")) {
+    void context.globalState.update("norn.toldOfOld", true);
+    void vscode.window
+      .showWarningMessage("SI Code Index is now Norn. The extension of the old name is still installed and would index this folder a second time: uninstall it.", "Show It")
+      .then((pick) => pick && vscode.commands.executeCommand("workbench.extensions.search", "@installed si-code-index"));
   }
 }
 
@@ -655,7 +692,7 @@ function sourceLabel(source: string): string {
 /** What the build defines, so that `#if` branches it does not compile are
  *  left out of the index: several sets, as a build has configurations, one
  *  in force. The view shows what that one comes to, macro by macro, under
- *  what says so. Kept in `.si/config.json` with the scope. */
+ *  what says so. Kept in `.norn/config.json` with the scope. */
 class ConditionsTree implements vscode.TreeDataProvider<ConditionRow> {
   private readonly changed = new vscode.EventEmitter<ConditionRow | undefined>();
   readonly onDidChangeTreeData = this.changed.event;
@@ -720,7 +757,7 @@ class ConditionsTree implements vscode.TreeDataProvider<ConditionRow> {
         ? "The project's own build configuration, followed without being asked. Click to switch to another, or to set conditions of your own."
         : "The set of compile conditions in force. Click to switch, add or remove sets.";
       item.iconPath = new vscode.ThemeIcon("list-selection");
-      item.command = { command: "si.conditions.switch", title: "Switch Configuration" };
+      item.command = { command: "norn.conditions.switch", title: "Switch Configuration" };
       item.contextValue = "config";
       return item;
     }
@@ -774,11 +811,11 @@ class ConditionsTree implements vscode.TreeDataProvider<ConditionRow> {
 
   /** Save every set and which is in force, and index under it. */
   private async send(configurations: Record<string, Partial<ConditionSettings>>, active: string | null, what: string) {
-    const r = await this.busy("si.conditions", "indexing", () =>
+    const r = await this.busy("norn.conditions", "indexing", () =>
       ask<Synced & { conditions?: ConditionState }>("si/setConditions", { configurations, activeConfiguration: active }),
     );
     if (!r || r.error) {
-      void vscode.window.showErrorMessage(r?.error ?? "SI is not running.");
+      void vscode.window.showErrorMessage(r?.error ?? "Norn is not running.");
       return;
     }
     if (r.conditions) {
@@ -1264,7 +1301,7 @@ class Lenses implements vscode.CodeLensProvider {
   }
 
   async provideCodeLenses(doc: vscode.TextDocument): Promise<vscode.CodeLens[]> {
-    if (!vscode.workspace.getConfiguration("si").get<boolean>("codeLens.enabled", true) || !isSource(doc)) {
+    if (!vscode.workspace.getConfiguration("norn").get<boolean>("codeLens.enabled", true) || !isSource(doc)) {
       return [];
     }
     const symbols = (await ask<{ name: string; kind: number; location: { range: Entry["range"] } }[]>("textDocument/documentSymbol", { textDocument: { uri: doc.uri.toString() } })) ?? [];
@@ -1274,13 +1311,13 @@ class Lenses implements vscode.CodeLensProvider {
       .map((s) => {
         const r = s.location.range;
         const lens = new vscode.CodeLens(new vscode.Range(r.start.line, r.start.character, r.end.line, r.end.character));
-        (lens as vscode.CodeLens & { si: unknown }).si = { textDocument: { uri: doc.uri.toString() }, position: r.start };
+        (lens as vscode.CodeLens & { norn: unknown }).norn = { textDocument: { uri: doc.uri.toString() }, position: r.start };
         return lens;
       });
   }
 
   async resolveCodeLens(lens: vscode.CodeLens): Promise<vscode.CodeLens> {
-    const at = (lens as vscode.CodeLens & { si: ReturnType<typeof positionParams> }).si;
+    const at = (lens as vscode.CodeLens & { norn: ReturnType<typeof positionParams> }).norn;
     const [callers, callees] = await Promise.all([
       ask<{ entries: Entry[] }>("si/relation", { ...at, direction: "callers" }),
       ask<{ entries: Entry[] }>("si/relation", { ...at, direction: "callees" }),
@@ -1290,7 +1327,7 @@ class Lenses implements vscode.CodeLensProvider {
     if (indirect) {
       parts.push(`${indirect} through function pointers`);
     }
-    lens.command = { title: parts.join(" · "), command: "si.showRelationAt", arguments: [at] };
+    lens.command = { title: parts.join(" · "), command: "norn.showRelationAt", arguments: [at] };
     return lens;
   }
 }
@@ -1309,7 +1346,7 @@ function bundledServer(): string | undefined {
 /** Where that server is, or would be. (Windows on Arm runs the x64 one.) */
 function bundledPath(): string {
   const machine = process.platform === "win32" ? "win32-x64" : `${process.platform}-${process.arch}`;
-  return path.join(home.fsPath, "bin", machine, process.platform === "win32" ? "si.exe" : "si");
+  return path.join(home.fsPath, "bin", machine, process.platform === "win32" ? "norn.exe" : "norn");
 }
 
 /** This extension's version, for messages that may be read back to us. */
@@ -1317,13 +1354,13 @@ function version(): string {
   return (vscode.extensions.all.find((e) => e.extensionUri.toString() === home.toString())?.packageJSON as { version?: string } | undefined)?.version ?? "?";
 }
 
-/** Which server to start: the one `si.serverPath` names when it names
+/** Which server to start: the one `norn.serverPath` names when it names
  *  one, else the one that came with the extension, else `si` on PATH. */
 function serverPath(): string {
-  let p = vscode.workspace.getConfiguration("si").get<string>("serverPath", "").trim();
+  let p = vscode.workspace.getConfiguration("norn").get<string>("serverPath", "").trim();
   p = p.replace(/^(["'])(.*)\1$/, "$2").trim();
-  if (p === "" || p === "si") {
-    return bundledServer() ?? "si";
+  if (p === "" || p === "norn" || p === "si") {
+    return bundledServer() ?? "norn";
   }
   const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (folder) {
@@ -1332,11 +1369,11 @@ function serverPath(): string {
   if (p === "~" || p.startsWith("~/") || p.startsWith("~\\")) {
     p = path.join(os.homedir(), p.slice(1));
   }
-  return p || "si";
+  return p || "norn";
 }
 
 function serverCommand(): { command: string; args: string[] } {
-  const config = vscode.workspace.getConfiguration("si");
+  const config = vscode.workspace.getConfiguration("norn");
   const aliases = config.get<string[]>("includeAliases", []);
   const args = ["lsp", ...aliases.flatMap((a) => ["--include-alias", a])];
   // The index is kept between sessions unless told otherwise.
@@ -1356,8 +1393,8 @@ export async function activate(context: vscode.ExtensionContext) {
   const contextView = new Context(vscode.Uri.joinPath(context.extensionUri, "media"));
   const lenses = new Lenses();
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 10);
-  status.text = "$(sync~spin) SI indexing";
-  status.command = "si.sync";
+  status.text = "$(sync~spin) Norn indexing";
+  status.command = "norn.sync";
   status.show();
 
   const selector: vscode.DocumentSelector = [{ scheme: "file", pattern: "**/*.{c,h}" }];
@@ -1367,11 +1404,11 @@ export async function activate(context: vscode.ExtensionContext) {
     // (While the index is read or made the server answers from what the
     // last session saved; the status says so until `si/ready`.)
     const loading = s?.loading ? (s.symbols ? "$(sync~spin) " : "$(sync~spin) indexing · ") : "";
-    status.text = s ? `$(symbol-namespace) SI ${loading}${s.files.toLocaleString()} files · ${s.symbols.toLocaleString()} symbols` : "$(warning) SI not running";
+    status.text = s ? `$(symbol-namespace) Norn ${loading}${s.files.toLocaleString()} files · ${s.symbols.toLocaleString()} symbols` : "$(warning) Norn not running";
     status.tooltip = s
       ? `Click to sync the index with the disk.\nAt start: ${s.loaded.toLocaleString()} files read from the saved index, ${s.parsed.toLocaleString()} parsed
-` + (s.cache ? `Index kept in ${s.cache}` : "Index not kept (si.cache.enabled is off)") + `
-SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : serverPath()}`
+` + (s.cache ? `Index kept in ${s.cache}` : "Index not kept (norn.cache.enabled is off)") + `
+Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : serverPath()}`
       : undefined;
   }
 
@@ -1380,14 +1417,14 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
     if (p.phase === "done") {
       void refreshStatus();
     } else if (p.phase === "linking") {
-      status.text = "$(sync~spin) SI linking";
+      status.text = "$(sync~spin) Norn linking";
     } else {
-      status.text = `$(sync~spin) SI parsing ${p.done.toLocaleString()} / ${p.total.toLocaleString()} files`;
+      status.text = `$(sync~spin) Norn parsing ${p.done.toLocaleString()} / ${p.total.toLocaleString()} files`;
     }
   }
   /** Run something that indexes, with the views it comes from showing that they are busy. */
   async function busy<T>(viewId: string, what: string, work: () => Promise<T>): Promise<T> {
-    status.text = `$(sync~spin) SI ${what}`;
+    status.text = `$(sync~spin) Norn ${what}`;
     return vscode.window.withProgress({ location: { viewId } }, work);
   }
 
@@ -1400,18 +1437,18 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
       follow(current, true);
     }
     vscode.window.setStatusBarMessage(
-      `SI: ${what}: ${r.added} added, ${r.removed} removed, ${r.changed} changed, ${r.parsed} parsed (${Math.round(r.ms)} ms)`,
+      `Norn: ${what}: ${r.added} added, ${r.removed} removed, ${r.changed} changed, ${r.parsed} parsed (${Math.round(r.ms)} ms)`,
       6000,
     );
   }
   let scopeView: vscode.TreeView<string> | undefined;
   const scopeTree = new ScopeTree(afterSync, busy, (pending) => {
-    void vscode.commands.executeCommand("setContext", "si.scopePending", pending);
+    void vscode.commands.executeCommand("setContext", "norn.scopePending", pending);
     if (scopeView) {
       scopeView.message = pending ? "Not applied yet. Press Apply (the check mark) to index this selection." : undefined;
     }
   });
-  scopeView = vscode.window.createTreeView("si.scope", { treeDataProvider: scopeTree, manageCheckboxStateManually: true });
+  scopeView = vscode.window.createTreeView("norn.scope", { treeDataProvider: scopeTree, manageCheckboxStateManually: true });
   scopeView.onDidChangeCheckboxState((e) => {
     // Checking only prepares; Apply indexes.
     for (const [rel, state] of e.items) {
@@ -1422,14 +1459,14 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
   const folderOf = (arg: unknown): string | undefined => (typeof arg === "string" ? arg : arg instanceof vscode.Uri ? scopeTree.relative(arg) : undefined);
   // Which set of conditions is in force, where it is always in sight.
   const configStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 9);
-  configStatus.command = "si.conditions.switch";
+  configStatus.command = "norn.conditions.switch";
   let conditionsView: vscode.TreeView<ConditionRow> | undefined;
   let offered = false;
   /** Pass the conditions in force on to the C/C++ extension, when asked
-   *  to (`si.conditions.updateCppProperties`) or told to now. */
+   *  to (`norn.conditions.updateCppProperties`) or told to now. */
   function toCpp(s: ConditionState, asked = false) {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    const on = vscode.workspace.getConfiguration("si").get<boolean>("conditions.updateCppProperties");
+    const on = vscode.workspace.getConfiguration("norn").get<boolean>("conditions.updateCppProperties");
     if (!root || !(asked || on) || !s.active) {
       return;
     }
@@ -1437,36 +1474,36 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
     try {
       did = writeCppProperties(root, s);
     } catch (e) {
-      void vscode.window.showErrorMessage(`SI could not write .vscode/c_cpp_properties.json: ${e instanceof Error ? e.message : e}`);
+      void vscode.window.showErrorMessage(`Norn could not write .vscode/c_cpp_properties.json: ${e instanceof Error ? e.message : e}`);
       return;
     }
     if (did === "added") {
       // Among other configurations theirs has to be picked, once; ours cannot pick it for them.
       void vscode.window
-        .showInformationMessage(`SI added the configuration "${CPP_CONFIGURATION}" to c_cpp_properties.json. Select it in the C/C++ extension to use these defines.`, "Select Configuration…")
+        .showInformationMessage(`Norn added the configuration "${CPP_CONFIGURATION}" to c_cpp_properties.json. Select it in the C/C++ extension to use these defines.`, "Select Configuration…")
         .then((pick) => pick && vscode.commands.executeCommand("C_Cpp.ConfigurationSelect").then(undefined, () => undefined));
     } else if (did || asked) {
-      vscode.window.setStatusBarMessage(`SI: C/C++ configuration "${CPP_CONFIGURATION}" ${did ? "now has" : "already has"} the defines of ${s.active}`, 5000);
+      vscode.window.setStatusBarMessage(`Norn: C/C++ configuration "${CPP_CONFIGURATION}" ${did ? "now has" : "already has"} the defines of ${s.active}`, 5000);
     }
   }
   let offeredCpp = false;
-  // Set once SI is a configuration provider of the C/C++ extension:
+  // Set once Norn is a configuration provider of the C/C++ extension:
   // tells it the conditions changed.
   let cppChanged: (() => void) | undefined;
   const conditions = new ConditionsTree(afterSync, busy, (s) => {
     toCpp(s);
     cppChanged?.();
     // Conditions in use and the C/C++ extension here: offer, once, to keep it in step.
-    const setting = vscode.workspace.getConfiguration("si").inspect<boolean>("conditions.updateCppProperties");
+    const setting = vscode.workspace.getConfiguration("norn").inspect<boolean>("conditions.updateCppProperties");
     const undecided = setting?.workspaceValue === undefined && setting?.globalValue === undefined && setting?.workspaceFolderValue === undefined;
-    // (As a configuration provider SI already gives it them, with nothing written.)
+    // (As a configuration provider Norn already gives it them, with nothing written.)
     if (s.active && s.effective.length && undecided && !offeredCpp && !cppChanged && vscode.extensions.getExtension("ms-vscode.cpptools")) {
       offeredCpp = true;
       void vscode.window
-        .showInformationMessage(`Also give the C/C++ extension these defines? SI keeps a configuration "${CPP_CONFIGURATION}" in c_cpp_properties.json in step with the one in force here.`, "Yes", "No")
+        .showInformationMessage(`Also give the C/C++ extension these defines? Norn keeps a configuration "${CPP_CONFIGURATION}" in c_cpp_properties.json in step with the one in force here.`, "Yes", "No")
         .then(async (pick) => {
           if (pick) {
-            await vscode.workspace.getConfiguration("si").update("conditions.updateCppProperties", pick === "Yes", vscode.ConfigurationTarget.Workspace);
+            await vscode.workspace.getConfiguration("norn").update("conditions.updateCppProperties", pick === "Yes", vscode.ConfigurationTarget.Workspace);
             if (pick === "Yes") {
               toCpp(conditions.state);
             }
@@ -1480,22 +1517,22 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
     if (s.active || s.available.length) {
       configStatus.text = `$(list-selection) ${s.active ?? "No configuration"}`;
       const found = s.automatic ? ", found in the project" : "";
-      configStatus.tooltip = `SI compile conditions: ${s.active ? `${s.active}${found} (${s.known.toLocaleString()} macros settled)` : "none in force"}. Click to switch.`;
+      configStatus.tooltip = `Norn compile conditions: ${s.active ? `${s.active}${found} (${s.known.toLocaleString()} macros settled)` : "none in force"}. Click to switch.`;
       configStatus.show();
     } else {
       configStatus.hide();
     }
     // The build has configurations of its own and none is used yet: say so, once.
-    if (!sets && s.available.length && !offered && !context.workspaceState.get("si.conditions.offered")) {
+    if (!sets && s.available.length && !offered && !context.workspaceState.get("norn.conditions.offered")) {
       offered = true;
-      void context.workspaceState.update("si.conditions.offered", true);
+      void context.workspaceState.update("norn.conditions.offered", true);
       const files = [...new Set(s.available.map((a) => sourceLabel(a.source).replace(/^.*\((.*)\)$/, "$1")))].join(", ");
       void vscode.window
-        .showInformationMessage(`SI found build configurations (${s.available.map((a) => a.name).join(", ")}) in ${files}. Use one for compile conditions?`, "Choose…")
-        .then((pick) => pick && vscode.commands.executeCommand("si.conditions.switch"));
+        .showInformationMessage(`Norn found build configurations (${s.available.map((a) => a.name).join(", ")}) in ${files}. Use one for compile conditions?`, "Choose…")
+        .then((pick) => pick && vscode.commands.executeCommand("norn.conditions.switch"));
     }
   });
-  conditionsView = vscode.window.createTreeView("si.conditions", { treeDataProvider: conditions });
+  conditionsView = vscode.window.createTreeView("norn.conditions", { treeDataProvider: conditions });
   {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (root) {
@@ -1507,7 +1544,7 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
   }
   const validName = (v: string) => (/^[A-Za-z_][A-Za-z0-9_]*(\s*=.*)?$/.test(v.trim()) ? undefined : "A macro name, optionally followed by =value");
   async function sync() {
-    const r = await busy("si.scope", "syncing", () => ask<Synced>("si/sync", {}));
+    const r = await busy("norn.scope", "syncing", () => ask<Synced>("si/sync", {}));
     if (r) {
       scopeTree.scope = { include: r.include, exclude: r.exclude, config: r.config };
       await conditions.load();
@@ -1538,35 +1575,36 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
    *  folders first. Returns false if the user backed out. */
   async function firstTime(): Promise<boolean> {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (!root || fs.existsSync(path.join(root, ".si", "config.json"))) {
+    if (!root || fs.existsSync(path.join(root, ".norn", "config.json"))) {
       return true;
     }
     const all = "Index Everything", choose = "Choose Folders First";
     const pick = await vscode.window.showInformationMessage(
-      "SI has not indexed this folder before.",
-      { modal: true, detail: "Index every C file in it, or choose which folders to index first? The choice is kept in .si/config.json and can be changed any time in the Index Scope view." },
+      "Norn has not indexed this folder before.",
+      { modal: true, detail: "Index every C file in it, or choose which folders to index first? The choice is kept in .norn/config.json and can be changed any time in the Index Scope view." },
       all,
       choose,
     );
     if (!pick) {
       return false;
     }
-    fs.mkdirSync(path.join(root, ".si"), { recursive: true });
-    fs.writeFileSync(path.join(root, ".si", "config.json"), JSON.stringify({ include: [], exclude: pick === choose ? ["."] : [] }, null, 2) + "\n");
+    fs.mkdirSync(path.join(root, ".norn"), { recursive: true });
+    fs.writeFileSync(path.join(root, ".norn", "config.json"), JSON.stringify({ include: [], exclude: pick === choose ? ["."] : [] }, null, 2) + "\n");
     if (pick === choose) {
-      void vscode.commands.executeCommand("si.scope.focus");
+      void vscode.commands.executeCommand("norn.scope.focus");
     }
     return true;
   }
 
   async function start(rebuild = false) {
+    await fromSi(context);
     if (!(await firstTime())) {
-      status.text = "$(circle-slash) SI not started";
+      status.text = "$(circle-slash) Norn not started";
       status.tooltip = "Click to choose what to index.";
-      status.command = "si.restart";
+      status.command = "norn.restart";
       return;
     }
-    status.command = "si.sync";
+    status.command = "norn.sync";
     const { command, args } = serverCommand();
     if (rebuild && !args.includes("--no-cache")) {
       args.push("--rebuild");
@@ -1574,17 +1612,17 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
     // A setting from before the server came inside the extension starts
     // an older server, which may not know what this extension asks of it.
     const builtIn = bundledServer();
-    if (builtIn && command !== builtIn && !context.workspaceState.get("si.keepServerPath")) {
+    if (builtIn && command !== builtIn && !context.workspaceState.get("norn.keepServerPath")) {
       void vscode.window
-        .showInformationMessage(`SI now includes its server. si.serverPath (${command}) is used instead of it; an older server may lack features of this version.`, "Use the Built-in Server", "Keep My Setting")
+        .showInformationMessage(`Norn now includes its server. norn.serverPath (${command}) is used instead of it; an older server may lack features of this version.`, "Use the Built-in Server", "Keep My Setting")
         .then(async (pick) => {
           if (pick === "Use the Built-in Server") {
-            const config = vscode.workspace.getConfiguration("si");
+            const config = vscode.workspace.getConfiguration("norn");
             for (const target of [vscode.ConfigurationTarget.Global, vscode.ConfigurationTarget.Workspace, vscode.ConfigurationTarget.WorkspaceFolder]) {
               await config.update("serverPath", undefined, target).then(undefined, () => undefined);
             }
           } else if (pick) {
-            await context.workspaceState.update("si.keepServerPath", true);
+            await context.workspaceState.update("norn.keepServerPath", true);
           }
         });
     }
@@ -1594,23 +1632,23 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
     // removed after installing, which security software does to programs
     // it does not know.
     const packaged = fs.existsSync(path.join(home.fsPath, "bin"));
-    if (command === "si" && packaged && !builtIn) {
-      status.text = "$(warning) SI not running";
-      status.tooltip = `SI ${version()}: built-in server missing at ${bundledPath()}`;
+    if (command === "norn" && packaged && !builtIn) {
+      status.text = "$(warning) Norn not running";
+      status.tooltip = `Norn ${version()}: built-in server missing at ${bundledPath()}`;
       const pick = await vscode.window.showErrorMessage(
-        `SI ${version()}: the built-in server is missing (${bundledPath()}). Security software may have removed it. Reinstall the extension, or set si.serverPath to si-windows-x64.exe from the release.`,
+        `Norn ${version()}: the built-in server is missing (${bundledPath()}). Security software may have removed it. Reinstall the extension, or set norn.serverPath to norn-windows-x64.exe from the release.`,
         "Open Settings",
       );
       if (pick) {
-        void vscode.commands.executeCommand("workbench.action.openSettings", "si.serverPath");
+        void vscode.commands.executeCommand("workbench.action.openSettings", "norn.serverPath");
       }
       return;
     }
     if (/[\\/]/.test(command) && !fs.existsSync(command)) {
-      status.text = "$(warning) SI not running";
-      const pick = await vscode.window.showErrorMessage(`si executable not found: ${command}`, "Open Settings");
+      status.text = "$(warning) Norn not running";
+      const pick = await vscode.window.showErrorMessage(`norn executable not found: ${command}`, "Open Settings");
       if (pick) {
-        void vscode.commands.executeCommand("workbench.action.openSettings", "si.serverPath");
+        void vscode.commands.executeCommand("workbench.action.openSettings", "norn.serverPath");
       }
       return;
     }
@@ -1619,7 +1657,7 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
       documentSelector: selector as LanguageClientOptions["documentSelector"],
       synchronize: { fileEvents: vscode.workspace.createFileSystemWatcher("**/*.{c,h}") },
     };
-    client = new LanguageClient("si", "SI", serverOptions, clientOptions);
+    client = new LanguageClient("norn", "Norn", serverOptions, clientOptions);
     client.onNotification("si/progress", progress);
     // The index is there (the server answers before it is, from what the
     // last session saved if anything): everything shown is asked for again.
@@ -1635,10 +1673,10 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
     try {
       await client.start();
     } catch (e) {
-      status.text = "$(warning) SI not running";
-      status.tooltip = `SI ${version()}: could not start ${command}`;
-      const why = command === "si" ? "No server came with this build of the extension and si is not on PATH: set si.serverPath to the si executable." : command === builtIn ? "The built-in server would not start; it may be blocked by security software." : "Check si.serverPath.";
-      void vscode.window.showErrorMessage(`SI ${version()} could not start its server (${command}). ${why} ${e instanceof Error ? e.message : ""}`);
+      status.text = "$(warning) Norn not running";
+      status.tooltip = `Norn ${version()}: could not start ${command}`;
+      const why = command === "norn" ? "No server came with this build of the extension and norn is not on PATH: set norn.serverPath to the norn executable." : command === builtIn ? "The built-in server would not start; it may be blocked by security software." : "Check norn.serverPath.";
+      void vscode.window.showErrorMessage(`Norn ${version()} could not start its server (${command}). ${why} ${e instanceof Error ? e.message : ""}`);
       return;
     }
     await refreshStatus();
@@ -1657,10 +1695,10 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
 
   context.subscriptions.push(
     status,
-    vscode.window.registerWebviewViewProvider("si.relation", relation, { webviewOptions: { retainContextWhenHidden: true } }),
-    vscode.window.registerTreeDataProvider("si.fileSymbols", fileSymbols),
-    vscode.window.registerWebviewViewProvider("si.search", search, { webviewOptions: { retainContextWhenHidden: true } }),
-    vscode.window.registerWebviewViewProvider("si.context", contextView),
+    vscode.window.registerWebviewViewProvider("norn.relation", relation, { webviewOptions: { retainContextWhenHidden: true } }),
+    vscode.window.registerTreeDataProvider("norn.fileSymbols", fileSymbols),
+    vscode.window.registerWebviewViewProvider("norn.search", search, { webviewOptions: { retainContextWhenHidden: true } }),
+    vscode.window.registerWebviewViewProvider("norn.context", contextView),
     vscode.languages.registerCodeLensProvider(selector, lenses),
     vscode.window.onDidChangeActiveTextEditor((e) => follow(e, true)),
     vscode.window.onDidChangeTextEditorSelection((e) => {
@@ -1683,45 +1721,45 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
         lenses.refresh();
       }
     }),
-    vscode.commands.registerCommand("si.open", (t: { uri: string; line: number; character: number }, beside: boolean) => open(t.uri, t.line, t.character, beside)),
-    vscode.commands.registerCommand("si.openToSide", (n: Node) => n?.target && open(n.target.uri, n.target.line, n.target.character, true)),
-    vscode.commands.registerCommand("si.relation.tree", () => relation.setView("tree")),
-    vscode.commands.registerCommand("si.relation.graph", () => relation.setView("graph")),
-    vscode.commands.registerCommand("si.relation.callers", () => relation.setMode("callers")),
-    vscode.commands.registerCommand("si.relation.callees", () => relation.setMode("callees")),
-    vscode.commands.registerCommand("si.relation.references", () => relation.setMode("references")),
-    vscode.commands.registerCommand("si.relation.assignments", () => relation.setMode("assignments")),
-    vscode.commands.registerCommand("si.relation.sync", () => {
+    vscode.commands.registerCommand("norn.open", (t: { uri: string; line: number; character: number }, beside: boolean) => open(t.uri, t.line, t.character, beside)),
+    vscode.commands.registerCommand("norn.openToSide", (n: Node) => n?.target && open(n.target.uri, n.target.line, n.target.character, true)),
+    vscode.commands.registerCommand("norn.relation.tree", () => relation.setView("tree")),
+    vscode.commands.registerCommand("norn.relation.graph", () => relation.setView("graph")),
+    vscode.commands.registerCommand("norn.relation.callers", () => relation.setMode("callers")),
+    vscode.commands.registerCommand("norn.relation.callees", () => relation.setMode("callees")),
+    vscode.commands.registerCommand("norn.relation.references", () => relation.setMode("references")),
+    vscode.commands.registerCommand("norn.relation.assignments", () => relation.setMode("assignments")),
+    vscode.commands.registerCommand("norn.relation.sync", () => {
       const editor = vscode.window.activeTextEditor && isSource(vscode.window.activeTextEditor.document) ? vscode.window.activeTextEditor : current;
       return editor ? relation.sync(editor) : undefined;
     }),
-    vscode.commands.registerCommand("si.relation.target", () => relation.target),
-    vscode.commands.registerCommand("si.serverInUse", () => serverPath()),
-    vscode.commands.registerCommand("si.fileSymbols.tree", () => fileSymbols.tree()),
-    vscode.commands.registerCommand("si.context.shown", () => contextView.state),
+    vscode.commands.registerCommand("norn.relation.target", () => relation.target),
+    vscode.commands.registerCommand("norn.serverInUse", () => serverPath()),
+    vscode.commands.registerCommand("norn.fileSymbols.tree", () => fileSymbols.tree()),
+    vscode.commands.registerCommand("norn.context.shown", () => contextView.state),
     vscode.window.onDidChangeActiveColorTheme(() => setTimeout(() => contextView.colors(), 300)),
-    vscode.commands.registerCommand("si.context.sync", () => {
+    vscode.commands.registerCommand("norn.context.sync", () => {
       const editor = vscode.window.activeTextEditor && isSource(vscode.window.activeTextEditor.document) ? vscode.window.activeTextEditor : current;
       return editor ? contextView.follow(editor, true) : undefined;
     }),
-    vscode.commands.registerCommand("si.relation.lock", () => lock("si.relationLocked", relation, true)),
-    vscode.commands.registerCommand("si.relation.unlock", () => lock("si.relationLocked", relation, false)),
-    vscode.commands.registerCommand("si.context.lock", () => lock("si.contextLocked", contextView, true)),
-    vscode.commands.registerCommand("si.context.unlock", () => lock("si.contextLocked", contextView, false)),
-    vscode.commands.registerCommand("si.showRelationAt", async (at: ReturnType<typeof positionParams>) => {
-      await vscode.commands.executeCommand("si.relation.focus");
+    vscode.commands.registerCommand("norn.relation.lock", () => lock("norn.relationLocked", relation, true)),
+    vscode.commands.registerCommand("norn.relation.unlock", () => lock("norn.relationLocked", relation, false)),
+    vscode.commands.registerCommand("norn.context.lock", () => lock("norn.contextLocked", contextView, true)),
+    vscode.commands.registerCommand("norn.context.unlock", () => lock("norn.contextLocked", contextView, false)),
+    vscode.commands.registerCommand("norn.showRelationAt", async (at: ReturnType<typeof positionParams>) => {
+      await vscode.commands.executeCommand("norn.relation.focus");
       const uri = vscode.Uri.parse(at.textDocument.uri);
       const editor = vscode.window.visibleTextEditors.find((e) => e.document.uri.toString() === uri.toString());
       if (editor) {
         const p = new vscode.Position(at.position.line, at.position.character);
         editor.selection = new vscode.Selection(p, p);
         relation.locked = false;
-        void vscode.commands.executeCommand("setContext", "si.relationLocked", false);
+        void vscode.commands.executeCommand("setContext", "norn.relationLocked", false);
         follow(editor, true);
       }
     }),
-    vscode.commands.registerCommand("si.restart", async () => {
-      status.text = "$(sync~spin) SI indexing";
+    vscode.commands.registerCommand("norn.restart", async () => {
+      status.text = "$(sync~spin) Norn indexing";
       if (client?.isRunning()) {
         await client.stop();
       }
@@ -1730,7 +1768,7 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
     scopeView,
     conditionsView,
     configStatus,
-    vscode.commands.registerCommand("si.conditions.switch", async (arg?: unknown) => {
+    vscode.commands.registerCommand("norn.conditions.switch", async (arg?: unknown) => {
       if (typeof arg === "string") {
         const found = conditions.state.available.find((a) => a.source === arg);
         return found ? conditions.follow(found) : conditions.state.configurations[arg] ? conditions.switchTo(arg) : conditions.create(arg);
@@ -1762,43 +1800,43 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
       const pick = await vscode.window.showQuickPick(picks, { placeHolder: "Compile conditions: which configuration is in force" });
       return pick?.run?.();
     }),
-    vscode.commands.registerCommand("si.conditions.add", async () => {
+    vscode.commands.registerCommand("norn.conditions.add", async () => {
       const picks = [
-        { label: "$(symbol-constant) Define a macro…", detail: "NAME or NAME=value", command: "si.conditions.define" },
-        { label: "$(circle-slash) Mark a macro as not defined…", command: "si.conditions.undefine" },
-        { label: "$(link) Follow a build configuration…", detail: "DS-5 / Eclipse .cproject, or VS Code C/C++ settings (c_cpp_properties.json)", command: "si.conditions.switch" },
-        { label: "$(file) Read from a file…", detail: "A header of #define lines, or a Kconfig .config", command: "si.conditions.addFile" },
-        { label: "$(question) Assume names are not defined…", detail: "A prefix such as CONFIG_, or * for every name the build does not define", command: "si.conditions.assume" },
+        { label: "$(symbol-constant) Define a macro…", detail: "NAME or NAME=value", command: "norn.conditions.define" },
+        { label: "$(circle-slash) Mark a macro as not defined…", command: "norn.conditions.undefine" },
+        { label: "$(link) Follow a build configuration…", detail: "DS-5 / Eclipse .cproject, or VS Code C/C++ settings (c_cpp_properties.json)", command: "norn.conditions.switch" },
+        { label: "$(file) Read from a file…", detail: "A header of #define lines, or a Kconfig .config", command: "norn.conditions.addFile" },
+        { label: "$(question) Assume names are not defined…", detail: "A prefix such as CONFIG_, or * for every name the build does not define", command: "norn.conditions.assume" },
       ];
       const pick = await vscode.window.showQuickPick(picks, { placeHolder: `Add to ${conditions.state.active ?? "a new configuration"}` });
       return pick ? vscode.commands.executeCommand(pick.command) : undefined;
     }),
-    vscode.commands.registerCommand("si.conditions.sourcesOff", () => conditions.useSources(false)),
-    vscode.commands.registerCommand("si.conditions.sourcesOn", () => conditions.useSources(true)),
-    vscode.commands.registerCommand("si.conditions.toCpp", () => {
+    vscode.commands.registerCommand("norn.conditions.sourcesOff", () => conditions.useSources(false)),
+    vscode.commands.registerCommand("norn.conditions.sourcesOn", () => conditions.useSources(true)),
+    vscode.commands.registerCommand("norn.conditions.toCpp", () => {
       if (!conditions.state.active) {
-        void vscode.window.showInformationMessage("SI has no compile configuration in force to pass on.");
+        void vscode.window.showInformationMessage("Norn has no compile configuration in force to pass on.");
         return;
       }
       toCpp(conditions.state, true);
     }),
-    vscode.commands.registerCommand("si.conditions.delete", (arg?: unknown) => (typeof arg === "string" ? conditions.delete(arg) : undefined)),
-    vscode.commands.registerCommand("si.conditions.override", async (row: ConditionRow) => {
+    vscode.commands.registerCommand("norn.conditions.delete", (arg?: unknown) => (typeof arg === "string" ? conditions.delete(arg) : undefined)),
+    vscode.commands.registerCommand("norn.conditions.override", async (row: ConditionRow) => {
       if (row?.type !== "macro" && row?.type !== "sourced") {
         return;
       }
       const text = await vscode.window.showInputBox({ prompt: `Value of ${row.name} in this configuration`, value: `${row.name}=${row.value ?? ""}`, validateInput: validName });
       return text ? conditions.define(text.trim()) : undefined;
     }),
-    vscode.commands.registerCommand("si.conditions.define", async (arg?: unknown) => {
+    vscode.commands.registerCommand("norn.conditions.define", async (arg?: unknown) => {
       const text = typeof arg === "string" ? arg : await vscode.window.showInputBox({ prompt: "Macro the build defines", placeHolder: "CONFIG_SMP  or  ARCH_SIZE=64", validateInput: validName });
       return text ? conditions.define(text.trim()) : undefined;
     }),
-    vscode.commands.registerCommand("si.conditions.undefine", async (arg?: unknown) => {
+    vscode.commands.registerCommand("norn.conditions.undefine", async (arg?: unknown) => {
       const text = typeof arg === "string" ? arg : await vscode.window.showInputBox({ prompt: "Macro the build does not define", placeHolder: "_WIN32", validateInput: (v) => (/^[A-Za-z_][A-Za-z0-9_]*$/.test(v.trim()) ? undefined : "A macro name") });
       return text ? conditions.undefine(text.trim()) : undefined;
     }),
-    vscode.commands.registerCommand("si.conditions.addFile", async (arg?: unknown) => {
+    vscode.commands.registerCommand("norn.conditions.addFile", async (arg?: unknown) => {
       const root = vscode.workspace.workspaceFolders?.[0]?.uri;
       let file = typeof arg === "string" ? arg : undefined;
       if (!file && root) {
@@ -1808,46 +1846,46 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
       }
       return file ? conditions.add("conditionFiles", file) : undefined;
     }),
-    vscode.commands.registerCommand("si.conditions.assume", async (arg?: unknown) => {
+    vscode.commands.registerCommand("norn.conditions.assume", async (arg?: unknown) => {
       const text = typeof arg === "string" ? arg : await vscode.window.showInputBox({
         prompt: "Names with this prefix are not defined unless listed or defined in the sources",
         placeHolder: "CONFIG_   (or * for every name the build does not define)",
       });
       return text ? conditions.add("assumeUndefined", text.trim()) : undefined;
     }),
-    vscode.commands.registerCommand("si.conditions.remove", (row: ConditionRow) => conditions.remove(row)),
-    vscode.commands.registerCommand("si.conditions.get", () => ({ ...conditions.settings, state: conditions.state })),
-    vscode.commands.registerCommand("si.sync", sync),
-    vscode.commands.registerCommand("si.scope.apply", () => scopeTree.applyDraft()),
-    vscode.commands.registerCommand("si.scope.discard", () => scopeTree.discard()),
-    vscode.commands.registerCommand("si.scope.selectAll", () => scopeTree.selectAll()),
-    vscode.commands.registerCommand("si.scope.clearAll", () => scopeTree.clearAll()),
-    vscode.commands.registerCommand("si.resetLayout", async () => {
-      // Put every SI view back where it started, whatever was dragged where.
-      for (const view of ["si.search", "si.fileSymbols", "si.scope", "si.relation", "si.context"]) {
+    vscode.commands.registerCommand("norn.conditions.remove", (row: ConditionRow) => conditions.remove(row)),
+    vscode.commands.registerCommand("norn.conditions.get", () => ({ ...conditions.settings, state: conditions.state })),
+    vscode.commands.registerCommand("norn.sync", sync),
+    vscode.commands.registerCommand("norn.scope.apply", () => scopeTree.applyDraft()),
+    vscode.commands.registerCommand("norn.scope.discard", () => scopeTree.discard()),
+    vscode.commands.registerCommand("norn.scope.selectAll", () => scopeTree.selectAll()),
+    vscode.commands.registerCommand("norn.scope.clearAll", () => scopeTree.clearAll()),
+    vscode.commands.registerCommand("norn.resetLayout", async () => {
+      // Put every Norn view back where it started, whatever was dragged where.
+      for (const view of ["norn.search", "norn.fileSymbols", "norn.scope", "norn.relation", "norn.context"]) {
         try {
           await vscode.commands.executeCommand(`${view}.resetViewLocation`);
         } catch {
           // Already at home.
         }
       }
-      await vscode.commands.executeCommand("si.relation.focus");
+      await vscode.commands.executeCommand("norn.relation.focus");
     }),
-    vscode.commands.registerCommand("si.scope.include", (arg: unknown) => {
+    vscode.commands.registerCommand("norn.scope.include", (arg: unknown) => {
       const rel = folderOf(arg);
       return rel !== undefined && rel !== "" ? scopeTree.set(rel, true) : undefined;
     }),
-    vscode.commands.registerCommand("si.scope.exclude", (arg: unknown) => {
+    vscode.commands.registerCommand("norn.scope.exclude", (arg: unknown) => {
       const rel = folderOf(arg);
       return rel !== undefined && rel !== "" ? scopeTree.set(rel, false) : undefined;
     }),
-    vscode.commands.registerCommand("si.scope.only", (arg: unknown) => {
+    vscode.commands.registerCommand("norn.scope.only", (arg: unknown) => {
       const rel = folderOf(arg);
       return rel ? scopeTree.apply({ include: [rel], exclude: [] }, `Indexing only ${rel}`) : undefined;
     }),
-    vscode.commands.registerCommand("si.scope.all", () => scopeTree.apply({ include: [], exclude: [] }, "Indexing the whole workspace")),
-    vscode.commands.registerCommand("si.scope.pending", () => !!scopeTree.draft),
-    vscode.commands.registerCommand("si.scope.openConfig", async () => {
+    vscode.commands.registerCommand("norn.scope.all", () => scopeTree.apply({ include: [], exclude: [] }, "Indexing the whole workspace")),
+    vscode.commands.registerCommand("norn.scope.pending", () => !!scopeTree.draft),
+    vscode.commands.registerCommand("norn.scope.openConfig", async () => {
       if (!scopeTree.scope.config || !fs.existsSync(scopeTree.scope.config)) {
         // Nothing chosen yet: write the setting out so there is a file to edit.
         await scopeTree.apply({ include: scopeTree.scope.include, exclude: scopeTree.scope.exclude }, "Wrote the scope");
@@ -1856,18 +1894,18 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
         await vscode.window.showTextDocument(vscode.Uri.file(scopeTree.scope.config));
       }
     }),
-    vscode.commands.registerCommand("si.rebuild", async () => {
-      status.text = "$(sync~spin) SI rebuilding";
+    vscode.commands.registerCommand("norn.rebuild", async () => {
+      status.text = "$(sync~spin) Norn rebuilding";
       if (client?.isRunning()) {
         await client.stop();
       }
       await start(true);
     }),
-    // The conditions written by hand (`.si/config.json`), or the build's
+    // The conditions written by hand (`.norn/config.json`), or the build's
     // own description changed in its tool: taken up without being asked,
     // a moment after the last write.
     (() => {
-      const watcher = vscode.workspace.createFileSystemWatcher("**/{.si/config.json,.cproject,*.uvprojx,*.uvproj,*.ewp,*.vcxproj,compile_commands.json,compile_flags.txt,platformio.ini,c_cpp_properties.json}");
+      const watcher = vscode.workspace.createFileSystemWatcher("**/{.norn/config.json,.cproject,*.uvprojx,*.uvproj,*.ewp,*.vcxproj,compile_commands.json,compile_flags.txt,platformio.ini,c_cpp_properties.json}");
       let soon: NodeJS.Timeout | undefined;
       const changed = () => {
         clearTimeout(soon);
@@ -1880,11 +1918,11 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
     })(),
     vscode.workspace.onDidChangeConfiguration((e) => {
       // A corrected path should take effect without reloading the window.
-      if (e.affectsConfiguration("si.fileSymbols")) {
+      if (e.affectsConfiguration("norn.fileSymbols")) {
         fileSymbols.refresh();
       }
-      if (e.affectsConfiguration("si.serverPath") || e.affectsConfiguration("si.includeAliases") || e.affectsConfiguration("si.cache")) {
-        void vscode.commands.executeCommand("si.restart");
+      if (e.affectsConfiguration("norn.serverPath") || e.affectsConfiguration("norn.includeAliases") || e.affectsConfiguration("norn.cache")) {
+        void vscode.commands.executeCommand("norn.restart");
       }
     }),
     { dispose: () => void client?.stop() },

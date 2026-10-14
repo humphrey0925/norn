@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SI = ROOT / "target" / "release" / "si.exe"
+SI = ROOT / "target" / "release" / "norn.exe"
 
 
 class Client:
@@ -210,14 +210,14 @@ def main():
         # The project's scope: leave `include/` out, and it is gone; the
         # setting is written into the tree; a sync sees files appear.
         r = c.request("si/setScope", {"include": [], "exclude": ["include"]})
-        assert r["removed"] == 1 and (work / ".si" / "config.json").is_file(), r
+        assert r["removed"] == 1 and (work / ".norn" / "config.json").is_file(), r
         assert not c.request("workspace/symbol", {"query": "ATTRIBUTE_UNUSED"})
         (work / "bfd" / "extra.c").write_text("int si_extra (void) { return 0; }\n")
         r = c.request("si/sync", {})
         assert r["added"] == 1 and r["exclude"] == ["include"], r
         r = c.request("si/setScope", {"include": [], "exclude": []})
         assert r["added"] == 1 and c.request("workspace/symbol", {"query": "ATTRIBUTE_UNUSED"}), r
-        print("scope: folders leave and return, saved in .si/config.json; sync picks up new files")
+        print("scope: folders leave and return, saved in .norn/config.json; sync picks up new files")
         # Compile conditions: bfdio.c has `#ifndef FD_CLOEXEC` / `#define
         # FD_CLOEXEC 1`; told the build defines it, that branch is skipped.
         has = lambda name: any(x["name"] == name for x in c.request("workspace/symbol", {"query": name}))
@@ -227,7 +227,7 @@ def main():
         assert r["conditions"]["known"] == 1 and r["parsed"] >= 7, r
         assert r["conditions"]["effective"] == [{"name": "FD_CLOEXEC", "value": "1", "source": ""}], r["conditions"]
         assert not has("FD_CLOEXEC") and has("bfd_read")
-        saved = json.loads((work / ".si" / "config.json").read_text())
+        saved = json.loads((work / ".norn" / "config.json").read_text())
         assert saved["configurations"]["Debug"]["defines"] == {"FD_CLOEXEC": "1"} and "exclude" in saved, saved
         # The other set is in force: nothing is said about it there.
         r = c.request("si/setConditions", {**one(defines={"FD_CLOEXEC": "1"}), "activeConfiguration": "Release"})
