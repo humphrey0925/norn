@@ -239,9 +239,12 @@ fn in_sight(
         // other reading.
         // (A prototype beside the stub, in the other branch, is no
         // definition either way.)
+        // (So is a macro defined only in a branch: `#ifdef
+        // CONFIG_DEBUG_LOCK_ALLOC` `#define mutex_lock(l) ...` `#else` the
+        // prototype.)
         let maybe = |c: &u32| {
             let s = &syms[*c as usize];
-            s.kind == kind::FUNCTION && s.flags & (flag::CONDITIONAL | flag::DECL) == flag::CONDITIONAL
+            matches!(s.kind, kind::FUNCTION | kind::MACRO) && s.flags & (flag::CONDITIONAL | flag::DECL) == flag::CONDITIONAL
         };
         let decl = |c: &u32| syms[*c as usize].flags & flag::DECL != 0;
         if out.iter().any(maybe) && out.iter().all(|c| maybe(c) || decl(c)) {

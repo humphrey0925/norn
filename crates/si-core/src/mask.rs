@@ -139,6 +139,9 @@ pub struct Define {
     pub test: bool,
     /// The line, for an `#include` that is certainly compiled (else 0).
     pub line: u32,
+    /// Made in a `.c` file: it stands in that file alone.
+    #[serde(default)]
+    pub local: bool,
 }
 
 impl Define {
@@ -158,6 +161,7 @@ impl Define {
             include: false,
             test: false,
             line: 0,
+            local: false,
         }
     }
 }
@@ -458,6 +462,10 @@ impl MacroSets {
             b.0 |= d.function_like;
             b.1 |= d.hides;
             b.2.extend(d.refs);
+            // (One in a `.c` file is that file's: see `Lexer::define`.)
+            if d.local {
+                continue;
+            }
             let e = by_name.entry(d.name).or_default();
             e.0 |= d.function_like;
             e.1.push(d.deps);
@@ -898,6 +906,10 @@ struct Lexer<'a> {
     local: crate::cond::Local,
     /// The file, as the conditions' `Source` numbers it.
     file: Option<u32>,
+    /// A `.c` file, whose macros stand in it alone.
+    c_file: bool,
+    /// Its own macros that are only attributes (see `define`).
+    own_transparent: FxHashMap<Vec<u8>, bool>,
     nest: Nest,
     /// Nesting at each open `#if`, restored at `#else` so that alternative
     /// branches do not both count their brackets.
@@ -1123,7 +1135,7 @@ impl<'a> Lexer<'a> {
         if let Some(&function_like) = self.transparent.expanding.get(&s[a..e]) {
             self.site(Tok { start: a as u32, end: e as u32, line, call: false, member: false }, function_like, before);
         }
-        let Some(&function_like) = self.transparent.transparent.get(&s[a..e]) else {
+        let Some(&function_like) = self.transparent.transparent.get(&s[a..e]).or_else(|| self.own_transparent.get(&s[a..e])) else {
             if a < self.hidden_until && !is_keyword(&s[a..e]) {
                 let (call, member) = (self.c.peek(0) == b'(', matches!(before_byte, b'.' | b'>'));
                 self.out.events.push(Event::Ref(Tok { start: a as u32, end: e as u32, line, call, member }));
@@ -1279,6 +1291,7 @@ impl<'a> Lexer<'a> {
                     // From here on the name is not defined, if this line is compiled at all.
                     let certain = !self.conds.iter().any(|c| !c.include_guard && c.compiled != Tri::True);
                     self.local.insert(s[a..e].to_vec(), certain.then_some(None));
+                    self.own_transparent.remove(&s[a..e]);
                     if let Some(defines) = &mut self.defines {
                         defines.push(Define { undef: true, ..Define::note(&s[a..e], certain) });
                     }
@@ -1534,7 +1547,20 @@ impl<'a> Lexer<'a> {
                 include: false,
                 test: false,
                 line: 0,
+                local: self.c_file,
             });
+        }
+        // A `.c` file's own macros stand in it alone, so they are not in
+        // the sets made from every file's: what of them is only an
+        // attribute is known here, as they come.
+        if self.c_file && !is_keyword(&s[a..e]) {
+            let deps = transparent_deps(s, body, end, &refs);
+            let transparent = deps.is_some_and(|d| d.iter().all(|x| self.transparent.contains(x) || self.own_transparent.contains_key(x)));
+            if transparent {
+                self.own_transparent.insert(s[a..e].to_vec(), function_like);
+            } else {
+                self.own_transparent.remove(&s[a..e]);
+            }
         }
         let keep = self.transparent.kept.contains(&s[a..e]);
         let guard_flag = guard;
@@ -1611,6 +1637,8 @@ fn lexer<'a>(src: &'a [u8], transparent: &'a MacroSets, conditions: &'a Conditio
     }
     Lexer {
         file: path.and_then(|p| conditions.source()?.file(p)),
+        c_file: path.is_some_and(|p| p.ends_with(".c")),
+        own_transparent: FxHashMap::default(),
         c: Cur { s: src, i: 0, line: 1 },
         transparent,
         conditions,
