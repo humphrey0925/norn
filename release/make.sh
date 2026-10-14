@@ -12,6 +12,8 @@ rm -rf vscode/bin && mkdir -p vscode/bin/win32-x64
 cp target/release/norn.exe vscode/bin/win32-x64/norn.exe
 (cd vscode && npm run package)
 unzip -l out/norn.vsix | grep -q "extension/bin/win32-x64/norn.exe" || { echo "the package has no server in it"; exit 1; }
+# The views draw their icons with this font; without it they are blank.
+unzip -l out/norn.vsix | grep -q "extension/node_modules/@vscode/codicons/dist/codicon.ttf" || { echo "the package has no icon font in it"; exit 1; }
 packed=$(unzip -p out/norn.vsix extension/package.json | node -p "JSON.parse(require('fs').readFileSync(0)).version")
 [ "$packed" = "$version" ] || { echo "the package is $packed, not $version"; exit 1; }
 stage=out/release-stage

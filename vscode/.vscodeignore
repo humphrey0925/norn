@@ -5,3 +5,6 @@ tsconfig.json
 .vscode-test/**
 out/test/**
 node_modules/**
+# The icon font the views draw with is read from here at run time.
+!node_modules/@vscode/codicons/dist/codicon.css
+!node_modules/@vscode/codicons/dist/codicon.ttf
