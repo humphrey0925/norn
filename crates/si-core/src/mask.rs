@@ -1444,6 +1444,11 @@ impl<'a> Lexer<'a> {
             };
             (self.c.i, self.c.line) = save;
             if called {
+                // What it expands to is read all the same (`scoped_guard
+                // (mutex, &m)` calls class_mutex_constructor in its head).
+                if let Some(&function_like) = sets.expanding.get(&s[a..e]) {
+                    self.site(Tok { start: a as u32, end: e as u32, line, call: false, member: false }, function_like, before);
+                }
                 blank(&mut self.out.masked, a, e);
                 for (k, &b) in b"while".iter().enumerate() {
                     self.put(a + k, b);
