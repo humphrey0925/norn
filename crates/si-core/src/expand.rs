@@ -549,9 +549,12 @@ impl<'a> Engine<'a> {
             }
             seen.truncate(MAX_CANDIDATES);
             let mut list: Vec<&'a Parsed> = seen.iter().map(|&(f, i, _)| &self.table.parsed[f as usize][i as usize]).collect();
-            // `#ifndef X` / `#define X default` gives way to any other
-            // definition there is.
-            if list.iter().any(|p| !p.fallback) {
+            // `#ifndef X` / `#define X default` gives way to another
+            // definition that is there for certain; one that may not be (the
+            // tracepoint headers' `TRACE_EVENT`, read again under
+            // `#ifdef CREATE_TRACE_POINTS`) is another reading beside it.
+            let certain = |p: &&'a Parsed| !p.fallback && !p.conditional && self.sure.get(p.file as usize).copied().unwrap_or(true);
+            if list.iter().any(certain) {
                 list.retain(|p| !p.fallback);
             }
             // In the cache first, so that a guard that leads back here ends.
@@ -989,7 +992,11 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str) -> Found {
         if owner.is_some() && brace > 0 && next_is("(") {
             found.refs.push((name(), refkind::CALL, owner.clone()));
         } else if t.origin == Origin::Pasted {
-            found.refs.push((name(), if next_is("(") { refkind::CALL } else { refkind::USE }, owner.clone()));
+            // Last of all, and the use is called: what follows the use is
+            // its arguments (`guard(mutex)(m)`, which ends in
+            // `class_mutex_constructor`).
+            let called = next_is("(") || i + 1 == n && s.flags & site::CALLED != 0;
+            found.refs.push((name(), if called { refkind::CALL } else { refkind::USE }, owner.clone()));
         }
     }
     found
@@ -1255,7 +1262,8 @@ fn expand_file(
         if units.len() <= MAX_UNITS {
             units.iter().map(|&r| Engine { sure: closure(r, sure_fwd), ..Engine::new(table, closure(r, fwd)) }).collect()
         } else {
-            vec![Engine { merged: Some(fi as u32), ..Engine::new(table, visible(fi as u32, fwd, rev)) }]
+            // (What it reads for certain: what it includes so, itself.)
+            vec![Engine { merged: Some(fi as u32), sure: closure(fi as u32, sure_fwd), ..Engine::new(table, visible(fi as u32, fwd, rev)) }]
         }
     };
     let t_setup = std::time::Instant::now();
