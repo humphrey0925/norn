@@ -133,9 +133,22 @@ fn include_edges(files: &[FileFacts], aliases: &[(String, String)], stats: &mut 
                     p == tail || p.ends_with(&tail) && p.as_bytes()[p.len() - tail.len() - 1] == b'/'
                 };
                 let cands: Vec<u32> = by_base.get(base).into_iter().flatten().filter(matches).copied().collect();
+                // The folder the operand is looked up from (`include/` for
+                // `include/linux/kernel.h`) is a `-I` of someone: of the
+                // files in the folder above it. One whose folder above does
+                // not hold the includer (`tools/virtio/` for a driver) is
+                // another program's; of the rest the nearest wins, then the
+                // one sharing the most of the includer's folder.
+                let above = |id: u32| {
+                    let p = files[id as usize].path.as_str();
+                    let root = p[..p.len() - tail.len()].trim_end_matches('/');
+                    let up = dir_of(root);
+                    let holds = up.is_empty() || dir == up || dir.starts_with(up) && dir.as_bytes().get(up.len()) == Some(&b'/');
+                    holds.then(|| up.split('/').filter(|s| !s.is_empty()).count())
+                };
                 let shared = |id: u32| {
                     let other = dir_of(&files[id as usize].path);
-                    dir.split('/').zip(other.split('/')).take_while(|(a, b)| a == b).count()
+                    (above(id), dir.split('/').zip(other.split('/')).take_while(|(a, b)| a == b).count())
                 };
                 match cands.iter().map(|&c| shared(c)).max() {
                     Some(best) => out.extend(cands.iter().copied().filter(|&c| shared(c) == best)),
@@ -211,6 +224,25 @@ fn in_sight(
     if out.is_empty() {
         // Included text is part of this translation unit, `static` or not.
         out.extend(cands.iter().filter(|&&c| want(&syms[c as usize]) && closure.member[syms[c as usize].file as usize]));
+        // All it includes may not be compiled (`#ifdef CONFIG_PCI` extern
+        // ... `#else` a stub): what is defined elsewhere for certain is the
+        // other reading.
+        // (A prototype beside the stub, in the other branch, is no
+        // definition either way.)
+        let maybe = |c: &u32| {
+            let s = &syms[*c as usize];
+            s.kind == kind::FUNCTION && s.flags & (flag::CONDITIONAL | flag::DECL) == flag::CONDITIONAL
+        };
+        let decl = |c: &u32| syms[*c as usize].flags & flag::DECL != 0;
+        if out.iter().any(maybe) && out.iter().all(|c| maybe(c) || decl(c)) {
+            let n = out.len();
+            for &c in cands.iter().filter(external) {
+                let s = &syms[c as usize];
+                if s.flags & (flag::CONDITIONAL | flag::DECL) == 0 && !out[..n].contains(&c) {
+                    out.push(c);
+                }
+            }
+        }
     }
     if !out.is_empty() && out.iter().all(|&c| syms[c as usize].flags & flag::DECL != 0) {
         let n = out.len();

@@ -264,6 +264,13 @@ impl Extractor {
         w.flush_local_calls();
         w.out.walk_ns = t.elapsed().as_nanos() as u64;
         let mut out = w.out;
+        // A function defined where it may not be compiled (the stub in the
+        // `#else` of a header) is only one reading of its name.
+        for d in out.defs.iter_mut().filter(|d| d.kind == kind::FUNCTION) {
+            if out.undecided.iter().any(|&(a, b, _)| a <= d.line && d.line <= b) {
+                d.flags |= flag::CONDITIONAL;
+            }
+        }
         out.shrink();
         out
     }
