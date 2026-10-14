@@ -23,10 +23,14 @@ MODES = [
 
 # How the comparison was made, for a reader of the page (the JSON carries
 # the same in the harness's own words, tool by tool).
+# Norn's version: the one the repository is at, as the release carries it
+# (the binaries measured are told apart by their build hash).
+NORN_VERSION = json.loads((Path(__file__).resolve().parent.parent / "vscode" / "package.json").read_text(encoding="utf-8"))["version"]
+
 METHOD = [
-    "平台不同：Norn、codebase-memory-mcp、clangd 在 Windows / NTFS 上執行；Universal Ctags、cscope、GNU Global 在 WSL2 / ext4 上對同一份檔案的複本執行。Linux 的行程啟動和檔案存取較便宜，對後三者有利，尤其是「每次查詢啟動一個行程」的延遲。",
+    "平台不同：Universal Ctags、cscope、GNU Global 在 WSL2 / ext4 上對同一份檔案的複本執行；Norn、clangd 在 Windows / NTFS 上執行；codebase-memory-mcp 在小語料上於 Windows 執行，在 Linux kernel 上於 WSL2 執行。Linux 的行程啟動和檔案存取較便宜，對在 WSL2 上執行的工具有利，尤其是「每次查詢啟動一個行程」的延遲；kernel 另有「Norn（WSL）」一列，是 Norn 在同樣條件下的量測。",
     "執行緒：Ctags、cscope、Global 是單執行緒；Norn、codebase-memory-mcp、clangd 使用全部核心。",
-    "「第一次索引」指磁碟上沒有索引；原始檔都已在作業系統的檔案快取中。重複三次取中位數。",
+    "「第一次索引」指磁碟上沒有索引；原始檔都已在作業系統的檔案快取中。其他工具在小語料上量三次取中位數；Norn 在每個語料、所有工具在 kernel 上都只量一次。",
     "記憶體峰值：Windows 上是整個行程樹的常駐記憶體，每 20 毫秒取樣；WSL 上取同樣取樣與核心記錄的單一行程高水位兩者較大者。",
     "查詢延遲：每個語料固定 20 個函式名稱、各重複 3 次。常駐伺服器和每次啟動行程不是同一種成本；Norn 兩種都列。clangd 的「誰呼叫它」不含開檔與解析該檔的時間。",
     "「改一個檔之後」各工具的做法不同：Norn 是在行程內、已知哪個檔變了；codebase-memory-mcp、cscope、GNU Global 的數字含行程啟動與找出變更；clangd 是帶著磁碟上的索引重新啟動。",
@@ -139,7 +143,7 @@ def corpus_section(d, remarks):
         spread = f' <span class="dim">({min(runs):.2f}–{max(runs):.2f})</span>' if len(runs) > 1 and max(runs) < 100 else ""
         rows.append(row(t, [NAMES[t], bar(i.get("wall_s"), most_t, secs(i.get("wall_s"))) + spread, bar(i.get("peak_rss_bytes"), most_m, mb(i.get("peak_rss_bytes"))), mb(i.get("disk_bytes")), incr]))
     out.append("<h3>建立索引的成本</h3>")
-    out.append(table(["工具", "第一次索引", "記憶體峰值", "索引大小", "改一個檔之後"], rows, "第一次索引取多次的中位數，括號內是最小–最大（秒）。長條為對數刻度。"))
+    out.append(table(["工具", "第一次索引", "記憶體峰值", "索引大小", "改一個檔之後"], rows, "量了多次的取中位數，括號內是最小–最大（秒）。長條為對數刻度。"))
 
     # Queries.
     rows = []
@@ -282,7 +286,7 @@ def main():
     for d in results:
         for t, r in d["tools"].items():
             v = r.get("version")
-            label = (startup or {}).get("norn_version", "") if t == "si" else ""
+            label = NORN_VERSION if t in ("si", "si_wsl") else ""
             versions.setdefault(t, (v.get("reported") or f'{label} (build {v.get("sha1", "")})').replace("codebase-memory-mcp ", "") if isinstance(v, dict) else str(v).split(",")[0].replace("clangd version ", "").replace("Universal Ctags ", "").replace("cscope: version ", "").replace("gtags (GNU Global) ", ""))
     notes = []
     for d in results:
