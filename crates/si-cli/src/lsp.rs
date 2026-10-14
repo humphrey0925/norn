@@ -339,6 +339,28 @@ impl Server {
         json!(places.into_iter().take(LIMIT).map(|(f, l, n)| self.location(&f, l, &n)).collect::<Vec<_>>())
     }
 
+    /// `si/references`: the references of the name under the cursor, by
+    /// file, each with the text of its line: what a view lists needs no
+    /// file opened in the editor, and comes from the index alone.
+    fn grouped_references(&mut self, params: &Value) -> Value {
+        let found = self.references(params);
+        let mut groups: Vec<Value> = Vec::new();
+        let mut total = 0;
+        for loc in found.as_array().into_iter().flatten() {
+            let uri = loc["uri"].as_str().unwrap_or("").to_string();
+            let Some(file) = self.relative(&uri_to_path(&uri)) else { continue };
+            let (line, character) = (loc["range"]["start"]["line"].as_u64().unwrap_or(0) as u32, loc["range"]["start"]["character"].as_u64().unwrap_or(0));
+            let text = self.line_text(&file, line + 1).trim().to_string();
+            let item = json!({ "line": line, "character": character, "text": text });
+            match groups.last_mut().filter(|g| g["uri"] == uri.as_str()) {
+                Some(g) => g["items"].as_array_mut().unwrap().push(item),
+                None => groups.push(json!({ "file": file, "uri": uri, "items": [item] })),
+            }
+            total += 1;
+        }
+        json!({ "groups": groups, "total": total })
+    }
+
     fn symbol_info(&mut self, sym: u32) -> Value {
         let (name, k, container) = {
             let g = self.g();
@@ -738,12 +760,12 @@ impl Server {
         // means is not what the same name means where it is compiled.
         let from_position = matches!(
             method,
-            "textDocument/definition" | "textDocument/declaration" | "textDocument/references" | "textDocument/prepareCallHierarchy" | "si/context" | "si/relation" | "si/assignments"
+            "textDocument/definition" | "textDocument/declaration" | "textDocument/references" | "textDocument/prepareCallHierarchy" | "si/context" | "si/relation" | "si/assignments" | "si/references"
         );
         if let Some((first, last)) = from_position.then(|| self.inactive_at(params)).flatten() {
             return Some(match method {
                 "textDocument/references" => json!([]),
-                "si/context" | "si/relation" | "si/assignments" => json!({ "inactive": [first, last] }),
+                "si/context" | "si/relation" | "si/assignments" | "si/references" => json!({ "inactive": [first, last] }),
                 _ => Value::Null,
             });
         }
@@ -758,6 +780,7 @@ impl Server {
             "si/search" => self.search(params),
             "si/context" => self.context(params),
             "si/relation" => self.relation(params),
+            "si/references" => self.grouped_references(params),
             "si/assignments" => self.assignments(params),
             "si/symbols" => self.symbols(params),
             "si/place" => self.place(params),

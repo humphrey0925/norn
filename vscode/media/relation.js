@@ -306,7 +306,10 @@
     const ref = e.target.closest("[data-ref]");
     if (ref) {
       const [g, i] = ref.dataset.ref.split(",").map(Number);
-      return open({ uri: refs[g].uri, line: refs[g].items[i].line, character: refs[g].items[i].character });
+      const at = { uri: refs[g].uri, line: refs[g].items[i].line, character: refs[g].items[i].character };
+      // One click: in the Context view. Two, or Ctrl: in the editor.
+      if (e.type === "dblclick" || beside) return open(at);
+      return vscode.postMessage({ show: at });
     }
     const what = e.target.closest("[data-act]")?.dataset.act;
     const row = e.target.closest("[data-assign]");
@@ -331,7 +334,12 @@
     open(c.uri && c.lines.length ? { uri: c.uri, line: c.lines[0] - 1, character: 0 } : definition(n));
   }
   root.addEventListener("click", act);
+  root.addEventListener("dblclick", (e) => {
+    if (e.target.closest("[data-ref]")) act(e);
+  });
   root.addEventListener("keydown", (e) => {
+    // Enter on a reference opens it, as a double click does.
+    if (e.key === "Enter" && e.target.closest("[data-ref]")) return act({ type: "dblclick", target: e.target, ctrlKey: e.ctrlKey, metaKey: e.metaKey });
     const el = e.target.closest("[data-id]");
     if (!el) return;
     const n = nodes.get(+el.dataset.id);
