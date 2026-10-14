@@ -1,5 +1,6 @@
 //! Code-intelligence core: per-file extraction, global link, pluggable stores.
 
+pub mod builds;
 pub mod cond;
 pub mod expand;
 pub mod extract;

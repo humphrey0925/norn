@@ -43,9 +43,18 @@ Source-Insight-style views for C in VS Code, backed by the `si` index.
   value, under what says so.
   - A set can *follow* a build configuration found in the workspace: a
     DS-5 / Arm Development Studio / Eclipse CDT `.cproject`, or the
-    `c_cpp_properties.json` of VS Code's C/C++ extension, or a
-    `compile_commands.json` (what every command in it defines). Its
-    defines are then read from there, and Sync picks up changes made there.
+    `c_cpp_properties.json` of VS Code's C/C++ extension, a
+    `compile_commands.json` (what every command in it defines), a Keil
+    µVision project (`.uvprojx`), an IAR one (`.ewp`), a Visual Studio
+    one (`.vcxproj`), `platformio.ini`, `compile_flags.txt`, or a
+    Makefile or `CMakeLists.txt`. They are looked for in the workspace
+    folder and up to three folders down. Its defines are then read from
+    there, and Sync picks up changes made there.
+  - Of a Makefile or `CMakeLists.txt` only what is said outright is
+    taken: a `-D` outside every `ifdef`/`if ()`, with a value that is
+    written, not computed. Neither is run. That is less than the build
+    defines; a project file or a compilation database says more, and is
+    preferred when there is one.
   - Nothing has to be set up for that: while the project has no sets of
     its own, the build configurations found in it are its sets, the first
     one in force (the status bar says which, and a click switches).

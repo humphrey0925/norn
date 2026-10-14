@@ -213,14 +213,29 @@ pub fn effective(settings: &Settings, root: &Path) -> Vec<Effective> {
 /// entries: `(name, entry)`.
 pub fn discover(root: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for file in [".cproject", ".vscode/c_cpp_properties.json", "compile_commands.json", "build/compile_commands.json"] {
-        let Ok(text) = std::fs::read(root.join(file)) else { continue };
+    // A project file may be anywhere near. Of Makefiles (and the like),
+    // which every folder may have, only those nearest the root that say
+    // anything: further down they are one part's, not the build's.
+    let mut makefiles_at: Option<usize> = None;
+    for file in crate::builds::find(root) {
+        let depth = file.matches('/').count();
+        let general = crate::builds::is_general(&file);
+        if general && makefiles_at.is_some_and(|d| d != depth) {
+            continue;
+        }
+        let Ok(text) = std::fs::read(root.join(&file)) else { continue };
         let text = String::from_utf8_lossy(&text);
-        let names = builds_of(file, &text).unwrap_or_default();
+        let names = builds_of(&file, &text).unwrap_or_default();
+        if general && !names.is_empty() {
+            makefiles_at = Some(depth);
+        }
         // (The configuration written for the C/C++ extension is our own
         // conditions on their way out, not a build's to follow.)
         let theirs = names.into_iter().filter(|c| c.name != WRITTEN);
-        out.extend(theirs.map(|c| (c.name.clone(), format!("{file}#{}", c.name))));
+        // Which folder's, for one that is not the root's (or `.vscode`'s).
+        let folder = file.rsplit_once('/').map_or("", |f| f.0);
+        let label = |name: &str| if folder.is_empty() || folder == ".vscode" { name.to_string() } else { format!("{name} ({folder})") };
+        out.extend(theirs.map(|c| (label(&c.name), format!("{file}#{}", c.name))));
     }
     out
 }
@@ -300,7 +315,7 @@ fn builds_of(path: &str, text: &str) -> Option<Vec<Build>> {
         ".cproject" => Some(cproject(text)),
         "c_cpp_properties.json" => Some(cpp_properties(text)),
         "compile_commands.json" => Some(compile_commands(text)),
-        _ => None,
+        _ => crate::builds::of(path, text),
     }
 }
 
@@ -380,11 +395,11 @@ fn words(line: &str) -> Vec<String> {
 
 /// One configuration of a build description.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct Build {
-    name: String,
-    defines: Vec<String>,
-    undefines: Vec<String>,
-    includes: Vec<String>,
+pub(crate) struct Build {
+    pub(crate) name: String,
+    pub(crate) defines: Vec<String>,
+    pub(crate) undefines: Vec<String>,
+    pub(crate) includes: Vec<String>,
 }
 
 /// `-DNAME=value` and `-UNAME` in a line of compiler flags.
