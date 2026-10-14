@@ -9,8 +9,8 @@ import html
 import json
 from pathlib import Path
 
-ORDER = ["si", "cbm", "clangd", "cscope", "gtags", "ctags"]
-NAMES = {"si": "Norn", "cbm": "codebase-memory-mcp", "clangd": "clangd", "cscope": "cscope", "gtags": "GNU Global", "ctags": "Universal Ctags"}
+ORDER = ["si", "si_wsl", "cbm", "clangd", "cscope", "gtags", "ctags"]
+NAMES = {"si": "Norn", "si_wsl": "Norn（WSL）", "cbm": "codebase-memory-mcp", "clangd": "clangd", "cscope": "cscope", "gtags": "GNU Global", "ctags": "Universal Ctags"}
 CORPORA = {"redis": "Redis", "git-c": "git", "c-only": "binutils", "linux": "Linux kernel"}
 
 
@@ -124,8 +124,8 @@ def corpus_section(d, remarks):
     def row(t, cells):
         if tools[t].get("status") != "ok":
             reason = esc(tools[t].get("reason", "failed"))[:160]
-            return ("failed" + (" us" if t == "si" else ""), [NAMES[t]] + cells[1:2] + [f'<span class="why">未完成：{reason}</span>'] + [""] * (len(cells) - 3))
-        return ("us" if t == "si" else "", cells)
+            return ("failed" + (" us" if t in ("si", "si_wsl") else ""), [NAMES[t]] + cells[1:2] + [f'<span class="why">未完成：{reason}</span>'] + [""] * (len(cells) - 3))
+        return ("us" if t in ("si", "si_wsl") else "", cells)
 
     # Cost.
     most_t = max((get(tools, t, "index", "wall_s") or 0) for t in present)
@@ -147,7 +147,7 @@ def corpus_section(d, remarks):
         q = get(tools, t, "query") or {}
         one = get(q, "one_shot", "find", "p50_ms") or get(q, "one_shot", "p50_ms")
         mode = esc(mode_zh(q.get("mode", "")))
-        if t == "si" and one:
+        if t in ("si", "si_wsl") and one:
             mode += f"；每次查詢啟動一個行程時 {ms(one)}"
         callers = ms(get(q, "callers", "p50_ms"))
         if t == "gtags" and get(q, "callers", "p50_ms"):
