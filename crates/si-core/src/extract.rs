@@ -499,8 +499,8 @@ impl<'a> Walk<'a> {
                     }
                     if m.keep {
                         let text = String::from_utf8_lossy(&self.orig[m.name.end as usize..m.end as usize]);
-                        let text = self.out.push_name(&text);
-                        let guard = if m.guard.is_empty() { NONE } else { self.out.push_name(&m.guard) };
+                        let text = self.out.push_text(&text);
+                        let guard = if m.guard.is_empty() { NONE } else { self.out.push_text(&m.guard) };
                         self.out.macros.push(MacroBody { name, text, function_like: m.name.call, guard, conditional: m.conditional, fallback: m.fallback });
                     }
                 }
@@ -510,7 +510,7 @@ impl<'a> Walk<'a> {
                         NONE
                     } else {
                         let text = String::from_utf8_lossy(&self.orig[s.name.end as usize..s.args_end as usize]);
-                        self.out.push_name(&text)
+                        self.out.push_text(&text)
                     };
                     // Outside every bracket is outside every function, whatever
                     // the parser made of the lines before.
@@ -523,7 +523,7 @@ impl<'a> Walk<'a> {
                     if close > open && close - open <= MAX_INIT_TEXT {
                         let type_name = self.intern(&self.orig[s.init_type.0 as usize..s.init_type.1 as usize]);
                         let text = String::from_utf8_lossy(&self.orig[open..close]);
-                        let text = self.out.push_name(&text);
+                        let text = self.out.push_text(&text);
                         let scope = if def == NONE { scope } else { def };
                         self.out.inits.push(InitSite { type_name, text, line: s.name.line, scope, array: s.init_array });
                     }
@@ -810,7 +810,7 @@ impl<'a> Walk<'a> {
                 let by_row = array && end - start > ROWS_APART;
                 if !by_row && end - start <= MAX_INIT_TEXT {
                     let text = String::from_utf8_lossy(&self.orig[start..end]);
-                    let text = self.out.push_name(&text);
+                    let text = self.out.push_text(&text);
                     let line = value.start_position().row as u32 + 1;
                     self.out.inits.push(InitSite { type_name, text, line, scope, array });
                 } else if by_row {
@@ -828,7 +828,7 @@ impl<'a> Walk<'a> {
                             // an array of that one element.
                             if e - a <= MAX_INIT_TEXT {
                                 let text = format!("{{{}}}", String::from_utf8_lossy(&self.orig[a..e]));
-                                let text = self.out.push_name(&text);
+                                let text = self.out.push_text(&text);
                                 let line = row.start_position().row as u32 + 1;
                                 self.out.inits.push(InitSite { type_name, text, line, scope, array: true });
                             }

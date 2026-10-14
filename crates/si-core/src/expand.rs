@@ -1015,18 +1015,14 @@ fn visible(file: u32, fwd: &[Vec<u32>], rev: &[Vec<u32>]) -> Vec<bool> {
     all
 }
 
+/// A file's names by their number among all files' names.
 struct Names {
-    ids: FxHashMap<String, u32>,
+    ids: FxHashMap<u32, u32>,
 }
 
 impl Names {
     fn id(&mut self, f: &mut FileFacts, s: &str) -> u32 {
-        if let Some(&id) = self.ids.get(s) {
-            return id;
-        }
-        let id = f.push_name(s);
-        self.ids.insert(s.to_string(), id);
-        id
+        *self.ids.entry(crate::names::id(s)).or_insert_with(|| f.push_name(s))
     }
 }
 
@@ -1265,7 +1261,7 @@ fn expand_file(
     let t_setup = std::time::Instant::now();
     let mut engines = make_engines();
     let mut out = f.clone();
-    let mut names = Names { ids: (0..f.n_names()).map(|i| (f.name(i).to_string(), i as u32)).collect() };
+    let mut names = Names { ids: f.shared_names().enumerate().filter(|&(_, id)| id != NONE).map(|(i, id)| (id, i as u32)).collect() };
     let (n_defs, n_refs) = (f.defs.len(), f.refs.len());
     let live: Vec<&Site> =
         f.sites.iter().filter(|s| engines.iter_mut().any(|e| e.hides(f.name(s.name as usize)))).collect();
@@ -1537,93 +1533,69 @@ pub struct Cache {
     pub(crate) names: NameCache,
 }
 
-/// Every name of every file under one number, kept between links: giving
-/// millions of names their numbers again at every edit is most of what a
-/// link costs in a large tree, and an edit changes one file's.
+/// The names in use, in order, kept between links: an edit seldom brings
+/// a name no file had, or takes the last use of one away, and when it does
+/// it is a handful among millions.
 #[derive(Default)]
 pub(crate) struct NameCache {
-    /// The names' text, in a few large blocks rather than one allocation
-    /// each: there are millions. A block is never moved or freed while
-    /// this lives, which is what lets `ids` and `strings` point into them.
-    blocks: Vec<Vec<u8>>,
-    ids: FxHashMap<&'static str, u32>,
-    strings: Vec<&'static str>,
-    /// How many files use each name.
-    uses: Vec<u32>,
-    /// Per file: its hash and expansion count when read, and its names.
-    files: Vec<(u64, u64, Vec<u32>)>,
-    /// The names in use in lexicographic order, and each name's place in it.
+    /// Which names ([`crate::names`]) some file uses, a bit each.
+    used: Vec<u64>,
+    /// Those, in lexicographic order, and each name's place in it.
     order: Vec<u32>,
     rank: Vec<u32>,
-    stale: bool,
 }
 
 impl NameCache {
-    /// A copy of `name` that lives as long as this does.
-    fn keep(&mut self, name: &str) -> &'static str {
-        const BLOCK: usize = 4 << 20;
-        if self.blocks.last().is_none_or(|b| b.capacity() - b.len() < name.len()) {
-            self.blocks.push(Vec::with_capacity(BLOCK.max(name.len())));
-        }
-        let block = self.blocks.last_mut().unwrap();
-        let at = block.len();
-        block.extend_from_slice(name.as_bytes());
-        // SAFETY: the bytes are a copy of a `str`; the block was made with
-        // room for them, so the push did not move it, and blocks are only
-        // dropped with `self`, together with `ids` and `strings` (which
-        // hold these references and hand them out no longer than `&self`).
-        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(block.as_ptr().add(at), name.len())) }
-    }
-
-    /// The table for `files` as they are now: for each file, the global
-    /// number of each of its names, a name's number being its
-    /// lexicographic rank; and the names in that order.
-    pub(crate) fn table(&mut self, files: &[&FileFacts], made: &[u64]) -> (Vec<Vec<u32>>, Vec<&str>) {
-        if self.files.len() != files.len() {
-            *self = NameCache { files: vec![(0, 0, Vec::new()); files.len()], stale: true, ..NameCache::default() };
-        }
-        for (i, f) in files.iter().enumerate() {
-            let at = made.get(i).copied().unwrap_or(0);
-            let known = &self.files[i];
-            if known.0 == f.hash && known.1 == at && known.2.len() == f.n_names() && at != 0 {
-                continue;
+    /// The table for `files` as they are now: for each file, the number
+    /// in the graph of each of its names, a name's number being its
+    /// lexicographic rank among the names in use (`NONE` for what is the
+    /// file's own text, which is no name); and the names in that order.
+    pub(crate) fn table(&mut self, files: &[&FileFacts]) -> (Vec<Vec<u32>>, Vec<&'static str>) {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let n = crate::names::count() as usize;
+        let bits: Vec<AtomicU64> = (0..n.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
+        files.par_iter().for_each(|f| {
+            for id in f.shared_names().filter(|&id| id != NONE) {
+                let (word, bit) = (&bits[id as usize / 64], 1u64 << (id % 64));
+                if word.load(Relaxed) & bit == 0 {
+                    word.fetch_or(bit, Relaxed);
+                }
             }
-            for &id in &self.files[i].2 {
-                self.uses[id as usize] -= 1;
-                self.stale |= self.uses[id as usize] == 0;
+        });
+        let used: Vec<u64> = bits.into_iter().map(AtomicU64::into_inner).collect();
+        self.used.resize(used.len(), 0);
+        let changed: Vec<u32> = (0..used.len())
+            .filter(|&w| used[w] != self.used[w])
+            .flat_map(|w| {
+                let differ = used[w] ^ self.used[w];
+                (0..64).filter(move |b| differ >> b & 1 != 0).map(move |b| (w * 64 + b) as u32)
+            })
+            .collect();
+        let is_used = |id: u32| used[id as usize / 64] >> (id % 64) & 1 != 0;
+        if changed.len() > 256 {
+            self.order = (0..n as u32).filter(|&id| is_used(id)).collect();
+            self.order.par_sort_unstable_by_key(|&id| crate::names::text(id));
+        } else {
+            for &id in &changed {
+                let at = self.order.binary_search_by_key(&crate::names::text(id), |&o| crate::names::text(o));
+                match (is_used(id), at) {
+                    (true, Err(at)) => self.order.insert(at, id),
+                    (false, Ok(at)) => drop(self.order.remove(at)),
+                    _ => {}
+                }
             }
-            let mut ids = Vec::with_capacity(f.n_names());
-            for n in 0..f.n_names() {
-                let name = f.name(n);
-                let id = match self.ids.get(name) {
-                    Some(&id) => id,
-                    None => {
-                        let id = self.strings.len() as u32;
-                        let kept = self.keep(name);
-                        self.ids.insert(kept, id);
-                        self.strings.push(kept);
-                        self.uses.push(0);
-                        id
-                    }
-                };
-                self.stale |= self.uses[id as usize] == 0;
-                self.uses[id as usize] += 1;
-                ids.push(id);
-            }
-            self.files[i] = (f.hash, at, ids);
         }
-        if std::mem::take(&mut self.stale) {
-            let (strings, uses) = (&self.strings, &self.uses);
-            self.order = (0..strings.len() as u32).filter(|&id| uses[id as usize] > 0).collect();
-            self.order.par_sort_unstable_by(|&a, &b| strings[a as usize].cmp(strings[b as usize]));
-            self.rank = vec![NONE; strings.len()];
+        if !changed.is_empty() || self.rank.len() != n {
+            self.rank.clear();
+            self.rank.resize(n, NONE);
             for (place, &id) in self.order.iter().enumerate() {
                 self.rank[id as usize] = place as u32;
             }
         }
+        self.used = used;
         let rank = &self.rank;
-        let remap = self.files.par_iter().map(|(_, _, ids)| ids.iter().map(|&id| rank[id as usize]).collect()).collect();
-        (remap, self.order.iter().map(|&id| self.strings[id as usize]).collect())
+        let remap = files.par_iter().map(|f| f.shared_names().map(|id| if id == NONE { NONE } else { rank[id as usize] }).collect()).collect();
+        (remap, self.order.iter().map(|&id| crate::names::text(id)).collect())
     }
 }
 
@@ -1837,7 +1809,7 @@ mod tests {
         ];
         let mut f = FileFacts::new("a.c".into());
         for (name, text, function_like) in macros {
-            let (name, text) = (f.push_name(name), f.push_name(text));
+            let (name, text) = (f.push_name(name), f.push_text(text));
             f.macros.push(crate::model::MacroBody { name, text, function_like, guard: NONE, conditional: false, fallback: false });
         }
         let files = [f];

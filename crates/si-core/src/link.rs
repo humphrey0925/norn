@@ -372,15 +372,14 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         eprintln!("facts     {}", part(&mut files.iter()));
         eprintln!("expanded  {}", part(&mut cache.expanded.iter().flatten()));
     }
-    let crate::expand::Cache { expanded, names: name_cache, made, .. } = cache;
+    let crate::expand::Cache { expanded, names: name_cache, .. } = cache;
     let files: Vec<&FileFacts> = files.iter().zip(expanded.iter()).map(|(f, e)| e.as_ref().unwrap_or(f)).collect();
     let files = &files[..];
 
-    // 1. Every file-local name under one global number, a name's number
-    //    being its lexicographic rank. The table is kept between links:
-    //    only the files that changed are read for their names.
+    // 1. Every file-local name under its number in the graph, which is
+    //    its lexicographic rank among the names in use.
     let t = Instant::now();
-    let (remap, names) = name_cache.table(files, made);
+    let (remap, names) = name_cache.table(files);
     let mut g = Graph::default();
     g.str_off.reserve(names.len() + 1);
     g.str_off.push(0);

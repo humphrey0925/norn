@@ -7,6 +7,7 @@ pub mod graph;
 pub mod link;
 pub mod mask;
 pub mod model;
+pub mod names;
 pub mod packed;
 pub mod progress;
 pub mod scope;

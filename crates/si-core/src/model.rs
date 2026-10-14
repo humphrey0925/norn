@@ -233,8 +233,7 @@ pub struct FileFacts {
     pub mask_ns: u64,
     pub parse_ns: u64,
     pub walk_ns: u64,
-    name_buf: String,
-    name_off: Vec<u32>,
+    names: Names,
     pub defs: Vec<Def>,
     pub refs: Vec<Ref>,
     /// `#include` operands as written, as file-local name ids.
@@ -284,30 +283,129 @@ pub struct Local {
     pub type_name: u32,
 }
 
-impl FileFacts {
-    pub fn new(path: String) -> Self {
-        FileFacts { path, name_off: vec![0], ..Default::default() }
+/// A file's names: for each, its number among the names of all files
+/// ([`crate::names`]), or, marked with [`OWN`], a place in the file's own
+/// text. The file's own are what is kept to be expanded later (a macro's
+/// body, the arguments of a use, an initializer): long, and written once.
+#[derive(Clone, Debug)]
+struct Names {
+    ids: Vec<u32>,
+    buf: String,
+    off: Vec<u32>,
+}
+
+const OWN: u32 = crate::names::LIMIT;
+
+impl Default for Names {
+    fn default() -> Self {
+        Names { ids: Vec::new(), buf: String::new(), off: vec![0] }
+    }
+}
+
+/// On disk a file's names are all text, so that what is saved of a file
+/// can be read by a process that has given the names other numbers.
+#[derive(Serialize, Deserialize)]
+struct SavedNames {
+    buf: String,
+    off: Vec<u32>,
+    /// Which of them are the file's own.
+    own: Vec<u32>,
+}
+
+impl Serialize for Names {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut saved = SavedNames { buf: String::new(), off: vec![0], own: Vec::new() };
+        for (i, &id) in self.ids.iter().enumerate() {
+            if id & OWN != 0 {
+                saved.own.push(i as u32);
+            }
+            saved.buf.push_str(self.get(i));
+            saved.off.push(saved.buf.len() as u32);
+        }
+        saved.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Names {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let saved = SavedNames::deserialize(d)?;
+        let mut names = Names::default();
+        let mut own = saved.own.iter().copied().peekable();
+        for i in 0..saved.off.len().saturating_sub(1) {
+            let text = saved.buf.get(saved.off[i] as usize..saved.off[i + 1] as usize).ok_or_else(|| serde::de::Error::custom("names out of bounds"))?;
+            if own.next_if_eq(&(i as u32)).is_some() {
+                names.push_own(text);
+            } else {
+                names.ids.push(crate::names::id(text));
+            }
+        }
+        names.ids.shrink_to_fit();
+        names.buf.shrink_to_fit();
+        names.off.shrink_to_fit();
+        Ok(names)
+    }
+}
+
+impl Names {
+    fn push_own(&mut self, s: &str) {
+        self.ids.push(OWN | (self.off.len() - 1) as u32);
+        self.buf.push_str(s);
+        self.off.push(self.buf.len() as u32);
     }
 
+    fn get(&self, i: usize) -> &str {
+        let id = self.ids[i];
+        if id & OWN == 0 {
+            crate::names::text(id)
+        } else {
+            let at = (id & !OWN) as usize;
+            &self.buf[self.off[at] as usize..self.off[at + 1] as usize]
+        }
+    }
+}
+
+impl FileFacts {
+    pub fn new(path: String) -> Self {
+        FileFacts { path, ..Default::default() }
+    }
+
+    /// A name: an identifier, a path, anything other files say too.
     pub fn push_name(&mut self, s: &str) -> u32 {
-        self.name_buf.push_str(s);
-        self.name_off.push(self.name_buf.len() as u32);
-        (self.name_off.len() - 2) as u32
+        self.names.ids.push(crate::names::id(s));
+        (self.names.ids.len() - 1) as u32
+    }
+
+    /// Text kept under a name's number that is no name: only this file has it.
+    pub fn push_text(&mut self, s: &str) -> u32 {
+        self.names.push_own(s);
+        (self.names.ids.len() - 1) as u32
     }
 
     pub fn n_names(&self) -> usize {
-        self.name_off.len() - 1
+        self.names.ids.len()
     }
 
     pub fn name(&self, i: usize) -> &str {
-        &self.name_buf[self.name_off[i] as usize..self.name_off[i + 1] as usize]
+        self.names.get(i)
+    }
+
+    /// For each name, its number among all files' names, or `NONE` for
+    /// what is the file's own text.
+    pub fn shared_names(&self) -> impl Iterator<Item = u32> + '_ {
+        self.names.ids.iter().map(|&id| if id & OWN == 0 { id } else { NONE })
+    }
+
+    /// The bytes of the file's own text.
+    pub fn own_text_bytes(&self) -> usize {
+        self.names.buf.len()
     }
 
     /// Give back what the vectors hold beyond what is in them: they grew
     /// by doubling, and in a large tree the slack of every file adds up.
     pub fn shrink(&mut self) {
-        self.name_buf.shrink_to_fit();
-        self.name_off.shrink_to_fit();
+        self.names.ids.shrink_to_fit();
+        self.names.buf.shrink_to_fit();
+        self.names.off.shrink_to_fit();
         self.defs.shrink_to_fit();
         self.refs.shrink_to_fit();
         self.includes.shrink_to_fit();
@@ -332,13 +430,12 @@ impl FileFacts {
 
     /// What the names (and the texts kept as names) take.
     pub fn names_bytes(&self) -> usize {
-        self.name_buf.capacity() + self.name_off.capacity() * 4
+        self.names.buf.capacity() + (self.names.off.capacity() + self.names.ids.capacity()) * 4
     }
 
     pub fn heap_bytes(&self) -> usize {
         self.path.capacity()
-            + self.name_buf.capacity()
-            + self.name_off.capacity() * 4
+            + self.names_bytes()
             + self.defs.capacity() * std::mem::size_of::<Def>()
             + self.refs.capacity() * std::mem::size_of::<Ref>()
             + self.includes.capacity() * 4
