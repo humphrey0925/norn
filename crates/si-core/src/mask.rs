@@ -448,6 +448,14 @@ pub struct MacroSets {
     conditions: Conditions,
 }
 
+/// One `#include`: the files it may mean, and whether it is in angle
+/// brackets.
+type Included = (Vec<u32>, bool);
+
+/// Where a macro is defined: the file, and how many of its `#include`s
+/// come before the definition.
+type Definition = (u32, u32);
+
 /// A header that more files read than this is taken as read by all: its
 /// macros are everyone's (a list of who reads it would cost more than it
 /// tells). A `.c` file's macros go no further than the headers it is made
@@ -553,7 +561,7 @@ impl MacroSets {
         // of nothing here may read anything, a header the build makes say:
         // it sees every macro.)
         let found = crate::link::Includes::new(paths.iter().map(String::as_str));
-        let read: Vec<(Vec<(Vec<u32>, bool)>, bool)> = per_file
+        let read: Vec<(Vec<Included>, bool)> = per_file
             .par_iter()
             .zip(paths)
             .map(|(defines, path)| {
@@ -567,7 +575,7 @@ impl MacroSets {
             })
             .collect();
         let open: Vec<u32> = read.iter().enumerate().filter(|(_, r)| r.1).map(|(f, _)| f as u32).collect();
-        let includes: Vec<Vec<(Vec<u32>, bool)>> = read.into_iter().map(|r| r.0).collect();
+        let includes: Vec<Vec<Included>> = read.into_iter().map(|r| r.0).collect();
         // Who includes each file, and at which of its `#include`s first.
         let mut up: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n];
         for (f, list) in includes.iter().enumerate() {
@@ -609,7 +617,7 @@ impl MacroSets {
         let mut defining: Vec<(u32, u32)> = defined_in.values().flatten().copied().collect();
         defining.sort_unstable();
         defining.dedup();
-        let reach: Vec<((u32, u32), Option<Vec<u32>>)> = defining
+        let reach: Vec<(Definition, Option<Vec<u32>>)> = defining
             .par_iter()
             .map_init(
                 || vec![false; n],
@@ -622,7 +630,7 @@ impl MacroSets {
                     // brackets (the system's, the project's own for all).
                     let source = !paths[f as usize].ends_with(".h");
                     let most = if source { WIDELY_READ_FROM_SOURCE } else { WIDELY_READ };
-                    let quoted = |list: &[(Vec<u32>, bool)], from: usize| -> Vec<u32> { list.iter().skip(from).filter(|(_, system)| !*system).flat_map(|(t, _)| t).copied().collect() };
+                    let quoted = |list: &[Included], from: usize| -> Vec<u32> { list.iter().skip(from).filter(|(_, system)| !*system).flat_map(|(t, _)| t).copied().collect() };
                     let mut after: Vec<u32> = quoted(&includes[f as usize], from as usize);
                     let mut i = 0;
                     while i < out.len() && out.len() <= most {
