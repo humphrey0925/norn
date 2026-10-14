@@ -717,6 +717,9 @@ struct View<'a> {
     local: &'a Local,
     /// The file, as [`Source`] numbers it, and the line.
     at: Option<(u32, u32)>,
+    /// How many macro values deep this is being read (a macro whose value
+    /// names itself, or one that names it, is not read forever).
+    depth: u8,
 }
 
 impl View<'_> {
@@ -749,12 +752,21 @@ impl View<'_> {
         }
     }
 
-    /// The value of a name in an `#if`: its definition if that is a number
-    /// (or a name that is), 0 if it is known not to be defined.
+    /// The value of a name in an `#if`: its definition if that is a number,
+    /// or a name or an expression that has one (`(0 && OTHER)` is 0 whatever
+    /// OTHER is), 0 if it is known not to be defined.
     fn value(&self, name: &[u8], depth: u8) -> Option<i64> {
         match self.text(name)? {
             None => Some(0),
-            Some(v) => number(v).or(if v.is_empty() || v == name || depth > 8 { None } else { self.value(v, depth + 1) }),
+            Some(v) if v.is_empty() || v == name || depth > 8 => number(v),
+            Some(v) => number(v).or_else(|| {
+                // Read as an `#if` would read it, its names in turn.
+                let toks = tokens(v);
+                let inner = View { c: self.c, local: self.local, at: self.at, depth: depth + 1 };
+                let mut p = Parser { c: inner, toks: &toks, at: 0 };
+                let value = p.or();
+                (p.at == toks.len()).then_some(value).flatten()
+            }),
         }
     }
 }
@@ -982,7 +994,7 @@ impl Conditions {
     /// above it. `at` is the file (as the [`Source`] numbers it) and line.
     pub fn eval_in(&self, local: &Local, at: Option<(u32, u32)>, expr: &[u8]) -> Tri {
         let toks = tokens(expr);
-        let mut p = Parser { c: View { c: self, local, at }, toks: &toks, at: 0 };
+        let mut p = Parser { c: View { c: self, local, at, depth: 0 }, toks: &toks, at: 0 };
         let v = p.or();
         if p.at != toks.len() {
             return Tri::Unknown;
@@ -991,12 +1003,13 @@ impl Conditions {
     }
 
     pub fn defined_in(&self, local: &Local, at: Option<(u32, u32)>, name: &[u8]) -> Tri {
-        View { c: self, local, at }.defined(name)
+        View { c: self, local, at, depth: 0 }.defined(name)
     }
 }
 
 /// A macro's body as a value: comments out, spaces closed up, the
-/// parentheses around all of it off. `None` if it is too long to be one.
+/// parentheses around all of it off. (However long: an `#if` may need all
+/// of it, and a value cut short would be read wrong.)
 pub fn value_of(body: &[u8]) -> Option<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
     let mut i = 0;
@@ -1028,7 +1041,7 @@ pub fn value_of(body: &[u8]) -> Option<Vec<u8>> {
     while v.first() == Some(&b'(') && v.last() == Some(&b')') && !v[1..v.len() - 1].iter().any(|b| matches!(b, b'(' | b')')) {
         v = v[1..v.len() - 1].trim_ascii();
     }
-    (v.len() <= 120).then(|| v.to_vec())
+    Some(v.to_vec())
 }
 
 fn number(v: &[u8]) -> Option<i64> {
@@ -1175,7 +1188,7 @@ impl Parser<'_> {
             Some(Tok::Ident(name)) => {
                 self.at += 1;
                 if !self.op(b"(") {
-                    return self.c.value(name, 0);
+                    return self.c.value(name, self.c.depth);
                 }
                 // A macro with arguments: the kernel's own, or unknown.
                 let arg = match (self.toks.get(self.at).cloned(), self.toks.get(self.at + 1)) {
@@ -1374,6 +1387,28 @@ mod tests {
         local.insert(b"DEFAULT_LEVEL".to_vec(), None);
         assert_eq!((c.eval_in(&local, a, b"LEVEL >= 3"), c.eval_in(&local, a, b"defined HAVE_X"), c.eval_in(&local, a, b"DEFAULT_LEVEL == 3")), (Tri::True, Tri::False, Tri::Unknown));
         assert_eq!((value_of(b" ( 0x10 ) /* sixteen */"), value_of(b"a  +\tb // x"), value_of(b"")), (Some(b"0x10".to_vec()), Some(b"a + b".to_vec()), Some(Vec::new())));
+    }
+
+    #[test]
+    fn a_macro_whose_value_is_an_expression_is_read_as_an_if_would() {
+        let mut local = Local::default();
+        let mut set = |name: &str, body: &str| {
+            local.insert(name.as_bytes().to_vec(), Some(value_of(body.as_bytes())));
+        };
+        // 0 && anything is 0, however little is known of the rest.
+        set("ENABLE_SELF_TEST", "(0 && ENABLE_OPT && (!ENABLE_ALT_BOOT) && (!ONE_IMAGE_ONLY) && !WIN32)");
+        set("ENABLE_ON", "(1 || ENABLE_OPT)");
+        set("ENABLE_BOTH", "(ENABLE_ON && !ENABLE_SELF_TEST)");
+        set("ENABLE_OPEN", "(ENABLE_OPT && 1)");
+        // Each in terms of the other: not read forever.
+        set("LOOP_A", "(LOOP_B && 1)");
+        set("LOOP_B", "(LOOP_A || 0)");
+        // However long the value.
+        set("LONG", &format!("(0{})", " && SOME_MACRO_NOBODY_DEFINES".repeat(40)));
+        let c = Conditions::default();
+        let v = |e: &str| c.eval_in(&local, None, e.as_bytes());
+        assert_eq!((v("ENABLE_SELF_TEST"), v("ENABLE_ON"), v("ENABLE_BOTH"), v("ENABLE_OPEN")), (Tri::False, Tri::True, Tri::True, Tri::Unknown));
+        assert_eq!((v("LOOP_A"), v("LONG")), (Tri::Unknown, Tri::False));
     }
 
     #[test]

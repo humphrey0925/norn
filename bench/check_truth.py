@@ -9,6 +9,7 @@ The truth covers one build configuration, so:
 import argparse
 import bisect
 import collections
+import io
 import json
 import sqlite3
 import subprocess
@@ -23,12 +24,19 @@ SI = Path(__file__).resolve().parent.parent / "target" / "release" / "norn.exe"
 
 
 def si_lines(cmd, index):
-    out = subprocess.run([str(SI), cmd, str(index)], capture_output=True, check=True).stdout
-    return [line.split("\t") for line in out.decode("utf-8", "replace").splitlines()]
+    """The rows `si <cmd>` prints, one at a time: the kernel's calls are
+    tens of millions, more than fit in memory all at once as Python lists."""
+    p = subprocess.Popen([str(SI), cmd, str(index)], stdout=subprocess.PIPE)
+    for line in io.TextIOWrapper(p.stdout, encoding="utf-8", errors="replace", newline="\n"):
+        yield line.rstrip("\n").split("\t")
+    if p.wait():
+        raise subprocess.CalledProcessError(p.returncode, [str(SI), cmd, str(index)])
 
 
-def si_index(index):
-    """(files, function definitions, call rows) of an si index."""
+def si_index(index, callers=None):
+    """(files, function definitions, call rows) of an si index. `callers`:
+    keep only the calls made from these files (those clang compiled; no
+    other call can be scored)."""
     files, defs = set(), collections.defaultdict(list)
     for file, line, kind, decl, name in si_lines("symbols", index):
         files.add(file)
@@ -36,6 +44,8 @@ def si_index(index):
             defs[file, name].append(int(line))
     calls, indirect = [], []
     for sf, sl, cn, cf, _cl, en, ef, _el, how, decl, via, path in si_lines("calls", index):
+        if callers is not None and cf not in callers:
+            continue
         if path == "indirect":
             indirect.append((sf, int(sl), cn, cf, en, ef, via, decl, how))
         else:
@@ -94,7 +104,9 @@ def score(truth_path, index, corpus, cbm=False, loaded=None, callers=None):
         cbm = True
         si_files, si_defs, call_rows, indirect_rows = loaded
     else:
-        si_files, si_defs, call_rows, indirect_rows = cbm_index(index) if cbm else si_index(index)
+        # Only calls from a file clang compiled are scored.
+        scored = {GENERATED.get(r[0], r[0]) for r in t.calls} | {GENERATED.get(r[0], r[0]) for r in t.raw.get("icalls", [])}
+        si_files, si_defs, call_rows, indirect_rows = cbm_index(index) if cbm else si_index(index, scored)
     if callers is not None:
         call_rows = [r for r in call_rows if (r[3], r[2]) in callers]
 

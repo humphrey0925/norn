@@ -122,7 +122,7 @@ pub struct Define {
     /// Names the body refers to.
     pub refs: Vec<Vec<u8>>,
     /// The body as a value (see `cond::value_of`), for a macro without
-    /// parameters whose body is short enough to be one.
+    /// parameters.
     pub value: Option<Vec<u8>>,
     /// Nothing around it may keep it from being compiled (an include
     /// guard apart).
