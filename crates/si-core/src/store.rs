@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped whenever what extraction records, or how it is laid out, changes:
 /// facts written by another version are not read.
-const FORMAT: u32 = 8;
+const FORMAT: u32 = 9;
 
 /// Size and modification time of a source file when its facts were made.
 pub type Stamp = (u64, u64);
@@ -53,6 +53,10 @@ pub struct Manifest {
     pub sets: u64,
     /// The files, by path relative to the root, in order.
     pub files: Vec<String>,
+    /// What reading the compilations decided of each file's conditions
+    /// (see `units`): part of what the files were extracted under.
+    #[serde(default)]
+    pub verdicts: crate::units::Verdicts,
 }
 
 pub struct Store {
@@ -98,9 +102,9 @@ impl Store {
         (m.format == FORMAT).then_some(m)
     }
 
-    pub fn save_manifest(&self, sets: u64, files: Vec<String>) {
+    pub fn save_manifest(&self, sets: u64, files: Vec<String>, verdicts: crate::units::Verdicts) {
         self.prepare();
-        if let Ok(bytes) = bincode::serialize(&Manifest { format: FORMAT, sets, files }) {
+        if let Ok(bytes) = bincode::serialize(&Manifest { format: FORMAT, sets, files, verdicts }) {
             // Written aside and moved into place: a start never reads half of it.
             let tmp = self.dir.join("manifest.tmp");
             if std::fs::write(&tmp, bytes).is_ok() {

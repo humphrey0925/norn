@@ -563,6 +563,10 @@ pub struct Source {
     /// Per file, its includes that are certainly compiled: the line, and
     /// the file included.
     includes: Vec<Vec<(u32, u32)>>,
+    /// Per file, the conditions that come out one way in every
+    /// compilation that reads them (see `units`): where the directive
+    /// starts, and whether it holds.
+    verdicts: std::sync::Arc<crate::units::Verdicts>,
 }
 
 fn bits_of(flags: &[bool]) -> Vec<u64> {
@@ -583,6 +587,7 @@ impl Source {
             files: paths.iter().enumerate().map(|(i, p)| (p.clone(), i as u32)).collect(),
             names: FxHashMap::default(),
             includes: vec![Vec::new(); paths.len()],
+            verdicts: Default::default(),
         }
     }
 
@@ -595,6 +600,26 @@ impl Source {
     /// `file` includes `target` on `line`, for certain.
     pub fn include(&mut self, file: u32, line: u32, target: u32) {
         self.includes[file as usize].push((line, target));
+    }
+
+    pub fn set_verdicts(&mut self, verdicts: std::sync::Arc<crate::units::Verdicts>) {
+        self.verdicts = verdicts;
+    }
+
+    /// Whether the condition of the directive that starts at `at` in
+    /// `file` holds, where every compilation agrees.
+    pub fn verdict(&self, file: u32, at: u32) -> Option<bool> {
+        let of = self.verdicts.get(file as usize)?;
+        of.binary_search_by_key(&at, |v| v.0).ok().map(|i| of[i].1)
+    }
+
+    pub fn verdicts(&self) -> &std::sync::Arc<crate::units::Verdicts> {
+        &self.verdicts
+    }
+
+    /// How many conditions are decided that way.
+    pub fn decided(&self) -> usize {
+        self.verdicts.iter().map(Vec::len).sum()
     }
 
     pub fn file(&self, path: &str) -> Option<u32> {
@@ -614,7 +639,7 @@ impl Source {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.names.is_empty()
+        self.names.is_empty() && self.verdicts.iter().all(Vec::is_empty)
     }
 
     fn digest(&self) -> u64 {
@@ -623,14 +648,15 @@ impl Source {
             values.iter().fold(0, |acc, (v, known, brings)| acc ^ h(bytemuck::cast_slice(brings), h(bytemuck::cast_slice(known), h(v, h(k, 15)))))
         };
         let lines = self.includes.iter().enumerate().fold(0, |acc, (f, list)| acc ^ list.iter().fold(0, |a, (l, t)| a ^ h(&t.to_le_bytes(), ((f as u64) << 32) | *l as u64)));
-        self.names.iter().map(each).fold(self.files.len() as u64 ^ lines, |a, b| a ^ b)
+        let told = self.verdicts.iter().flatten().fold(0u64, |d, &(at, holds)| h(&at.to_le_bytes(), d.rotate_left(1) + holds as u64));
+        self.names.iter().map(each).fold(self.files.len() as u64 ^ lines ^ told, |a, b| a ^ b)
     }
 
     /// What `file` is told: other facts come of it when this changes.
     pub fn file_digest(&self, path: &str) -> u64 {
         use xxhash_rust::xxh3::xxh3_64_with_seed as h;
         let Some(file) = self.file(path) else { return 0 };
-        let mut d = 0;
+        let mut d = self.verdicts.get(file as usize).map_or(0, |v| v.iter().fold(0, |d, &(at, holds)| h(&at.to_le_bytes(), d + 17 + holds as u64)));
         for (k, values) in &self.names {
             for (v, known, brings) in values {
                 if has(known, file) {
@@ -853,6 +879,19 @@ impl Conditions {
     }
 
     /// Do the settings themselves say whether `name` is defined?
+    /// The same conditions, with `names` not defined where the settings
+    /// do not say they are.
+    pub fn with_undefined(&self, names: impl IntoIterator<Item = Vec<u8>>) -> Conditions {
+        let mut c = self.clone();
+        c.undefined.extend(names.into_iter().filter(|n| !self.settles(n)));
+        c
+    }
+
+    /// Whether some source file defines `name`.
+    pub fn in_source(&self, name: &[u8]) -> bool {
+        self.in_source.contains(name)
+    }
+
     pub fn settles(&self, name: &[u8]) -> bool {
         self.defined.contains_key(name) || self.undefined.contains(name)
     }

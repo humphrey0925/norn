@@ -274,7 +274,8 @@ impl Session {
         let mut conditions = Session::conditions_now(root, &facts);
         if conditions.uses_source() {
             let paths: Vec<String> = files.iter().map(|p| crate::rel_path(root, p)).collect();
-            let source = mask::source_of(&defines, &paths);
+            let mut source = mask::source_of(&defines, &paths);
+            source.set_verdicts(std::sync::Arc::new(manifest.verdicts.clone()));
             if !source.is_empty() {
                 conditions.set_source(Some(std::sync::Arc::new(source)));
             }
@@ -335,7 +336,8 @@ impl Session {
     fn save_manifest(&self) {
         if let Some(store) = &self.store {
             let files = self.files.iter().map(|p| crate::rel_path(&self.root, p)).collect();
-            store.save_manifest(self.sets.digest(), files);
+            let verdicts = self.conditions.source().map(|s| s.verdicts().as_ref().clone()).unwrap_or_default();
+            store.save_manifest(self.sets.digest(), files, verdicts);
         }
     }
 
@@ -660,8 +662,9 @@ mod tests {
         let open = |d: &Dir| Session::open_cached(&d.0, Options::default(), cache.clone());
         let (mut s, _) = open(&d);
         assert_eq!((functions(&s, "net_init"), functions(&s, "net_stub"), functions(&s, "usb_init")), (1, 0, 0));
-        // Tested above the include that brings the switch in: not known yet, so kept.
-        assert_eq!(functions(&s, "before"), 1);
+        // Tested above the include that brings the switch in: the header
+        // defines it outright, so it was not defined before.
+        assert_eq!(functions(&s, "before"), 0);
         // The switch is thrown in the header: the file that tests it is read again.
         d.write("config.h", "#ifndef CONFIG_H\n#define CONFIG_H\n#define USE_NET 0\n#define USE_USB 1\n#endif\n");
         let up = s.update(&[d.0.join("config.h")]);

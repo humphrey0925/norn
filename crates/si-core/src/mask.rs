@@ -270,6 +270,133 @@ pub fn source_of(per_file: &[Vec<Define>], paths: &[String]) -> crate::cond::Sou
     source
 }
 
+/// One preprocessor directive of a file, as far as reading the file the
+/// way a compilation does needs it (see `units`).
+pub enum Op {
+    /// `#if`, `#ifdef`, `#ifndef`: where the directive starts, and its
+    /// condition; `kind` is 0 for an expression, 1 for a name that has to
+    /// be defined, 2 for one that has not to be.
+    If { at: u32, kind: u8, expr: Vec<u8> },
+    Elif { at: u32, kind: u8, expr: Vec<u8> },
+    Else,
+    Endif,
+    /// `value` as `cond::value_of` has it; empty for a macro with
+    /// parameters or a body too long to be a value.
+    Define { name: Vec<u8>, value: Vec<u8> },
+    Undef { name: Vec<u8> },
+    Include { name: Vec<u8>, quoted: bool },
+}
+
+#[derive(Default)]
+pub struct Script {
+    pub ops: Vec<Op>,
+    /// The file is read once in a compilation however often it is
+    /// included: `#pragma once`, or an include guard (whose own three
+    /// directives are then left out of `ops`).
+    pub once: bool,
+}
+
+/// The directives of `src`, in order.
+pub fn script(src: &[u8]) -> Script {
+    let mut out = Script::default();
+    let mut c = Cur { s: src, i: 0, line: 1 };
+    let mut line_start = true;
+    while c.i < src.len() {
+        match src[c.i] {
+            b'\n' => {
+                c.i += 1;
+                line_start = true;
+            }
+            b' ' | b'\t' | b'\r' | 0x0c => c.i += 1,
+            b'/' if matches!(c.peek(1), b'*' | b'/') => {
+                c.skip_comment();
+            }
+            b'"' | b'\'' => {
+                c.skip_literal();
+                line_start = false;
+            }
+            b'#' if line_start => {
+                let at = c.i as u32;
+                c.i += 1;
+                c.skip_space(false);
+                let (a, e) = c.ident();
+                c.skip_directive();
+                let rest = &src[e..c.i];
+                // The first name of the rest, and where it ends.
+                let named = || {
+                    let mut r = Cur { s: rest, i: 0, line: 0 };
+                    r.skip_space(false);
+                    let (a, e) = r.ident();
+                    (&rest[a..e], e)
+                };
+                match &src[a..e] {
+                    b"if" => out.ops.push(Op::If { at, kind: 0, expr: rest.to_vec() }),
+                    b"ifdef" => out.ops.push(Op::If { at, kind: 1, expr: named().0.to_vec() }),
+                    b"ifndef" => out.ops.push(Op::If { at, kind: 2, expr: named().0.to_vec() }),
+                    b"elif" => out.ops.push(Op::Elif { at, kind: 0, expr: rest.to_vec() }),
+                    b"elifdef" => out.ops.push(Op::Elif { at, kind: 1, expr: named().0.to_vec() }),
+                    b"elifndef" => out.ops.push(Op::Elif { at, kind: 2, expr: named().0.to_vec() }),
+                    b"else" => out.ops.push(Op::Else),
+                    b"endif" => out.ops.push(Op::Endif),
+                    b"define" => {
+                        let (name, end) = named();
+                        if !name.is_empty() {
+                            let plain = rest.get(end) != Some(&b'(');
+                            let value = if plain { crate::cond::value_of(&rest[end..]).unwrap_or_default() } else { Vec::new() };
+                            out.ops.push(Op::Define { name: name.to_vec(), value });
+                        }
+                    }
+                    b"undef" => {
+                        let name = named().0;
+                        if !name.is_empty() {
+                            out.ops.push(Op::Undef { name: name.to_vec() });
+                        }
+                    }
+                    b"include" | b"include_next" => {
+                        let text = rest.trim_ascii_start();
+                        let close = match text.first() {
+                            Some(b'"') => b'"',
+                            Some(b'<') => b'>',
+                            _ => 0,
+                        };
+                        match text.iter().skip(1).position(|&b| b == close) {
+                            Some(len) => out.ops.push(Op::Include { name: text[1..1 + len].to_vec(), quoted: close == b'"' }),
+                            // `#include NAME`: some file, which is not known.
+                            None => out.ops.push(Op::Include { name: Vec::new(), quoted: true }),
+                        }
+                    }
+                    b"pragma" if named().0 == b"once" => out.once = true,
+                    _ => {}
+                }
+                line_start = false;
+            }
+            _ => {
+                c.i += 1;
+                line_start = false;
+            }
+        }
+    }
+    // An include guard: all of the file inside `#ifndef G`, which the
+    // next directive defines.
+    if let [Op::If { kind: 2, expr, .. }, Op::Define { name, .. }, ..] = &out.ops[..] {
+        let mut depth = 0;
+        let close = out.ops.iter().position(|op| {
+            match op {
+                Op::If { .. } => depth += 1,
+                Op::Endif => depth -= 1,
+                _ => {}
+            }
+            depth == 0
+        });
+        if expr == name && close == Some(out.ops.len() - 1) {
+            out.ops.pop();
+            out.ops.drain(..2);
+            out.once = true;
+        }
+    }
+    out
+}
+
 /// What the corpus-wide pre-pass learns about macros, by name.
 ///
 /// * *Transparent* macros can be deleted from the token stream without
@@ -689,6 +816,41 @@ fn blank(buf: &mut [u8], start: usize, end: usize) {
         if *b != b'\n' {
             *b = b' ';
         }
+    }
+}
+
+/// With `SI_COND_PROFILE` set: the names that left a condition open, and
+/// how many conditions each (the first of a condition's names is charged).
+pub static OPEN: std::sync::Mutex<Option<FxHashMap<Vec<u8>, (u64, u64)>>> = std::sync::Mutex::new(None);
+
+fn profile(conditions: &Conditions, local: &crate::cond::Local, expr: &[u8], here: Option<(u32, u32)>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("SI_COND_PROFILE").is_some()) || here.is_none() {
+        return;
+    }
+    let mut c = Cur { s: expr, i: 0, line: 0 };
+    let mut names: Vec<&[u8]> = Vec::new();
+    while c.i < expr.len() {
+        if is_ident_start(expr[c.i]) {
+            let (a, e) = c.ident();
+            if &expr[a..e] != b"defined" && conditions.defined_in(local, here, &expr[a..e]) == Tri::Unknown {
+                names.push(&expr[a..e]);
+            }
+        } else if expr[c.i].is_ascii_digit() {
+            c.skip_number();
+        } else {
+            c.i += 1;
+        }
+    }
+    let mut open = OPEN.lock().unwrap();
+    let open = open.get_or_insert_with(FxHashMap::default);
+    for (k, name) in names.iter().enumerate() {
+        let e = open.entry(name.to_vec()).or_default();
+        e.0 += (k == 0) as u64;
+        e.1 += 1;
+    }
+    if names.is_empty() {
+        open.entry(b"(no name)".to_vec()).or_default().0 += 1;
     }
 }
 
@@ -1154,11 +1316,17 @@ impl<'a> Lexer<'a> {
                     let (a, e) = c.ident();
                     self.conditions.defined_in(&self.local, here, &s[a..e])
                 };
-                let holds = match word {
-                    b"ifdef" => named(),
-                    b"ifndef" => named().not(),
+                // What reading the compilations came to, where it came to one thing.
+                let told = |at: usize| self.file.and_then(|f| self.conditions.source()?.verdict(f, at as u32));
+                let holds = match (told(start), word) {
+                    (Some(holds), _) => if holds { Tri::True } else { Tri::False },
+                    (None, b"ifdef") => named(),
+                    (None, b"ifndef") => named().not(),
                     _ => self.conditions.eval_in(&self.local, here, &s[e..span.1]),
                 };
+                if holds == Tri::Unknown {
+                    self.profile(&s[e..span.1], here);
+                }
                 self.conds.push(Cond {
                     nest: self.nest.clone(),
                     spans: vec![span],
@@ -1184,7 +1352,17 @@ impl<'a> Lexer<'a> {
                     // This branch is compiled only if none before it was,
                     // and (for `#elif`) its own condition holds.
                     if word != b"endif" {
-                        let own = if word == b"elif" { self.conditions.eval_in(&self.local, here, &s[e..span.1]) } else if word == b"else" { Tri::True } else { Tri::Unknown };
+                        let told = self.file.and_then(|f| self.conditions.source()?.verdict(f, start as u32));
+                        let own = match told {
+                            Some(holds) if word != b"else" => if holds { Tri::True } else { Tri::False },
+                            _ if word == b"elif" => self.conditions.eval_in(&self.local, here, &s[e..span.1]),
+                            _ if word == b"else" => Tri::True,
+                            _ => Tri::Unknown,
+                        };
+                        if word == b"elif" && own == Tri::Unknown {
+                            let (conditions, local) = (self.conditions, &self.local);
+                            profile(conditions, local, &s[e..span.1], here);
+                        }
                         c.compiled = c.taken.not().and(own);
                         skip = c.compiled == Tri::False;
                         c.taken = c.taken.or(own);
@@ -1212,6 +1390,10 @@ impl<'a> Lexer<'a> {
         if skip {
             self.skip_branch();
         }
+    }
+
+    fn profile(&self, expr: &[u8], here: Option<(u32, u32)>) {
+        profile(self.conditions, &self.local, expr, here);
     }
 
     /// Past a branch the build does not compile, to the `#elif`, `#else` or

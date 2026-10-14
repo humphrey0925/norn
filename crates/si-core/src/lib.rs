@@ -15,6 +15,7 @@ pub mod search;
 pub mod session;
 pub mod sqlite;
 pub mod store;
+pub mod units;
 
 use mask::MacroSets;
 use model::FileFacts;
@@ -127,12 +128,33 @@ pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions)
     let read = |c: &cond::Conditions| -> Vec<Vec<mask::Define>> {
         files.par_iter().zip(&paths).map(|(p, rel)| mask::defines_of(&std::fs::read(p).unwrap_or_default(), c, Some(rel))).collect()
     };
-    let mut defines = read(conditions);
     if !conditions.uses_source() {
-        return defines;
+        return read(conditions);
     }
+    // What each condition comes to compilation by compilation, first:
+    // which definitions are compiled depends on it.
+    let scripts: Vec<mask::Script> = files.par_iter().map(|p| mask::script(&std::fs::read(p).unwrap_or_default())).collect();
+    let verdicts = std::sync::Arc::new(units::verdicts(&paths, &scripts, conditions).unwrap_or_default());
+    drop(scripts);
+    if std::env::var_os("SI_COND_PROFILE").is_some() {
+        eprintln!("decided   {} conditions, by reading each compilation", verdicts.iter().map(Vec::len).sum::<usize>());
+        for (file, told) in files.iter().zip(verdicts.iter()).filter(|x| !x.1.is_empty()) {
+            let src = std::fs::read(file).unwrap_or_default();
+            for &(at, holds) in told {
+                let line = src[at as usize..].split(|&b| b == b'\n').next().unwrap_or_default();
+                eprintln!("told      {} {} {}", holds, rel_path(root, file), String::from_utf8_lossy(line).trim());
+            }
+        }
+    }
+    let mut first = cond::Source::new(&paths);
+    first.set_verdicts(verdicts.clone());
+    if !first.is_empty() {
+        conditions.set_source(Some(std::sync::Arc::new(first)));
+    }
+    let mut defines = read(conditions);
     for _ in 0..4 {
-        let source = mask::source_of(&defines, &paths);
+        let mut source = mask::source_of(&defines, &paths);
+        source.set_verdicts(verdicts.clone());
         if conditions.source().map_or(source.is_empty(), |s| **s == source) {
             break;
         }
@@ -162,8 +184,25 @@ pub fn extract_file(ex: &mut extract::Extractor, root: &Path, path: &Path, trans
 /// Extract all files on the current rayon pool; output order matches `files`.
 pub fn extract_all(root: &Path, files: &[PathBuf], transparent: &MacroSets) -> Vec<FileFacts> {
     progress::parsing(files.len());
-    let facts = files.par_iter().map_init(extract::Extractor::new, |ex, p| extract_file(ex, root, p, transparent)).collect();
+    let facts: Vec<FileFacts> = files.par_iter().map_init(extract::Extractor::new, |ex, p| extract_file(ex, root, p, transparent)).collect();
     mem_mark("extracted");
+    if let Some(open) = mask::OPEN.lock().unwrap().take() {
+        let mut defined: rustc_hash::FxHashMap<&str, u32> = Default::default();
+        for f in &facts {
+            for &n in &f.defined_names {
+                *defined.entry(f.name(n as usize)).or_default() += 1;
+            }
+        }
+        let mut rows: Vec<(&[u8], u64, bool)> = open.iter().map(|(n, k)| (&n[..], k.0, std::str::from_utf8(n).is_ok_and(|n| defined.contains_key(n)))).collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.1));
+        let all: u64 = rows.iter().map(|r| r.1).sum();
+        for sourced in [true, false] {
+            let these: Vec<_> = rows.iter().filter(|r| r.2 == sourced).collect();
+            let n: u64 = these.iter().map(|r| r.1).sum();
+            let top: Vec<String> = these.iter().take(40).map(|r| format!("{} {}", String::from_utf8_lossy(r.0), r.1)).collect();
+            eprintln!("open      {n} of {all} conditions on {} names {}: {}", these.len(), if sourced { "the sources define" } else { "nothing here defines" }, top.join(", "));
+        }
+    }
     facts
 }
 
