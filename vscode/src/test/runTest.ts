@@ -8,8 +8,18 @@ import { runTests } from "@vscode/test-electron";
 async function main() {
   const root = path.resolve(__dirname, "../../..");
   const corpus = path.join(root, "corpus", "c-only");
-  const work = fs.mkdtempSync(path.join(os.tmpdir(), "si-vscode-"));
-  for (const rel of ["bfd/opncls.c", "bfd/bfd-in2.h", "bfd/libbfd.c", "bfd/libbfd.h", "bfd/cache.c", "bfd/bfdio.c", "include/ansidecl.h"]) {
+  // For pictures (`demo`), a folder with a name fit to be seen in the
+  // window's title, and the whole of two directories in it.
+  const demo = process.argv[2] === "demo";
+  const made = fs.mkdtempSync(path.join(os.tmpdir(), "si-vscode-"));
+  const work = demo ? path.join(made, "norn-demo") : made;
+  fs.mkdirSync(work, { recursive: true });
+  if (demo) {
+    for (const dir of ["bfd", "include"]) {
+      fs.cpSync(path.join(corpus, dir), path.join(work, dir), { recursive: true });
+    }
+  }
+  for (const rel of demo ? [] : ["bfd/opncls.c", "bfd/bfd-in2.h", "bfd/libbfd.c", "bfd/libbfd.h", "bfd/cache.c", "bfd/bfdio.c", "include/ansidecl.h"]) {
     fs.mkdirSync(path.dirname(path.join(work, rel)), { recursive: true });
     fs.copyFileSync(path.join(corpus, rel), path.join(work, rel));
   }
@@ -30,7 +40,7 @@ async function main() {
       launchArgs: cpp ? [work, "--extensions-dir", path.resolve(__dirname, "../../.vscode-test/extensions-cpp")] : [work, "--disable-extensions"],
     });
   } finally {
-    fs.rmSync(work, { recursive: true, force: true });
+    fs.rmSync(made, { recursive: true, force: true });
   }
 }
 

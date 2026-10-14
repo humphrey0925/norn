@@ -822,7 +822,14 @@ impl Conditions {
     /// description the configuration meant after `#` (else its first).
     fn read_source(&mut self, root: &Path, entry: &str) {
         let (path, wanted) = split_entry(entry);
-        let Ok(text) = std::fs::read(root.join(path)) else { return };
+        // A file kept in the settings folder, written down when the folder
+        // was called `.si`: it is where the folder is now.
+        let moved = path.strip_prefix(".si/").or(path.strip_prefix(".si\\")).map(|rest| crate::scope::home(root).join(rest));
+        let at = match moved {
+            Some(moved) if !root.join(path).exists() => moved,
+            _ => root.join(path),
+        };
+        let Ok(text) = std::fs::read(at) else { return };
         let text = String::from_utf8_lossy(&text);
         let Some(builds) = builds_of(path, &text) else { return self.read_file(&text) };
         let Some(b) = builds.iter().find(|b| wanted.is_none_or(|w| b.name == w)) else { return };

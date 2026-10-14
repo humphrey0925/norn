@@ -25,7 +25,7 @@ export async function run(): Promise<void> {
   await sleep(1500);
   if (process.env.SI_DEMO_SCOPE) {
     await vscode.commands.executeCommand("norn.scope.clearAll");
-    await vscode.commands.executeCommand("workbench.actions.treeView.si.fileSymbols.collapseAll");
+    await vscode.commands.executeCommand("workbench.actions.treeView.norn.fileSymbols.collapseAll");
     await vscode.commands.executeCommand("norn.scope.focus");
   }
   if (process.env.SI_DEMO_CONDITIONS) {
@@ -35,12 +35,12 @@ export async function run(): Promise<void> {
       <option valueType="undefDefinedSymbols"><listOptionValue value="NDEBUG"/></option></tool></toolChain></folderInfo></configuration>
       <configuration name="Release"><folderInfo><toolChain><tool><option valueType="definedSymbols"><listOptionValue value="NDEBUG"/><listOptionValue value="BOARD_REV=3"/></option></tool></toolChain></folderInfo></configuration></cproject>`);
     await vscode.commands.executeCommand("norn.sync");
-    await vscode.commands.executeCommand("norn.conditions.switch", ".cproject#Release");
-    await vscode.commands.executeCommand("norn.conditions.switch", ".cproject#Debug");
+    // (The project's own configurations are followed unasked: Debug, the
+    // first, is in force.)
     await vscode.commands.executeCommand("norn.conditions.define", "ARCH_SIZE=64");
     await vscode.commands.executeCommand("norn.conditions.undefine", "_WIN32");
     await vscode.commands.executeCommand("norn.conditions.assume", "CONFIG_");
-    await vscode.commands.executeCommand("workbench.actions.treeView.si.fileSymbols.collapseAll");
+    await vscode.commands.executeCommand("workbench.actions.treeView.norn.fileSymbols.collapseAll");
     await vscode.commands.executeCommand("norn.conditions.focus");
     if (process.env.SI_DEMO_CONDITIONS === "pick") {
       void vscode.commands.executeCommand("norn.conditions.switch");
@@ -63,7 +63,7 @@ export async function run(): Promise<void> {
       ['#include "config.h"', "#if USE_NET", "int net_init (void) { return 1; }", "#endif", "#if USE_USB", "int usb_init (void) { return 1; }", "#endif", "#if BOARD_REV >= 3", "int rev3 (void) { return 1; }", "#endif", ""].join("\n"),
     );
     await vscode.commands.executeCommand("norn.sync");
-    await vscode.commands.executeCommand("workbench.actions.treeView.si.fileSymbols.collapseAll");
+    await vscode.commands.executeCommand("workbench.actions.treeView.norn.fileSymbols.collapseAll");
     await vscode.commands.executeCommand("norn.conditions.focus");
     await vscode.commands.executeCommand("list.focusLast");
     await vscode.commands.executeCommand("list.expand");
@@ -78,5 +78,8 @@ export async function run(): Promise<void> {
   if (process.env.SI_DEMO_MODE) {
     await vscode.commands.executeCommand("norn.relation." + process.env.SI_DEMO_MODE);
   }
+  // (The window says its extensions are off; that is not for the picture.)
+  await sleep(1500);
+  await vscode.commands.executeCommand("notifications.clearAll");
   await sleep(Number(process.env.SI_DEMO_HOLD_MS ?? 12000));
 }

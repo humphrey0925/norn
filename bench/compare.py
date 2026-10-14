@@ -38,7 +38,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TRUTH = {"c-only": "truth.json", "git-c": "truth-git.json", "redis": "truth-redis-src.json"}
 WSL_TOOLS = ("ctags", "cscope", "gtags")
 ALL_TOOLS = ("si", "cbm", "clangd", *WSL_TOOLS)
-SKIP_DIRS = (".git", ".si")
+SKIP_DIRS = (".git", ".si", ".norn")
 EDIT = b"\n/* bench edit */\n"
 
 
@@ -136,7 +136,7 @@ class Ctx:
         return left
 
     def ensure_copy(self):
-        """Mirror the corpus (without .git and .si) for the tools that are
+        """Mirror the corpus (without .git and .norn) for the tools that are
         measured after an edit. Not timed."""
         if self._copied:
             return
@@ -270,7 +270,7 @@ def tool_si(ctx, res):
 
 def tool_cbm(ctx, res):
     res["version"] = {"reported": first_line([run.CBM, "--version"]), **exe_id(run.CBM)}
-    res["platform"] = "Windows, NTFS, copy of the corpus without .git and .si"
+    res["platform"] = "Windows, NTFS, copy of the corpus without .git and .norn"
     ctx.ensure_copy()
     mode = ctx.args.cbm_mode
     res["command"] = f"codebase-memory-mcp cli --quiet --json index_repository --repo-path <copy> --mode {mode}"
@@ -335,7 +335,7 @@ def tool_cbm(ctx, res):
 def tool_clangd(ctx, res):
     exe = ctx.args.clangd
     res["version"] = first_line([exe, "--version"])
-    res["platform"] = "Windows, NTFS, copy of the corpus without .git and .si"
+    res["platform"] = "Windows, NTFS, copy of the corpus without .git and .norn"
     ctx.ensure_copy()
     db = ctx.work / "clangd"
     index_dir = db / ".cache" / "clangd" / "index"
@@ -498,7 +498,7 @@ def wsl_loaded(dump):
 
 def tool_wsl(tool):
     def go(ctx, res):
-        res["platform"] = "WSL2 (Linux), ext4, copy of the corpus without .git and .si"
+        res["platform"] = "WSL2 (Linux), ext4, copy of the corpus without .git and .norn"
         wsl_sync(ctx)
         names = ctx.work / "names.json"
         names.write_text(json.dumps(ctx.names), encoding="utf-8")
@@ -617,7 +617,7 @@ def main():
     ap.add_argument("--index-reps", type=int, default=1, help="cold indexes per tool; the median is reported")
     ap.add_argument("--incr-n", type=int, default=4, help="files `si bench-incr` re-extracts")
     ap.add_argument("--edit-file", help="file edited for the incremental runs (default: the .c file of median size)")
-    ap.add_argument("--si", default=str(locate(Path("target/release/si.exe"))))
+    ap.add_argument("--si", default=str(locate(Path("target/release/norn.exe"))))
     ap.add_argument("--cbm", default=str(locate(Path("tools/cbm/codebase-memory-mcp.exe"))))
     ap.add_argument("--cbm-mode", default="full", choices=["fast", "moderate", "full"])
     ap.add_argument("--clangd", default=shutil.which("clangd") or "C:/Program Files/LLVM/bin/clangd.exe")

@@ -368,7 +368,7 @@ def main():
 
     files = []
     for d, dirs, fs in os.walk(a.src):
-        dirs[:] = sorted(x for x in dirs if x not in (".git", ".si"))
+        dirs[:] = sorted(x for x in dirs if x not in (".git", ".si", ".norn"))
         files += [os.path.relpath(os.path.join(d, f), a.src) for f in fs if f.endswith((".c", ".h"))]
     files.sort()
     a.list = os.path.join(a.work, "files.txt")
