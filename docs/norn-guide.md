@@ -1,6 +1,6 @@
 # Norn 安裝與使用指南
 
-適用版本：Norn 0.19.11（VS Code 擴充套件，Windows x64）
+適用版本：Norn 0.19.12（VS Code 擴充套件，Windows x64）
 
 Norn 讓你在大型 C 專案裡立刻查到每個函式和變數在哪定義、誰呼叫它、它又呼叫誰。它不需要先把專案編譯過，開啟資料夾就自動建立索引，連透過巨集和函式指標的呼叫也追得到。
 
@@ -43,11 +43,11 @@ Norn 不連網，也不會把任何資料傳出去。
 
 ### 2.1 取得安裝檔
 
-下載 `norn-0.19.11-windows-x64.7z` 並解壓縮，裡面有三個檔案：
+下載 `norn-0.19.12-windows-x64.7z` 並解壓縮，裡面有三個檔案：
 
 | 檔案 | 用途 |
 |---|---|
-| `norn-0.19.11.vsix` | VS Code 擴充套件，安裝這個就夠了 |
+| `norn-0.19.12.vsix` | VS Code 擴充套件，安裝這個就夠了 |
 | `norn-windows-x64.exe` | 同一個索引程式的命令列版本，給腳本或其他工具用；擴充套件不需要它 |
 | `README.md` | 簡短說明 |
 
@@ -60,12 +60,12 @@ Norn 不連網，也不會把任何資料傳出去。
 1. 開啟 VS Code，按左側活動列的「擴充功能」（或 `Ctrl+Shift+X`）。
 2. 按擴充功能面板右上角的「…」。
 3. 選「從 VSIX 安裝…」（Install from VSIX…）。
-4. 選擇 `norn-0.19.11.vsix`。
+4. 選擇 `norn-0.19.12.vsix`。
 
 **從命令列安裝**
 
 ```
-code --install-extension norn-0.19.11.vsix
+code --install-extension norn-0.19.12.vsix
 ```
 
 ### 2.3 確認安裝成功
@@ -196,7 +196,9 @@ Relation 和 Context 在下方面板的「Norn」分頁裡。**它們會跟著�
 
 ![References](images/relation-references.png)
 
-依檔案分組，列出每一處出現的程式碼。上圖是列舉值 `bfd_error_system_call` 在 38 個檔案裡的 90 處參考。
+依檔案分組，列出每一處出現的程式碼。上圖是列舉值 `bfd_error_system_call` 在 38 個檔案裡的 90 處參考。清單直接取自 Norn 的索引，不需要另外掃描檔案。
+
+**單擊**一筆參考，Context 視窗會顯示它前後的程式碼，編輯器停在原處，方便一筆一筆瀏覽；**雙擊**或按 **Enter** 才會在編輯器開啟，**Ctrl＋點擊**則在旁邊的編輯器群組開啟。
 
 ### 8.4 Assignments：函式指標被指派的地方
 

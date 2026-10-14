@@ -1,6 +1,6 @@
 # Norn 變更紀錄
 
-## 未發布
+## 0.19.12
 
 - **Relation 的 References 改在 Context 視窗顯示**：單擊一筆 reference，Context 視窗會顯示那一行的前後文，編輯器停在原處。要開檔就雙擊或按 Enter；Ctrl＋點擊會在旁邊的編輯器群組開啟。
 - **References 變快**：清單改成直接向 Norn 的索引查詢（`si/references`），連同每一行的文字一起取回。以前是透過 VS Code 去問所有的 reference provider，裝了 C/C++ 擴充套件時它也會掃一次整個資料夾，而且每個檔案都要在編輯器裡打開才拿得到那一行的文字，所以很慢。

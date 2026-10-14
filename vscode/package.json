@@ -2,7 +2,7 @@
   "name": "norn",
   "displayName": "Norn",
   "description": "Norn: Source-Insight-style symbol search, context and relation views for C, from an index that follows macros and function pointers.",
-  "version": "0.19.11",
+  "version": "0.19.12",
   "publisher": "humphrey0925",
   "icon": "media/icon.png",
   "repository": {
