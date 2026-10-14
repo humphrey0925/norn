@@ -970,6 +970,11 @@ class Search implements vscode.WebviewViewProvider {
     void this.view?.webview.postMessage({ type: "reset" });
   }
 
+  /** Put `text` in the box and list what matches. */
+  ask(text: string) {
+    void this.view?.webview.postMessage({ type: "ask", text });
+  }
+
   resolveWebviewView(view: vscode.WebviewView) {
     this.view = view;
     view.webview.html = page(
@@ -1057,6 +1062,7 @@ class Search implements vscode.WebviewViewProvider {
       window.addEventListener("message", (e) => {
         const d = e.data;
         if (d.type === "reset") return reset();
+        if (d.type === "ask") { q.value = d.text; q.focus(); q.dispatchEvent(new Event("input")); return; }
         if (d.type === "page") {
           if (d.epoch !== epoch) return;
           total = d.total;
@@ -1698,6 +1704,16 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
     vscode.window.registerWebviewViewProvider("norn.relation", relation, { webviewOptions: { retainContextWhenHidden: true } }),
     vscode.window.registerTreeDataProvider("norn.fileSymbols", fileSymbols),
     vscode.window.registerWebviewViewProvider("norn.search", search, { webviewOptions: { retainContextWhenHidden: true } }),
+    vscode.commands.registerCommand("norn.search.ask", async (given?: string) => {
+      // The word under the cursor is what one most often wants to look up.
+      const editor = vscode.window.activeTextEditor;
+      const at = editor?.document.getWordRangeAtPosition(editor.selection.active);
+      const text = typeof given === "string" ? given : await vscode.window.showInputBox({ prompt: "Symbols to find: fragments in any order, or initials", value: at ? editor!.document.getText(at) : "" });
+      if (text !== undefined) {
+        await vscode.commands.executeCommand("norn.search.focus");
+        search.ask(text);
+      }
+    }),
     vscode.window.registerWebviewViewProvider("norn.context", contextView),
     vscode.languages.registerCodeLensProvider(selector, lenses),
     vscode.window.onDidChangeActiveTextEditor((e) => follow(e, true)),

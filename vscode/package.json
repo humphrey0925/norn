@@ -80,6 +80,10 @@
     },
     "commands": [
       {
+        "command": "norn.search.ask",
+        "title": "Norn: Search Symbols…"
+      },
+      {
         "command": "norn.relation.callers",
         "title": "Norn: Show Callers",
         "icon": "$(call-incoming)"
@@ -504,7 +508,7 @@
         "norn.serverPath": {
           "type": "string",
           "default": "",
-          "description": "Leave empty to use the server that comes with the extension (Windows x64), or si on PATH where there is none. Set it to the full path of another si executable to use that instead, for example D:\\tools\\si-windows-x64.exe (no quotes needed)."
+          "description": "Leave empty to use the server that comes with the extension (Windows x64), or norn on PATH where there is none. Set it to the full path of another norn executable to use that instead, for example D:\\tools\\norn-windows-x64.exe (no quotes needed)."
         },
         "norn.includeAliases": {
           "type": "array",

@@ -69,8 +69,7 @@ export async function run(): Promise<void> {
     await vscode.commands.executeCommand("list.expand");
   }
   if (process.env.SI_DEMO_SEARCH) {
-    // Nothing to type into a webview from here; the list is shown by the
-    // check script's own query. Left for manual runs.
+    await vscode.commands.executeCommand("norn.search.ask", process.env.SI_DEMO_SEARCH);
   }
   if (process.env.SI_DEMO_VIEW === "graph") {
     await vscode.commands.executeCommand("norn.relation.graph");
