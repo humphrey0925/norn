@@ -511,7 +511,7 @@ def tool_wsl(tool):
                     "--src", f"{ctx.args.wsl_dir}/{ctx.name}", "--work", f"{ctx.args.wsl_dir}/idx/{ctx.name}/{tool}",
                     "--names", wsl_path(names), "--edit-file", ctx.edit_file, "--out", wsl_path(out),
                     "--dump", wsl_path(dump), "--reps", str(ctx.args.reps), "--index-reps", str(ctx.args.index_reps),
-                    "--timeout", str(left), timeout=left + 120)
+                    "--timeout", str(left), *([] if ctx.truth else ["--no-dump"]), timeout=left + 120)
             stderr = r.stderr
         except subprocess.TimeoutExpired:
             wsl(ctx, "pkill", "-f", "compare_wsl.py")

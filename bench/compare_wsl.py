@@ -184,6 +184,8 @@ def ctags(a, res, save, deadline):
                     "callers": None, "callers_note": "ctags records no references"}
     save()
     defs, kinds = [], {}
+    if a.no_dump:
+        return {"defs": [], "typed": True, "calls": None}
     with open(tags, "rb") as f:
         for raw in f:
             if raw.startswith(b"!_TAG_"):
@@ -256,8 +258,19 @@ def cscope(a, res, save, deadline):
                     "callers": time_queries(a.names_list, a.reps, lambda n: [*base, "-L", "-3", n], a.src, deadline)}
     save()
 
-    # The same sources once more without compression or inverted index, only
-    # to read every definition and call out of it in one pass (not timed).
+    with Edited(os.path.join(a.src, a.edit_file), db):
+        before = os.stat(db).st_mtime_ns
+        m = measure(cmd, a.src, deadline)
+    res["incremental"] = {"supported": True, **m, "edited": a.edit_file, "index_rewritten": os.stat(db).st_mtime_ns != before,
+                          "note": "the same build command with the old database present: cscope copies the entries of "
+                                  "unchanged files and reparses the edited one, then rebuilds the inverted index (-q) whole"}
+    save()
+    if a.no_dump:
+        return {"defs": [], "typed": True, "calls": []}
+
+    # The sources (as they were: the edit is undone) once more without
+    # compression or inverted index, only to read every definition and call
+    # out of it in one pass (not timed).
     dump = os.path.join(a.work, "dump.out")
     subprocess.run(["cscope", "-b", "-c", "-k", "-i", a.list, "-f", dump], cwd=a.src, check=True,
                    stdin=subprocess.DEVNULL, timeout=deadline.left())
@@ -285,13 +298,6 @@ def cscope(a, res, save, deadline):
                          "note": "calls are read from an uncompressed rebuild of the database; this compares that "
                                  "with `cscope -dL -2 <fn>` for every k-th function name"}
     save()
-
-    before = os.stat(db).st_mtime_ns
-    with Edited(os.path.join(a.src, a.edit_file), db):
-        m = measure(cmd, a.src, deadline)
-    res["incremental"] = {"supported": True, **m, "edited": a.edit_file, "index_rewritten": os.stat(db).st_mtime_ns != before,
-                          "note": "the same build command with the old database present: cscope copies the entries of "
-                                  "unchanged files and reparses the edited one, then rebuilds the inverted index (-q) whole"}
     return {"defs": defs, "typed": True, "calls": calls}
 
 
@@ -312,14 +318,15 @@ def gtags(a, res, save, deadline):
                                     "function, so this is 'where is it used', not 'who calls it'"}
     save()
 
-    out = subprocess.run(["global", "-x", ".*"], cwd=a.src, env=env, capture_output=True, check=True,
-                         timeout=deadline.left()).stdout
+    out = b"" if a.no_dump else subprocess.run(["global", "-x", ".*"], cwd=a.src, env=env, capture_output=True,
+                                               check=True, timeout=deadline.left()).stdout
     defs = []
     for line in out.decode("latin-1").splitlines():
         parts = line.split(None, 3)
         if len(parts) >= 3 and parts[1].isdigit():
             defs.append([parts[2], parts[0], int(parts[1])])
-    res["counts"] = {"definitions_any_kind": len(defs)}
+    if not a.no_dump:
+        res["counts"] = {"definitions_any_kind": len(defs)}
     save()
 
     db = os.path.join(a.work, "GTAGS")
@@ -348,6 +355,7 @@ def main():
     ap.add_argument("--dump", required=True)
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--index-reps", type=int, default=1)
+    ap.add_argument("--no-dump", action="store_true", help="skip listing definitions and calls (nothing to score them against)")
     ap.add_argument("--timeout", type=float, default=3600)
     a = ap.parse_args()
     a.src = os.path.abspath(os.path.expanduser(a.src))
