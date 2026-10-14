@@ -101,6 +101,18 @@ export async function run(): Promise<void> {
   assert.ok(shown!.uri.endsWith("bfd-in2.h") && shown!.lines === header.lineCount && header.lineAt(shown!.line - 1).text.includes("bfd_set_error"), JSON.stringify(shown));
   editor.selection = new vscode.Selection(read, read);
 
+  // References in Relation: from the index, each with its line's text; a
+  // click on one shows it in Context, and the editor stays where it is.
+  type Refs = { groups: { file: string; uri: string; items: { line: number; character: number; text: string }[] }[]; message: string };
+  const refs = await vscode.commands.executeCommand<Refs>("norn.relation.referencesAt", { textDocument: { uri: doc.uri.toString() }, position: setError });
+  const away = refs.groups.flatMap((g) => g.items.map((it) => ({ ...it, uri: g.uri }))).find((it) => it.uri !== doc.uri.toString());
+  assert.ok(away && away.text.includes("bfd_set_error"), JSON.stringify(refs).slice(0, 400));
+  const editorBefore = vscode.window.activeTextEditor!.document.uri.toString();
+  await vscode.commands.executeCommand("norn.relation.showReference", away);
+  const atRef = await vscode.commands.executeCommand<{ uri: string; line: number }>("norn.context.shown");
+  assert.ok(atRef.uri === away.uri && atRef.line === away.line + 1, JSON.stringify({ atRef, away }));
+  assert.strictEqual(vscode.window.activeTextEditor!.document.uri.toString(), editorBefore, "Context showed it; the editor did not go there");
+
   // Parameters and local variables: under their function in File Symbols,
   // and with a definition, a context and a relation of their own.
   type Listed = { label: string; children?: Listed[] };

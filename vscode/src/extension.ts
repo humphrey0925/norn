@@ -116,6 +116,9 @@ class Relation implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | undefined;
   private at: At | undefined;
 
+  /** Shows one reference in the Context view (set by `activate`). */
+  showInContext: (at: { uri: string; line: number; character: number }) => void = () => undefined;
+
   constructor(private readonly media: vscode.Uri) {}
 
   resolveWebviewView(view: vscode.WebviewView) {
@@ -136,9 +139,11 @@ class Relation implements vscode.WebviewViewProvider {
       </div>
       <div id="message"></div><div id="root"></div>
       <script src="${file("relation.js")}"></script></body></html>`;
-    w.onDidReceiveMessage(async (m: { ready?: boolean; open?: { uri: string; line: number; character: number }; beside?: boolean; mode?: Mode; expand?: Entry["data"]; id?: number }) => {
+    w.onDidReceiveMessage(async (m: { ready?: boolean; open?: { uri: string; line: number; character: number }; show?: { uri: string; line: number; character: number }; beside?: boolean; mode?: Mode; expand?: Entry["data"]; id?: number }) => {
       if (m.ready) {
         await this.load(this.at ?? (current ? positionParams(current) : undefined));
+      } else if (m.show) {
+        this.showInContext(m.show);
       } else if (m.open) {
         await open(m.open.uri, m.open.line, m.open.character, !!m.beside);
       } else if (m.mode) {
@@ -211,26 +216,17 @@ class Relation implements vscode.WebviewViewProvider {
     void w.postMessage({ type: "root", mode: this.mode, root: r?.root ?? null, entries: r?.entries ?? [], message });
   }
 
-  private async references(at: At) {
-    const uri = vscode.Uri.parse(at.textDocument.uri);
-    const pos = new vscode.Position(at.position.line, at.position.character);
-    const found = (await vscode.commands.executeCommand<vscode.Location[]>("vscode.executeReferenceProvider", uri, pos)) ?? [];
-    const byFile = new Map<string, vscode.Location[]>();
-    for (const loc of found) {
-      const k = loc.uri.toString();
-      byFile.set(k, [...(byFile.get(k) ?? []), loc]);
+  /** The references of the name at `at`, by file, from Norn's index
+   *  alone: asking every reference provider there is (the C/C++
+   *  extension's scans the folder) and opening each file for its lines
+   *  is what made this slow. */
+  async references(at: At) {
+    const r = await ask<{ groups: { file: string; uri: string; items: { line: number; character: number; text: string }[] }[]; total: number; inactive?: [number, number] }>("si/references", at);
+    if (r?.inactive) {
+      return { groups: [], message: switchedOff(r.inactive) };
     }
-    const groups = [];
-    for (const [file, locs] of byFile) {
-      const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(file));
-      const items = locs.map((l) => ({
-        line: l.range.start.line,
-        character: l.range.start.character,
-        text: l.range.start.line < doc.lineCount ? doc.lineAt(l.range.start.line).text.trim() : "",
-      }));
-      groups.push({ file: vscode.workspace.asRelativePath(doc.uri), uri: file, items });
-    }
-    return { groups, message: `${found.length} references in ${byFile.size} files` };
+    const groups = r?.groups ?? [];
+    return { groups, message: `${r?.total ?? 0} references in ${groups.length} files` };
   }
 }
 
@@ -1278,6 +1274,39 @@ class Context implements vscode.WebviewViewProvider {
     void this.view?.webview.postMessage({ type: "show", entry, kindName: KIND_NAMES[entry.kind] ?? entry.kind, key, text });
   }
 
+  /** Show `at` (a reference, say) as a definition is shown: the file
+   *  around that line, the name marked. Asked for, so shown though locked. */
+  async showAt(at: { uri: string; line: number; character: number }) {
+    const uri = vscode.Uri.parse(at.uri);
+    const doc = await vscode.workspace.openTextDocument(uri);
+    const pos = new vscode.Position(at.line, at.character);
+    const word = doc.getWordRangeAtPosition(pos) ?? new vscode.Range(pos, pos);
+    const name = doc.getText(word);
+    const range = { start: { line: at.line, character: word.start.character }, end: { line: at.line, character: word.end.character } };
+    const file = vscode.workspace.asRelativePath(uri);
+    const entry: Entry = {
+      name,
+      kind: "reference",
+      file,
+      line: at.line + 1,
+      endLine: at.line + 1,
+      declaration: false,
+      uri: at.uri,
+      range,
+      data: { file, line: at.line + 1, name },
+    };
+    // (The cursor moving on shows what it is on again.)
+    this.last = "";
+    this.shown = { entry, doc };
+    // Shown before the view is: a view made anew shows `shown` when ready,
+    // rather than what the cursor is on.
+    if (!this.view?.visible) {
+      await vscode.commands.executeCommand("norn.context.focus");
+    }
+    this.view?.show(true);
+    this.post(entry, doc);
+  }
+
   async follow(editor: vscode.TextEditor, asked = false) {
     if ((this.locked && !asked) || !this.view?.visible) {
       return;
@@ -1416,6 +1445,7 @@ export async function activate(context: vscode.ExtensionContext) {
   const fileSymbols = new FileSymbols();
   const search = new Search();
   const contextView = new Context(vscode.Uri.joinPath(context.extensionUri, "media"));
+  relation.showInContext = (at) => void contextView.showAt(at);
   const lenses = new Lenses();
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 10);
   status.text = "$(sync~spin) Norn indexing";
@@ -1778,6 +1808,9 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
     vscode.commands.registerCommand("norn.serverInUse", () => serverPath()),
     vscode.commands.registerCommand("norn.fileSymbols.tree", () => fileSymbols.tree()),
     vscode.commands.registerCommand("norn.context.shown", () => contextView.state),
+    // For checks: the references Relation lists, and a click on one.
+    vscode.commands.registerCommand("norn.relation.referencesAt", (at: At) => relation.references(at)),
+    vscode.commands.registerCommand("norn.relation.showReference", (at: { uri: string; line: number; character: number }) => contextView.showAt(at)),
     vscode.window.onDidChangeActiveColorTheme(() => setTimeout(() => contextView.colors(), 300)),
     vscode.commands.registerCommand("norn.context.sync", () => {
       const editor = vscode.window.activeTextEditor && isSource(vscode.window.activeTextEditor.document) ? vscode.window.activeTextEditor : current;
