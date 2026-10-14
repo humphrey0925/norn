@@ -98,17 +98,82 @@ pub struct Options {
     pub include_aliases: Vec<(String, String)>,
 }
 
+/// How an `#include` operand is found among the indexed files, without the
+/// build's `-I` list (see [`Options`]).
+pub(crate) struct Includes<'a> {
+    paths: Vec<&'a str>,
+    by_path: FxHashMap<&'a str, u32>,
+    by_base: FxHashMap<&'a str, Vec<u32>>,
+}
+
+impl<'a> Includes<'a> {
+    pub(crate) fn new(paths: impl IntoIterator<Item = &'a str>) -> Includes<'a> {
+        let paths: Vec<&str> = paths.into_iter().collect();
+        let by_path = paths.iter().enumerate().map(|(i, p)| (*p, i as u32)).collect();
+        let mut by_base: FxHashMap<&str, Vec<u32>> = FxHashMap::default();
+        for (i, p) in paths.iter().enumerate() {
+            by_base.entry(p.rsplit('/').next().unwrap_or(p)).or_default().push(i as u32);
+        }
+        Includes { paths, by_path, by_base }
+    }
+
+    /// The files `operand`, written in an `#include` of `includer`, may
+    /// mean. Pushed onto `out`; false if there is none.
+    pub(crate) fn resolve(&self, includer: &str, operand: &str, out: &mut Vec<u32>) -> bool {
+        let dir = dir_of(includer);
+        if let Some(&id) = self.by_path.get(join(dir, operand).as_str()) {
+            out.push(id);
+            return true;
+        }
+        let tail = join("", operand);
+        let base = tail.rsplit('/').next().unwrap_or(&tail);
+        let paths = &self.paths;
+        let matches = |id: &&u32| {
+            let p = paths[**id as usize];
+            p == tail || p.ends_with(&tail) && p.as_bytes()[p.len() - tail.len() - 1] == b'/'
+        };
+        let cands: Vec<u32> = self.by_base.get(base).into_iter().flatten().filter(matches).copied().collect();
+        // The folder the operand is looked up from (`include/` for
+        // `include/linux/kernel.h`) is a `-I` of someone: of the
+        // files in the folder above it. One whose folder above does
+        // not hold the includer (`tools/virtio/` for a driver) is
+        // another program's; of the rest the nearest wins, then the
+        // one sharing the most of the includer's folder.
+        let root = |id: u32| {
+            let p = paths[id as usize];
+            p[..p.len() - tail.len()].trim_end_matches('/')
+        };
+        let above = |id: u32| {
+            let up = dir_of(root(id));
+            let holds = up.is_empty() || dir == up || dir.starts_with(up) && dir.as_bytes().get(up.len()) == Some(&b'/');
+            holds.then(|| up.split('/').filter(|s| !s.is_empty()).count())
+        };
+        // Where none is above the includer (`asm/barrier.h` from
+        // `include/linux/`: each architecture's, and a test
+        // program's), the folders made to be looked up from, by
+        // their name (`arch/x86/include/`), before the others
+        // (`tools/virtio/`).
+        let include_folder = |id: u32| root(id).rsplit('/').next().is_some_and(|last| last == "include");
+        let shared = |id: u32| {
+            let other = dir_of(paths[id as usize]);
+            (above(id), include_folder(id), dir.split('/').zip(other.split('/')).take_while(|(a, b)| a == b).count())
+        };
+        match cands.iter().map(|&c| shared(c)).max() {
+            Some(best) => {
+                out.extend(cands.iter().copied().filter(|&c| shared(c) == best));
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 /// Returns the edges twice: all of them, and those not under an `#if`.
 fn include_edges(files: &[FileFacts], aliases: &[(String, String)], stats: &mut LinkStats) -> (Vec<Vec<u32>>, Vec<Vec<u32>>) {
-    let by_path: FxHashMap<&str, u32> = files.iter().enumerate().map(|(i, f)| (f.path.as_str(), i as u32)).collect();
-    let mut by_base: FxHashMap<&str, Vec<u32>> = FxHashMap::default();
-    for (i, f) in files.iter().enumerate() {
-        by_base.entry(f.path.rsplit('/').next().unwrap_or(&f.path)).or_default().push(i as u32);
-    }
+    let found = Includes::new(files.iter().map(|f| f.path.as_str()));
     let edges: Vec<(Vec<u32>, u64, Vec<u32>)> = files
         .par_iter()
         .map(|f| {
-            let dir = dir_of(&f.path);
             let (mut out, mut sure, mut missing) = (Vec::new(), Vec::new(), 0);
             for (k, &inc) in f.includes.iter().enumerate() {
                 let before = out.len();
@@ -119,50 +184,8 @@ fn include_edges(files: &[FileFacts], aliases: &[(String, String)], stats: &mut 
                     (dir.is_empty() || dir.ends_with('/')).then(|| format!("{dir}{to}"))
                 });
                 let operand = renamed.as_deref().unwrap_or(written);
-                if let Some(&id) = by_path.get(join(dir, operand).as_str()) {
-                    out.push(id);
-                    if always {
-                        sure.push(id);
-                    }
-                    continue;
-                }
-                let tail = join("", operand);
-                let base = tail.rsplit('/').next().unwrap_or(&tail);
-                let matches = |id: &&u32| {
-                    let p = files[**id as usize].path.as_str();
-                    p == tail || p.ends_with(&tail) && p.as_bytes()[p.len() - tail.len() - 1] == b'/'
-                };
-                let cands: Vec<u32> = by_base.get(base).into_iter().flatten().filter(matches).copied().collect();
-                // The folder the operand is looked up from (`include/` for
-                // `include/linux/kernel.h`) is a `-I` of someone: of the
-                // files in the folder above it. One whose folder above does
-                // not hold the includer (`tools/virtio/` for a driver) is
-                // another program's; of the rest the nearest wins, then the
-                // one sharing the most of the includer's folder.
-                let above = |id: u32| {
-                    let p = files[id as usize].path.as_str();
-                    let root = p[..p.len() - tail.len()].trim_end_matches('/');
-                    let up = dir_of(root);
-                    let holds = up.is_empty() || dir == up || dir.starts_with(up) && dir.as_bytes().get(up.len()) == Some(&b'/');
-                    holds.then(|| up.split('/').filter(|s| !s.is_empty()).count())
-                };
-                // Where none is above the includer (`asm/barrier.h` from
-                // `include/linux/`: each architecture's, and a test
-                // program's), the folders made to be looked up from, by
-                // their name (`arch/x86/include/`), before the others
-                // (`tools/virtio/`).
-                let include_folder = |id: u32| {
-                    let p = files[id as usize].path.as_str();
-                    let root = p[..p.len() - tail.len()].trim_end_matches('/');
-                    root.rsplit('/').next().is_some_and(|last| last == "include")
-                };
-                let shared = |id: u32| {
-                    let other = dir_of(&files[id as usize].path);
-                    (above(id), include_folder(id), dir.split('/').zip(other.split('/')).take_while(|(a, b)| a == b).count())
-                };
-                match cands.iter().map(|&c| shared(c)).max() {
-                    Some(best) => out.extend(cands.iter().copied().filter(|&c| shared(c) == best)),
-                    None => missing += 1,
+                if !found.resolve(&f.path, operand, &mut out) {
+                    missing += 1;
                 }
                 if always {
                     sure.extend_from_slice(&out[before..]);

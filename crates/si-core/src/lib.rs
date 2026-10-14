@@ -202,7 +202,8 @@ pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions)
 /// `conditions` come back with what the sources settle added.
 pub fn prescan_under(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions) -> MacroSets {
     let defines = settle(root, files, conditions);
-    let sets = MacroSets::from_defines(defines.into_iter().flatten()).with_conditions(conditions.clone());
+    let paths: Vec<String> = files.iter().map(|p| rel_path(root, p)).collect();
+    let sets = MacroSets::of_files(&defines, &paths).with_conditions(conditions.clone());
     trim_memory();
     sets
 }

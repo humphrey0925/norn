@@ -142,6 +142,10 @@ pub struct Define {
     /// Made in a `.c` file: it stands in that file alone.
     #[serde(default)]
     pub local: bool,
+    /// An `#include <...>` (and not `"..."`): the system's, when it is not
+    /// among the files.
+    #[serde(default)]
+    pub system: bool,
 }
 
 impl Define {
@@ -162,6 +166,7 @@ impl Define {
             test: false,
             line: 0,
             local: false,
+            system: false,
         }
     }
 }
@@ -427,11 +432,28 @@ pub struct MacroSets {
     transparent: FxHashMap<Vec<u8>, bool>,
     expanding: FxHashMap<Vec<u8>, bool>,
     kept: FxHashSet<Vec<u8>>,
+    /// The macros only some files can see (see `scope`): name -> where it
+    /// is defined, files numbered as in `ids`. A name not here is seen
+    /// everywhere.
+    scoped: FxHashMap<Vec<u8>, Vec<(u32, u32)>>,
+    /// For each of those definitions (the file, and how many of its
+    /// `#include`s come before it), the files that read it, in order.
+    reach: FxHashMap<(u32, u32), Vec<u32>>,
+    /// The files, by path, as `scoped` and `reach` number them; only when
+    /// anything is scoped.
+    ids: FxHashMap<String, u32>,
     /// What the build is known to define: branches it never compiles are
     /// skipped (see `cond`). (Not saved: made anew from the settings.)
     #[serde(skip)]
     conditions: Conditions,
 }
+
+/// A header that more files read than this is taken as read by all: its
+/// macros are everyone's (a list of who reads it would cost more than it
+/// tells). A `.c` file's macros go no further than the headers it is made
+/// with, so they may go further than that.
+const WIDELY_READ: usize = 1024;
+const WIDELY_READ_FROM_SOURCE: usize = 8192;
 
 /// What a macro may expand to and still be dropped: attributes, and
 /// `inline`, which says nothing an index needs.
@@ -509,7 +531,159 @@ impl MacroSets {
                 }
             }
         }
-        MacroSets { transparent: set, expanding, kept, conditions: Conditions::default() }
+        MacroSets { transparent: set, expanding, kept, ..MacroSets::default() }
+    }
+
+    /// The sets of every file's `#define`s (`per_file`, the files being
+    /// `paths`), each macro seen only where it can be: in the files that
+    /// define it and those that read them. A test program's
+    /// `#define kfree(p) free(p)` (in `tools/`) is no attribute or
+    /// expansion of the kernel's `kfree`.
+    pub fn of_files(per_file: &[Vec<Define>], paths: &[String]) -> MacroSets {
+        let mut sets = MacroSets::from_defines(per_file.iter().flatten().cloned());
+        sets.scope(per_file, paths);
+        sets
+    }
+
+    fn scope(&mut self, per_file: &[Vec<Define>], paths: &[String]) {
+        use rayon::prelude::*;
+        let n = paths.len();
+        // Who reads whom, as the link will find it: each file's `#include`s
+        // in order, with what each means. (A file with an `#include "..."`
+        // of nothing here may read anything, a header the build makes say:
+        // it sees every macro.)
+        let found = crate::link::Includes::new(paths.iter().map(String::as_str));
+        let read: Vec<(Vec<(Vec<u32>, bool)>, bool)> = per_file
+            .par_iter()
+            .zip(paths)
+            .map(|(defines, path)| {
+                let (mut out, mut open) = (Vec::new(), false);
+                for d in defines.iter().filter(|d| d.include) {
+                    let mut targets = Vec::new();
+                    open |= !found.resolve(path, &String::from_utf8_lossy(&d.name), &mut targets) && !d.system;
+                    out.push((targets, d.system));
+                }
+                (out, open)
+            })
+            .collect();
+        let open: Vec<u32> = read.iter().enumerate().filter(|(_, r)| r.1).map(|(f, _)| f as u32).collect();
+        let includes: Vec<Vec<(Vec<u32>, bool)>> = read.into_iter().map(|r| r.0).collect();
+        // Who includes each file, and at which of its `#include`s first.
+        let mut up: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n];
+        for (f, list) in includes.iter().enumerate() {
+            for (k, (targets, _)) in list.iter().enumerate() {
+                for &t in targets {
+                    if !up[t as usize].iter().any(|&(g, _)| g == f as u32) {
+                        up[t as usize].push((f as u32, k as u32));
+                    }
+                }
+            }
+        }
+        // Where each macro that changes how code is read is defined: the
+        // file, and how many of its `#include`s come before the definition
+        // (a macro reaches only what is read after it).
+        let mut defined_in: FxHashMap<&[u8], Vec<(u32, u32)>> = FxHashMap::default();
+        for (f, defines) in per_file.iter().enumerate() {
+            let mut before = 0u32;
+            for d in defines {
+                if d.include {
+                    before += 1;
+                    continue;
+                }
+                if d.test || d.undef {
+                    continue;
+                }
+                // (A `.c` file's attribute macro is its own already: see `Lexer::define`.)
+                let own_attribute = d.local && !self.expanding.contains_key(&d.name);
+                if !own_attribute && (self.transparent.contains_key(&d.name) || self.expanding.contains_key(&d.name)) {
+                    let at = defined_in.entry(&d.name).or_default();
+                    if !at.iter().any(|&(g, _)| g == f as u32) {
+                        at.push((f as u32, before));
+                    }
+                }
+            }
+        }
+        // Who reads each definition, as far as few do: the file itself and
+        // what it includes after it; the files that include it (or include
+        // what does), and what each of those includes after that.
+        let mut defining: Vec<(u32, u32)> = defined_in.values().flatten().copied().collect();
+        defining.sort_unstable();
+        defining.dedup();
+        let reach: Vec<((u32, u32), Option<Vec<u32>>)> = defining
+            .par_iter()
+            .map_init(
+                || vec![false; n],
+                |seen, &(f, from)| {
+                    let mut out = vec![f];
+                    seen[f as usize] = true;
+                    // Read after the definition, and what they include in
+                    // turn: what is included in quotes (the headers a file
+                    // is made with, `"aout-target.h"`), not in angle
+                    // brackets (the system's, the project's own for all).
+                    let source = !paths[f as usize].ends_with(".h");
+                    let most = if source { WIDELY_READ_FROM_SOURCE } else { WIDELY_READ };
+                    let quoted = |list: &[(Vec<u32>, bool)], from: usize| -> Vec<u32> { list.iter().skip(from).filter(|(_, system)| !*system).flat_map(|(t, _)| t).copied().collect() };
+                    let mut after: Vec<u32> = quoted(&includes[f as usize], from as usize);
+                    let mut i = 0;
+                    while i < out.len() && out.len() <= most {
+                        for &(g, at) in &up[out[i] as usize] {
+                            if !std::mem::replace(&mut seen[g as usize], true) {
+                                out.push(g);
+                                after.extend(quoted(&includes[g as usize], at as usize + 1));
+                            }
+                        }
+                        i += 1;
+                    }
+                    let mut i = 0;
+                    while i < after.len() && out.len() <= most {
+                        let g = after[i];
+                        if !std::mem::replace(&mut seen[g as usize], true) {
+                            out.push(g);
+                            after.extend(quoted(&includes[g as usize], 0));
+                        }
+                        i += 1;
+                    }
+                    for &g in &out {
+                        seen[g as usize] = false;
+                    }
+                    if out.len() > most {
+                        return ((f, from), None);
+                    }
+                    out.sort_unstable();
+                    ((f, from), Some(out))
+                },
+            )
+            .collect();
+        let reach: FxHashMap<(u32, u32), Option<Vec<u32>>> = reach.into_iter().collect();
+        for (name, at) in defined_in {
+            // Seen everywhere if one of its definitions is.
+            if at.iter().all(|d| reach[d].is_some()) {
+                self.scoped.insert(name.to_vec(), at);
+            }
+        }
+        let used: FxHashSet<(u32, u32)> = self.scoped.values().flatten().copied().collect();
+        self.reach = reach.into_iter().filter(|(d, _)| used.contains(d)).filter_map(|(d, r)| Some((d, r?))).collect();
+        if std::env::var_os("SI_SCOPE_PROFILE").is_some() {
+            eprintln!("scope     {} macros seen by few files, {} definitions, {} entries", self.scoped.len(), self.reach.len(), self.reach.values().map(Vec::len).sum::<usize>());
+        }
+        if !self.scoped.is_empty() {
+            // Those who may read anything are not numbered: they see all.
+            let open: FxHashSet<u32> = open.into_iter().collect();
+            self.ids = paths.iter().enumerate().filter(|(i, _)| !open.contains(&(*i as u32))).map(|(i, p)| (p.clone(), i as u32)).collect();
+        }
+    }
+
+    /// The number `scope` gave the file at `path`, if any.
+    pub fn file_id(&self, path: &str) -> Option<u32> {
+        self.ids.get(path).copied()
+    }
+
+    /// Can the file numbered `file` see a definition of `name`?
+    pub fn visible(&self, name: &[u8], file: u32) -> bool {
+        match self.scoped.get(name) {
+            None => true,
+            Some(defining) => defining.iter().any(|d| self.reach.get(d).is_some_and(|r| r.binary_search(&file).is_ok())),
+        }
     }
 
     pub fn with_conditions(mut self, conditions: Conditions) -> MacroSets {
@@ -553,6 +727,19 @@ impl MacroSets {
             out.extend(b.iter().filter(|(k, v)| a.get(*k) != Some(v)).map(|(k, _)| k.clone()));
         }
         out.extend(self.kept.symmetric_difference(&other.kept).cloned());
+        // Seen from other files now.
+        let seen_from = |sets: &MacroSets, name: &Vec<u8>| -> Option<Vec<u32>> {
+            let defining = sets.scoped.get(name)?;
+            let mut all: Vec<u32> = defining.iter().flat_map(|d| sets.reach.get(d).into_iter().flatten().copied()).collect();
+            all.sort_unstable();
+            all.dedup();
+            Some(all)
+        };
+        for name in self.scoped.keys().chain(other.scoped.keys()) {
+            if seen_from(self, name) != seen_from(other, name) {
+                out.insert(name.clone());
+            }
+        }
         out
     }
 
@@ -562,6 +749,10 @@ impl MacroSets {
         self.transparent.iter().fold(0, |acc, (k, v)| acc ^ h(k, *v as u64))
             ^ self.expanding.iter().fold(0, |acc, (k, v)| acc ^ h(k, 2 + *v as u64))
             ^ self.kept.iter().fold(0, |acc, k| acc ^ h(k, 4))
+            ^ self.scoped.iter().fold(0, |acc, (k, files)| {
+                let seen: u64 = files.iter().flat_map(|f| self.reach.get(f).into_iter().flatten()).fold(0, |a, &x| a.rotate_left(5) ^ x as u64);
+                acc ^ h(k, 6 ^ seen)
+            })
             ^ self.conditions.digest()
     }
 }
@@ -908,6 +1099,8 @@ struct Lexer<'a> {
     file: Option<u32>,
     /// A `.c` file, whose macros stand in it alone.
     c_file: bool,
+    /// This file as the macro sets number it, for which macros it sees.
+    here: Option<u32>,
     /// Its own macros that are only attributes (see `define`).
     own_transparent: FxHashMap<Vec<u8>, bool>,
     nest: Nest,
@@ -1132,10 +1325,16 @@ impl<'a> Lexer<'a> {
         let (a, e) = self.c.ident();
         let before_byte = std::mem::replace(&mut self.prev, b'a');
         let before = std::mem::replace(&mut self.last_ident, (a as u32, e as u32));
-        if let Some(&function_like) = self.transparent.expanding.get(&s[a..e]) {
+        // A macro no definition of which this file can see is a name like
+        // any other here.
+        let here = self.here;
+        let sets = self.transparent;
+        let seen = |name: &[u8]| here.is_none_or(|f| sets.visible(name, f));
+        if let Some(&function_like) = sets.expanding.get(&s[a..e]).filter(|_| seen(&s[a..e])) {
             self.site(Tok { start: a as u32, end: e as u32, line, call: false, member: false }, function_like, before);
         }
-        let Some(&function_like) = self.transparent.transparent.get(&s[a..e]).or_else(|| self.own_transparent.get(&s[a..e])) else {
+        let shared = sets.transparent.get(&s[a..e]).filter(|_| seen(&s[a..e]));
+        let Some(&function_like) = shared.or_else(|| self.own_transparent.get(&s[a..e])) else {
             if a < self.hidden_until && !is_keyword(&s[a..e]) {
                 let (call, member) = (self.c.peek(0) == b'(', matches!(before_byte, b'.' | b'>'));
                 self.out.events.push(Event::Ref(Tok { start: a as u32, end: e as u32, line, call, member }));
@@ -1311,7 +1510,7 @@ impl<'a> Lexer<'a> {
                     let conditional = self.conds.iter().any(|c| !c.include_guard && c.compiled != Tri::True);
                     self.out.includes.push((open as u32 + 1, (open + 1 + len) as u32, conditional));
                     if let Some(defines) = &mut self.defines {
-                        defines.push(Define { include: true, line: if conditional { 0 } else { line }, ..Define::note(&s[open + 1..open + 1 + len], !conditional) });
+                        defines.push(Define { include: true, system: close == b'>', line: if conditional { 0 } else { line }, ..Define::note(&s[open + 1..open + 1 + len], !conditional) });
                     }
                 }
             }
@@ -1548,6 +1747,7 @@ impl<'a> Lexer<'a> {
                 test: false,
                 line: 0,
                 local: self.c_file,
+                system: false,
             });
         }
         // A `.c` file's own macros stand in it alone, so they are not in
@@ -1638,6 +1838,7 @@ fn lexer<'a>(src: &'a [u8], transparent: &'a MacroSets, conditions: &'a Conditio
     Lexer {
         file: path.and_then(|p| conditions.source()?.file(p)),
         c_file: path.is_some_and(|p| p.ends_with(".c")),
+        here: path.and_then(|p| transparent.file_id(p)),
         own_transparent: FxHashMap::default(),
         c: Cur { s: src, i: 0, line: 1 },
         transparent,
@@ -1720,7 +1921,7 @@ pub fn defines_of(src: &[u8], conditions: &Conditions, path: Option<&str>) -> Ve
             };
             let Some(len) = rest[1..].iter().position(|&b| b == close) else { continue };
             if seen.insert(rest[1..1 + len].to_vec()) {
-                defines.push(Define { include: true, ..Define::note(&rest[1..1 + len], false) });
+                defines.push(Define { include: true, system: close == b'>', ..Define::note(&rest[1..1 + len], false) });
             }
         } else if rest.starts_with(b"if") || rest.starts_with(b"elif") {
             let mut i = 0;

@@ -127,7 +127,9 @@ impl Session {
         let files = crate::scan_scope(root, &scope);
         let mut conditions = crate::conditions_of(root, &files);
         let defines: Vec<Vec<Define>> = crate::settle(root, &files, &mut conditions);
-        let sets = MacroSets::from_defines(defines.iter().flatten().cloned()).with_conditions(conditions.clone());
+        let paths: Vec<String> = files.iter().map(|p| crate::rel_path(root, p)).collect();
+        let sets = MacroSets::of_files(&defines, &paths).with_conditions(conditions.clone());
+        drop(paths);
         let defines = Packed::all(defines);
         let facts = crate::extract_all(root, &files, &sets);
         let mut cache = Cache::default();
@@ -528,7 +530,7 @@ impl Session {
         // Saved with the manifest; made again if not (a save from before
         // they were).
         let sets = store.load_sets(manifest.sets, &conditions).unwrap_or_else(|| {
-            let sets = MacroSets::from_defines(defines.iter().flatten().cloned()).with_conditions(conditions.clone());
+            let sets = MacroSets::of_files(&defines, &manifest.files).with_conditions(conditions.clone());
             if sets.digest() == manifest.sets {
                 store.save_sets(&sets);
             }
@@ -722,7 +724,9 @@ impl Session {
         // Did any macro change character? Then whoever mentions it is stale.
         let mut reclassified = FxHashSet::default();
         if defines_changed {
-            let sets = MacroSets::from_defines(self.defines.iter().flat_map(Packed::get)).with_conditions(self.conditions.clone());
+            let per_file: Vec<Vec<Define>> = self.defines.iter().map(Packed::get).collect();
+            let paths: Vec<String> = self.files.iter().map(|p| crate::rel_path(&self.root, p)).collect();
+            let sets = MacroSets::of_files(&per_file, &paths).with_conditions(self.conditions.clone());
             reclassified = self.sets.reclassified(&sets);
             self.sets = sets;
         }
@@ -884,6 +888,26 @@ mod tests {
         drop(s);
         let (s, up) = open(&d);
         assert_eq!((up.loaded, up.extracted, functions(&s, "fresh")), (3, 0, 1));
+    }
+
+    #[test]
+    fn a_macro_is_only_seen_where_its_definition_can_be_read() {
+        let d = Dir::new("scoped");
+        for dir in ["include/linux", "tools/include/linux", "tools/prog", "drivers", "arch/parisc"] {
+            std::fs::create_dir_all(d.0.join(dir)).unwrap();
+        }
+        d.write("include/linux/spinlock.h", "static inline void unlock (int *l, unsigned long f)\n{\n\thelper (f);\n}\n");
+        d.write("drivers/a.c", "#include <linux/spinlock.h>\nvoid helper (unsigned long f) { }\nvoid user (int *l) { unlock (l, 0); }\n");
+        // Another program's macro of the name, and a file's own.
+        d.write("tools/include/linux/spinlock.h", "#define unlock(x, f) (void)f, pthread_mutex_unlock(x)\n");
+        d.write("tools/prog/t.c", "#include <linux/spinlock.h>\nvoid t (int *m) { unlock (m, 0); }\n");
+        d.write("arch/parisc/fw.c", "# define unlock(a, b)\nvoid fw (void) { unlock (0, 0); }\n");
+        let s = Session::open(&d.0, Options::default());
+        assert_eq!(functions(&s, "unlock"), 1, "the function in include/ is not taken for either macro");
+        let g = &s.graph;
+        let unlock = (0..g.syms.len() as u32).find(|&x| g.sym_name(x) == "unlock" && g.syms[x as usize].kind == kind::FUNCTION).unwrap();
+        let callers: Vec<&str> = crate::callers_through_macros(g, unlock).iter().map(|c| g.sym_name(c.caller)).collect();
+        assert_eq!(callers, ["user"]);
     }
 
     #[test]
