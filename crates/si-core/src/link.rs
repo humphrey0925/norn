@@ -244,6 +244,8 @@ fn in_sight(
     syms: &[Sym],
     own: std::ops::Range<u32>,
     closure: &Closure,
+    // What the file reads in every configuration (empty: not known).
+    sure: &[bool],
     want: impl Fn(&Sym) -> bool,
     out: &mut Vec<u32>,
 ) {
@@ -281,9 +283,11 @@ fn in_sight(
         // (So is a macro defined only in a branch: `#ifdef
         // CONFIG_DEBUG_LOCK_ALLOC` `#define mutex_lock(l) ...` `#else` the
         // prototype.)
+        // (Or in a header read only in some: `rcutiny.h` or `rcutree.h`.)
         let maybe = |c: &u32| {
             let s = &syms[*c as usize];
-            matches!(s.kind, kind::FUNCTION | kind::MACRO) && s.flags & (flag::CONDITIONAL | flag::DECL) == flag::CONDITIONAL
+            let read_always = sure.is_empty() || sure[s.file as usize] || own.contains(c);
+            matches!(s.kind, kind::FUNCTION | kind::MACRO) && s.flags & flag::DECL == 0 && (s.flags & flag::CONDITIONAL != 0 || !read_always)
         };
         let decl = |c: &u32| syms[*c as usize].flags & flag::DECL != 0;
         if out.iter().any(maybe) && out.iter().all(|c| maybe(c) || decl(c)) {
@@ -382,7 +386,7 @@ impl Types<'_> {
             kind_of_root => {
                 // The variable or function the name means here, then its type.
                 let wanted = if kind_of_root == root::VAR { kind::GLOBAL } else { kind::FUNCTION };
-                in_sight(g.syms_named(name), &g.syms, own, closure, |s| s.kind == wanted, scratch);
+                in_sight(g.syms_named(name), &g.syms, own, closure, &[], |s| s.kind == wanted, scratch);
                 *scratch.iter().find_map(|s| self.of_symbol.get(s))?
             }
         };
@@ -631,7 +635,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                         tmp.clear();
                         tmp.push(sym);
                     }
-                    None => in_sight(cands, syms, base..end, closure, want, &mut tmp),
+                    None => in_sight(cands, syms, base..end, closure, &sure.member, want, &mut tmp),
                 }
                 if tmp.is_empty() {
                     counts[2] += 1;
@@ -679,7 +683,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     slots.clear();
                     slots.push(sym);
                 } else if b.var {
-                    in_sight(g.syms_named(remap[fi][b.slot as usize]), syms, base..end, closure, |s| s.kind == kind::GLOBAL, &mut slots);
+                    in_sight(g.syms_named(remap[fi][b.slot as usize]), syms, base..end, closure, &sure.member, |s| s.kind == kind::GLOBAL, &mut slots);
                 } else {
                     // Positional: the member is the struct's `index`-th.
                     // The struct may be named through a macro, and then it
@@ -714,7 +718,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     };
                     let cands = g.syms_named(name);
                     let holds = |s: &Sym| s.kind == kind::FIELD && s.flags & flag::CALLABLE != 0;
-                    in_sight(cands, syms, base..end, closure, holds, &mut slots);
+                    in_sight(cands, syms, base..end, closure, &sure.member, holds, &mut slots);
                     // The very member at that position, when the struct's
                     // layout says which definition it is.
                     let exact = (b.index != NONE)
@@ -739,7 +743,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     continue;
                 }
                 let named = g.syms_named(remap[fi][b.func as usize]);
-                in_sight(named, syms, base..end, closure, |s| s.kind == kind::FUNCTION, &mut tmp);
+                in_sight(named, syms, base..end, closure, &sure.member, |s| s.kind == kind::FUNCTION, &mut tmp);
                 // Read in another translation unit, the name is first of all
                 // that unit's own function.
                 let own = |c: &&u32| syms[**c as usize].kind == kind::FUNCTION && syms[**c as usize].file == b.unit;
@@ -763,13 +767,13 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
             if !through_param.is_empty() {
                 let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
                 for a in &f.arg_passes {
-                    in_sight(g.syms_named(remap[fi][a.callee as usize]), syms, base..end, closure, |s| s.kind == kind::FUNCTION, &mut slots);
+                    in_sight(g.syms_named(remap[fi][a.callee as usize]), syms, base..end, closure, &sure.member, |s| s.kind == kind::FUNCTION, &mut slots);
                     if slots.iter().any(is_def) {
                         slots.retain(is_def);
                     }
                     for &callee in slots.iter().take(MAX_MEMBER_CANDIDATES) {
                         for &(_, line) in through_param.get(&callee).into_iter().flatten().filter(|p| p.0 == a.index) {
-                            in_sight(g.syms_named(remap[fi][a.func as usize]), syms, base..end, closure, |s| s.kind == kind::FUNCTION, &mut tmp);
+                            in_sight(g.syms_named(remap[fi][a.func as usize]), syms, base..end, closure, &sure.member, |s| s.kind == kind::FUNCTION, &mut tmp);
                             if tmp.iter().any(is_def) {
                                 tmp.retain(is_def);
                             }
