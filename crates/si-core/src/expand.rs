@@ -1625,7 +1625,7 @@ impl Cache {
     /// is then expanded again).
     pub fn restored(index: CacheIndex, expanded: Vec<Result<Option<FileFacts>, ()>>) -> Cache {
         let mut hashes = index.hashes;
-        let expanded = expanded
+        let mut expanded: Vec<Option<FileFacts>> = expanded
             .into_iter()
             .enumerate()
             .map(|(i, e)| {
@@ -1635,6 +1635,7 @@ impl Cache {
                 })
             })
             .collect();
+        crate::gather(expanded.iter_mut().flatten());
         let made = vec![1; hashes.len()];
         Cache { environment: index.environment, hashes, expanded, added: index.added, changed: Vec::new(), epoch: 1, made, names: NameCache::default() }
     }
@@ -1752,7 +1753,9 @@ pub fn expand(files: &[FileFacts], includes: &[Vec<u32>], sure_includes: &[Vec<u
         }
         for (&fi, d) in stale.iter().zip(done) {
             (cache.expanded[fi], cache.added[fi]) = match d {
-                Some((f, defs, refs)) => (Some(f), (defs, refs)),
+                // Kept in memory of this thread's, not among what the
+                // workers made on the way and let go (see `crate::gather`).
+                Some((f, defs, refs)) => (Some(f.clone()), (defs, refs)),
                 None => (None, (0, 0)),
             };
         }

@@ -402,30 +402,50 @@ impl FileFacts {
 
     /// Give back what the vectors hold beyond what is in them: they grew
     /// by doubling, and in a large tree the slack of every file adds up.
+    ///
+    /// Each is copied into a block of its size. Asking the allocator to
+    /// make the block smaller (`shrink_to_fit`) is not enough: mimalloc
+    /// leaves a block as it is unless less than half of it is wanted, so
+    /// the vectors would go on holding a third more than is in them (in
+    /// the kernel, 0.8 GB) while saying they do not.
     pub fn shrink(&mut self) {
-        self.names.ids.shrink_to_fit();
-        self.names.buf.shrink_to_fit();
-        self.names.off.shrink_to_fit();
-        self.defs.shrink_to_fit();
-        self.refs.shrink_to_fit();
-        self.includes.shrink_to_fit();
-        self.include_conditional.shrink_to_fit();
-        self.macros.shrink_to_fit();
-        self.sites.shrink_to_fit();
-        self.binds.shrink_to_fit();
-        self.inits.shrink_to_fit();
-        self.records.shrink_to_fit();
-        self.aliases.shrink_to_fit();
-        self.field_types.shrink_to_fit();
-        self.param_calls.shrink_to_fit();
-        self.arg_passes.shrink_to_fit();
-        self.hints.shrink_to_fit();
-        self.hint_path.shrink_to_fit();
-        self.ref_hints.shrink_to_fit();
-        self.typed.shrink_to_fit();
-        self.defined_names.shrink_to_fit();
-        self.locals.shrink_to_fit();
-        self.local_uses.shrink_to_fit();
+        fn exact<T>(v: &mut Vec<T>) {
+            if v.capacity() > v.len() {
+                let mut fitting = Vec::with_capacity(v.len());
+                fitting.append(v);
+                *v = fitting;
+            }
+        }
+        exact(&mut self.names.ids);
+        if self.names.buf.capacity() > self.names.buf.len() {
+            self.names.buf = self.names.buf.clone();
+        }
+        exact(&mut self.names.off);
+        exact(&mut self.defs);
+        exact(&mut self.refs);
+        exact(&mut self.includes);
+        exact(&mut self.include_conditional);
+        exact(&mut self.macros);
+        exact(&mut self.sites);
+        exact(&mut self.binds);
+        exact(&mut self.inits);
+        for r in &mut self.records {
+            exact(&mut r.fields);
+            exact(&mut r.types);
+            exact(&mut r.defs);
+        }
+        exact(&mut self.records);
+        exact(&mut self.aliases);
+        exact(&mut self.field_types);
+        exact(&mut self.param_calls);
+        exact(&mut self.arg_passes);
+        exact(&mut self.hints);
+        exact(&mut self.hint_path);
+        exact(&mut self.ref_hints);
+        exact(&mut self.typed);
+        exact(&mut self.defined_names);
+        exact(&mut self.locals);
+        exact(&mut self.local_uses);
     }
 
     /// What the names (and the texts kept as names) take.

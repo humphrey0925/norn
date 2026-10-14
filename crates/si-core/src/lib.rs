@@ -162,9 +162,29 @@ pub fn extract_file(ex: &mut extract::Extractor, root: &Path, path: &Path, trans
 /// Extract all files on the current rayon pool; output order matches `files`.
 pub fn extract_all(root: &Path, files: &[PathBuf], transparent: &MacroSets) -> Vec<FileFacts> {
     progress::parsing(files.len());
-    let facts = files.par_iter().map_init(extract::Extractor::new, |ex, p| extract_file(ex, root, p, transparent)).collect();
+    let mut facts: Vec<FileFacts> = files.par_iter().map_init(extract::Extractor::new, |ex, p| extract_file(ex, root, p, transparent)).collect();
     mem_mark("extracted");
+    gather(&mut facts);
+    trim_memory();
+    mem_mark("extracted, gathered");
     facts
+}
+
+/// Move what is kept of each file into memory this thread allocates.
+///
+/// The facts were made on the worker threads, each of which allocates from
+/// pages of its own, between the trees, tokens and lists it made on the way
+/// and has let go since. What was let go leaves holes around what is kept:
+/// the pages stay, a quarter empty (0.5 GB in the kernel, on 28 threads,
+/// and more with every link, whose own short-lived lists land in the holes
+/// and commit what was not yet). Copied by the one thread that asks, the
+/// facts lie side by side in pages that hold nothing else, and the workers'
+/// pages, left empty, go back to the system at the next [`trim_memory`].
+pub fn gather<'a>(facts: impl IntoIterator<Item = &'a mut FileFacts>) {
+    for f in facts {
+        // A clone's vectors are each as long as what is in them.
+        *f = f.clone();
+    }
 }
 
 /// Route tree-sitter's C allocations through mimalloc. The platform heap
@@ -191,6 +211,28 @@ pub fn mem_mark(what: &str) {
     let z: *mut usize = &mut zero;
     unsafe { libmimalloc_sys::mi_process_info(z, z, z, &mut rss, &mut peak, &mut commit, z, z) };
     eprintln!("mem       {what}: resident {} MB, committed {} MB, peak {} MB", rss >> 20, commit >> 20, peak >> 20);
+    // What the allocator's pages hold: a page is of blocks of one size,
+    // and stays while one of them is in use. `used` is what was asked for,
+    // rounded up to the block sizes there are; the rest of what is
+    // committed is holes.
+    unsafe extern "C" fn page(
+        _: *const libmimalloc_sys::mi_heap_t,
+        area: *const libmimalloc_sys::mi_heap_area_t,
+        _: *mut std::ffi::c_void,
+        _: usize,
+        sums: *mut std::ffi::c_void,
+    ) -> bool {
+        let (sums, area) = (&mut *(sums as *mut [usize; 3]), &*area);
+        *sums = [sums[0] + 1, sums[1] + area.committed, sums[2] + area.used * area.full_block_size];
+        true
+    }
+    extern "C" {
+        // Every thread allocates from this one heap (the binding does not name it).
+        fn mi_heap_main() -> *mut libmimalloc_sys::mi_heap_t;
+    }
+    let mut sums = [0usize; 3];
+    unsafe { libmimalloc_sys::mi_heap_visit_blocks(mi_heap_main(), false, Some(page), &mut sums as *mut _ as *mut _) };
+    eprintln!("mem         in {} pages: committed {} MB, used {} MB", sums[0], sums[1] >> 20, sums[2] >> 20);
 }
 
 pub fn use_mimalloc_for_parser() {

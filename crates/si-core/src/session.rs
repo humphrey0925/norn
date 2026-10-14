@@ -20,6 +20,7 @@ use crate::mask::{self, Define, MacroSets};
 use crate::model::FileFacts;
 use crate::scope::Scope;
 use crate::store::{stamp, Stamp, Store};
+use bincode::Options as _;
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use std::path::{Path, PathBuf};
@@ -29,7 +30,7 @@ pub struct Session {
     root: PathBuf,
     /// Sorted, like `scan` gives them; the other vectors run parallel.
     files: Vec<PathBuf>,
-    defines: Vec<Vec<Define>>,
+    defines: Vec<Packed>,
     facts: Vec<FileFacts>,
     sets: MacroSets,
     cache: Cache,
@@ -47,6 +48,35 @@ pub struct Session {
     all_stale: bool,
     pub graph: Graph,
     pub stats: LinkStats,
+}
+
+/// A file's `#define`s as the session keeps them: in bytes, as they are
+/// saved (but with every length and line in as few bytes as it needs).
+///
+/// They are only ever wanted a file at a time, all of them: to see whether
+/// an edit changed any, to make the macro sets again when one did, to save.
+/// As they are worked with (a list for the name, one for each name the
+/// body refers to) the kernel's take 1.4 GB in millions of small blocks,
+/// several times what they say.
+#[derive(PartialEq)]
+struct Packed(Box<[u8]>);
+
+impl Packed {
+    fn of(defines: &[Define]) -> Packed {
+        Packed(bincode::options().serialize(defines).unwrap_or_default().into())
+    }
+
+    fn get(&self) -> Vec<Define> {
+        bincode::options().deserialize(&self.0).unwrap_or_default()
+    }
+
+    /// Those of every file. Packed by all threads, then moved into memory
+    /// of this one's (see `crate::gather`).
+    fn all(defines: Vec<Vec<Define>>) -> Vec<Packed> {
+        let packed: Vec<Packed> = defines.par_iter().map(|d| Packed::of(d)).collect();
+        drop(defines);
+        packed.into_iter().map(|p| Packed(p.0.clone())).collect()
+    }
 }
 
 /// What one `update` did.
@@ -81,6 +111,7 @@ impl Session {
         let mut conditions = crate::conditions_of(root, &files);
         let defines: Vec<Vec<Define>> = crate::settle(root, &files, &mut conditions);
         let sets = MacroSets::from_defines(defines.iter().flatten().cloned()).with_conditions(conditions.clone());
+        let defines = Packed::all(defines);
         let facts = crate::extract_all(root, &files, &sets);
         let mut cache = Cache::default();
         let (graph, stats) = link_cached(&facts, &options, &mut cache);
@@ -211,7 +242,7 @@ impl Session {
                 Some(false) => {
                     self.stamps[i] = stamp(&self.files[i]);
                     if let Some(store) = &self.store {
-                        store.save(&crate::rel_path(&self.root, &self.files[i]), self.stamps[i], &self.defines[i], &self.facts[i]);
+                        store.save(&crate::rel_path(&self.root, &self.files[i]), self.stamps[i], &self.defines[i].get(), &self.facts[i]);
                     }
                 }
                 None => {}
@@ -241,7 +272,7 @@ impl Session {
         store.invalidate();
         let s = &session;
         (0..s.files.len()).into_par_iter().for_each(|i| {
-            store.save(&crate::rel_path(root, &s.files[i]), s.stamps[i], &s.defines[i], &s.facts[i]);
+            store.save(&crate::rel_path(root, &s.files[i]), s.stamps[i], &s.defines[i].get(), &s.facts[i]);
         });
         session.store = Some(store);
         session.save_manifest();
@@ -267,6 +298,8 @@ impl Session {
         if !files.windows(2).all(|w| w[0] < w[1]) {
             return None;
         }
+        // Read by all threads, each between the files' bytes it has let go.
+        crate::gather(&mut facts);
         // The facts were all extracted under these sets, or the save was
         // interrupted and cannot be trusted.
         // (The conditions are part of the sets: a save made under other
@@ -300,7 +333,7 @@ impl Session {
         Some(Session {
             root: root.to_path_buf(),
             files,
-            defines,
+            defines: Packed::all(defines),
             facts,
             sets,
             cache,
@@ -366,7 +399,7 @@ impl Session {
             let there = path.is_file() && self.scope.contains(&crate::rel_path(&self.root, &path));
             match (self.files.binary_search(&path), there) {
                 (Ok(i), true) => {
-                    let defines = mask::defines(&std::fs::read(&path).unwrap_or_default(), &self.conditions);
+                    let defines = Packed::of(&mask::defines(&std::fs::read(&path).unwrap_or_default(), &self.conditions));
                     defines_changed |= defines != self.defines[i];
                     self.defines[i] = defines;
                     up.changed += 1;
@@ -385,7 +418,7 @@ impl Session {
                 }
                 (Err(i), true) => {
                     self.files.insert(i, path.clone());
-                    self.defines.insert(i, mask::defines(&std::fs::read(&path).unwrap_or_default(), &self.conditions));
+                    self.defines.insert(i, Packed::of(&mask::defines(&std::fs::read(&path).unwrap_or_default(), &self.conditions)));
                     self.facts.insert(i, FileFacts::new(String::new()));
                     self.stamps.insert(i, (0, 0));
                     defines_changed = true;
@@ -407,7 +440,7 @@ impl Session {
         let mut retold: FxHashSet<PathBuf> = FxHashSet::default();
         if all_stale || defines_changed && self.conditions.uses_source() {
             let before = self.conditions.source().cloned();
-            self.defines = crate::settle(&self.root, &self.files, &mut self.conditions);
+            self.defines = Packed::all(crate::settle(&self.root, &self.files, &mut self.conditions));
             defines_changed = true;
             let now = self.conditions.source();
             if before.as_ref() != now {
@@ -427,7 +460,7 @@ impl Session {
         // Did any macro change character? Then whoever mentions it is stale.
         let mut reclassified = FxHashSet::default();
         if defines_changed {
-            let sets = MacroSets::from_defines(self.defines.iter().flatten().cloned()).with_conditions(self.conditions.clone());
+            let sets = MacroSets::from_defines(self.defines.iter().flat_map(Packed::get)).with_conditions(self.conditions.clone());
             reclassified = self.sets.reclassified(&sets);
             self.sets = sets;
         }
@@ -447,10 +480,11 @@ impl Session {
         let fresh: Vec<FileFacts> =
             stale.par_iter().map_init(Extractor::new, |ex, &i| crate::extract_file(ex, root, &files[i], sets)).collect();
         up.extracted = fresh.len();
-        for (&i, f) in stale.iter().zip(fresh) {
+        for (&i, mut f) in stale.iter().zip(fresh) {
             // Read again, perhaps under other conditions with the very
             // same text: what the link kept of the file no longer holds.
             self.cache.forget(i);
+            crate::gather([&mut f]);
             self.facts[i] = f;
             self.stamps[i] = stamp(&self.files[i]);
         }
@@ -461,13 +495,16 @@ impl Session {
             store.invalidate();
             let s = &*self;
             stale.par_iter().for_each(|&i| {
-                store.save(&crate::rel_path(&s.root, &s.files[i]), s.stamps[i], &s.defines[i], &s.facts[i]);
+                store.save(&crate::rel_path(&s.root, &s.files[i]), s.stamps[i], &s.defines[i].get(), &s.facts[i]);
             });
             self.save_manifest();
         }
         up.extract_ms = ms(t);
 
         let t = Instant::now();
+        // The graph that was goes first: nobody can ask it anything while
+        // this runs, and the link would make the new one beside it.
+        self.graph = Graph::default();
         (self.graph, self.stats) = link_cached(&self.facts, &self.options, &mut self.cache);
         up.link_ms = ms(t);
         self.save_expansions();
