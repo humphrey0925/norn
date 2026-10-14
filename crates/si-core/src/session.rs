@@ -231,7 +231,13 @@ impl Session {
             session.store = Some(store);
             // What the tree looks like now, against what was saved.
             let paths = session.out_of_date();
+            if std::env::var_os("SI_START_PROFILE").is_some() {
+                eprintln!("start     tree checked: {:.0} ms", ms(t));
+            }
             let mut up = session.update(&paths);
+            if std::env::var_os("SI_START_PROFILE").is_some() {
+                eprintln!("start     linked: {:.0} ms", ms(t));
+            }
             up.loaded = loaded;
             up.extract_ms = ms(t) - up.link_ms;
             return (session, up);
@@ -253,8 +259,16 @@ impl Session {
     /// The session as it was last saved, not yet linked; `None` if the save
     /// is missing, from another version, incomplete or inconsistent.
     fn restore(root: &Path, options: &Options, store: &Store) -> Option<Session> {
+        let t = Instant::now();
+        let mark = |what: &str| {
+            if std::env::var_os("SI_START_PROFILE").is_some() {
+                eprintln!("start     {what}: {:.0} ms", ms(t));
+            }
+        };
         let manifest = store.manifest()?;
+        mark("manifest");
         let saved: Vec<Option<crate::store::Saved>> = manifest.files.par_iter().map(|rel| store.load(rel)).collect();
+        mark("facts read");
         let mut files = Vec::with_capacity(saved.len());
         let (mut defines, mut facts, mut stamps) = (Vec::new(), Vec::new(), Vec::new());
         for (rel, s) in manifest.files.iter().zip(saved) {
@@ -281,6 +295,7 @@ impl Session {
             }
         }
         let sets = MacroSets::from_defines(defines.iter().flatten().cloned()).with_conditions(conditions.clone());
+        mark("sets");
         if sets.digest() != manifest.sets {
             return None;
         }
@@ -298,6 +313,7 @@ impl Session {
             }
             None => Cache::default(),
         };
+        mark("expansions read");
         Some(Session {
             root: root.to_path_buf(),
             files,
