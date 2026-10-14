@@ -254,6 +254,22 @@ fn in_sight(
         let s = &syms[**c as usize];
         want(s) && (s.flags & flag::STATIC == 0 || s.flags & flag::HEADER != 0)
     };
+    // Unless all it is is a prototype and a stub that may not be compiled
+    // (`#ifdef CONFIG_SMP` the prototype, `#else` the stub, both here): the
+    // definitions elsewhere are the other reading.
+    {
+        let s = |c: &u32| &syms[*c as usize];
+        let decl = |c: &u32| s(c).flags & flag::DECL != 0;
+        let maybe = |c: &u32| matches!(s(c).kind, kind::FUNCTION | kind::MACRO) && s(c).flags & (flag::CONDITIONAL | flag::DECL) == flag::CONDITIONAL;
+        if out.iter().any(decl) && out.iter().any(maybe) && out.iter().all(|c| decl(c) || maybe(c)) {
+            let n = out.len();
+            for &c in cands.iter().filter(external) {
+                if !decl(&c) && !out[..n].contains(&c) {
+                    out.push(c);
+                }
+            }
+        }
+    }
     if out.is_empty() {
         // Included text is part of this translation unit, `static` or not.
         out.extend(cands.iter().filter(|&&c| want(&syms[c as usize]) && closure.member[syms[c as usize].file as usize]));
