@@ -60,7 +60,7 @@ export async function run(): Promise<void> {
   // With no path set, the server is the one inside the extension.
   if (process.env.SI_TEST_BUNDLED) {
     const used = await vscode.commands.executeCommand<string>("norn.serverInUse");
-    assert.ok(/[\\/]bin[\\/][a-z0-9]+-[a-z0-9]+[\\/]si(\.exe)?$/.test(used), used);
+    assert.ok(/[\\/]bin[\\/][a-z0-9]+-[a-z0-9]+[\\/]norn(\.exe)?$/.test(used), used);
   }
 
   // The views and their commands exist and run.
