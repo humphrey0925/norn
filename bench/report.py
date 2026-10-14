@@ -14,6 +14,38 @@ NAMES = {"si": "Norn", "cbm": "codebase-memory-mcp", "clangd": "clangd", "cscope
 CORPORA = {"redis": "Redis", "git-c": "git", "c-only": "binutils", "linux": "Linux kernel"}
 
 
+MODES = [
+    ("warm server over a pipe", "常駐伺服器"),
+    ("warm MCP server over a pipe", "常駐 MCP 伺服器"),
+    ("warm language server over a pipe", "常駐語言伺服器"),
+    ("one process per query", "每次查詢啟動一個行程"),
+]
+
+# How the comparison was made, for a reader of the page (the JSON carries
+# the same in the harness's own words, tool by tool).
+METHOD = [
+    "平台不同：Norn、codebase-memory-mcp、clangd 在 Windows / NTFS 上執行；Universal Ctags、cscope、GNU Global 在 WSL2 / ext4 上對同一份檔案的複本執行。Linux 的行程啟動和檔案存取較便宜，對後三者有利，尤其是「每次查詢啟動一個行程」的延遲。",
+    "執行緒：Ctags、cscope、Global 是單執行緒；Norn、codebase-memory-mcp、clangd 使用全部核心。",
+    "「第一次索引」指磁碟上沒有索引；原始檔都已在作業系統的檔案快取中。重複三次取中位數。",
+    "記憶體峰值：Windows 上是整個行程樹的常駐記憶體，每 20 毫秒取樣；WSL 上取同樣取樣與核心記錄的單一行程高水位兩者較大者。",
+    "查詢延遲：每個語料固定 20 個函式名稱、各重複 3 次。常駐伺服器和每次啟動行程不是同一種成本；Norn 兩種都列。clangd 的「誰呼叫它」不含開檔與解析該檔的時間。",
+    "「改一個檔之後」各工具的做法不同：Norn 是在行程內、已知哪個檔變了；codebase-memory-mcp、cscope、GNU Global 的數字含行程啟動與找出變更；clangd 是帶著磁碟上的索引重新啟動。",
+    "準確度：定義以（檔案、名稱）比對函式定義；一條呼叫邊是（呼叫者檔案、呼叫者、被呼叫者檔案、被呼叫者）。找到率以 clang 在該工具讀過的檔案裡看到的為分母；正確率以工具回報、且位於某個編譯單元實際編譯到的行上的為分母。",
+    "clangd 沒有真正的編譯資料庫：測試用的是合成的 compile_commands.json，沒有 include 路徑和 -D，且以 Windows 主機為目標（對照資料是 Linux 建置）。所以它的準確度是下限，索引時間也可能偏低。它無法列出全部索引內容，定義與呼叫都只抽樣 300 個函式，定義沒有正確率。",
+    "cscope 只記錄被呼叫者的名稱，所以每個呼叫會連到所有同名的函式定義；只有恰好一個同名定義時才算「確定」。",
+    "GNU Global 的定義不分種類，所以沒有正確率；它有名稱的參考位置，但不歸屬到呼叫者，因此沒有呼叫圖。Universal Ctags 只記錄定義。",
+    "輸入不完全相同：Ctags、cscope、Global 拿到的是語料的 *.c 與 *.h 清單；Norn 和 codebase-memory-mcp 自己決定讀哪些檔。Norn 直接讀語料本身，其餘在複本上執行。",
+    "codebase-memory-mcp 以 full 模式執行，只使用手動下載的執行檔，沒有執行它的安裝程式。",
+]
+
+
+def mode_zh(mode):
+    for en, zh in MODES:
+        if mode.startswith(en):
+            return zh
+    return mode
+
+
 def esc(s):
     return html.escape(str(s))
 
@@ -78,7 +110,7 @@ def bar(value, most, text):
     return f'<span class="bar" style="--w:{w}%">{text}</span>'
 
 
-def corpus_section(d):
+def corpus_section(d, remarks):
     name = d["corpus"]["name"]
     tools = d["tools"]
     present = [t for t in ORDER if t in tools]
@@ -114,9 +146,9 @@ def corpus_section(d):
     for t in present:
         q = get(tools, t, "query") or {}
         one = get(q, "one_shot", "find", "p50_ms") or get(q, "one_shot", "p50_ms")
-        mode = esc(q.get("mode", ""))
+        mode = esc(mode_zh(q.get("mode", "")))
         if t == "si" and one:
-            mode += f"；單次啟動查詢 {ms(one)}"
+            mode += f"；每次查詢啟動一個行程時 {ms(one)}"
         rows.append(row(t, [NAMES[t], ms(get(q, "find", "p50_ms")), ms(get(q, "callers", "p50_ms")), f'<span class="dim">{mode}</span>']))
     out.append("<h3>查詢延遲（中位數）</h3>")
     out.append(table(["工具", "找定義", "誰呼叫它", "量測方式"], rows))
@@ -154,6 +186,8 @@ def corpus_section(d):
         )
     else:
         out.append('<p class="note">這個語料沒有 clang 對照資料，不評準確度。</p>')
+    if remarks.get(name):
+        out.append(f'<p class="note">{esc(remarks[name])}</p>')
     out.append("</section>")
     return "".join(out)
 
@@ -222,7 +256,8 @@ def keys(results):
         r = get(si, "accuracy", "calls", "recall_any")
         if r is not None:
             best = max(((get(tools, t, "accuracy", "calls", "recall_any") or 0), t) for t in tools if t != "si")
-            out.append((pct(r), f"{name}：Norn 找到的呼叫；其他工具最高 {pct(best[0])}（{NAMES[best[1]]}）"))
+            own = "（Norn 使用了語料附的建置條件）" if d["corpus"]["name"] == "git-c" else ""
+            out.append((pct(r), f"{name}：Norn 找到的呼叫；其他工具最高 {pct(best[0])}（{NAMES[best[1]]}）{own}"))
     return '<div class="keys">' + "".join(f'<div class="key"><b>{esc(a)}</b><span>{esc(b)}</span></div>' for a, b in out[:8]) + "</div>"
 
 
@@ -239,7 +274,8 @@ def main():
     for d in results:
         for t, r in d["tools"].items():
             v = r.get("version")
-            versions.setdefault(t, v.get("reported") or f'build {v.get("sha1", "")} ({v.get("modified", "")})' if isinstance(v, dict) else v)
+            label = (startup or {}).get("norn_version", "") if t == "si" else ""
+            versions.setdefault(t, (v.get("reported") or f'{label} (build {v.get("sha1", "")})').replace("codebase-memory-mcp ", "") if isinstance(v, dict) else str(v).split(",")[0].replace("clangd version ", "").replace("Universal Ctags ", "").replace("cscope: version ", "").replace("gtags (GNU Global) ", ""))
     notes = []
     for d in results:
         for n in d.get("notes", []):
@@ -252,17 +288,17 @@ def main():
     nav = "".join(f'<a href="#{esc(d["corpus"]["name"])}">{esc(CORPORA.get(d["corpus"]["name"], d["corpus"]["name"]))}</a>' for d in results)
     page = [
         f"<title>Norn 基準測試</title><style>{CSS}</style><main>",
-        f'<header>{MARK}<div><h1>Norn 基準測試</h1><p class="lede">與五個 C 程式碼索引工具，在四個語料上比成本、查詢與準確度。{esc(results[-1]["date"][:10])}</p></div></header>',
+        f'<header>{MARK}<div><h1>Norn 基準測試</h1><p class="lede">與五個 C 程式碼索引工具，在 {len(results)} 個語料上比成本、查詢與準確度。{esc(results[-1]["date"][:10])}</p></div></header>',
         keys(results),
         f'<nav>{nav}<a href="#startup">啟動時間</a><a href="#method">方法與限制</a></nav>',
     ]
-    page += [corpus_section(d) for d in results]
+    page += [corpus_section(d, (startup or {}).get("remarks", {})) for d in results]
     page.append(startup_section(startup))
     page.append('<section id="method"><h2>方法與限制</h2><ul>')
-    page += [f"<li>{esc(n)}</li>" for n in notes]
+    page += [f"<li>{esc(n)}</li>" for n in METHOD]
     page.append("</ul>")
     page.append(
-        f'<p class="note">機器：{esc(m["cpu"])}，{m["physical_cores"]} 核 / {m["logical_cores"]} 執行緒，{m["ram_bytes"] / 2**30:.0f} GB；{esc(m["os"])}；WSL {esc(get(m, "wsl", "distro") or "")}（{esc(get(m, "wsl", "filesystem") or "")}）。</p>'
+        f'<p class="note">機器：{esc(m["cpu"])}，{m["physical_cores"]} 核 / {m["logical_cores"]} 執行緒，{m["ram_bytes"] / 2**30:.0f} GB；{esc(m["os"].replace("Windows-10-10.0.2", "Windows 11 (10.0.2").replace("-SP0", ")"))}；WSL {esc(get(m, "wsl", "distro") or "")}（{esc(get(m, "wsl", "filesystem") or "")}）。</p>'
     )
     page.append('<p class="note">版本：' + "；".join(f"{esc(NAMES.get(t, t))} {esc(v)}" for t, v in versions.items()) + "。</p>")
     page.append('<p class="note">Source Insight 與 VS Code C/C++ 擴充套件的 IntelliSense 沒有可自動化量測的介面，不在表內。</p></section></main>')
