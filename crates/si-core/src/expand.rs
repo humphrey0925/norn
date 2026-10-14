@@ -773,6 +773,13 @@ impl<'a> Engine<'a> {
     fn variants(&mut self, toks: &[T], pinned: &Choice, mut novel: impl FnMut(&[T]) -> bool) -> Vec<(Vec<T>, Choice)> {
         let mut results: Vec<(Vec<T>, Choice)> = Vec::new();
         let mut free: Vec<(Box<str>, usize)> = Vec::new();
+        // Every definition of every name met is read once before any two
+        // are read together: one name, one other definition, the rest as
+        // first read. (Else the outermost name, which turns slowest, had a
+        // definition never read: `DEFINE_EVENT`'s tracepoint one among
+        // five.)
+        let mut singles: std::collections::VecDeque<(Box<str>, usize)> = std::collections::VecDeque::new();
+        let mut combining = false;
         let mut choice = pinned.clone();
         let mut stale = 0;
         for _ in 0..self.max_variants * 2 {
@@ -791,6 +798,7 @@ impl<'a> Engine<'a> {
             SPENT[5].fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
             for m in self.met.drain(..) {
                 if !pinned.contains_key(&m.0) && !free.iter().any(|f| f.0 == m.0) {
+                    singles.extend((1..m.1).map(|i| (m.0.clone(), i)));
                     free.push(m);
                 }
             }
@@ -805,6 +813,16 @@ impl<'a> Engine<'a> {
             }
             if results.len() >= self.max_variants {
                 break;
+            }
+            if !combining {
+                if let Some((name, i)) = singles.pop_front() {
+                    choice = pinned.clone();
+                    choice.insert(name, i);
+                    continue;
+                }
+                // Then together, from the first reading again.
+                combining = true;
+                choice = pinned.clone();
             }
             // Next combination, the most recently met name turning fastest.
             let mut k = free.len();
