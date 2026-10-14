@@ -39,6 +39,8 @@ TRUTH = {"c-only": "truth.json", "git-c": "truth-git.json", "redis": "truth-redi
 WSL_TOOLS = ("ctags", "cscope", "gtags")
 ALL_TOOLS = ("si", "cbm", "clangd", *WSL_TOOLS)
 SKIP_DIRS = (".git", ".si", ".norn")
+# Where the Windows tools run, as the results say it.
+HOST = "Windows, NTFS" if os.name == "nt" else "Linux (WSL2), ext4"
 EDIT = b"\n/* bench edit */\n"
 
 
@@ -140,6 +142,13 @@ class Ctx:
         measured after an edit. Not timed."""
         if self._copied:
             return
+        if os.name != "nt":
+            # (On Linux, to compare there what runs on both.)
+            self.copy.mkdir(parents=True, exist_ok=True)
+            excludes = [x for d in SKIP_DIRS for x in ("--exclude", d)]
+            subprocess.run(["rsync", "-a", "--delete", *excludes, f"{self.corpus}/", f"{self.copy}/"], check=True)
+            self._copied = True
+            return
         r = subprocess.run(["robocopy", str(self.corpus), str(self.copy), "/MIR", "/XD", *SKIP_DIRS, "/MT:16",
                             "/NFL", "/NDL", "/NJH", "/NJS", "/NP", "/R:1", "/W:1"], capture_output=True, text=True)
         if r.returncode >= 8:
@@ -203,7 +212,7 @@ NO_TRUTH = {"available": False, "note": "no clang ground truth for this corpus"}
 def tool_si(ctx, res):
     si, out = run.SI, ctx.work / "si"
     res["version"] = exe_id(si)  # it has no --version: the binary is identified by its hash
-    res["platform"] = "Windows, NTFS, corpus in place"
+    res["platform"] = f"{HOST}, corpus in place"
     cmd = [si, "index", ctx.corpus, "--out", out, "--stores", "csr"]
     res["command"] = " ".join(str(c) for c in cmd)
     runs = []
@@ -270,7 +279,7 @@ def tool_si(ctx, res):
 
 def tool_cbm(ctx, res):
     res["version"] = {"reported": first_line([run.CBM, "--version"]), **exe_id(run.CBM)}
-    res["platform"] = "Windows, NTFS, copy of the corpus without .git and .norn"
+    res["platform"] = f"{HOST}, copy of the corpus without .git and .norn"
     ctx.ensure_copy()
     mode = ctx.args.cbm_mode
     res["command"] = f"codebase-memory-mcp cli --quiet --json index_repository --repo-path <copy> --mode {mode}"
@@ -335,7 +344,7 @@ def tool_cbm(ctx, res):
 def tool_clangd(ctx, res):
     exe = ctx.args.clangd
     res["version"] = first_line([exe, "--version"])
-    res["platform"] = "Windows, NTFS, copy of the corpus without .git and .norn"
+    res["platform"] = f"{HOST}, copy of the corpus without .git and .norn"
     ctx.ensure_copy()
     db = ctx.work / "clangd"
     index_dir = db / ".cache" / "clangd" / "index"
@@ -617,8 +626,9 @@ def main():
     ap.add_argument("--index-reps", type=int, default=1, help="cold indexes per tool; the median is reported")
     ap.add_argument("--incr-n", type=int, default=4, help="files `si bench-incr` re-extracts")
     ap.add_argument("--edit-file", help="file edited for the incremental runs (default: the .c file of median size)")
-    ap.add_argument("--si", default=str(locate(Path("target/release/norn.exe"))))
-    ap.add_argument("--cbm", default=str(locate(Path("tools/cbm/codebase-memory-mcp.exe"))))
+    exe = ".exe" if os.name == "nt" else ""
+    ap.add_argument("--si", default=str(locate(Path(f"target/release/norn{exe}"))))
+    ap.add_argument("--cbm", default=str(locate(Path(f"tools/cbm/codebase-memory-mcp{exe}"))))
     ap.add_argument("--cbm-mode", default="full", choices=["fast", "moderate", "full"])
     ap.add_argument("--clangd", default=shutil.which("clangd") or "C:/Program Files/LLVM/bin/clangd.exe")
     ap.add_argument("--clangd-flags", default="", help="extra compiler flags for every entry of the synthetic database")
