@@ -891,6 +891,26 @@ mod tests {
     }
 
     #[test]
+    fn a_loop_macro_does_not_lose_the_functions_after_it() {
+        let d = Dir::new("loops");
+        d.write(
+            "loops.h",
+            "#define for_each_bit(b, n) for ((b) = 0; (b) < (n); (b)++)\n#define for_each_cpu(c) for_each_bit(c, 64)\n#define skip_spaces(p) while (*(p) == ' ') ++(p)\n",
+        );
+        d.write(
+            "a.c",
+            "#include \"loops.h\"\nint g (int x) { return x; }\nint f (void)\n{\n\tint i, sum = 0;\n\tfor_each_cpu(i)\n\t\tsum += g (i);\n\treturn sum;\n}\nint h (char *p) { skip_spaces(p); return g (1); }\nint k (void) { return h (0); }\n",
+        );
+        let s = Session::open(&d.0, Options::default());
+        assert_eq!((functions(&s, "f"), functions(&s, "h"), functions(&s, "k")), (1, 1, 1));
+        let g = &s.graph;
+        let gid = (0..g.syms.len() as u32).find(|&x| g.sym_name(x) == "g" && g.syms[x as usize].kind == kind::FUNCTION).unwrap();
+        let mut callers: Vec<&str> = crate::callers_through_macros(g, gid).iter().map(|c| g.sym_name(c.caller)).collect();
+        callers.sort_unstable();
+        assert_eq!(callers, ["f", "h"]);
+    }
+
+    #[test]
     fn a_body_after_a_macro_with_no_type_before_it_is_the_function_it_makes() {
         let d = Dir::new("syscall");
         d.write(

@@ -149,6 +149,9 @@ pub struct Define {
     /// among the files.
     #[serde(default)]
     pub system: bool,
+    /// The first word of the body (`for`, or the macro it begins with).
+    #[serde(default)]
+    pub head: Vec<u8>,
 }
 
 impl Define {
@@ -170,6 +173,7 @@ impl Define {
             line: 0,
             local: false,
             system: false,
+            head: Vec::new(),
         }
     }
 }
@@ -435,6 +439,9 @@ pub struct MacroSets {
     transparent: FxHashMap<Vec<u8>, bool>,
     expanding: FxHashMap<Vec<u8>, bool>,
     kept: FxHashSet<Vec<u8>>,
+    /// Macros with arguments every definition of which is a loop: `for`
+    /// or `while` first, or another of these (`for_each_online_cpu(i)`).
+    loops: FxHashSet<Vec<u8>>,
     /// The macros only some files can see (see `scope`): name -> where it
     /// is defined, files numbered as in `ids`. A name not here is seen
     /// everywhere.
@@ -486,10 +493,16 @@ impl MacroSets {
         let mut by_name: FxHashMap<Vec<u8>, (bool, Vec<Option<Vec<Vec<u8>>>>)> = FxHashMap::default();
         // name -> (takes arguments, hides names, names its bodies refer to)
         let mut bodies: FxHashMap<Vec<u8>, (bool, bool, Vec<Vec<u8>>)> = FxHashMap::default();
+        // (name, first word of the body) of each macro with arguments.
+        let mut loop_heads: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for d in defines {
             // `#define inline` and the like: the keyword still matters to us.
             if is_keyword(&d.name) || d.undef || d.include || d.test {
                 continue;
+            }
+            // (One in a `.c` file is that file's.)
+            if d.function_like && !d.local {
+                loop_heads.push((d.name.clone(), d.head.clone()));
             }
             let b = bodies.entry(d.name.clone()).or_default();
             b.0 |= d.function_like;
@@ -542,7 +555,24 @@ impl MacroSets {
                 }
             }
         }
-        MacroSets { transparent: set, expanding, kept, ..MacroSets::default() }
+        // Loops: least fixed point over "begins with a loop".
+        let mut heads: FxHashMap<&[u8], Vec<&[u8]>> = FxHashMap::default();
+        for d in &loop_heads {
+            heads.entry(&d.0).or_default().push(&d.1);
+        }
+        let mut loops: FxHashSet<Vec<u8>> = FxHashSet::default();
+        loop {
+            let before = loops.len();
+            for (name, hs) in &heads {
+                if !loops.contains(*name) && hs.iter().all(|h| matches!(*h, b"for" | b"while") || loops.contains(*h)) {
+                    loops.insert(name.to_vec());
+                }
+            }
+            if loops.len() == before {
+                break;
+            }
+        }
+        MacroSets { transparent: set, expanding, kept, loops, ..MacroSets::default() }
     }
 
     /// The sets of every file's `#define`s (`per_file`, the files being
@@ -738,6 +768,7 @@ impl MacroSets {
             out.extend(b.iter().filter(|(k, v)| a.get(*k) != Some(v)).map(|(k, _)| k.clone()));
         }
         out.extend(self.kept.symmetric_difference(&other.kept).cloned());
+        out.extend(self.loops.symmetric_difference(&other.loops).cloned());
         // Seen from other files now.
         let seen_from = |sets: &MacroSets, name: &Vec<u8>| -> Option<Vec<u32>> {
             let defining = sets.scoped.get(name)?;
@@ -760,6 +791,7 @@ impl MacroSets {
         self.transparent.iter().fold(0, |acc, (k, v)| acc ^ h(k, *v as u64))
             ^ self.expanding.iter().fold(0, |acc, (k, v)| acc ^ h(k, 2 + *v as u64))
             ^ self.kept.iter().fold(0, |acc, k| acc ^ h(k, 4))
+            ^ self.loops.iter().fold(0, |acc, k| acc ^ h(k, 5))
             ^ self.scoped.iter().fold(0, |acc, (k, files)| {
                 let seen: u64 = files.iter().flat_map(|f| self.reach.get(f).into_iter().flatten()).fold(0, |a, &x| a.rotate_left(5) ^ x as u64);
                 acc ^ h(k, 6 ^ seen)
@@ -1028,6 +1060,31 @@ impl Nest {
 }
 
 /// `buf` is empty when only the report is wanted.
+/// What a macro's body is, when it is only the head of a loop: `for` (or
+/// `while`) for `for (...)`, the macro's name for `other_loop(...)`; else
+/// nothing. (`while (x) ++p` is a whole statement, no head.)
+fn first_word(body: &[u8]) -> Vec<u8> {
+    let text = crate::cond::value_of(body).unwrap_or_default();
+    let end = text.iter().position(|&b| !is_ident(b)).unwrap_or(text.len());
+    if end == 0 || !is_ident_start(text[0]) {
+        return Vec::new();
+    }
+    // The parentheses after the word, and nothing after them.
+    let rest = text[end..].trim_ascii_start();
+    if rest.first() != Some(&b'(') {
+        return Vec::new();
+    }
+    let mut depth = 0i32;
+    let close = rest.iter().position(|&b| {
+        depth += (b == b'(') as i32 - (b == b')') as i32;
+        depth == 0
+    });
+    match close {
+        Some(c) if rest[c + 1..].trim_ascii().is_empty() => text[..end].to_vec(),
+        _ => Vec::new(),
+    }
+}
+
 /// Is there nothing that could be a type before `at`: the start of the
 /// file, a `;` or `}`, past comments and preprocessor lines?
 fn typeless_before(s: &[u8], at: usize) -> bool {
@@ -1372,6 +1429,29 @@ impl<'a> Lexer<'a> {
         let here = self.here;
         let sets = self.transparent;
         let seen = |name: &[u8]| here.is_none_or(|f| sets.visible(name, f));
+        // A loop macro in a function (`for_each_online_cpu(i) sum += ...`):
+        // the parser, which does not know it, takes it for a call with no
+        // `;` after it, and loses the functions that follow. It is shown
+        // `while` in the place of the name; the arguments stay.
+        if e - a >= 5 && sets.loops.contains(&s[a..e]) && seen(&s[a..e]) && self.nest.braces.last().is_some_and(|b| b.0 == Brace::Block) {
+            let save = (self.c.i, self.c.line);
+            self.c.skip_space(true);
+            // (With something in the parentheses: `while ()` is no loop.)
+            let called = self.c.peek(0) == b'(' && {
+                self.c.i += 1;
+                self.c.skip_space(true);
+                self.c.peek(0) != b')'
+            };
+            (self.c.i, self.c.line) = save;
+            if called {
+                blank(&mut self.out.masked, a, e);
+                for (k, &b) in b"while".iter().enumerate() {
+                    self.put(a + k, b);
+                }
+                self.out.events.push(Event::Ref(Tok { start: a as u32, end: e as u32, line, call: true, member: false }));
+                return;
+            }
+        }
         if let Some(&function_like) = sets.expanding.get(&s[a..e]).filter(|_| seen(&s[a..e])) {
             self.site(Tok { start: a as u32, end: e as u32, line, call: false, member: false }, function_like, before);
         }
@@ -1806,6 +1886,7 @@ impl<'a> Lexer<'a> {
                 line: 0,
                 local: self.c_file,
                 system: false,
+                head: first_word(&s[body..end]),
             });
         }
         // A `.c` file's own macros stand in it alone, so they are not in
