@@ -5,7 +5,34 @@ import * as os from "os";
 import * as path from "path";
 import { runTests } from "@vscode/test-electron";
 
+/** `startup <folder>`: VS Code opening a folder of one's own, as it is
+ *  (its `.norn` included), Norn's server from this build set in a user
+ *  settings folder of the test's own, not in the folder. */
+async function startup(folder: string) {
+  const root = path.resolve(__dirname, "../../..");
+  const user = fs.mkdtempSync(path.join(os.tmpdir(), "norn-startup-"));
+  fs.mkdirSync(path.join(user, "User"), { recursive: true });
+  const server = path.join(root, "target", "release", process.platform === "win32" ? "norn.exe" : "norn");
+  fs.writeFileSync(path.join(user, "User", "settings.json"), JSON.stringify({ "norn.serverPath": server, "workbench.startupEditor": "none" }));
+  const t = Date.now();
+  console.log(`launched at ${t} ms since 1970`);
+  try {
+    await runTests({
+      extensionDevelopmentPath: path.resolve(__dirname, "../.."),
+      extensionTestsPath: path.resolve(__dirname, "./startup"),
+      // NORN_STARTUP_CPP: with the C/C++ extension too (see `cpp` below).
+      launchArgs: [folder, "--user-data-dir", user, ...(process.env.NORN_STARTUP_CPP ? ["--extensions-dir", path.resolve(__dirname, "../../.vscode-test/extensions-cpp")] : ["--disable-extensions"])],
+    });
+  } finally {
+    console.log(`VS Code ran ${((Date.now() - t) / 1000).toFixed(1)} s`);
+    fs.rmSync(user, { recursive: true, force: true });
+  }
+}
+
 async function main() {
+  if (process.argv[2] === "startup") {
+    return startup(path.resolve(process.argv[3]));
+  }
   const root = path.resolve(__dirname, "../../..");
   const corpus = path.join(root, "corpus", "c-only");
   // For pictures (`demo`), a folder with a name fit to be seen in the

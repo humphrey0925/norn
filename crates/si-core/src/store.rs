@@ -26,7 +26,10 @@ const FORMAT: u32 = 10;
 pub type Stamp = (u64, u64);
 
 pub fn stamp(path: &Path) -> Stamp {
-    let Ok(m) = std::fs::metadata(path) else { return (0, 0) };
+    std::fs::metadata(path).map_or((0, 0), |m| stamp_of(&m))
+}
+
+pub fn stamp_of(m: &std::fs::Metadata) -> Stamp {
     let modified = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
     (m.len(), modified.map_or(0, |d| d.as_nanos() as u64))
 }
@@ -111,6 +114,28 @@ impl Store {
                 let _ = std::fs::rename(&tmp, self.dir.join("manifest"));
             }
         }
+    }
+
+    /// The macro sets the saved files were extracted under, as they were
+    /// made from their `#define`s: written before the manifest that has
+    /// their digest, which vouches for them. Making them again from every
+    /// file's defines is most of what a start of a large tree costs.
+    pub fn save_sets(&self, sets: &crate::mask::MacroSets) {
+        self.prepare();
+        if let Ok(bytes) = bincode::serialize(&(FORMAT, sets.digest(), sets)) {
+            let tmp = self.dir.join("sets.tmp");
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, self.dir.join("sets"));
+            }
+        }
+    }
+
+    /// The saved macro sets, if they are the ones of digest `sets` once
+    /// given `conditions` (which are not saved with them).
+    pub fn load_sets(&self, sets: u64, conditions: &crate::cond::Conditions) -> Option<crate::mask::MacroSets> {
+        let (format, digest, saved): (u32, u64, crate::mask::MacroSets) = bincode::deserialize(&std::fs::read(self.dir.join("sets")).ok()?).ok()?;
+        let saved = saved.with_conditions(conditions.clone());
+        (format == FORMAT && digest == sets && saved.digest() == sets).then_some(saved)
     }
 
     /// The graph, with what it is the graph of (a digest the session

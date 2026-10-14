@@ -19,6 +19,22 @@ use std::path::{Path, PathBuf};
 /// Results sent for one request at most.
 const LIMIT: usize = 2000;
 
+/// With `NORN_TRACE` set to a file, what the server was asked and when
+/// (milliseconds since it started), and what each change of the index
+/// cost: to see what an editor does with it at start.
+fn trace(line: impl FnOnce() -> String) {
+    use std::sync::{Mutex, OnceLock};
+    static FILE: OnceLock<Option<(std::time::Instant, Mutex<std::fs::File>)>> = OnceLock::new();
+    let file = FILE.get_or_init(|| {
+        let path = std::env::var_os("NORN_TRACE")?;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        Some((std::time::Instant::now(), Mutex::new(file)))
+    });
+    if let Some((start, file)) = file {
+        let _ = writeln!(file.lock().unwrap(), "{:>8.0} {}", start.elapsed().as_secs_f64() * 1000.0, line());
+    }
+}
+
 fn read_message(input: &mut impl BufRead) -> Option<Value> {
     let mut length = 0usize;
     loop {
@@ -610,6 +626,7 @@ impl Server {
     }
 
     fn synced(&mut self, up: si_core::session::Update) -> Value {
+        trace(|| format!("  synced: {} added, {} removed, {} changed, {} parsed, {:.0} ms", up.added, up.removed, up.changed, up.extracted, up.extract_ms + up.link_ms));
         self.lines.clear();
         self.listing = [None, None];
         let mut v = self.scope();
@@ -625,7 +642,8 @@ impl Server {
 
     fn update(&mut self, paths: Vec<PathBuf>) {
         if !paths.is_empty() {
-            self.session.update(&paths);
+            let up = self.session.update(&paths);
+            trace(|| format!("  updated {} files: {} parsed, {:.0} ms", paths.len(), up.extracted, up.extract_ms + up.link_ms));
             self.lines.clear();
             self.listing = [None, None];
         }
@@ -765,7 +783,9 @@ impl Server {
             }
             "textDocument/didSave" => self.update(doc().into_iter().collect()),
             "workspace/didChangeWatchedFiles" => {
-                let paths = params["changes"].as_array().into_iter().flatten().filter_map(|c| c["uri"].as_str()).map(uri_to_path).collect();
+                let changes = params["changes"].as_array().into_iter().flatten();
+                trace(|| format!("  {}", changes.clone().take(5).map(|c| format!("{} {}", c["type"], c["uri"].as_str().unwrap_or(""))).collect::<Vec<_>>().join(", ")));
+                let paths = changes.filter_map(|c| c["uri"].as_str()).map(uri_to_path).collect();
                 self.update(paths);
             }
             _ => {}
@@ -828,8 +848,10 @@ pub fn run(
         });
     }
     let mut server: Option<Server> = None;
+    trace(|| format!("started at {} ms since 1970", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis())));
     let handle = |server: &mut Option<Server>, msg: Value, out: &mut std::io::Stdout| -> bool {
         let method = msg["method"].as_str().unwrap_or("").to_string();
+        trace(|| format!("{method}{}", if server.as_ref().is_some_and(|s| s.loading && changes(&method)) { " (waits for the index)" } else { "" }));
         let (id, params) = (msg.get("id").cloned(), &msg["params"]);
         if method == "initialize" {
             let from_client = params["rootUri"].as_str().map(uri_to_path).or(params["rootPath"].as_str().map(PathBuf::from));
@@ -901,6 +923,7 @@ pub fn run(
             }
             Event::Opened(opened) => {
                 let (mut session, up) = *opened;
+                trace(|| format!("index ready: {} read from the save, {} parsed, graph {}", up.loaded, up.extracted, if up.graph_kept { "kept" } else { "read or linked" }));
                 let Some(s) = &mut server else { continue };
                 if up.graph_kept {
                     session.adopt(&mut s.session);

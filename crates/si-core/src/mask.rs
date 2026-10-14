@@ -409,13 +409,14 @@ pub fn script(src: &[u8]) -> Script {
 ///   carried in the facts.
 ///
 /// Values: whether the macro takes arguments.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct MacroSets {
     transparent: FxHashMap<Vec<u8>, bool>,
     expanding: FxHashMap<Vec<u8>, bool>,
     kept: FxHashSet<Vec<u8>>,
     /// What the build is known to define: branches it never compiles are
-    /// skipped (see `cond`).
+    /// skipped (see `cond`). (Not saved: made anew from the settings.)
+    #[serde(skip)]
     conditions: Conditions,
 }
 

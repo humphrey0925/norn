@@ -229,37 +229,63 @@ impl Session {
             self.conditions = conditions;
             self.all_stale = true;
         }
-        let paths = self.out_of_date();
-        let mut up = self.update(&paths);
+        let (paths, listed) = self.out_of_date();
+        let mut up = self.update_listed(&paths, Some(&listed));
         up.extract_ms = ms(t) - up.link_ms;
         up
     }
 
     /// Files that are not as the index has them: new ones, ones that are
-    /// gone or out of scope, and ones whose content changed.
-    fn out_of_date(&mut self) -> Vec<PathBuf> {
-        let now = crate::scan_scope(&self.root, &self.scope);
-        let mut paths: Vec<PathBuf> = now.iter().filter(|p| self.files.binary_search(p).is_err()).cloned().collect();
-        let on_disk: FxHashSet<&PathBuf> = now.iter().collect();
+    /// gone or out of scope, and ones whose content changed; and of them,
+    /// those the walk of the tree found to be in the project.
+    fn out_of_date(&mut self) -> (Vec<PathBuf>, FxHashSet<PathBuf>) {
         let this = &*self;
+        // What a file as it was when indexed includes is in its facts: it
+        // is not read again to find out.
+        let known = |path: &Path, at: Stamp| -> Option<Vec<String>> {
+            let i = this.files.binary_search_by(|f| f.as_path().cmp(path)).ok()?;
+            let facts = &this.facts[i];
+            (this.stamps[i] == at).then(|| facts.includes.iter().map(|&n| facts.name(n as usize).to_string()).collect())
+        };
+        let now = crate::scan_scope_with(&this.root, &this.scope, &known);
+        // Both in order: what the walk saw of each indexed file (nothing,
+        // if it is gone), and the files that are new.
+        let mut seen: Vec<Option<Stamp>> = vec![None; this.files.len()];
+        let mut paths = Vec::new();
+        let mut j = 0;
+        for (path, at) in now {
+            while j < this.files.len() && this.files[j] < path {
+                j += 1;
+            }
+            if this.files.get(j) == Some(&path) {
+                seen[j] = Some(at);
+            } else {
+                paths.push(path);
+            }
+        }
+        let mut listed: FxHashSet<PathBuf> = paths.iter().cloned().collect();
         let stale: Vec<Option<bool>> = (0..this.files.len())
             .into_par_iter()
-            .map(|i| {
-                let path = &this.files[i];
-                if !on_disk.contains(path) {
-                    return Some(true); // gone
+            .map(|i| match seen[i] {
+                None => Some(true), // gone
+                Some(at) if at == this.stamps[i] => None,
+                // (The walk sees a link, the index what it leads to.)
+                Some(_) if stamp(&this.files[i]) == this.stamps[i] => None,
+                Some(_) => {
+                    // Touched: the content says whether it changed.
+                    let same = std::fs::read(&this.files[i]).is_ok_and(|src| xxhash_rust::xxh3::xxh3_64(&src) == this.facts[i].hash);
+                    Some(!same)
                 }
-                if stamp(path) == this.stamps[i] {
-                    return None;
-                }
-                // Touched: the content says whether it changed.
-                let same = std::fs::read(path).is_ok_and(|src| xxhash_rust::xxh3::xxh3_64(&src) == this.facts[i].hash);
-                Some(!same)
             })
             .collect();
         for (i, s) in stale.into_iter().enumerate() {
             match s {
-                Some(true) => paths.push(self.files[i].clone()),
+                Some(true) => {
+                    if seen[i].is_some() {
+                        listed.insert(self.files[i].clone());
+                    }
+                    paths.push(self.files[i].clone());
+                }
                 Some(false) => {
                     self.stamps[i] = stamp(&self.files[i]);
                     if let Some(store) = &self.store {
@@ -269,7 +295,7 @@ impl Session {
                 None => {}
             }
         }
-        paths
+        (paths, listed)
     }
 
     /// Like `open`, keeping every file's facts in `dir` between runs: what
@@ -298,7 +324,7 @@ impl Session {
             let loaded = session.files.len();
             // What the tree looks like now, against what was saved.
             session.store = Some(store);
-            let paths = session.out_of_date();
+            let (paths, listed) = session.out_of_date();
             profile("tree checked");
             // Nothing changed, and the graph that was saved is the graph
             // of these very facts: linking would only make it again.
@@ -318,7 +344,7 @@ impl Session {
                     return (session, up);
                 }
             }
-            let mut up = session.update(&paths);
+            let mut up = session.update_listed(&paths, Some(&listed));
             profile("linked");
             up.loaded = loaded;
             up.extract_ms = ms(t) - up.link_ms;
@@ -483,11 +509,13 @@ impl Session {
         }
         // Read by all threads, each between the files' bytes it has let go.
         crate::gather(&mut facts);
+        mark("gathered");
         // The facts were all extracted under these sets, or the save was
         // interrupted and cannot be trusted.
         // (The conditions are part of the sets: a save made under other
         // conditions does not match and is rebuilt.)
         let mut conditions = Session::conditions_now(root, &facts);
+        mark("conditions");
         if conditions.uses_source() {
             let paths: Vec<String> = files.iter().map(|p| crate::rel_path(root, p)).collect();
             let mut source = mask::source_of(&defines, &paths);
@@ -495,8 +523,17 @@ impl Session {
             if !source.is_empty() {
                 conditions.set_source(Some(std::sync::Arc::new(source)));
             }
+            mark("source");
         }
-        let sets = MacroSets::from_defines(defines.iter().flatten().cloned()).with_conditions(conditions.clone());
+        // Saved with the manifest; made again if not (a save from before
+        // they were).
+        let sets = store.load_sets(manifest.sets, &conditions).unwrap_or_else(|| {
+            let sets = MacroSets::from_defines(defines.iter().flatten().cloned()).with_conditions(conditions.clone());
+            if sets.digest() == manifest.sets {
+                store.save_sets(&sets);
+            }
+            sets
+        });
         mark("sets");
         if sets.digest() != manifest.sets {
             return None;
@@ -559,6 +596,7 @@ impl Session {
         if let Some(store) = &self.store {
             let files = self.files.iter().map(|p| crate::rel_path(&self.root, p)).collect();
             let verdicts = self.conditions.source().map(|s| s.verdicts().as_ref().clone()).unwrap_or_default();
+            store.save_sets(&self.sets);
             store.save_manifest(self.sets.digest(), files, verdicts);
         }
     }
@@ -589,6 +627,13 @@ impl Session {
     /// Bring the index up to date with what is on disk at `paths` (absolute,
     /// or relative to the root): files edited, created or deleted.
     pub fn update(&mut self, paths: &[PathBuf]) -> Update {
+        self.update_listed(paths, None)
+    }
+
+    /// The same, a walk of the tree having found which of `paths` are in
+    /// the project (`listed`): a file of another kind comes and goes with
+    /// the sources that include it.
+    fn update_listed(&mut self, paths: &[PathBuf], listed: Option<&FxHashSet<PathBuf>>) -> Update {
         let mut up = Update::default();
         let t = Instant::now();
         let mut touched: FxHashSet<PathBuf> = FxHashSet::default();
@@ -597,11 +642,12 @@ impl Session {
         for p in paths {
             let path = if p.is_absolute() { p.clone() } else { self.root.join(p) };
             // (A file of another kind is in the index when a source includes it.)
-            if !(is_source(&path) || self.files.binary_search(&path).is_ok()) || !touched.insert(path.clone()) {
+            let in_list = listed.map(|l| l.contains(&path));
+            if !(in_list == Some(true) || is_source(&path) || self.files.binary_search(&path).is_ok()) || !touched.insert(path.clone()) {
                 continue;
             }
             // A file out of the project's scope is as good as not there.
-            let there = path.is_file() && self.scope.contains(&crate::rel_path(&self.root, &path));
+            let there = in_list != Some(false) && path.is_file() && self.scope.contains(&crate::rel_path(&self.root, &path));
             match (self.files.binary_search(&path), there) {
                 (Ok(i), true) => {
                     let defines = Packed::of(&mask::defines(&std::fs::read(&path).unwrap_or_default(), &self.conditions));
@@ -827,6 +873,28 @@ mod tests {
         drop(s);
         let (s, up) = open(&d);
         assert_eq!((up.loaded, up.extracted, functions(&s, "fresh")), (3, 0, 1));
+    }
+
+    #[test]
+    fn a_file_included_by_name_is_found_again_without_reading_the_sources() {
+        let d = Dir::new("included");
+        let cache = d.0.join(".cache");
+        d.write("t.c", "#include \"rows.def\"\nint t (void) { return 0; }\n");
+        d.write("rows.def", "int row (void) { return 1; }\n");
+        d.write("other.def", "int not_included (void) { return 1; }\n");
+        let open = |d: &Dir| Session::open_cached(&d.0, Options::default(), cache.clone());
+        let (s, _) = open(&d);
+        assert_eq!((s.files(), functions(&s, "row"), functions(&s, "not_included")), (2, 1, 0));
+        drop(s);
+        // As it was: the includes come from what was saved.
+        let (s, up) = open(&d);
+        assert_eq!((up.loaded, up.extracted, s.files(), functions(&s, "row")), (2, 0, 2, 1));
+        drop(s);
+        // The source changed while nothing ran: read, and it includes another.
+        d.write("t.c", "#include \"other.def\"\nint t (void) { return 2; }\n");
+        let (s, up) = open(&d);
+        assert_eq!((up.removed, up.added, up.changed), (1, 1, 1), "rows.def, other.def, t.c");
+        assert_eq!((s.files(), functions(&s, "row"), functions(&s, "not_included")), (2, 0, 1));
     }
 
     #[test]
