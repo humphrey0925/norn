@@ -510,6 +510,8 @@ interface ConditionState {
   effective: { name: string; value: string | null; source: string }[];
   /** Where the build looks for headers, as far as a build description says. */
   includePaths?: string[];
+  /** The folders that hold indexed headers, absolute. */
+  headerDirs?: string[];
   /** Macros whose value the sources settle, and in how many files each is known. */
   fromSources?: { name: string; value: string; files: number }[];
   fromSourcesTotal?: number;
@@ -569,6 +571,68 @@ function writeCppProperties(root: string, state: ConditionState): "created" | "a
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, text);
   return !exists ? "created" : added ? "added" : "updated";
+}
+
+/** The conditions in force as the C/C++ extension takes them from a
+ *  configuration provider: the macros that are defined, and where headers
+ *  are (the build's include paths first, then every folder with one). */
+function cppConfiguration(root: string, state: ConditionState) {
+  const defines = state.effective.filter((e) => e.value !== null).map((e) => (e.value === "" ? e.name : `${e.name}=${e.value}`));
+  const fromBuild = (state.includePaths ?? []).map((p) => (/^([A-Za-z]:|\/)/.test(p) ? p : path.join(root, p)));
+  const includePath = [...new Set([...fromBuild, ...(state.headerDirs ?? [])])];
+  return { includePath, defines };
+}
+
+/** What the C/C++ extension was last given, and how often it asked (for
+ *  the tests: there is no asking it what it holds). */
+export const cppProbe = { asked: 0, defines: [] as string[], includePath: [] as string[] };
+
+/** Become a configuration provider of the C/C++ extension
+ *  (ms-vscode.cpptools), if it is here: its IntelliSense then asks SI for
+ *  each file's defines and include paths, and is told the moment the
+ *  conditions change. Nothing is written anywhere; the C/C++ extension
+ *  asks the user once whether SI may configure the folder. Returns how to
+ *  say the conditions changed, or undefined without the extension. */
+async function registerCppProvider(context: vscode.ExtensionContext, root: string, state: () => ConditionState): Promise<(() => void) | undefined> {
+  const cpptools = vscode.extensions.getExtension("ms-vscode.cpptools");
+  if (!cpptools) {
+    return undefined;
+  }
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const exported: any = cpptools.isActive ? cpptools.exports : await cpptools.activate();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const api: any = typeof exported?.getApi === "function" ? exported.getApi(6) : exported;
+    if (typeof api?.registerCustomConfigurationProvider !== "function") {
+      return undefined;
+    }
+    const inside = (uri: vscode.Uri) => uri.scheme === "file" && !path.relative(root, uri.fsPath).startsWith("..");
+    const provider = {
+      name: "SI Code Index",
+      extensionId: context.extension.id,
+      canProvideConfiguration: async (uri: vscode.Uri) => !!state().active && inside(uri),
+      provideConfigurations: async (uris: vscode.Uri[]) => {
+        const configuration = cppConfiguration(root, state());
+        Object.assign(cppProbe, { asked: cppProbe.asked + 1, ...configuration });
+        return uris.filter(inside).map((uri) => ({ uri, configuration }));
+      },
+      canProvideBrowseConfiguration: async () => !!state().active,
+      provideBrowseConfiguration: async () => ({ browsePath: [root] }),
+      canProvideBrowseConfigurationsPerFolder: async () => false,
+      provideFolderBrowseConfiguration: async () => null,
+      dispose: () => undefined,
+    };
+    api.registerCustomConfigurationProvider(provider);
+    api.notifyReady?.(provider);
+    context.subscriptions.push({ dispose: () => api.dispose?.() });
+    return () => {
+      api.didChangeCustomConfiguration?.(provider);
+      api.didChangeCustomBrowseConfiguration?.(provider);
+    };
+  } catch (e) {
+    console.warn(`SI: could not register as a configuration provider of the C/C++ extension: ${e instanceof Error ? e.message : e}`);
+    return undefined;
+  }
 }
 
 /** One row of the Conditions view. */
@@ -1383,12 +1447,17 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
     }
   }
   let offeredCpp = false;
+  // Set once SI is a configuration provider of the C/C++ extension:
+  // tells it the conditions changed.
+  let cppChanged: (() => void) | undefined;
   const conditions = new ConditionsTree(afterSync, busy, (s) => {
     toCpp(s);
+    cppChanged?.();
     // Conditions in use and the C/C++ extension here: offer, once, to keep it in step.
     const setting = vscode.workspace.getConfiguration("si").inspect<boolean>("conditions.updateCppProperties");
     const undecided = setting?.workspaceValue === undefined && setting?.globalValue === undefined && setting?.workspaceFolderValue === undefined;
-    if (s.active && s.effective.length && undecided && !offeredCpp && vscode.extensions.getExtension("ms-vscode.cpptools")) {
+    // (As a configuration provider SI already gives it them, with nothing written.)
+    if (s.active && s.effective.length && undecided && !offeredCpp && !cppChanged && vscode.extensions.getExtension("ms-vscode.cpptools")) {
       offeredCpp = true;
       void vscode.window
         .showInformationMessage(`Also give the C/C++ extension these defines? SI keeps a configuration "${CPP_CONFIGURATION}" in c_cpp_properties.json in step with the one in force here.`, "Yes", "No")
@@ -1424,6 +1493,15 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
     }
   });
   conditionsView = vscode.window.createTreeView("si.conditions", { treeDataProvider: conditions });
+  {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (root) {
+      void registerCppProvider(context, root, () => conditions.state).then((changed) => {
+        cppChanged = changed;
+        changed?.();
+      });
+    }
+  }
   const validName = (v: string) => (/^[A-Za-z_][A-Za-z0-9_]*(\s*=.*)?$/.test(v.trim()) ? undefined : "A macro name, optionally followed by =value");
   async function sync() {
     const r = await busy("si.scope", "syncing", () => ask<Synced>("si/sync", {}));
@@ -1771,6 +1849,21 @@ SI ${version()} · server: ${serverPath() === bundledServer() ? "built in" : ser
       }
       await start(true);
     }),
+    // The conditions written by hand (`.si/config.json`), or the build's
+    // own description changed in its tool: taken up without being asked,
+    // a moment after the last write.
+    (() => {
+      const watcher = vscode.workspace.createFileSystemWatcher("**/{.si/config.json,.cproject,*.uvprojx,*.uvproj,*.ewp,*.vcxproj,compile_commands.json,compile_flags.txt,platformio.ini,c_cpp_properties.json}");
+      let soon: NodeJS.Timeout | undefined;
+      const changed = () => {
+        clearTimeout(soon);
+        soon = setTimeout(() => void sync(), 700);
+      };
+      watcher.onDidChange(changed);
+      watcher.onDidCreate(changed);
+      watcher.onDidDelete(changed);
+      return watcher;
+    })(),
     vscode.workspace.onDidChangeConfiguration((e) => {
       // A corrected path should take effect without reloading the window.
       if (e.affectsConfiguration("si.fileSymbols")) {

@@ -62,7 +62,15 @@ Source-Insight-style views for C in VS Code, backed by the `si` index.
     header of `#define` lines or a Kconfig `.config`, and names with a
     prefix, or all names, can be assumed not defined unless the build or
     the sources define them.
-  - The set in force can be passed on to VS Code's C/C++ extension
+  - VS Code's C/C++ extension is given the set in force as it changes:
+    SI is a *configuration provider* for it, so IntelliSense takes each
+    file's defines (and the folders that hold headers) from SI, and is
+    told the moment a macro is added, a set is switched, or
+    `.si/config.json` or the build's own description is edited. The C/C++
+    extension asks once whether SI may configure the folder (or set
+    `"C_Cpp.default.configurationProvider": "humphrey0925.si-code-index"`).
+    Nothing is written for this.
+  - Without that, the set in force can be passed on to VS Code's C/C++ extension
     (`si.conditions.updateCppProperties`, or "Write Compile Conditions to
     the C/C++ Extension" in the view's menu): a configuration named `SI`
     in `.vscode/c_cpp_properties.json` gets its defines and, from a

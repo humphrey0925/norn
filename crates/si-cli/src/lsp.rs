@@ -589,6 +589,7 @@ impl Server {
                 "fromSources": from_sources, "fromSourcesTotal": all.len(), "files": self.session.files(),
                 "sourceDefines": project.current().source_defines != Some(false),
                 "effective": effective, "includePaths": cond::include_paths(&project.current(), &self.root),
+                "headerDirs": self.session.header_dirs().iter().take(4000).map(|d| d.to_string_lossy().into_owned()).collect::<Vec<_>>(),
                 "known": self.session.conditions_known() })
     }
 

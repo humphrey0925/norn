@@ -399,6 +399,20 @@ impl Session {
         self.files.len()
     }
 
+    /// The folders that hold indexed headers, as absolute paths: where an
+    /// `#include` can find something, for whoever has no build to ask.
+    pub fn header_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for file in self.files.iter().filter(|f| f.extension().is_some_and(|x| x == "h")) {
+            if let Some(dir) = file.parent().filter(|d| dirs.last().map(PathBuf::as_path) != Some(*d)) {
+                dirs.push(dir.to_path_buf());
+            }
+        }
+        dirs.sort();
+        dirs.dedup();
+        dirs
+    }
+
     /// Bring the index up to date with what is on disk at `paths` (absolute,
     /// or relative to the root): files edited, created or deleted.
     pub fn update(&mut self, paths: &[PathBuf]) -> Update {
