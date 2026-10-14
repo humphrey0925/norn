@@ -1412,6 +1412,10 @@ fn expand_file(
     for m in made {
         for (n, kind, flags) in m.found.decls {
             let name = names.id(&mut out, &n);
+            // Made where it may not be compiled (`_PCI_NOP_ALL(read, *)` in
+            // `#else /* CONFIG_PCI is not enabled */`): as one written there.
+            let undecided = kind == kind::FUNCTION && f.undecided.iter().any(|&(a, b, _)| a <= m.line && m.line <= b);
+            let flags = flags | if undecided { flag::CONDITIONAL } else { 0 };
             let def = Def { name, line: m.line, end_line: m.line, kind, flags };
             if m.first && seen_defs.insert(key(&def)) {
                 made_here.insert((name, m.line), out.defs.len() as u32);

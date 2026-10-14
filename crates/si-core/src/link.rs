@@ -154,9 +154,12 @@ impl<'a> Includes<'a> {
         // their name (`arch/x86/include/`), before the others
         // (`tools/virtio/`).
         let include_folder = |id: u32| root(id).rsplit('/').next().is_some_and(|last| last == "include");
+        // And of those the least deep: `arch/x86/include/` before
+        // `tools/arch/x86/include/`, a copy kept for another program.
+        let shallow = |id: u32| if above(id).is_none() { -(root(id).split('/').filter(|s| !s.is_empty()).count() as i64) } else { 0 };
         let shared = |id: u32| {
             let other = dir_of(paths[id as usize]);
-            (above(id), include_folder(id), dir.split('/').zip(other.split('/')).take_while(|(a, b)| a == b).count())
+            (above(id), include_folder(id), shallow(id), dir.split('/').zip(other.split('/')).take_while(|(a, b)| a == b).count())
         };
         match cands.iter().map(|&c| shared(c)).max() {
             Some(best) => {
