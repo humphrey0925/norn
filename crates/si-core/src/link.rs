@@ -272,9 +272,11 @@ fn in_sight(
         let decl = |c: &u32| syms[*c as usize].flags & flag::DECL != 0;
         if out.iter().any(maybe) && out.iter().all(|c| maybe(c) || decl(c)) {
             let n = out.len();
+            // (Under the same condition, often: `drivers/base/core.c` has
+            // `_dev_info` in `#ifdef CONFIG_PRINTK` too.)
             for &c in cands.iter().filter(external) {
                 let s = &syms[c as usize];
-                if s.flags & (flag::CONDITIONAL | flag::DECL) == 0 && !out[..n].contains(&c) {
+                if s.flags & flag::DECL == 0 && !out[..n].contains(&c) {
                     out.push(c);
                 }
             }
