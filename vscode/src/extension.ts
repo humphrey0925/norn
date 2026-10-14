@@ -1710,6 +1710,12 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
     follow(vscode.window.activeTextEditor, true);
   }
 
+  // The views start unlocked, and say so: the window keeps a context key
+  // when only the extension starts again (after an update, say), and a
+  // view left locked then showed the lock of a view that was not.
+  for (const key of ["norn.relationLocked", "norn.contextLocked"]) {
+    void vscode.commands.executeCommand("setContext", key, false);
+  }
   const lock = (key: string, view: { locked: boolean }, on: boolean) => {
     view.locked = on;
     void vscode.commands.executeCommand("setContext", key, on);
