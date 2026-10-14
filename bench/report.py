@@ -164,6 +164,10 @@ def corpus_section(d, remarks):
             a = get(tools, t, "accuracy") or {}
             dfn, calls = a.get("definitions") or {}, a.get("calls") or {}
             sampled = "sampled" in str(dfn.get("note", "")) or t == "clangd"
+            if a.get("available") is False:
+                # It has calls; they were not scored on this corpus.
+                rows.append(row(t, [NAMES[t], '<span class="why">這個語料上沒有評分</span>', "", "", "", "", ""]))
+                continue
             ind = a.get("indirect_calls_by_member") or {}
             rows.append(
                 row(
