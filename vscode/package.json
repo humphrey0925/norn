@@ -554,7 +554,8 @@
     "vscode:prepublish": "npm run compile",
     "watch": "tsc -watch -p ./",
     "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license -o ../out/norn.vsix",
-    "test": "npm run compile && node ./out/test/runTest.js"
+    "test": "npm run compile && node ./out/test/runTest.js",
+    "test:package": "npm run compile && npm run package && node ./out/test/package.js && node ./out/test/runTest.js packaged"
   },
   "dependencies": {
     "@vscode/codicons": "^0.0.36",

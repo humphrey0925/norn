@@ -4,6 +4,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { runTests } from "@vscode/test-electron";
+import { extract } from "./zip";
 
 /** `startup <folder>`: VS Code opening a folder of one's own, as it is
  *  (its `.norn` included), Norn's server from this build set in a user
@@ -34,6 +35,15 @@ async function main() {
     return startup(path.resolve(process.argv[3]));
   }
   const root = path.resolve(__dirname, "../../..");
+  // `packaged [file.vsix]`: the extension as its package installs it, its
+  // own server included (see packaged.ts).
+  const packaged = process.argv[2] === "packaged";
+  let extension = path.resolve(__dirname, "../..");
+  if (packaged) {
+    const unpacked = fs.mkdtempSync(path.join(os.tmpdir(), "norn-vsix-"));
+    extract(path.resolve(process.argv[3] ?? path.join(root, "out", "norn.vsix")), unpacked);
+    extension = path.join(unpacked, "extension");
+  }
   const corpus = path.join(root, "corpus", "c-only");
   // For pictures (`demo`), a folder with a name fit to be seen in the
   // window's title, and the whole of two directories in it.
@@ -59,15 +69,18 @@ async function main() {
   // extensions folder: `node out/test/runTest.js cpp`), Norn its provider.
   const cpp = process.argv[2] === "cpp";
   const withCpp = cpp ? { "C_Cpp.default.configurationProvider": "humphrey0925.norn" } : {};
-  fs.writeFileSync(path.join(work, ".vscode", "settings.json"), JSON.stringify({ ...withCpp, ...(process.env.SI_TEST_BUNDLED ? {} : { "norn.serverPath": `"${server}"` }), ...(process.env.SI_DEMO_THEME ? { "workbench.colorTheme": process.env.SI_DEMO_THEME } : {}) }));
+  fs.writeFileSync(path.join(work, ".vscode", "settings.json"), JSON.stringify({ ...withCpp, ...(process.env.SI_TEST_BUNDLED || packaged ? {} : { "norn.serverPath": `"${server}"` }), ...(process.env.SI_DEMO_THEME ? { "workbench.colorTheme": process.env.SI_DEMO_THEME } : {}) }));
   try {
     await runTests({
-      extensionDevelopmentPath: path.resolve(__dirname, "../.."),
-      extensionTestsPath: path.resolve(__dirname, process.argv[2] === "demo" ? "./demo" : cpp ? "./cpp" : "./suite"),
+      extensionDevelopmentPath: extension,
+      extensionTestsPath: path.resolve(__dirname, process.argv[2] === "demo" ? "./demo" : cpp ? "./cpp" : packaged ? "./packaged" : "./suite"),
       launchArgs: cpp ? [work, "--extensions-dir", path.resolve(__dirname, "../../.vscode-test/extensions-cpp")] : [work, "--disable-extensions"],
     });
   } finally {
     fs.rmSync(made, { recursive: true, force: true });
+    if (packaged) {
+      fs.rmSync(path.dirname(extension), { recursive: true, force: true });
+    }
   }
 }
 
