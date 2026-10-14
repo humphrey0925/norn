@@ -47,6 +47,8 @@ export function check(vsix: string): string[] {
 
   // The server it starts.
   need("bin/win32-x64/norn.exe", "the built-in server");
+  // What others made that it includes, with their licenses.
+  need("THIRD_PARTY_NOTICES.txt", "the third-party notices");
 
   // The icon font the views link, and what its stylesheet loads in turn.
   const css = "node_modules/@vscode/codicons/dist/codicon.css";

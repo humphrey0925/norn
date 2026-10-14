@@ -1,0 +1,143 @@
+// THIRD_PARTY_NOTICES.txt: what the release ships of other people's work,
+// each with its license as its authors wrote it.
+//   node release/notices.js [out file]   (default: out/THIRD_PARTY_NOTICES.txt)
+// The server's crates are those linked into it (normal dependencies of the
+// workspace, not build tools or tests); the extension's packages, its
+// dependencies in package.json and theirs. A package whose own files
+// carry no license text is listed with its license's name and where it
+// comes from, and counted: the script says how many.
+"use strict";
+const { execFileSync } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+
+const root = path.resolve(__dirname, "..");
+const out = path.resolve(process.argv[2] ?? path.join(root, "out", "THIRD_PARTY_NOTICES.txt"));
+
+/** The license, notice and copying files a package carries. */
+function licenseTexts(dir) {
+  let names;
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  return names
+    .filter((n) => /^(licen[cs]e|copying|notice|unlicense|copyright)([-._].*)?$/i.test(n))
+    .filter((n) => fs.statSync(path.join(dir, n)).isFile())
+    .sort()
+    .map((n) => ({ name: n, text: fs.readFileSync(path.join(dir, n), "utf8").replace(/^﻿/, "").trimEnd() }));
+}
+
+// --- The server: crates linked into norn.exe --------------------------------
+// (For the platform the release is for: another's crates are not linked.)
+const target = process.env.NORN_TARGET ?? "x86_64-pc-windows-msvc";
+const meta = JSON.parse(execFileSync("cargo", ["metadata", "--format-version", "1", "--locked", "--filter-platform", target], { cwd: root, maxBuffer: 1 << 28 }).toString());
+const nodes = new Map(meta.resolve.nodes.map((n) => [n.id, n]));
+const packages = new Map(meta.packages.map((p) => [p.id, p]));
+const members = new Set(meta.workspace_members);
+const linked = new Set();
+const stack = [...members];
+while (stack.length) {
+  const id = stack.pop();
+  if (linked.has(id)) continue;
+  linked.add(id);
+  for (const dep of nodes.get(id).deps) {
+    // Normal dependencies only: a build script's are not in the program.
+    if (dep.dep_kinds.some((k) => k.kind === null)) stack.push(dep.pkg);
+  }
+}
+const crates = [...linked]
+  .filter((id) => !members.has(id))
+  .map((id) => packages.get(id))
+  .map((p) => ({
+    name: p.name,
+    version: p.version,
+    license: p.license ?? (p.license_file ? `see ${p.license_file}` : "not stated"),
+    from: p.repository ?? `https://crates.io/crates/${p.name}`,
+    texts: licenseTexts(path.dirname(p.manifest_path)),
+  }));
+
+// --- The extension: packages bundled into its code, and the icon font ------
+const npm = new Map();
+function walk(name, from) {
+  let dir = from;
+  let file;
+  for (;;) {
+    const candidate = path.join(dir, "node_modules", name, "package.json");
+    if (fs.existsSync(candidate)) {
+      file = candidate;
+      break;
+    }
+    const up = path.dirname(dir);
+    if (up === dir) throw new Error(`${name} is not installed (npm install in vscode/)`);
+    dir = up;
+  }
+  const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+  const key = `${pkg.name}@${pkg.version}`;
+  if (npm.has(key)) return;
+  const repo = typeof pkg.repository === "string" ? pkg.repository : pkg.repository?.url;
+  npm.set(key, {
+    name: pkg.name,
+    version: pkg.version,
+    license: typeof pkg.license === "string" ? pkg.license : JSON.stringify(pkg.license ?? pkg.licenses ?? "not stated"),
+    from: (repo ?? `https://www.npmjs.com/package/${pkg.name}`).replace(/^git\+/, ""),
+    texts: licenseTexts(path.dirname(file)),
+  });
+  for (const dep of Object.keys(pkg.dependencies ?? {})) walk(dep, path.dirname(file));
+}
+const extension = JSON.parse(fs.readFileSync(path.join(root, "vscode", "package.json"), "utf8"));
+for (const dep of Object.keys(extension.dependencies ?? {})) walk(dep, path.join(root, "vscode"));
+
+// A crate that carries no license file of its own has the one a crate from
+// the same repository carries (tree-sitter's is in tree-sitter-language).
+for (const c of crates.filter((c) => !c.texts.length)) {
+  const sibling = crates.find((o) => o !== c && o.texts.length && o.from === c.from && o.license === c.license);
+  if (sibling) {
+    c.texts = sibling.texts.map((t) => ({ name: `${t.name} (from ${sibling.name} ${sibling.version}, same repository)`, text: t.text }));
+  }
+}
+
+// --- Written out ------------------------------------------------------------
+const byName = (a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version);
+const rule = "=".repeat(78);
+const lines = [
+  "THIRD-PARTY NOTICES",
+  "",
+  "Norn includes the following software of others. Each is listed with the",
+  "license it is distributed under and the license text its authors ship with",
+  "it. Where a package is offered under a choice of licenses (\"MIT OR",
+  "Apache-2.0\"), every license file it carries is reproduced.",
+  "",
+  `Generated by release/notices.js for Norn ${extension.version}.`,
+  "",
+];
+const missing = [];
+const given = new Map();
+for (const [title, list] of [
+  ["Part 1. The Norn server (norn.exe): Rust crates linked into it", crates],
+  ["Part 2. The VS Code extension: npm packages bundled into it", [...npm.values()]],
+]) {
+  list.sort(byName);
+  lines.push(rule, title, `${list.length} packages`, rule, "");
+  for (const p of list) {
+    lines.push("-".repeat(78), `${p.name} ${p.version}`, `License: ${p.license}`, `Source: ${p.from}`, "");
+    if (!p.texts.length) {
+      missing.push(`${p.name} ${p.version} (${p.license})`);
+      lines.push(`(The package carries no license file. It is distributed under ${p.license};`, " the text is at the source above.)", "");
+    }
+    for (const t of p.texts) {
+      // A text word for word the same as one already given is referred to.
+      const first = given.get(t.text);
+      if (first) {
+        lines.push(`--- ${t.name} ---`, `(The same text as ${first} above.)`, "");
+      } else {
+        given.set(t.text, `${t.name} of ${p.name} ${p.version}`);
+        lines.push(`--- ${t.name} ---`, t.text, "");
+      }
+    }
+  }
+}
+fs.mkdirSync(path.dirname(out), { recursive: true });
+fs.writeFileSync(out, lines.join("\n") + "\n");
+console.log(`${path.relative(root, out)}: ${crates.length} crates, ${npm.size} npm packages; ${missing.length} without a license file${missing.length ? ":\n  " + missing.join("\n  ") : ""}`);
