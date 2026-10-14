@@ -149,7 +149,11 @@ def corpus_section(d, remarks):
         mode = esc(mode_zh(q.get("mode", "")))
         if t == "si" and one:
             mode += f"；每次查詢啟動一個行程時 {ms(one)}"
-        rows.append(row(t, [NAMES[t], ms(get(q, "find", "p50_ms")), ms(get(q, "callers", "p50_ms")), f'<span class="dim">{mode}</span>']))
+        callers = ms(get(q, "callers", "p50_ms"))
+        if t == "gtags" and get(q, "callers", "p50_ms"):
+            # global -rx answers an easier question: every place the name is written.
+            callers += '<br><span class="why">只列出名稱出現處，不分是誰呼叫，與其他工具不是同一題</span>'
+        rows.append(row(t, [NAMES[t], ms(get(q, "find", "p50_ms")), callers, f'<span class="dim">{mode}</span>']))
     out.append("<h3>查詢延遲（中位數）</h3>")
     out.append(table(["工具", "找定義", "誰呼叫它", "量測方式"], rows))
 
