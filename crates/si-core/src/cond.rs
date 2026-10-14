@@ -74,6 +74,13 @@ pub struct Settings {
     /// known outside the file that defines them.
     #[serde(default, rename = "sourceDefines", skip_serializing_if = "Option::is_none")]
     pub source_defines: Option<bool>,
+    /// What a branch on a macro nothing here settles is taken to be:
+    /// `"both"` (the default, as Source Insight does), possibly compiled,
+    /// both branches indexed and marked as only possibly compiled; `"off"`,
+    /// not compiled, the macro taken as not defined (as a compiler takes a
+    /// name it has no definition of).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undecided: Option<String>,
 }
 
 impl Settings {
@@ -565,6 +572,8 @@ pub struct Conditions {
     source: Option<std::sync::Arc<Source>>,
     /// Set when the settings say not to use those.
     no_source: bool,
+    /// A name nothing settles is taken as not defined (`undecided: off`).
+    undecided_off: bool,
 }
 
 /// The macros whose value the sources settle, and in which files each is
@@ -805,6 +814,7 @@ impl Conditions {
         c.assume_undefined = prefixes().map(|p| p.as_bytes().to_vec()).collect();
         c.assume_all = settings.assume_undefined.iter().any(|p| p == "*");
         c.no_source = settings.source_defines == Some(false);
+        c.undecided_off = settings.undecided.as_deref() == Some("off");
         c
     }
 
@@ -884,7 +894,7 @@ impl Conditions {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.defined.is_empty() && self.undefined.is_empty() && self.assume_undefined.is_empty() && !self.assume_all
+        self.defined.is_empty() && self.undefined.is_empty() && self.assume_undefined.is_empty() && !self.assume_all && !self.undecided_off
     }
 
     /// Do these conditions assume anything about names they do not list?
@@ -946,7 +956,7 @@ impl Conditions {
         let u = self.undefined.iter().fold(0, |acc, k| acc ^ h(k, 12));
         let a = self.assume_undefined.iter().fold(self.assume_all as u64, |acc, k| acc ^ h(k, 13));
         let s = self.in_source.iter().fold(0, |acc, k| acc ^ h(k, 14));
-        let c = self.source.as_ref().map_or(0, |s| s.digest()) ^ self.no_source as u64;
+        let c = self.source.as_ref().map_or(0, |s| s.digest()) ^ self.no_source as u64 ^ (self.undecided_off as u64) << 1;
         d ^ u ^ a ^ s ^ c
     }
 
@@ -955,7 +965,7 @@ impl Conditions {
             Tri::True
         } else if self.undefined.contains(name) {
             Tri::False
-        } else if !self.in_source.contains(name) && (self.assume_all || self.assume_undefined.iter().any(|p| name.starts_with(p))) {
+        } else if self.undecided_off || !self.in_source.contains(name) && (self.assume_all || self.assume_undefined.iter().any(|p| name.starts_with(p))) {
             Tri::False
         } else {
             Tri::Unknown
