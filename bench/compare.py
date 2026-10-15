@@ -341,7 +341,8 @@ def tool_cbm(ctx, res):
     if not ctx.truth:
         res["accuracy"] = NO_TRUTH
         return
-    score = check_truth.score(ctx.truth, run.CBM_CACHE / f"{project}.db", ctx.corpus, cbm=True)[0]
+    # (Its functions are named without their classes, as cscope's are.)
+    score = check_truth.score(ctx.truth, run.CBM_CACHE / f"{project}.db", ctx.corpus, cbm=True, short=True)[0]
     res["accuracy"] = {**accuracy(ctx, score), "indirect_calls_by_member": score["indirect_calls_by_member"]}
 
 
@@ -432,7 +433,8 @@ def tool_clangd(ctx, res):
 
 
 def clangd_accuracy(ctx, client, deadline):
-    t = check_truth.Truth(ctx.truth)
+    # (Its call hierarchy names a method without its class, as cscope does.)
+    t = check_truth.Truth(ctx.truth, short=True)
     n = ctx.args.clangd_sample
     text = {}
 
@@ -442,7 +444,7 @@ def clangd_accuracy(ctx, client, deadline):
         return line <= len(text[file]) and name in text[file][line - 1]
 
     pool = [(file, name, line) for name, file, line in t.defs
-            if file.endswith(".c") and (ctx.corpus / file).is_file() and written(file, line, name)]
+            if file.endswith(UNIT_SUFFIXES) and (ctx.corpus / file).is_file() and written(file, line, name)]
     functions = compare_clangd.sample(pool, n)
     t0 = time.perf_counter()
     rows, unresolved, found_defs = compare_clangd.call_edges(client, functions, deadline)
@@ -454,13 +456,13 @@ def clangd_accuracy(ctx, client, deadline):
     rows = [r for r in rows if r[5] in files]
     (ctx.work / "clangd-edges.json").write_text(json.dumps({"functions": functions, "rows": rows, "unresolved": unresolved}),
                                                 encoding="utf-8")
-    score, detail = check_truth.score(ctx.truth, None, ctx.corpus, loaded=(files, {}, rows, []), callers=callers)
+    score, detail = check_truth.score(ctx.truth, None, ctx.corpus, loaded=(files, {}, rows, []), callers=callers, short=True)
     # clangd keeps one symbol for all external functions of one name (every
     # program's cmd_main, say) and answers with the calls of all of them.
     times_defined = collections.Counter(name for name, _file, _line in t.defs)
     merged = sum(times_defined[k[1]] > 1 for k in detail["phantom"])
     how = (f"sampled: the {len(functions)} functions of lowest SHA-1(file, name) among the {len(pool)} that clang saw "
-           "defined in a .c file with the name written on the line")
+           "defined in a source file (not a header) with the name written on the line")
     return {
         "definitions": {"truth": len(functions), "found": len(found_defs), "recall": len(found_defs) / max(1, len(functions)),
                         "precision": None,
