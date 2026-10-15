@@ -727,6 +727,9 @@ struct View<'a> {
     /// ways down to them (exponentially many). A name being worked out is
     /// in it with no value, so one whose value comes back to it has none.
     memo: &'a std::cell::RefCell<FxHashMap<Vec<u8>, Option<Int>>>,
+    /// Where asked: every name looked up, for the condition comes out the
+    /// same again wherever these are as they were.
+    noted: Option<&'a std::cell::RefCell<Vec<Vec<u8>>>>,
 }
 
 impl View<'_> {
@@ -736,7 +739,14 @@ impl View<'_> {
         self.c.source.as_ref()?.get(file, line, name)
     }
 
+    fn note(&self, name: &[u8]) {
+        if let Some(noted) = self.noted {
+            noted.borrow_mut().push(name.to_vec());
+        }
+    }
+
     fn defined(&self, name: &[u8]) -> Tri {
+        self.note(name);
         match self.local.get(name) {
             Some(Some(Some(_))) => Tri::True,
             Some(Some(None)) => Tri::False,
@@ -749,6 +759,7 @@ impl View<'_> {
     }
 
     fn text(&self, name: &[u8]) -> Option<Option<&[u8]>> {
+        self.note(name);
         match self.local.get(name) {
             Some(Some(v)) => Some(v.as_deref()),
             Some(None) => None,
@@ -773,6 +784,7 @@ impl View<'_> {
                     return *known;
                 }
                 self.memo.borrow_mut().insert(name.to_vec(), None);
+                COUNTS.with(|c| c.set((c.get().0 + 1, c.get().1)));
                 // Read as an `#if` would read it, its names in turn.
                 let toks = tokens(v);
                 let inner = View { depth: depth + 1, ..*self };
@@ -1024,9 +1036,15 @@ impl Conditions {
     /// The same at a place in a file, after what the file said of macros
     /// above it. `at` is the file (as the [`Source`] numbers it) and line.
     pub fn eval_in(&self, local: &Local, at: Option<(u32, u32)>, expr: &[u8]) -> Tri {
+        self.eval_noting(local, at, expr, None)
+    }
+
+    /// The same, noting in `noted` every name the condition comes to
+    /// depend on: all it was worked out from, besides the settings.
+    pub fn eval_noting(&self, local: &Local, at: Option<(u32, u32)>, expr: &[u8], noted: Option<&std::cell::RefCell<Vec<Vec<u8>>>>) -> Tri {
         let toks = tokens(expr);
         let memo = Default::default();
-        let mut p = Parser { c: View { c: self, local, at, depth: 0, memo: &memo }, toks: &toks, at: 0 };
+        let mut p = Parser { c: View { c: self, local, at, depth: 0, memo: &memo, noted }, toks: &toks, at: 0 };
         let v = p.ternary();
         if p.at != toks.len() {
             return Tri::Unknown;
@@ -1035,7 +1053,7 @@ impl Conditions {
     }
 
     pub fn defined_in(&self, local: &Local, at: Option<(u32, u32)>, name: &[u8]) -> Tri {
-        View { c: self, local, at, depth: 0, memo: &Default::default() }.defined(name)
+        View { c: self, local, at, depth: 0, memo: &Default::default(), noted: None }.defined(name)
     }
 }
 
@@ -1227,7 +1245,14 @@ fn function_parts(v: &[u8]) -> Option<(Vec<&[u8]>, &[u8])> {
     Some((params, &rest[at + 1..]))
 }
 
+thread_local! {
+    /// For `SI_COND_PROFILE`: macro values read, and bytes tokenized, on
+    /// this thread.
+    pub static COUNTS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 fn tokens(s: &[u8]) -> Vec<Tok<'_>> {
+    COUNTS.with(|c| c.set((c.get().0, c.get().1 + s.len() as u64)));
     let mut out = Vec::new();
     let mut i = 0;
     while i < s.len() {

@@ -43,6 +43,35 @@ const MOST_STEPS: u64 = 200_000_000;
 /// means, every one is read, and that can multiply without end.)
 const MOST_IN_ONE: u64 = 3_000_000;
 const DEEPEST: u32 = 200;
+/// Ways one condition is kept worked out, at most, on each thread.
+const KEPT_WAYS: usize = 8;
+
+/// A condition worked out: the names it depends on, each with how it was
+/// (see [`state`]), and what it came to.
+struct Kept {
+    names: Box<[(Box<[u8]>, u64)]>,
+    unseen: bool,
+    holds: Tri,
+}
+
+thread_local! {
+    /// Per file and step, the conditions this thread worked out. Every
+    /// compilation reads the same headers, mostly with the same macros
+    /// defined: their conditions come out the same, and working each out
+    /// (its macros expanded, their values read, again and again) was most
+    /// of the time.
+    static KEPT: std::cell::RefCell<FxHashMap<(u32, u32), Vec<Kept>>> = Default::default();
+}
+
+/// How a name is in a compilation, as one number.
+fn state(local: &Local, name: &[u8]) -> u64 {
+    match local.get(name) {
+        None => 0,
+        Some(None) => 1,
+        Some(Some(None)) => 2,
+        Some(Some(Some(v))) => xxhash_rust::xxh3::xxh3_64(v) | 3 << 62,
+    }
+}
 
 enum Step {
     /// `kind`: 0 an expression, 1 `defined`, 2 `!defined`.
@@ -121,6 +150,9 @@ struct Unit<'a> {
     /// itself, having defined something to read itself differently).
     reading: FxHashMap<u32, u8>,
     spent: u64,
+    /// For `SI_COND_PROFILE`: conditions worked out and the ns they took,
+    /// definitions kept and their ns, includes followed.
+    prof: Option<[u64; 5]>,
 }
 
 impl Unit<'_> {
@@ -128,12 +160,40 @@ impl Unit<'_> {
         if self.unseen { self.w.plain } else { &self.w.told }
     }
 
-    fn holds(&self, kind: u8, expr: &[u8]) -> Tri {
+    fn holds(&self, file: u32, step: usize, kind: u8, expr: &[u8]) -> Tri {
         match kind {
-            0 => self.conditions().eval_in(&self.local, None, expr),
+            0 => self.worked_out(file, step, expr),
             1 => self.conditions().defined_in(&self.local, None, expr),
             _ => self.conditions().defined_in(&self.local, None, expr).not(),
         }
+    }
+
+    /// An `#if` expression, as worked out before where the names it
+    /// depends on are as they were then.
+    fn worked_out(&self, file: u32, step: usize, expr: &[u8]) -> Tri {
+        let key = (file, step as u32);
+        let found = KEPT.with(|k| {
+            k.borrow().get(&key).and_then(|ways| {
+                ways.iter().find(|w| w.unseen == self.unseen && w.names.iter().all(|(n, s)| state(&self.local, n) == *s)).map(|w| w.holds)
+            })
+        });
+        if let Some(holds) = found {
+            return holds;
+        }
+        let noted = std::cell::RefCell::new(Vec::new());
+        let holds = self.conditions().eval_noting(&self.local, None, expr, Some(&noted));
+        let mut names = noted.into_inner();
+        names.sort_unstable();
+        names.dedup();
+        let names = names.into_iter().map(|n| { let s = state(&self.local, &n); (n.into_boxed_slice(), s) }).collect();
+        KEPT.with(|k| {
+            let mut k = k.borrow_mut();
+            let ways = k.entry(key).or_default();
+            if ways.len() < KEPT_WAYS {
+                ways.push(Kept { names, unseen: self.unseen, holds });
+            }
+        });
+        holds
     }
 
     /// Read `file`; `maybe`: it is not known to be read at all.
@@ -162,7 +222,12 @@ impl Unit<'_> {
         for (i, step) in steps.iter().enumerate() {
             match step {
                 Step::If { kind, expr, .. } => {
-                    let holds = if live == Tri::False { Tri::False } else { self.holds(*kind, expr) };
+                    let t = self.prof.map(|_| std::time::Instant::now());
+                    let holds = if live == Tri::False { Tri::False } else { self.holds(file, i, *kind, expr) };
+                    if let (Some(p), Some(t)) = (&mut self.prof, t) {
+                        p[0] += 1;
+                        p[1] += t.elapsed().as_nanos() as u64;
+                    }
                     if live != Tri::False {
                         w.seen[file as usize][i].fetch_or(1 << holds as u8, Relaxed);
                     }
@@ -172,17 +237,18 @@ impl Unit<'_> {
                 Step::Elif { kind, expr, .. } => {
                     let Some(group) = open.last_mut() else { continue };
                     let outer = group.2;
+                    let t = self.prof.map(|_| std::time::Instant::now());
                     let own = if outer == Tri::False || group.0 == Tri::True {
                         Tri::False
                     } else {
-                        let own = match kind {
-                            0 => if self.unseen { w.plain } else { &w.told }.eval_in(&self.local, None, expr),
-                            1 => if self.unseen { w.plain } else { &w.told }.defined_in(&self.local, None, expr),
-                            _ => if self.unseen { w.plain } else { &w.told }.defined_in(&self.local, None, expr).not(),
-                        };
+                        let own = self.holds(file, i, *kind, expr);
                         w.seen[file as usize][i].fetch_or(1 << own as u8, Relaxed);
                         own
                     };
+                    if let (Some(p), Some(t)) = (&mut self.prof, t) {
+                        p[0] += 1;
+                        p[1] += t.elapsed().as_nanos() as u64;
+                    }
                     group.1 = group.0.not().and(own);
                     group.0 = group.0.or(own);
                     live = outer.and(group.1);
@@ -200,6 +266,10 @@ impl Unit<'_> {
                 }
                 _ if live == Tri::False => {}
                 Step::Define { name, value } => {
+                    let t = self.prof.map(|_| std::time::Instant::now());
+                    if let Some(p) = &mut self.prof {
+                        p[2] += 1;
+                    }
                     if live == Tri::True && !maybe {
                         if let Some(outright) = &mut self.outright {
                             if !self.local.contains_key(&name[..]) && !w.plain.settles(name) {
@@ -209,6 +279,9 @@ impl Unit<'_> {
                         self.local.insert(name.to_vec(), Some(Some(value.to_vec())));
                     } else if self.local.get(&name[..]).is_none_or(|v| v.as_ref().and_then(|v| v.as_deref()) != Some(&value[..])) {
                         self.local.insert(name.to_vec(), None);
+                    }
+                    if let (Some(p), Some(t)) = (&mut self.prof, t) {
+                        p[3] += t.elapsed().as_nanos() as u64;
                     }
                 }
                 Step::Undef { name } => {
@@ -220,6 +293,9 @@ impl Unit<'_> {
                 }
                 Step::Unseen => self.unseen = true,
                 Step::Include { files } => {
+                    if let Some(p) = &mut self.prof {
+                        p[4] += files.len() as u64;
+                    }
                     let maybe = maybe || live != Tri::True || files.len() > 1;
                     for &f in files.iter() {
                         if w.once[f as usize] {
@@ -339,10 +415,17 @@ pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -
     };
     // Returns the names defined outright (on the first pass), and the
     // compilations that were too much to read.
+    let profile = std::env::var_os("SI_COND_PROFILE").is_some();
+    // (Per compilation: ms, steps, local names, and the counts of `prof`.)
+    let profiled: std::sync::Mutex<Vec<(f64, u64, usize, u32, [u64; 5])>> = Default::default();
     let read_all = |w: &World, first: bool| -> (FxHashSet<Vec<u8>>, Vec<u32>) {
+        // (What was worked out under other conditions does not hold now.)
+        rayon::broadcast(|_| KEPT.with(|k| k.borrow_mut().clear()));
+        KEPT.with(|k| k.borrow_mut().clear());
         roots
             .par_iter()
             .fold(Default::default, |mut all: (FxHashSet<Vec<u8>>, Vec<u32>), &root| {
+                let t = std::time::Instant::now();
                 let mut unit = Unit {
                     w,
                     local: Local::default(),
@@ -353,9 +436,13 @@ pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -
                     outright: first.then(FxHashSet::default),
                     reading: FxHashMap::default(),
                     spent: 0,
+                    prof: profile.then_some([0; 5]),
                 };
                 unit.read.insert(root, true);
                 unit.read(root, false, 0);
+                if let Some(p) = unit.prof {
+                    profiled.lock().unwrap().push((t.elapsed().as_secs_f64() * 1000.0, unit.spent, unit.local.len(), root, p));
+                }
                 if unit.spent > MOST_IN_ONE {
                     all.1.push(root);
                 } else {
@@ -372,7 +459,17 @@ pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -
     // Once to learn which names the sources define outright, and then
     // knowing that.
     let (outright, mut left) = read_all(&w, true);
-    if std::env::var_os("SI_COND_PROFILE").is_some() {
+    if profile {
+        let mut rows = std::mem::take(&mut *profiled.lock().unwrap());
+        let mut sum = [0u64; 5];
+        rows.iter().for_each(|r| (0..5).for_each(|i| sum[i] += r.4[i]));
+        let (values, bytes) = rayon::broadcast(|_| crate::cond::COUNTS.with(|c| c.take())).into_iter().chain([crate::cond::COUNTS.with(|c| c.take())]).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        let ms: f64 = rows.iter().map(|r| r.0).sum();
+        eprintln!("unitsprof {ms:.0} ms in all units; {} conditions {:.0} ms; {} defines {:.0} ms; {} includes; {values} macro values read; {bytes} bytes tokenized", sum[0], sum[1] as f64 / 1e6, sum[2], sum[3] as f64 / 1e6, sum[4]);
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for r in rows.iter().take(5) {
+            eprintln!("unitslow  {:.0} ms, {} steps, {} names, {} conditions {:.0} ms, {} defines {:.0} ms, {} includes: {}", r.0, r.1, r.2, r.4[0], r.4[1] as f64 / 1e6, r.4[2], r.4[3] as f64 / 1e6, r.4[4], paths[r.3 as usize]);
+        }
         eprintln!("units     {} roots of {} files, {} steps, {} names defined outright, {} compilations left{}", roots.len(), n, w.spent.load(Relaxed), outright.len(), left.len(), if w.stop.load(Relaxed) { ", given up" } else { "" });
     }
     if w.stop.load(Relaxed) {
@@ -387,6 +484,8 @@ pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -
             return None;
         }
     }
+    rayon::broadcast(|_| KEPT.with(|k| std::mem::take(&mut *k.borrow_mut())));
+    KEPT.with(|k| std::mem::take(&mut *k.borrow_mut()));
     // What a compilation left unread may read in a way nobody saw.
     let mut unread = vec![false; n];
     while let Some(f) = left.pop() {
