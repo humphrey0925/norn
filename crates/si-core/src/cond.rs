@@ -668,6 +668,16 @@ impl Source {
         self.names.is_empty() && self.verdicts.iter().all(Vec::is_empty)
     }
 
+    /// What differs from `other`: the names whose values do, and per file
+    /// whether its includes that are certainly compiled do (what a file is
+    /// told of a name depends on those of its own alone).
+    pub fn changes(&self, other: &Source) -> (FxHashSet<Vec<u8>>, Vec<bool>) {
+        let mut names: FxHashSet<Vec<u8>> = self.names.iter().filter(|(k, v)| other.names.get(*k) != Some(*v)).map(|(k, _)| k.clone()).collect();
+        names.extend(other.names.keys().filter(|k| !self.names.contains_key(*k)).cloned());
+        let files = (0..self.includes.len().max(other.includes.len())).map(|i| self.includes.get(i) != other.includes.get(i)).collect();
+        (names, files)
+    }
+
     fn digest(&self) -> u64 {
         use xxhash_rust::xxh3::xxh3_64_with_seed as h;
         let each = |(k, values): (&Vec<u8>, &Vec<(Vec<u8>, Vec<u64>, Vec<u64>)>)| {

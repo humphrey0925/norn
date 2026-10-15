@@ -193,6 +193,17 @@ pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions)
         slowest("defines", times);
         defines
     };
+    // Read again: only the files `again` says, the others' as they were.
+    let reread = |c: &cond::Conditions, defines: &mut Vec<Vec<mask::Define>>, again: &[bool]| {
+        let fresh: Vec<(usize, Vec<mask::Define>)> = (0..files.len())
+            .into_par_iter()
+            .filter(|&i| again[i])
+            .map(|i| (i, mask::defines_of(&std::fs::read(&files[i]).unwrap_or_default(), c, Some(&paths[i]))))
+            .collect();
+        for (i, d) in fresh {
+            defines[i] = d;
+        }
+    };
     if !conditions.uses_source() {
         let defines = read(conditions);
         step("defines", &mut t);
@@ -212,7 +223,20 @@ pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions)
     slowest("scripts", times);
     step("scripts", &mut t);
     let verdicts = std::sync::Arc::new(units::verdicts(&paths, &scripts, conditions).unwrap_or_default());
-    drop(scripts);
+    // The names each file's conditions name: its `#define`s come out
+    // otherwise only where what is known of one of these does.
+    let tested: Vec<rustc_hash::FxHashSet<&[u8]>> = scripts
+        .par_iter()
+        .map(|s| {
+            let mut names = rustc_hash::FxHashSet::default();
+            for op in &s.ops {
+                if let mask::Op::If { expr, .. } | mask::Op::Elif { expr, .. } = op {
+                    units::names_in(expr, |n| _ = names.insert(n));
+                }
+            }
+            names
+        })
+        .collect();
     step("verdicts", &mut t);
     if std::env::var_os("SI_COND_PROFILE").is_some() {
         eprintln!("decided   {} conditions, by reading each compilation", verdicts.iter().map(Vec::len).sum::<usize>());
@@ -238,10 +262,38 @@ pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions)
         if conditions.source().map_or(source.is_empty(), |s| **s == source) {
             break;
         }
+        // What is known of a name changes where its value names one whose
+        // does (its value is read for it), and with it what a file's
+        // conditions come to where they name either.
+        let (mut changed, includes) = conditions.source().map_or_else(|| (Default::default(), vec![true; files.len()]), |s| s.changes(&source));
+        loop {
+            let before = changed.len();
+            for d in defines.iter().flatten().filter(|d| !d.include && !d.test) {
+                let mut names = d.refs.iter().map(|r| &r[..]).chain(d.deps.iter().flatten().map(|r| &r[..])).collect::<Vec<_>>();
+                if let Some(v) = &d.value {
+                    units::names_in(v, |n| names.push(n));
+                }
+                if !changed.contains(&d.name) && names.iter().any(|n| changed.contains(*n)) {
+                    changed.insert(d.name.clone());
+                }
+            }
+            if changed.len() == before {
+                break;
+            }
+        }
+        let again: Vec<bool> = (0..files.len()).map(|i| includes.get(i).copied().unwrap_or(true) || tested[i].iter().any(|n| changed.contains(*n))).collect();
         conditions.set_source(Some(std::sync::Arc::new(source)));
-        defines = read(conditions);
+        if std::env::var_os("SI_SETTLE_CHECK").is_some() {
+            let mut some = defines.clone();
+            reread(conditions, &mut some, &again);
+            let all = read(conditions);
+            let differ = (0..files.len()).filter(|&i| some[i] != all[i]).count();
+            eprintln!("settle    {} of {} files read again, {} names changed; {} files would differ", again.iter().filter(|a| **a).count(), files.len(), changed.len(), differ);
+        }
+        reread(conditions, &mut defines, &again);
         step("defines", &mut t);
     }
+    drop(scripts);
     defines
 }
 
@@ -252,8 +304,11 @@ pub fn prescan_under(root: &Path, files: &[PathBuf], conditions: &mut cond::Cond
     let defines = settle(root, files, conditions);
     let mut t = std::time::Instant::now();
     let paths: Vec<String> = files.iter().map(|p| rel_path(root, p)).collect();
-    let sets = MacroSets::of_files(&defines, &paths).with_conditions(conditions.clone());
+    let mut sets = MacroSets::of_defines(defines.iter().flatten());
     step("sets", &mut t);
+    sets.scope(&defines, &paths);
+    let sets = sets.with_conditions(conditions.clone());
+    step("scope", &mut t);
     trim_memory();
     sets
 }
