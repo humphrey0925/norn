@@ -187,6 +187,10 @@ pub struct Record {
     pub defs: Vec<u32>,
     /// C++: a class in a class, called by its short name only in there.
     pub nested: bool,
+    /// C++: for each member that is a container (`std::vector<T> v`), the
+    /// name of its elements' type (`T`; of a map, its values'), else `NONE`.
+    /// Empty where none is.
+    pub elems: Vec<u32>,
 }
 
 /// What a member access is made on, as far as the text says: something of a
@@ -468,6 +472,7 @@ impl FileFacts {
             exact(&mut r.fields);
             exact(&mut r.types);
             exact(&mut r.defs);
+            exact(&mut r.elems);
         }
         exact(&mut self.records);
         exact(&mut self.aliases);

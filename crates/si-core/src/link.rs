@@ -420,13 +420,28 @@ impl Types<'_> {
         let (mut rf, mut ri) = record_of(type_name, fi as u32, closure, self.records, self.aliases).or_else(|| {
             self.cpp.bases.get(&type_name)?.iter().find_map(|&b| record_of(b, fi as u32, closure, self.records, self.aliases))
         })?;
-        for &m in path {
-            let (mf, mi, at) = self.find(rf, ri, self.remap[fi][m as usize], closure, 8)?;
-            let t = self.files[mf as usize].records[mi as usize].types[at];
+        // (C++: `[]` after a member marks an element of it, a container.)
+        let element = g.name_id("[]");
+        let mut i = 0;
+        while i < path.len() {
+            let m = self.remap[fi][path[i] as usize];
+            if Some(m) == element {
+                // Of what is no member (`p[i]` of a pointer): of its type.
+                i += 1;
+                continue;
+            }
+            let (mf, mi, at) = self.find(rf, ri, m, closure, 8)?;
+            let r = &self.files[mf as usize].records[mi as usize];
+            let of_element = path.get(i + 1).is_some_and(|&n| Some(self.remap[fi][n as usize]) == element);
+            let t = match r.elems.get(at) {
+                Some(&e) if of_element && e != NONE => e,
+                _ => r.types[at],
+            };
             if t == NONE {
                 return None;
             }
             (rf, ri) = record_of(self.remap[mf as usize][t as usize], mf, closure, self.records, self.aliases)?;
+            i += 1 + of_element as usize;
         }
         let (rf, ri, at) = self.find(rf, ri, member, closure, 8)?;
         let def = self.files[rf as usize].records[ri as usize].defs[at];
@@ -1681,6 +1696,41 @@ int c() { auto* p = new Box(); return p->Size(); }
         assert_eq!(class_of("a"), ["Key::Size"]);
         assert_eq!(class_of("b"), ["Key::Size"]);
         assert_eq!(class_of("c"), ["Box::Size"]);
+    }
+
+    #[test]
+    fn an_element_of_a_container_is_of_its_elements_type() {
+        let g = graph(&[
+            ("b.h", "#include <vector>
+class Tx {
+ public:
+  int Hash() const { return 1; }
+};
+class Peer {
+ public:
+  int Hash() const { return 2; }
+};
+typedef std::shared_ptr<const Tx> TxRef;
+class Block {
+ public:
+  std::vector<TxRef> vtx;
+};
+"),
+            ("b.cc", "#include \"b.h\"
+int a(const Block& b) { return b.vtx[0]->Hash(); }
+int c(const Block& b) { return b.vtx.back()->Hash(); }
+int d(const Block& b) { int n = 0; for (const auto& tx : b.vtx) n += tx->Hash(); return n; }
+int e(const std::vector<Peer>& peers) { int n = 0; for (const auto& p : peers) n += p.Hash(); return n; }
+"),
+        ]);
+        let q = crate::graph::Qualifier::new(&g);
+        let certain = |caller: &str| -> Vec<String> {
+            g.find(caller).iter().flat_map(|&s| g.refs_from(s)).filter(|e| g.sym_name(e.other) == "Hash" && !e.ambiguous()).map(|e| q.name(&g, e.other).into_owned()).collect()
+        };
+        for f in ["a", "c", "d"] {
+            assert_eq!(certain(f), ["Tx::Hash"], "{f}");
+        }
+        assert_eq!(certain("e"), ["Peer::Hash"]);
     }
 
     #[test]

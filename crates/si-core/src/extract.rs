@@ -294,6 +294,14 @@ const SMART_POINTERS: &[&[u8]] = &[
     b"ComPtr", b"optional", b"reference_wrapper", b"not_null",
 ];
 
+/// C++ containers whose elements are their first template argument, and
+/// those (maps) whose values are their second.
+const CONTAINERS: &[&[u8]] = &[
+    b"vector", b"array", b"deque", b"list", b"forward_list", b"set", b"multiset", b"unordered_set", b"unordered_multiset",
+    b"span", b"valarray", b"queue", b"priority_queue", b"stack", b"initializer_list", b"prevector", b"SmallVector",
+];
+const MAPS: &[&[u8]] = &[b"map", b"multimap", b"unordered_map", b"unordered_multimap", b"flat_map"];
+
 /// Longest initializer kept as text for expansion.
 const MAX_INIT_TEXT: usize = 256 << 10;
 /// An array initializer longer than this is expanded a row at a time.
@@ -356,6 +364,8 @@ struct Walk<'a> {
     /// C++: of an `auto` local, where a member access on it starts (as a
     /// member hint's root and path): what it was made from.
     local_roots: FxHashMap<&'a [u8], (u8, u32, Vec<u32>)>,
+    /// C++: of a local container, its elements' type.
+    local_elems: FxHashMap<&'a [u8], u32>,
     /// Hints worked out at a member access, for the reference its member
     /// name is about to become (by the name's position).
     pending_hints: FxHashMap<usize, u32>,
@@ -473,6 +483,7 @@ impl Extractor {
             params: FxHashMap::default(),
             local_types: FxHashMap::default(),
             local_roots: FxHashMap::default(),
+            local_elems: FxHashMap::default(),
             pending_hints: FxHashMap::default(),
             open_records: Vec::new(),
             cpp,
@@ -826,6 +837,7 @@ impl<'a> Walk<'a> {
         self.params.clear();
         self.local_types.clear();
         self.local_roots.clear();
+        self.local_elems.clear();
     }
 
     /// The name of a declaration's type when it is a struct, a union or a
@@ -884,6 +896,12 @@ impl<'a> Walk<'a> {
         let ids = self.ids;
         for _ in 0..32 {
             let k = n.kind_id();
+            if self.cpp && k == ids.subscript_expression {
+                // `v[i]`: an element.
+                let (kind, root, prefix) = self.element_of(n.child_by_field_id(ids.f_argument)?)?;
+                path.extend(prefix);
+                return Some((kind, root));
+            }
             if k == ids.parenthesized_expression {
                 n = n.named_child(0)?;
             } else if k == ids.pointer_expression || k == ids.subscript_expression {
@@ -922,9 +940,15 @@ impl<'a> Walk<'a> {
         if k == ids.call_expression {
             let f = n.child_by_field_id(ids.f_function)?;
             if self.cpp && f.kind_id() == ids.field_expression {
+                let (_, method) = self.qualified_parts(f.child_by_field_id(ids.f_field)?);
+                if matches!(self.text(method), b"at" | b"back" | b"front" | b"top") {
+                    // `v.back ()`: an element.
+                    let (kind, root, prefix) = self.element_of(f.child_by_field_id(ids.f_argument)?)?;
+                    path.extend(prefix);
+                    return Some((kind, root));
+                }
                 // `x.Get ().f ()`: what the method returns, as if a member.
                 let r = self.object_root(f.child_by_field_id(ids.f_argument)?, path)?;
-                let (_, method) = self.qualified_parts(f.child_by_field_id(ids.f_field)?);
                 path.push(self.intern(self.text(method)));
                 return Some(r);
             }
@@ -970,6 +994,43 @@ impl<'a> Walk<'a> {
         }
         let mut path = Vec::new();
         let (kind, root) = self.object_root(v, &mut path)?;
+        Some((kind, root, path))
+    }
+
+    /// C++: the type of the elements of a container type (`std::vector<T>`:
+    /// `T`; a map's: its values'), or `NONE`.
+    fn element_type(&mut self, t: Node<'a>) -> u32 {
+        let ids = self.ids;
+        let t = if t.kind_id() == ids.qualified_identifier { self.qualified_parts(t).1 } else { t };
+        if t.kind_id() != ids.template_type {
+            return NONE;
+        }
+        let Some(name) = t.child_by_field_id(ids.f_name) else { return NONE };
+        let which = match self.text(name) {
+            n if CONTAINERS.contains(&n) => 0,
+            n if MAPS.contains(&n) => 1,
+            _ => return NONE,
+        };
+        let Some(args) = t.child_by_field_id(ids.f_arguments) else { return NONE };
+        let mut c = args.walk();
+        let arg = args.named_children(&mut c).nth(which).filter(|a| a.kind_id() == ids.type_descriptor);
+        match arg.and_then(|a| a.child_by_field_id(ids.f_type)) {
+            Some(a) => self.type_name(a),
+            None => NONE,
+        }
+    }
+
+    /// C++: where a member access on an element of `container` starts: of a
+    /// local container, its elements' type; else the container's own root
+    /// and path, and the mark of an element (`[]`).
+    fn element_of(&mut self, container: Node<'a>) -> Option<(u8, u32, Vec<u32>)> {
+        let c = self.strip(container);
+        if c.kind_id() == self.ids.identifier && self.in_fn() && self.locals.contains(self.text(c)) {
+            return self.local_elems.get(self.text(c)).map(|&e| (root::TYPE, e, Vec::new()));
+        }
+        let mut path = Vec::new();
+        let (kind, root) = self.object_root(c, &mut path)?;
+        path.push(self.intern_str("[]"));
         Some((kind, root, path))
     }
 
@@ -1286,7 +1347,7 @@ impl<'a> Walk<'a> {
     /// The members of a struct body in order, each with its type's name
     /// (see `type_name_of`). The members of an unnamed struct or union
     /// member are members of this one.
-    fn member_names(&mut self, body: Node<'a>, names: &mut Vec<u32>, types: &mut Vec<u32>) {
+    fn member_names(&mut self, body: Node<'a>, names: &mut Vec<u32>, types: &mut Vec<u32>, elems: &mut Vec<u32>) {
         let ids = self.ids;
         let mut c = body.walk();
         // (A C++ class's methods are members too, declared or defined in it,
@@ -1305,15 +1366,20 @@ impl<'a> Walk<'a> {
             if ds.is_empty() {
                 let inner = decl.child_by_field_id(ids.f_type).and_then(|t| t.child_by_field_id(ids.f_body));
                 match inner {
-                    Some(inner) => self.member_names(inner, names, types),
+                    Some(inner) => self.member_names(inner, names, types, elems),
                     None => {
                         names.push(NONE);
                         types.push(NONE);
+                        elems.push(NONE);
                     }
                 }
                 continue;
             }
             let t = self.type_name_of(decl);
+            let e = match decl.child_by_field_id(ids.f_type).filter(|_| cpp) {
+                Some(ty) => self.element_type(ty),
+                None => NONE,
+            };
             for d in ds {
                 // A member that is a function pointer has no struct type,
                 // whatever its return type is.
@@ -1324,16 +1390,20 @@ impl<'a> Walk<'a> {
                 };
                 names.push(name);
                 types.push(t);
+                elems.push(if self.declares_function(d) { NONE } else { e });
             }
         }
     }
 
     fn push_record(&mut self, name: u32, node: Node<'a>, body: Node<'a>) {
-        let (mut fields, mut types) = (Vec::new(), Vec::new());
-        self.member_names(body, &mut fields, &mut types);
+        let (mut fields, mut types, mut elems) = (Vec::new(), Vec::new(), Vec::new());
+        self.member_names(body, &mut fields, &mut types, &mut elems);
+        if elems.iter().all(|&e| e == NONE) {
+            elems = Vec::new();
+        }
         let defs = vec![NONE; fields.len()];
         self.open_records.push((node.end_byte(), self.out.records.len()));
-        self.out.records.push(Record { name, fields, types, defs, nested: false });
+        self.out.records.push(Record { name, fields, types, defs, nested: false, elems });
     }
 
     /// A braced initializer of an object of struct type `type_name` (or of
@@ -1751,6 +1821,16 @@ impl<'a> Walk<'a> {
                     if let Some((name, _)) = self.decl_name(d) {
                         self.skip.insert(name.start_byte());
                         self.local_roots.remove(self.text(name));
+                        self.local_elems.remove(self.text(name));
+                        if self.cpp && !self.declares_function(d) {
+                            let e = match node.child_by_field_id(ids.f_type) {
+                                Some(ty) => self.element_type(ty),
+                                None => NONE,
+                            };
+                            if e != NONE {
+                                self.local_elems.insert(self.text(name), e);
+                            }
+                        }
                         if declared != NONE && !self.declares_function(d) {
                             self.local_types.insert(self.text(name), declared);
                         } else {
@@ -1817,6 +1897,15 @@ impl<'a> Walk<'a> {
             if let Some((name, _)) = named {
                 self.skip.insert(name.start_byte());
                 if self.in_fn() {
+                    if self.cpp {
+                        let e = match node.child_by_field_id(ids.f_type) {
+                            Some(ty) => self.element_type(ty),
+                            None => NONE,
+                        };
+                        if e != NONE {
+                            self.local_elems.insert(self.text(name), e);
+                        }
+                    }
                     // (A lambda's: its function's are typed already.)
                     if self.cpp && !self.local_types.contains_key(self.text(name)) {
                         let t = self.type_name_of(node);
@@ -1826,6 +1915,27 @@ impl<'a> Walk<'a> {
                     }
                     self.note_local(name, true);
                 }
+            }
+            return true;
+        }
+        if self.cpp && self.in_fn() && node.kind() == "for_range_loop" {
+            // `for (const auto& tx : block.vtx)`: an element of the container
+            // (of a type written, that type). (Not `auto& [k, v]`.)
+            let declared = node.child_by_field_id(ids.f_declarator.get()).and_then(|d| self.decl_name(d));
+            if let (Some((name, _)), Some(right)) = (declared, node.child_by_field_id(ids.f_right)) {
+                let text = self.text(name);
+                self.skip.insert(name.start_byte());
+                self.local_roots.remove(text);
+                let t = self.type_name_of(node);
+                if t != NONE {
+                    self.local_types.insert(text, t);
+                } else {
+                    self.local_types.remove(text);
+                    if let Some(root) = self.element_of(right) {
+                        self.local_roots.insert(text, root);
+                    }
+                }
+                self.note_local(name, false);
             }
             return true;
         }
