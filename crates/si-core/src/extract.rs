@@ -53,6 +53,22 @@ struct Ids {
     f_name: u16,
     f_body: u16,
     f_function: u16,
+    // C++ (0, matching no node, in C's grammar).
+    class_specifier: u16,
+    namespace_definition: u16,
+    qualified_identifier: u16,
+    template_type: u16,
+    template_function: u16,
+    template_method: u16,
+    destructor_name: u16,
+    operator_name: u16,
+    this: u16,
+    base_class_clause: u16,
+    dependent_name: u16,
+    virtual_specifier: u16,
+    friend_declaration: u16,
+    type_descriptor: u16,
+    f_scope: u16,
 }
 
 impl Ids {
@@ -103,9 +119,137 @@ impl Ids {
             f_name: f("name").get(),
             f_body: f("body").get(),
             f_function: f("function").get(),
+            class_specifier: k("class_specifier"),
+            namespace_definition: k("namespace_definition"),
+            qualified_identifier: k("qualified_identifier"),
+            template_type: k("template_type"),
+            template_function: k("template_function"),
+            template_method: k("template_method"),
+            destructor_name: k("destructor_name"),
+            operator_name: k("operator_name"),
+            this: k("this"),
+            base_class_clause: k("base_class_clause"),
+            dependent_name: k("dependent_name"),
+            virtual_specifier: k("virtual_specifier"),
+            friend_declaration: k("friend_declaration"),
+            type_descriptor: k("type_descriptor"),
+            f_scope: lang.field_id_for_name("scope").map_or(0, |f| f.get()),
         }
     }
 }
+
+/// Is the file C++? By its name, and a header by what it says: C has no
+/// `namespace`, `template <`, `class X {`, access labels, `std::` or
+/// `extern "C++"`. (Not `::`: a C file's `asm` has it.)
+pub fn is_cpp(path: &str, src: &[u8]) -> bool {
+    let ext = path.rsplit_once('.').map_or("", |(_, e)| e);
+    match ext {
+        "cc" | "cpp" | "cxx" | "c++" | "C" | "hh" | "hpp" | "hxx" | "h++" | "ipp" | "inl" | "tcc" | "ixx" | "cppm" => true,
+        "h" | "H" => looks_cpp(src),
+        _ => false,
+    }
+}
+
+fn looks_cpp(src: &[u8]) -> bool {
+    let mut words: Vec<&[u8]> = Vec::with_capacity(4);
+    let mut i = 0;
+    let n = src.len();
+    let mut line_start = true;
+    while i < n {
+        let b = src[i];
+        if b == b'\n' {
+            line_start = true;
+            i += 1;
+            continue;
+        }
+        if b == b' ' || b == b'\t' || b == b'\r' {
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < n && src[i + 1] == b'/' {
+            while i < n && src[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < n && src[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < n && !(src[i] == b'*' && src[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+        if b == b'#' && line_start {
+            // A directive (and its continuation lines) says nothing.
+            while i < n && !(src[i] == b'\n' && src[i - 1] != b'\\') {
+                i += 1;
+            }
+            continue;
+        }
+        line_start = false;
+        if b == b'"' || b == b'\'' {
+            let q = b;
+            let start = i;
+            i += 1;
+            while i < n && src[i] != q && src[i] != b'\n' {
+                if src[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+            if q == b'"' && words.last() == Some(&&b"extern"[..]) && src.get(start..i) == Some(b"\"C++\"") {
+                return true;
+            }
+            words.clear();
+            continue;
+        }
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            while i < n && (src[i].is_ascii_alphanumeric() || src[i] == b'_') {
+                i += 1;
+            }
+            let w = &src[start..i];
+            if (w == b"public" || w == b"private" || w == b"protected") && src[i..].iter().find(|c| !c.is_ascii_whitespace()) == Some(&b':') {
+                let colon = i + src[i..].iter().position(|c| !c.is_ascii_whitespace()).unwrap_or(0);
+                if src.get(colon + 1) != Some(&b':') {
+                    return true;
+                }
+            }
+            if w == b"std" && src.get(i..i + 2) == Some(b"::") {
+                return true;
+            }
+            if words.len() == 4 {
+                words.remove(0);
+            }
+            words.push(w);
+            continue;
+        }
+        // A punctuator ends a run of words: what came before it decides.
+        let last = words.last().copied();
+        let before = words.len().checked_sub(2).map(|k| words[k]);
+        let cpp = match b {
+            b'<' => last == Some(b"template"),
+            b'{' => before == Some(b"namespace") || before == Some(b"class") || last == Some(b"namespace"),
+            b':' => before == Some(b"class") && src.get(i + 1) != Some(&b':'),
+            _ => false,
+        };
+        if cpp {
+            return true;
+        }
+        words.clear();
+        i += 1;
+    }
+    false
+}
+
+/// C++ templates whose `->` (or `*`) reaches the object of the type they
+/// are given.
+const SMART_POINTERS: &[&[u8]] = &[
+    b"unique_ptr", b"shared_ptr", b"weak_ptr", b"scoped_ptr", b"auto_ptr", b"intrusive_ptr", b"scoped_refptr",
+    b"ComPtr", b"optional", b"reference_wrapper", b"not_null",
+];
 
 /// Longest initializer kept as text for expansion.
 const MAX_INIT_TEXT: usize = 256 << 10;
@@ -116,6 +260,15 @@ const ROWS_APART: usize = 8 << 10;
 pub struct Extractor {
     parser: Parser,
     ids: Ids,
+    /// C++'s, made when the first C++ file comes.
+    cpp: Option<(Parser, Ids)>,
+}
+
+/// A class whose body is being read.
+struct OpenClass {
+    end: usize,
+    /// `Outer::Inner`.
+    chain: String,
 }
 
 #[derive(Clone, Copy)]
@@ -162,6 +315,23 @@ struct Walk<'a> {
     pending_hints: FxHashMap<usize, u32>,
     /// Struct bodies being read: (end, index in `out.records`).
     open_records: Vec<(usize, usize)>,
+    /// C++.
+    cpp: bool,
+    /// Class bodies being read, outermost first.
+    classes: Vec<OpenClass>,
+    /// The class of the method being read (`this`), or `NONE`.
+    method_class: u32,
+    /// The end of the `friend` declaration being read: what it declares
+    /// is no member.
+    friend_end: usize,
+    /// The end of the anonymous namespace being read: what is defined in
+    /// it is the translation unit's own, as if `static`.
+    anon_end: usize,
+    /// Names made rather than read (`A::B`, `operator==`), once each.
+    made_names: FxHashMap<String, u32>,
+    /// C++: where the macros that make a definition are named (`TEST_F`
+    /// of `TEST_F (A, b) { ... }`).
+    defining_macros: FxHashSet<usize>,
 }
 
 impl Default for Extractor {
@@ -175,7 +345,7 @@ impl Extractor {
         let lang: Language = tree_sitter_c::LANGUAGE.into();
         let mut parser = Parser::new();
         parser.set_language(&lang).expect("tree-sitter-c ABI");
-        Extractor { parser, ids: Ids::new(&lang) }
+        Extractor { parser, ids: Ids::new(&lang), cpp: None }
     }
 
     /// The facts depend on the file's content and on `transparent`.
@@ -203,8 +373,21 @@ impl Extractor {
         out.inactive = inactive_lines(src, &lexed.skipped);
         out.undecided = undecided_lines(src, &lexed.undecided);
         out.mask_ns = t.elapsed().as_nanos() as u64;
+        let cpp = is_cpp(path, src);
+        out.cpp = cpp;
+        let (parser, ids) = if cpp {
+            let c = self.cpp.get_or_insert_with(|| {
+                let lang: Language = tree_sitter_cpp::LANGUAGE.into();
+                let mut parser = Parser::new();
+                parser.set_language(&lang).expect("tree-sitter-cpp ABI");
+                (parser, Ids::new(&lang))
+            });
+            (&mut c.0, &c.1)
+        } else {
+            (&mut self.parser, &self.ids)
+        };
         let t = std::time::Instant::now();
-        let Some(tree) = self.parser.parse(&lexed.masked, None) else {
+        let Some(tree) = parser.parse(&lexed.masked, None) else {
             out.has_error = true;
             return out;
         };
@@ -221,7 +404,7 @@ impl Extractor {
             next_event: events.next(),
             events,
             blocks: &lexed.blocks,
-            ids: &self.ids,
+            ids,
             out,
             names: FxHashMap::default(),
             skip: FxHashSet::default(),
@@ -243,6 +426,20 @@ impl Extractor {
             local_types: FxHashMap::default(),
             pending_hints: FxHashMap::default(),
             open_records: Vec::new(),
+            cpp,
+            classes: Vec::new(),
+            method_class: NONE,
+            friend_end: 0,
+            anon_end: 0,
+            made_names: FxHashMap::default(),
+            defining_macros: lexed
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Site(s) if s.def_at != 0 => Some(s.name.start as usize),
+                    _ => None,
+                })
+                .collect(),
         };
         w.site_starts = w.site_defs.keys().copied().collect();
         w.site_starts.sort_unstable();
@@ -308,12 +505,168 @@ impl<'a> Walk<'a> {
         id
     }
 
-    fn push_def(&mut self, name: Node, span: Node, kind: u8, flags: u8) -> u32 {
+    /// A name made here rather than read (`operator==` from `operator ==`).
+    fn intern_str(&mut self, s: &str) -> u32 {
+        if let Some(&id) = self.made_names.get(s) {
+            return id;
+        }
+        let id = self.out.push_name(s);
+        self.made_names.insert(s.to_string(), id);
+        id
+    }
+
+    /// The name a definition is known by: its text, but a C++ operator's or
+    /// destructor's without spaces.
+    fn def_name(&mut self, name: Node<'a>) -> u32 {
+        let k = name.kind_id();
+        if self.cpp && (k == self.ids.operator_name || k == self.ids.destructor_name) {
+            // One space between words (`operator bool`), none elsewhere
+            // (`operator==`, `~Foo`).
+            let text = String::from_utf8_lossy(self.text(name));
+            let mut s = String::with_capacity(text.len());
+            for word in text.split_whitespace() {
+                let joins = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+                if joins(s.chars().last()) && joins(word.chars().next()) {
+                    s.push(' ');
+                }
+                s.push_str(word);
+            }
+            return self.intern_str(&s);
+        }
+        self.intern(self.text(name))
+    }
+
+    /// C++: the parts of the scope a qualified name is written with (`A`
+    /// and `B` of `A::B<T>::f`, without template arguments), and the name.
+    /// `::f` has one empty part.
+    fn qualified_parts(&self, mut n: Node<'a>) -> (Vec<&'a [u8]>, Node<'a>) {
+        let ids = self.ids;
+        let mut parts = Vec::new();
+        for _ in 0..16 {
+            let k = n.kind_id();
+            if k == ids.qualified_identifier {
+                let part = match n.child_by_field_id(ids.f_scope) {
+                    Some(s) if s.kind_id() == ids.template_type => s.child_by_field_id(ids.f_name).map(|t| self.text(t)),
+                    Some(s) => Some(self.text(s)),
+                    None => Some(&b""[..]),
+                };
+                // A name, not whatever the parser made of text it could not
+                // read (`decltype (...)`, or a stretch of code past an error).
+                match part {
+                    Some(p) if p.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80) => parts.push(p),
+                    _ => parts.push(b"?"),
+                }
+                match n.child_by_field_id(ids.f_name) {
+                    Some(name) => n = name,
+                    None => break,
+                }
+            } else if k == ids.template_function || k == ids.template_method {
+                match n.child_by_field_id(ids.f_name) {
+                    Some(name) => n = name,
+                    None => break,
+                }
+            } else if k == ids.dependent_name {
+                match n.named_child(0) {
+                    Some(inner) => n = inner,
+                    None => break,
+                }
+            } else {
+                break;
+            }
+        }
+        (parts, n)
+    }
+
+    /// C++: the scope written in a declarator's name (`A::B` of
+    /// `A::B::f (...)`), as its parts.
+    fn declared_scope(&self, mut n: Node<'a>) -> Vec<&'a [u8]> {
+        let ids = self.ids;
+        for _ in 0..32 {
+            let k = n.kind_id();
+            if k == ids.qualified_identifier {
+                let (mut parts, _) = self.qualified_parts(n);
+                parts.retain(|p| !p.is_empty());
+                return parts;
+            }
+            if k == ids.identifier || k == ids.field_identifier || k == ids.type_identifier || k == ids.destructor_name || k == ids.operator_name {
+                break;
+            }
+            match n.child_by_field_id(ids.f_declarator.get()).or_else(|| n.named_child(0)) {
+                Some(inner) => n = inner,
+                None => break,
+            }
+        }
+        Vec::new()
+    }
+
+    /// C++: the class whose body a member declared at `pos` is in: the
+    /// innermost being read, outside any function or `friend`.
+    fn class_at(&mut self, pos: usize) -> Option<usize> {
+        while self.classes.last().is_some_and(|c| pos >= c.end) {
+            self.classes.pop();
+        }
+        (!self.in_fn() && pos >= self.friend_end && !self.classes.is_empty()).then(|| self.classes.len() - 1)
+    }
+
+    /// C++: note that `def` is a member of the class `class` (being read)
+    /// and of the classes `scope` names. Returns the class's own name.
+    fn note_owner(&mut self, def: u32, scope: &[&[u8]], class: Option<usize>) -> u32 {
+        let mut chain = class.map(|c| self.classes[c].chain.clone()).unwrap_or_default();
+        for part in scope.iter().filter(|p| **p != b"?") {
+            if !chain.is_empty() {
+                chain.push_str("::");
+            }
+            chain.push_str(&String::from_utf8_lossy(part));
+        }
+        if chain.is_empty() {
+            return NONE;
+        }
+        let own = chain.rsplit("::").next().unwrap_or("").to_string();
+        let (chain, own) = (self.intern_str(&chain), self.intern_str(&own));
+        self.out.owners.push((def, chain, own));
+        own
+    }
+
+    /// C++: is the function declared `virtual`, `override` or `final`?
+    fn is_virtual(&self, decl: Node<'a>) -> bool {
+        let ids = self.ids;
+        let mut c = decl.walk();
+        if decl.children(&mut c).any(|ch| !ch.is_named() && self.text(ch) == b"virtual") {
+            return true;
+        }
+        let mut n = decl.child_by_field_id(ids.f_declarator.get());
+        for _ in 0..8 {
+            let Some(d) = n else { break };
+            if d.kind_id() == ids.function_declarator {
+                let mut c = d.walk();
+                return d.children(&mut c).any(|ch| ch.kind_id() == ids.virtual_specifier);
+            }
+            n = d.child_by_field_id(ids.f_declarator.get());
+        }
+        false
+    }
+
+    /// C++: a member just defined takes its place in the class being read,
+    /// for what the class's layout says (`x.f ()` with `x` of the class).
+    fn place_in_record(&mut self, def: u32, pos: usize) {
+        while self.open_records.last().is_some_and(|r| pos >= r.0) {
+            self.open_records.pop();
+        }
+        if let Some(&(_, r)) = self.open_records.last() {
+            let id = self.out.defs[def as usize].name;
+            let record = &mut self.out.records[r];
+            if let Some(at) = (0..record.fields.len()).find(|&i| record.fields[i] == id && record.defs[i] == NONE) {
+                record.defs[at] = def;
+            }
+        }
+    }
+
+    fn push_def(&mut self, name: Node<'a>, span: Node, kind: u8, flags: u8) -> u32 {
         self.skip.insert(name.start_byte());
         if let Some(slot) = self.site_defs.get_mut(&name.start_byte()) {
             *slot = self.out.defs.len() as u32;
         }
-        let name = self.intern(self.text(name));
+        let name = self.def_name(name);
         self.out.defs.push(Def {
             name,
             line: span.start_position().row as u32 + 1,
@@ -367,7 +720,25 @@ impl<'a> Walk<'a> {
         let k = t.kind_id();
         if k == ids.type_identifier {
             self.intern(self.text(t))
-        } else if k == ids.struct_specifier || k == ids.union_specifier {
+        } else if self.cpp && k == ids.qualified_identifier {
+            // `ns::Type`: the type.
+            let name = self.qualified_parts(t).1;
+            if name.id() == t.id() { NONE } else { self.type_name(name) }
+        } else if self.cpp && k == ids.template_type {
+            // What a smart pointer points to is what `->` reaches; any
+            // other template is taken for the class it names.
+            let Some(name) = t.child_by_field_id(ids.f_name) else { return NONE };
+            let text = self.text(name);
+            if SMART_POINTERS.contains(&text) {
+                let arg = t
+                    .child_by_field_id(ids.f_arguments)
+                    .and_then(|a| a.named_child(0))
+                    .filter(|a| a.kind_id() == ids.type_descriptor)
+                    .and_then(|d| d.child_by_field_id(ids.f_type));
+                return arg.map_or(NONE, |a| self.type_name(a));
+            }
+            self.type_name(name)
+        } else if k == ids.struct_specifier || k == ids.union_specifier || (self.cpp && k == ids.class_specifier) {
             match t.child_by_field_id(ids.f_name) {
                 Some(n) => self.intern(self.text(n)),
                 None if t.child_by_field_id(ids.f_body).is_some() => self.unnamed(t),
@@ -400,10 +771,19 @@ impl<'a> Walk<'a> {
             }
         }
         let k = n.kind_id();
+        if self.cpp && k == ids.this && self.method_class != NONE {
+            return Some((root::TYPE, self.method_class));
+        }
         if k == ids.identifier {
             let text = self.text(n);
             if self.in_fn() && self.locals.contains(text) {
                 return self.local_types.get(text).map(|&t| (root::TYPE, t));
+            }
+            if self.cpp && self.in_fn() && self.method_class != NONE {
+                // In a method, a name that is not local is first of all a
+                // member of its class: `iter_->Next ()`.
+                path.push(self.intern(text));
+                return Some((root::TYPE, self.method_class));
             }
             return Some((root::VAR, self.intern(text)));
         }
@@ -450,7 +830,12 @@ impl<'a> Walk<'a> {
         let mut n = declarator;
         for _ in 0..32 {
             let Some(inner) = n.child_by_field_id(ids.f_declarator.get()).or_else(|| n.named_child(0)) else { return };
-            if n.kind_id() == ids.function_declarator && inner.kind_id() == ids.identifier {
+            let ik = inner.kind_id();
+            let named = ik == ids.identifier
+                || (self.cpp
+                    && (ik == ids.field_identifier || ik == ids.qualified_identifier || ik == ids.destructor_name
+                        || ik == ids.operator_name || ik == ids.template_function));
+            if n.kind_id() == ids.function_declarator && named {
                 break;
             }
             n = inner;
@@ -575,17 +960,30 @@ impl<'a> Walk<'a> {
     /// whether the name itself is declared as a function (`f(...)`, as opposed
     /// to a function pointer `(*f)(...)`).
     fn decl_name(&self, mut n: Node<'a>) -> Option<(Node<'a>, bool)> {
+        let ids = self.ids;
         let mut is_fn = false;
         for _ in 0..32 {
             let k = n.kind_id();
-            if k == self.ids.identifier || k == self.ids.type_identifier || k == self.ids.field_identifier {
+            if k == ids.identifier || k == ids.type_identifier || k == ids.field_identifier
+                || (self.cpp && (k == ids.destructor_name || k == ids.operator_name))
+            {
                 // A name the parser made up to get past an error (where a
                 // macro stood, say) has no text, and names nothing.
                 return (!n.byte_range().is_empty()).then_some((n, is_fn));
             }
-            let inner = n.child_by_field_id(self.ids.f_declarator.get()).or_else(|| n.named_child(0))?;
-            if k == self.ids.function_declarator {
-                is_fn = inner.kind_id() == self.ids.identifier;
+            if self.cpp && (k == ids.qualified_identifier || k == ids.template_function) {
+                // `A::f`, `f<int>`: the name, the scope aside.
+                n = self.qualified_parts(n).1;
+                continue;
+            }
+            let inner = n.child_by_field_id(ids.f_declarator.get()).or_else(|| n.named_child(0))?;
+            if k == ids.function_declarator {
+                let ik = inner.kind_id();
+                // (In C++ a method's name is a field's, and may be qualified.)
+                is_fn = ik == ids.identifier
+                    || (self.cpp
+                        && (ik == ids.field_identifier || ik == ids.qualified_identifier || ik == ids.destructor_name
+                            || ik == ids.operator_name || ik == ids.template_function));
             }
             n = inner;
         }
@@ -692,7 +1090,17 @@ impl<'a> Walk<'a> {
     fn member_names(&mut self, body: Node<'a>, names: &mut Vec<u32>, types: &mut Vec<u32>) {
         let ids = self.ids;
         let mut c = body.walk();
-        let decls: Vec<Node<'a>> = body.named_children(&mut c).filter(|d| d.kind_id() == ids.field_declaration).collect();
+        // (A C++ class's methods are members too, declared or defined in it,
+        // templates or not.)
+        let cpp = self.cpp;
+        let decls: Vec<Node<'a>> = body
+            .named_children(&mut c)
+            .map(|d| if cpp && d.kind() == "template_declaration" { d.named_child(d.named_child_count().saturating_sub(1)).unwrap_or(d) } else { d })
+            .filter(|d| {
+                let k = d.kind_id();
+                k == ids.field_declaration || (cpp && (k == ids.function_definition || k == ids.declaration))
+            })
+            .collect();
         for decl in decls {
             let ds = self.declarators(decl);
             if ds.is_empty() {
@@ -725,7 +1133,7 @@ impl<'a> Walk<'a> {
         self.member_names(body, &mut fields, &mut types);
         let defs = vec![NONE; fields.len()];
         self.open_records.push((node.end_byte(), self.out.records.len()));
-        self.out.records.push(Record { name, fields, types, defs });
+        self.out.records.push(Record { name, fields, types, defs, nested: false });
     }
 
     /// A braced initializer of an object of struct type `type_name` (or of
@@ -869,6 +1277,23 @@ impl<'a> Walk<'a> {
         let k = node.kind_id();
         let ids = self.ids;
 
+        if self.cpp {
+            if k == ids.namespace_definition {
+                match node.child_by_field_id(ids.f_name).filter(|n| n.kind() == "namespace_identifier" && !n.byte_range().is_empty()) {
+                    Some(name) => {
+                        self.push_def(name, node, kind::NAMESPACE, 0);
+                    }
+                    None if node.child_by_field_id(ids.f_name).is_none() => self.anon_end = self.anon_end.max(node.end_byte()),
+                    None => {}
+                }
+                return true;
+            }
+            if k == ids.friend_declaration {
+                self.friend_end = node.end_byte();
+                return true;
+            }
+        }
+
         if k == ids.identifier {
             let taken = self.skip.remove(&node.start_byte());
             if self.in_fn() && self.locals.contains(self.text(node)) {
@@ -882,7 +1307,12 @@ impl<'a> Walk<'a> {
             return false;
         }
         if k == ids.type_identifier {
-            if !self.skip.remove(&node.start_byte()) {
+            // C++: the macro a definition is made with, which the parser takes
+            // for its type (`TEST_F f(...) {`, the use masked), is not used
+            // by what it defines: what the macro's text calls (registering
+            // a test) is not called from the body.
+            let defining = self.cpp && self.defining_macros.contains(&node.start_byte());
+            if !self.skip.remove(&node.start_byte()) && !defining {
                 self.push_ref(node, refkind::USE);
             }
             return false;
@@ -931,18 +1361,42 @@ impl<'a> Walk<'a> {
                         }
                     }
                 }
+                Some(f) if self.cpp && (f.kind_id() == ids.qualified_identifier || f.kind_id() == ids.template_function) => {
+                    // `X::f (...)`, `f<T> (...)`: the name, and what it is
+                    // qualified with.
+                    let qualified = f.kind_id() == ids.qualified_identifier;
+                    let (parts, name) = self.qualified_parts(f);
+                    if name.kind_id() == ids.identifier {
+                        self.skip.insert(name.start_byte());
+                        self.push_ref(name, refkind::CALL);
+                        if let Some(q) = parts.last().filter(|_| qualified) {
+                            let q = self.intern(q);
+                            self.out.ref_quals.push((self.out.refs.len() as u32 - 1, q));
+                        }
+                    }
+                }
                 Some(f) => {
                     self.out.indirect_calls += 1;
                     let target = self.strip(f);
                     let tk = target.kind_id();
                     if tk == ids.field_expression {
-                        // `p->member (...)`: through whatever is stored there.
-                        if let Some(member) = target.child_by_field_id(ids.f_field) {
-                            self.skip.insert(member.start_byte());
-                            self.push_ref(member, refkind::ICALL);
-                            let hint = self.member_hint(target);
-                            if hint != NONE {
-                                self.out.ref_hints.push((self.out.refs.len() as u32 - 1, hint));
+                        // `p->member (...)`: through whatever is stored there
+                        // (in C++, mostly a method).
+                        if let Some(field) = target.child_by_field_id(ids.f_field) {
+                            let (parts, member) = if self.cpp { self.qualified_parts(field) } else { (Vec::new(), field) };
+                            if member.kind_id() == ids.field_identifier || member.kind_id() == ids.identifier {
+                                self.skip.insert(member.start_byte());
+                                self.push_ref(member, refkind::ICALL);
+                                let at = self.out.refs.len() as u32 - 1;
+                                let hint = self.member_hint(target);
+                                if hint != NONE {
+                                    self.out.ref_hints.push((at, hint));
+                                }
+                                // `p->Base::f ()`.
+                                if let Some(q) = parts.last().filter(|q| !q.is_empty()) {
+                                    let q = self.intern(q);
+                                    self.out.ref_quals.push((at, q));
+                                }
                             }
                         }
                     } else if tk == ids.identifier && !(self.in_fn() && self.locals.contains(self.text(target))) {
@@ -983,8 +1437,16 @@ impl<'a> Walk<'a> {
                 self.open_records.pop();
             }
             for d in self.declarators(node) {
-                if let Some((name, _)) = self.decl_name(d) {
-                    let def = if self.declares_function(d) {
+                if let Some((name, is_fn)) = self.decl_name(d) {
+                    let def = if self.cpp && is_fn {
+                        // A method, declared.
+                        let class = self.class_at(node.start_byte());
+                        let flags = flag::DECL | if self.is_virtual(node) { flag::VIRTUAL } else { 0 };
+                        let def = self.push_def(name, node, kind::FUNCTION, flags);
+                        let scope = self.declared_scope(d);
+                        self.note_owner(def, &scope, class);
+                        def
+                    } else if self.declares_function(d) {
                         self.push_def(name, node, kind::FIELD, flag::CALLABLE)
                     } else {
                         let def = self.push_def(name, node, kind::FIELD, 0);
@@ -1016,8 +1478,38 @@ impl<'a> Walk<'a> {
                     self.push_ref(name, refkind::CALL);
                     return true;
                 }
-                let flags = self.storage_flags(node);
+                let mut flags = self.storage_flags(node);
+                let (class, scope) = if self.cpp {
+                    let class = self.class_at(node.start_byte());
+                    let scope = node.child_by_field_id(ids.f_declarator.get()).map(|d| self.declared_scope(d)).unwrap_or_default();
+                    (class, scope)
+                } else {
+                    (None, Vec::new())
+                };
+                if class.is_some() || !scope.is_empty() {
+                    // A member: `static` says nothing of where it is seen.
+                    flags &= !flag::STATIC;
+                    if self.is_virtual(node) {
+                        flags |= flag::VIRTUAL;
+                    }
+                } else if node.start_byte() < self.anon_end {
+                    flags |= flag::STATIC;
+                }
+                if self.cpp {
+                    // `= default`, `= delete`: no body written, nothing to go to.
+                    let mut c = node.walk();
+                    if node.children(&mut c).any(|ch| matches!(ch.kind(), "default_method_clause" | "delete_method_clause")) {
+                        flags |= flag::DECL;
+                    }
+                }
                 let def = self.push_def(name, node, kind::FUNCTION, flags);
+                self.method_class = NONE;
+                if self.cpp {
+                    self.method_class = self.note_owner(def, &scope, class);
+                    if class.is_some() {
+                        self.place_in_record(def, node.start_byte());
+                    }
+                }
                 let returns = self.type_name_of(node);
                 if returns != NONE {
                     self.out.typed.push((def, returns));
@@ -1067,9 +1559,28 @@ impl<'a> Walk<'a> {
                 let mut first = None;
                 for d in self.declarators(node) {
                     if let Some((name, is_fn)) = self.decl_name(d) {
-                        let (kind, flags) =
+                        let (kind, mut flags) =
                             if is_fn { (kind::FUNCTION, storage | flag::DECL) } else { (kind::GLOBAL, storage) };
+                        // C++: a member of the class being read (a
+                        // constructor, say), or of the one it is qualified
+                        // with (`int Cache::hits = 0;`).
+                        let (class, scope) = if self.cpp { (self.class_at(node.start_byte()), self.declared_scope(d)) } else { (None, Vec::new()) };
+                        let member = class.is_some() || !scope.is_empty();
+                        if member {
+                            flags &= !flag::STATIC;
+                            if is_fn && self.is_virtual(node) {
+                                flags |= flag::VIRTUAL;
+                            }
+                        } else if self.cpp && node.start_byte() < self.anon_end {
+                            flags |= flag::STATIC;
+                        }
                         let def = self.push_def(name, node, kind, flags);
+                        if member {
+                            self.note_owner(def, &scope, class);
+                            if class.is_some() {
+                                self.place_in_record(def, node.start_byte());
+                            }
+                        }
                         // A function's return type, or a variable's own
                         // (a pointer to a function has neither to offer).
                         if declared != NONE && (is_fn || !self.declares_function(d)) {
@@ -1115,10 +1626,30 @@ impl<'a> Walk<'a> {
             }
             return true;
         }
-        if k == ids.struct_specifier || k == ids.union_specifier || k == ids.enum_specifier {
+        let is_class = self.cpp && k == ids.class_specifier;
+        if k == ids.struct_specifier || k == ids.union_specifier || k == ids.enum_specifier || is_class {
             if node.child_by_field_id(ids.f_body).is_some() {
-                if let Some(name) = node.child_by_field_id(ids.f_name).filter(|n| !n.byte_range().is_empty()) {
-                    let kind = if k == ids.struct_specifier {
+                // (`class Foo<int> { ... }`, a specialization: `Foo`;
+                // `struct List<T>::Node { ... }`, a member defined apart:
+                // `Node`, in `List`.)
+                let mut scope = Vec::new();
+                let named = node
+                    .child_by_field_id(ids.f_name)
+                    .map(|n| {
+                        let n = if self.cpp && n.kind_id() == ids.qualified_identifier {
+                            let (parts, name) = self.qualified_parts(n);
+                            scope = parts;
+                            name
+                        } else {
+                            n
+                        };
+                        if self.cpp && n.kind_id() == ids.template_type { n.child_by_field_id(ids.f_name).unwrap_or(n) } else { n }
+                    })
+                    .filter(|n| !n.byte_range().is_empty());
+                if let Some(name) = named {
+                    let kind = if is_class {
+                        kind::CLASS
+                    } else if k == ids.struct_specifier {
                         kind::STRUCT
                     } else if k == ids.union_specifier {
                         kind::UNION
@@ -1128,7 +1659,49 @@ impl<'a> Walk<'a> {
                     self.push_def(name, node, kind, 0);
                     if k != ids.enum_specifier {
                         let record = self.intern(self.text(name));
-                        self.push_record(record, node, node.child_by_field_id(ids.f_body).unwrap());
+                        let body = node.child_by_field_id(ids.f_body).unwrap();
+                        let outer = if self.cpp { self.class_at(node.start_byte()) } else { None };
+                        // (A class in a class is meant by its short name only
+                        // inside the outer one.)
+                        let nested = outer.is_some() || scope.iter().any(|p| !p.is_empty());
+                        self.push_record(record, node, body);
+                        if nested {
+                            if let Some(r) = self.out.records.last_mut() {
+                                r.nested = true;
+                            }
+                        }
+                        if self.cpp {
+                            // What its members are members of, and what it
+                            // derives from.
+                            let mut chain = outer.map(|c| self.classes[c].chain.clone()).unwrap_or_default();
+                            for part in scope.iter().filter(|p| !p.is_empty() && **p != b"?").chain(std::iter::once(&self.text(name))) {
+                                if !chain.is_empty() {
+                                    chain.push_str("::");
+                                }
+                                chain.push_str(&String::from_utf8_lossy(part));
+                            }
+                            let mut c = node.walk();
+                            let clause: Vec<Node<'a>> = node.children(&mut c).filter(|ch| ch.kind_id() == ids.base_class_clause).collect();
+                            for clause in clause {
+                                let mut c = clause.walk();
+                                let named: Vec<Node<'a>> = clause.named_children(&mut c).collect();
+                                for b in named {
+                                    let base = self.type_name(b);
+                                    if base != NONE {
+                                        self.out.bases.push((record, base));
+                                    }
+                                }
+                            }
+                            // Where the body's brace is closed: error recovery
+                            // can make the node end elsewhere (past what a
+                            // macro hid, to the end of the file).
+                            let at = self.blocks.partition_point(|b| (b.0 as usize) < body.start_byte());
+                            let end = match self.blocks.get(at) {
+                                Some(&(start, block_end, _)) if start as usize == body.start_byte() => block_end as usize,
+                                _ => body.end_byte(),
+                            };
+                            self.classes.push(OpenClass { end, chain });
+                        }
                     }
                 } else if k != ids.enum_specifier {
                     let record = self.unnamed(node);

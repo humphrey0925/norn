@@ -71,9 +71,24 @@ def cbm_index(db_path, project=None):
     return files, defs, calls, []
 
 
+def short_names(t):
+    """The truth with every function named without its classes, for a tool
+    that does not record them (`DBImpl::Get` as `Get`)."""
+    last = lambda n: n.rsplit("::", 1)[-1]
+    t["defs"] = [[u, last(n), *rest] for u, n, *rest in t["defs"]]
+    t["calls"] = [[cf, last(cn), cl, u, last(en), *rest] for cf, cn, cl, u, en, *rest in t["calls"]]
+    t["icalls"] = [[cf, last(cn), *rest] for cf, cn, *rest in t.get("icalls", [])]
+    t["binds"] = [[r, m, u, last(n), *rest] for r, m, u, n, *rest in t.get("binds", [])]
+    if "overrides" in t:
+        t["overrides"] = [[u, last(n), f, bu, last(bn), bf] for u, n, f, bu, bn, bf in t["overrides"]]
+    return t
+
+
 class Truth:
-    def __init__(self, path):
+    def __init__(self, path, short=False):
         t = json.load(open(path, encoding="utf-8"))
+        if short:
+            t = short_names(t)
         self.raw = t
         self.files = {GENERATED.get(f, f): v for f, v in t["files"].items()}
         self.defs = [(name, GENERATED.get(file, file), line) for _, name, file, line, _ in t["defs"]]
@@ -82,6 +97,8 @@ class Truth:
             self.homes[usr].add(GENERATED.get(file, file))
         self.calls = t["calls"]
         self._starts = {f: [r[0] for r in v["inactive"]] for f, v in self.files.items()}
+        # C++: calls in templates that clang binds only once instantiated.
+        self.dependent = {(GENERATED.get(f, f), line) for f, line in t.get("dependent_sites", [])}
 
     def active(self, file, line):
         """Did any translation unit compile this line?"""
@@ -92,12 +109,12 @@ class Truth:
         return i < 0 or line > info["inactive"][i][1]
 
 
-def score(truth_path, index, corpus, cbm=False, loaded=None, callers=None):
+def score(truth_path, index, corpus, cbm=False, loaded=None, callers=None, short=False):
     """`loaded`: (files, defs, call rows, indirect rows) of some other tool, in
     the shape si_index returns; it is then scored as codebase-memory-mcp is (one
     kind of call edge, no stores). `callers`: score calls only from these
     (file, function) pairs, for a tool whose calls were sampled."""
-    t = Truth(truth_path)
+    t = Truth(truth_path, short)
     corpus = Path(corpus)
     # files, (file, name) -> lines, call rows
     if loaded is not None:
@@ -117,7 +134,7 @@ def score(truth_path, index, corpus, cbm=False, loaded=None, callers=None):
         """Is the name spelled on that line (not produced by a macro)?"""
         if file not in text:
             text[file] = (corpus / file).read_bytes().decode("latin-1").split("\n")  # not splitlines: ^L is not a line break
-        return line <= len(text[file]) and name in text[file][line - 1]
+        return line <= len(text[file]) and name.rsplit("::", 1)[-1] in text[file][line - 1]
 
     want = {(file, name, line) for name, file, line in t.defs if file in si_files}
     outside = len({d for d in t.defs if d[1] not in si_files})
@@ -146,9 +163,22 @@ def score(truth_path, index, corpus, cbm=False, loaded=None, callers=None):
     names_called = collections.defaultdict(set)  # (caller file, caller name) -> callee names, defined or not
     per_program = set()      # (caller file, caller name, callee name): which definition depends on the link
     external = 0
-    for cf, cn, _cl, usr, callee_name, home, _site_file, _site_line in t.calls:
+    forms = collections.Counter()
+    by_form = collections.defaultdict(set)  # form -> edges, for the forms not in the score
+    unscored = set()  # (caller file, caller name, callee name) of those forms
+    for cf, cn, _cl, usr, callee_name, home, _site_file, _site_line, *form in t.calls:
         cf = GENERATED.get(cf, cf)
         if cf not in si_files or (callers is not None and (cf, cn) not in callers):
+            continue
+        form = form[0] if form else "call"
+        forms[form] += 1
+        if form not in ("call", "virtual"):
+            homes = {GENERATED.get(home, home)} if home else t.homes.get(usr, set())
+            if len(homes) == 1 and homes <= si_files:
+                by_form[form].add((cf, cn, *homes, callee_name))
+            # (A call of a constructor or operator found is no error, only
+            # not scored: it is no call written by the callee's name.)
+            unscored.add((cf, cn, callee_name))
             continue
         names_called[cf, cn].add(callee_name)
         homes = {GENERATED.get(home, home)} if home else t.homes.get(usr, set())
@@ -170,7 +200,8 @@ def score(truth_path, index, corpus, cbm=False, loaded=None, callers=None):
         any_.add(key)
         if how == "certain":
             certain.add(key)
-            if (cf, cn) in names_called and (cf, cn, en) not in per_program and t.active(site_file, int(site_line)):
+            if (cf, cn) in names_called and (cf, cn, en) not in per_program and (cf, cn, en) not in unscored \
+                    and (site_file, int(site_line)) not in t.dependent and t.active(site_file, int(site_line)):
                 judged.append(key)
     judged_keys = set(judged)
     right = judged_keys & want_calls
@@ -181,6 +212,29 @@ def score(truth_path, index, corpus, cbm=False, loaded=None, callers=None):
     undefined = {k for k in judged_keys - want_calls - wrong_file if k[3] in names_called[k[0], k[1]]}
     phantom = judged_keys - want_calls - wrong_file - undefined
     missed_calls = want_calls - any_
+    # A virtual call may run any override of the method named: the edges to
+    # the overrides defined in the corpus (transitively), which a reader
+    # following the call wants listed too.
+    overriders = collections.defaultdict(set)  # base usr -> (file, name) of overrides
+    for usr, name, file, base_usr, _bn, _bf in t.raw.get("overrides", []):
+        overriders[base_usr].add((usr, GENERATED.get(file, file), name))
+    want_virtual = set()
+    for cf, cn, _cl, usr, _callee_name, _home, _sf, _sl, *form in t.calls:
+        cf = GENERATED.get(cf, cf)
+        if not form or form[0] != "virtual" or cf not in si_files:
+            continue
+        seen, todo = set(), [usr]
+        while todo:
+            for u, f, n in overriders.get(todo.pop(), ()):
+                if u not in seen and f in si_files:
+                    seen.add(u)
+                    todo.append(u)
+                    want_virtual.add((cf, cn, f, n))
+    other_forms = {f: {"truth_edges": len(e), "found_any": len(e & any_), "recall_any": len(e & any_) / max(1, len(e))}
+                   for f, e in sorted(by_form.items())}
+    if want_virtual:
+        other_forms["virtual_overrides"] = {"truth_edges": len(want_virtual), "found_any": len(want_virtual & any_),
+                                            "recall_any": len(want_virtual & any_) / max(1, len(want_virtual))}
     calls = {"truth_edges": len(want_calls), "truth_call_sites_to_undefined": external,
              "truth_edges_decided_by_link": len(per_program),
              "found_certain": len(want_calls & certain), "found_any": len(want_calls & any_),
@@ -190,7 +244,9 @@ def score(truth_path, index, corpus, cbm=False, loaded=None, callers=None):
              "wrong_definition_chosen": len(wrong_file), "callee_undefined_in_build": len(undefined),
              "no_such_call": len(phantom),
              "precision_certain": len(right) / max(1, len(judged_keys) - len(undefined)),
-             "si_edges_to_prototypes": len(to_decl)}
+             "si_edges_to_prototypes": len(to_decl),
+             **({"truth_call_sites_by_form": dict(forms), "other_forms": other_forms,
+                 "dependent_calls_in_templates": t.raw.get("dependent_calls", 0)} if "cpp_translation_units" in t.raw else {})}
     # --- calls through struct members -----------------------------------------
     # What clang's types say: a call through member M of struct S may reach
     # any function stored in S.M anywhere. An upper bound, not a trace.

@@ -325,7 +325,7 @@ pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -
     }
     // What a compilation starts from: a file that is not a header, or a
     // header nothing here includes (it is somebody's, out of sight).
-    let roots: Vec<u32> = (0..n as u32).filter(|&i| !paths[i as usize].ends_with(".h") || !included[i as usize]).collect();
+    let roots: Vec<u32> = (0..n as u32).filter(|&i| !crate::is_header(&paths[i as usize]) || !included[i as usize]).collect();
     let sizes: Vec<usize> = steps.iter().map(Vec::len).collect();
     let seen = || sizes.iter().map(|&n| (0..n).map(|_| AtomicU8::new(0)).collect()).collect();
     let mut w = World {
@@ -348,7 +348,7 @@ pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -
                     local: Local::default(),
                     // A header nothing here includes is included by
                     // something out of sight, after who knows what.
-                    unseen: paths[root as usize].ends_with(".h"),
+                    unseen: crate::is_header(&paths[root as usize]),
                     read: FxHashMap::default(),
                     outright: first.then(FxHashSet::default),
                     reading: FxHashMap::default(),

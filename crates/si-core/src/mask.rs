@@ -224,7 +224,7 @@ pub fn source_of(per_file: &[Vec<Define>], paths: &[String]) -> crate::cond::Sou
     }
     // What a compilation starts from: a file that is not a header, or a
     // header nothing here includes (it is somebody's, out of sight).
-    let roots: Vec<u32> = (0..n as u32).filter(|&i| !paths[i as usize].ends_with(".h") || up[i as usize].is_empty()).collect();
+    let roots: Vec<u32> = (0..n as u32).filter(|&i| !crate::is_header(&paths[i as usize]) || up[i as usize].is_empty()).collect();
     // What is said of each tested name, and where.
     #[derive(Default)]
     struct Said<'a> {
@@ -661,7 +661,7 @@ impl MacroSets {
                     // turn: what is included in quotes (the headers a file
                     // is made with, `"aout-target.h"`), not in angle
                     // brackets (the system's, the project's own for all).
-                    let source = !paths[f as usize].ends_with(".h");
+                    let source = !crate::is_header(&paths[f as usize]);
                     let most = if source { WIDELY_READ_FROM_SOURCE } else { WIDELY_READ };
                     let quoted = |list: &[Included], from: usize| -> Vec<u32> { list.iter().skip(from).filter(|(_, system)| !*system).flat_map(|(t, _)| t).copied().collect() };
                     let mut after: Vec<u32> = quoted(&includes[f as usize], from as usize);
@@ -1213,6 +1213,11 @@ struct Lexer<'a> {
     arg: Option<OperatorArg>,
     /// Start of the top-level block being read.
     block: Option<usize>,
+    /// C++: blocks at every depth are reported (a class or a function is
+    /// in a namespace), and here is where each open brace started (`None`
+    /// for an initializer's), one per brace in `nest`.
+    all_blocks: bool,
+    open_blocks: Vec<Option<usize>>,
     /// The identifier before the one being read.
     last_ident: (u32, u32),
     /// End of a macro use hidden from the parser whose arguments are being
@@ -1288,16 +1293,36 @@ impl<'a> Lexer<'a> {
                         self.block = (!init).then_some(self.c.i);
                     }
                     self.nest.braces.push((if init { Brace::Init } else { Brace::Block }, self.nest.parens));
+                    if self.all_blocks {
+                        self.open_blocks.truncate(self.nest.braces.len() - 1);
+                        self.open_blocks.push((!init).then_some(self.c.i));
+                    }
                     self.nest.parens = 0;
                     self.c.i += 1;
                 }
                 b'}' => {
+                    // C++: the block this closes (in column 0, the outermost).
+                    let closed = if !self.all_blocks {
+                        None
+                    } else if col0 {
+                        self.open_blocks.first().copied().flatten()
+                    } else if self.open_blocks.len() == self.nest.braces.len() {
+                        self.open_blocks.last().copied().flatten()
+                    } else {
+                        None
+                    };
                     if col0 {
                         self.nest = Nest::default();
                     } else if let Some((_, parens)) = self.nest.braces.pop() {
                         self.nest.parens = parens;
                     }
                     self.c.i += 1;
+                    if self.all_blocks {
+                        self.open_blocks.truncate(self.nest.braces.len());
+                        if let Some(start) = closed {
+                            self.out.blocks.push((start as u32, self.c.i as u32, self.c.line));
+                        }
+                    }
                     if self.nest.braces.is_empty() {
                         if let Some(start) = self.block.take() {
                             self.out.blocks.push((start as u32, self.c.i as u32, self.c.line));
@@ -1981,7 +2006,7 @@ fn lexer<'a>(src: &'a [u8], transparent: &'a MacroSets, conditions: &'a Conditio
     }
     Lexer {
         file: path.and_then(|p| conditions.source()?.file(p)),
-        c_file: path.is_some_and(|p| p.ends_with(".c")),
+        c_file: path.is_some_and(crate::is_unit),
         here: path.and_then(|p| transparent.file_id(p)),
         own_transparent: FxHashMap::default(),
         c: Cur { s: src, i: 0, line: 1 },
@@ -1996,6 +2021,8 @@ fn lexer<'a>(src: &'a [u8], transparent: &'a MacroSets, conditions: &'a Conditio
         line_start: true,
         arg: None,
         block: None,
+        all_blocks: path.is_some_and(|p| crate::extract::is_cpp(p, src)),
+        open_blocks: Vec::new(),
         last_ident: (0, 0),
         hidden_until: 0,
     }
@@ -2011,6 +2038,11 @@ pub fn lex(src: &[u8], transparent: &MacroSets) -> Lexed {
 pub fn lex_file(src: &[u8], transparent: &MacroSets, path: Option<&str>) -> Lexed {
     let mut l = lexer(src, transparent, &transparent.conditions, true, path);
     l.run();
+    if l.all_blocks {
+        // (Reported as they closed: inner ones first.)
+        l.out.blocks.sort_unstable();
+        l.out.blocks.dedup_by_key(|b| b.0);
+    }
     l.out
 }
 

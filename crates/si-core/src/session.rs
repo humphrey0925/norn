@@ -118,7 +118,7 @@ fn ms(t: Instant) -> f64 {
 }
 
 fn is_source(path: &Path) -> bool {
-    matches!(path.extension().and_then(|x| x.to_str()), Some("c" | "h"))
+    path.file_name().and_then(|n| n.to_str()).is_some_and(crate::is_source)
 }
 
 impl Session {

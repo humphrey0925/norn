@@ -5,7 +5,7 @@ use bytemuck::Pod;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-const MAGIC: &[u8; 8] = b"SIGRAPH1";
+const MAGIC: &[u8; 8] = b"SIGRAPH2";
 
 /// All arrays are flat and integer-only. Names are sorted, so a name id is
 /// also its lexicographic rank: lookup is a binary search with no hash table,
@@ -25,6 +25,57 @@ pub struct Graph {
     /// symbol -> incoming references (CSR).
     pub in_off: Vec<u32>,
     pub inc: Vec<EdgeHalf>,
+    /// C++: symbol -> the scope it is a member of as written (a name id,
+    /// `NONE` for none). Empty when no symbol has one.
+    pub owner: Vec<u32>,
+}
+
+/// Names a C++ symbol with the classes it is in, not the namespaces:
+/// `DBImpl::Get`, `Writer::Rep::~Rep`.
+pub struct Qualifier {
+    /// Names that are namespaces and no class.
+    namespaces: rustc_hash::FxHashSet<u32>,
+}
+
+impl Qualifier {
+    pub fn new(g: &Graph) -> Self {
+        use crate::model::kind;
+        let mut namespaces = rustc_hash::FxHashSet::default();
+        if !g.owner.is_empty() {
+            for s in g.syms.iter().filter(|s| s.kind == kind::NAMESPACE) {
+                namespaces.insert(s.name);
+            }
+            namespaces.retain(|&n| !g.syms_named(n).iter().any(|&c| matches!(g.syms[c as usize].kind, kind::CLASS | kind::STRUCT | kind::UNION)));
+        }
+        Qualifier { namespaces }
+    }
+
+    /// The classes of a scope as written (`leveldb::DBImpl` → `DBImpl`).
+    pub fn classes<'g>(&self, g: &'g Graph, scope: u32) -> &'g str {
+        let mut s = g.name(scope);
+        while let Some((first, rest)) = s.split_once("::") {
+            match g.name_id(first) {
+                Some(id) if self.namespaces.contains(&id) => s = rest,
+                _ => break,
+            }
+        }
+        // (A scope all namespaces: `ns::f`, no member.)
+        match g.name_id(s) {
+            Some(id) if self.namespaces.contains(&id) && !s.contains("::") => "",
+            _ => s,
+        }
+    }
+
+    pub fn name<'g>(&self, g: &'g Graph, sym: u32) -> std::borrow::Cow<'g, str> {
+        let name = g.sym_name(sym);
+        match g.owner.get(sym as usize).filter(|&&o| o != crate::model::NONE) {
+            Some(&o) => match self.classes(g, o) {
+                "" => name.into(),
+                classes => format!("{classes}::{name}").into(),
+            },
+            None => name.into(),
+        }
+    }
 }
 
 pub(crate) fn write_vec<T: Pod, W: Write>(w: &mut W, v: &[T]) -> io::Result<()> {
@@ -138,6 +189,7 @@ impl Graph {
             + self.files.len() * std::mem::size_of::<FileRec>()
             + self.syms.len() * std::mem::size_of::<Sym>()
             + (self.out.len() + self.inc.len()) * std::mem::size_of::<EdgeHalf>()
+            + self.owner.len() * 4
     }
 
     /// The tables shared by every graph layout: names, files, symbols, name index.
@@ -147,7 +199,8 @@ impl Graph {
         write_vec(w, &self.files)?;
         write_vec(w, &self.syms)?;
         write_vec(w, &self.by_name_off)?;
-        write_vec(w, &self.by_name)
+        write_vec(w, &self.by_name)?;
+        write_vec(w, &self.owner)
     }
 
     pub(crate) fn read_tables<R: Read>(r: &mut R) -> io::Result<Graph> {
@@ -158,6 +211,7 @@ impl Graph {
             syms: read_vec(r)?,
             by_name_off: read_vec(r)?,
             by_name: read_vec(r)?,
+            owner: read_vec(r)?,
             ..Default::default()
         })
     }

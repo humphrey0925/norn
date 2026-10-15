@@ -170,10 +170,18 @@ class Edited:
 
 # ---------------------------------------------------------------- ctags
 
+# C and C++ sources and headers.
+SOURCE_SUFFIXES = (".c", ".h", ".cc", ".cpp", ".cxx", ".c++", ".hh", ".hpp", ".hxx", ".h++", ".ipp", ".inl", ".tcc")
+UNIT_SUFFIXES = (".c", ".cc", ".cpp", ".cxx", ".c++")
+
+
 def ctags(a, res, save, deadline):
     res["version"] = version(["ctags", "--version"])
     tags = os.path.join(a.work, "tags")
-    cmd = ["ctags", "--languages=C", "--langmap=C:.c.h", "--fields=+n", "-L", a.list, "-f", tags]
+    with open(a.list) as f:
+        cpp = any(x.rstrip("\n").endswith(UNIT_SUFFIXES[1:]) for x in f)
+    langmap = ["--langmap=C:.c", "--langmap=C++:+.h"] if cpp else ["--langmap=C:.c.h"]
+    cmd = ["ctags", "--languages=C,C++", *langmap, "--fields=+nsK", "--extras=-q", "-L", a.list, "-f", tags]
     res["command"] = " ".join(cmd)
     res["index"] = cold_index(a, cmd, deadline, {"tags"})
     save()
@@ -186,6 +194,7 @@ def ctags(a, res, save, deadline):
     defs, kinds = [], {}
     if a.no_dump:
         return {"defs": [], "typed": True, "calls": None}
+    rows, namespaces = [], set()
     with open(tags, "rb") as f:
         for raw in f:
             if raw.startswith(b"!_TAG_"):
@@ -193,10 +202,24 @@ def ctags(a, res, save, deadline):
             line = raw.decode("latin-1").rstrip("\n")
             name, file, rest = line.split("\t", 2)
             fields = rest.rsplit(';"\t', 1)[1].split("\t")
-            kinds[fields[0]] = kinds.get(fields[0], 0) + 1
-            if fields[0] == "f":
+            kind = fields[0]
+            kinds[kind] = kinds.get(kind, 0) + 1
+            scope = next((x.split(":", 1)[1] for x in fields[1:] if x.split(":", 1)[0] in ("class", "struct", "union", "namespace")), "")
+            if kind == "namespace":
+                namespaces.add(f"{scope}::{name}" if scope else name)
+            if kind == "function":
                 lineno = next(int(x[5:]) for x in fields if x.startswith("line:"))
-                defs.append([file, name, lineno])
+                rows.append((file, name, lineno, scope))
+    # A function's name, as the ground truth spells it: qualified by the
+    # classes it is in, not by namespaces.
+    for file, name, lineno, scope in rows:
+        parts = scope.split("::") if scope else []
+        # (The namespaces lead: the longest run of them is dropped.)
+        lead = 0
+        for i in range(1, len(parts) + 1):
+            if "::".join(parts[:i]) in namespaces:
+                lead = i
+        defs.append([file, "::".join(parts[lead:] + [name]), lineno])
     res["counts"] = {"tags_by_kind": kinds}
     return {"defs": defs, "typed": True, "calls": None}
 
@@ -369,7 +392,7 @@ def main():
     files = []
     for d, dirs, fs in os.walk(a.src):
         dirs[:] = sorted(x for x in dirs if x not in (".git", ".si", ".norn"))
-        files += [os.path.relpath(os.path.join(d, f), a.src) for f in fs if f.endswith((".c", ".h"))]
+        files += [os.path.relpath(os.path.join(d, f), a.src) for f in fs if f.endswith(SOURCE_SUFFIXES)]
     files.sort()
     a.list = os.path.join(a.work, "files.txt")
     with open(a.list, "w", encoding="latin-1") as f:

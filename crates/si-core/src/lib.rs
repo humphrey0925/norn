@@ -23,14 +23,36 @@ use model::FileFacts;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 
-/// C sources and headers under `root`, sorted for determinism.
+/// Is a file of this name a C or C++ source or header?
+pub fn is_source(name: &str) -> bool {
+    matches!(
+        name.rsplit_once('.').map_or("", |(_, e)| e),
+        "c" | "h" | "cc" | "cpp" | "cxx" | "c++" | "C" | "H" | "hh" | "hpp" | "hxx" | "h++" | "ipp" | "inl" | "tcc" | "ixx" | "cppm"
+    )
+}
+
+/// A header: read where it is included, not compiled on its own.
+pub fn is_header(name: &str) -> bool {
+    matches!(name.rsplit_once('.').map_or("", |(_, e)| e), "h" | "H" | "hh" | "hpp" | "hxx" | "h++" | "ipp" | "inl" | "tcc")
+}
+
+/// A source compiled on its own (a translation unit).
+pub fn is_unit(name: &str) -> bool {
+    matches!(name.rsplit_once('.').map_or("", |(_, e)| e), "c" | "cc" | "cpp" | "cxx" | "c++" | "C" | "ixx" | "cppm")
+}
+
+fn is_source_path(p: &Path) -> bool {
+    p.file_name().and_then(|n| n.to_str()).is_some_and(is_source)
+}
+
+/// C and C++ sources and headers under `root`, sorted for determinism.
 pub fn scan(root: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = walkdir::WalkDir::new(root)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .map(|e| e.into_path())
-        .filter(|p| matches!(p.extension().and_then(|x| x.to_str()), Some("c" | "h")))
+        .filter(|p| is_source_path(p))
         .collect();
     files.sort_unstable();
     files
@@ -54,7 +76,7 @@ pub(crate) type Seen = (PathBuf, store::Stamp);
 /// is as it was when last read includes (the names as written), and the
 /// file is not read again to find out.
 pub(crate) fn scan_scope_with(root: &Path, scope: &scope::Scope, known: &(dyn Fn(&Path, store::Stamp) -> Option<Vec<String>> + Sync)) -> Vec<Seen> {
-    let is_c = |p: &Path| matches!(p.extension().and_then(|x| x.to_str()), Some("c" | "h"));
+    let is_c = |p: &Path| is_source_path(p);
     // (Where a directory is listed, the size and time come with each name.)
     let (mut files, others): (Vec<Seen>, Vec<Seen>) = walkdir::WalkDir::new(root)
         .into_iter()
@@ -80,7 +102,7 @@ pub(crate) fn scan_scope_with(root: &Path, scope: &scope::Scope, known: &(dyn Fn
                 let names = known(p, *at).unwrap_or_else(|| included(&std::fs::read(p).unwrap_or_default()));
                 let mut out = Vec::new();
                 for name in names {
-                    if name.ends_with(".c") || name.ends_with(".h") {
+                    if is_source(&name) {
                         continue;
                     }
                     // Beside the file that includes it, or the only one of that name.

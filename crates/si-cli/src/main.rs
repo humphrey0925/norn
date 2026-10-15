@@ -596,10 +596,11 @@ fn serve(dir: &Path) {
 
 fn symbols(dir: &Path) {
     let g = Graph::load(&dir.join("graph.si")).expect("load graph.si");
+    let q = si_core::graph::Qualifier::new(&g);
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     for (id, s) in g.syms.iter().enumerate().filter(|(_, s)| s.kind != kind::FILE) {
         let decl = if s.flags & flag::DECL != 0 { "decl" } else { "def" };
-        writeln!(out, "{}	{}	{}	{decl}	{}", g.file_path(s.file), s.line, kind::name(s.kind), g.sym_name(id as u32))
+        writeln!(out, "{}	{}	{}	{decl}	{}", g.file_path(s.file), s.line, kind::name(s.kind), q.name(&g, id as u32))
             .expect("write symbols");
     }
 }
@@ -610,6 +611,7 @@ fn symbols(dir: &Path) {
 /// variable the call was made through (or `-`), and `direct|indirect`.
 fn calls(dir: &Path) {
     let g = Graph::load(&dir.join("graph.si")).expect("load graph.si");
+    let q = si_core::graph::Qualifier::new(&g);
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     for (id, s) in g.syms.iter().enumerate().filter(|(_, s)| s.kind == kind::FUNCTION) {
         let decl = if s.flags & flag::DECL != 0 { "decl" } else { "def" };
@@ -622,8 +624,8 @@ fn calls(dir: &Path) {
             let via = c.slot.or(c.via).map_or(if c.pointer { "*" } else { "-" }, |m| g.sym_name(m));
             let how = if c.indirect() { "indirect" } else { "direct" };
             writeln!(out, "{}	{}	{}	{}	{}	{}	{}	{}	{certain}	{decl}	{via}	{how}",
-                     g.file_path(from.file), c.line, g.sym_name(c.caller), g.file_path(from.file), from.line,
-                     g.sym_name(id as u32), g.file_path(s.file), s.line)
+                     g.file_path(from.file), c.line, q.name(&g, c.caller), g.file_path(from.file), from.line,
+                     q.name(&g, id as u32), g.file_path(s.file), s.line)
                 .expect("write calls");
         }
     }

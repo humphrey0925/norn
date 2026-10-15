@@ -95,6 +95,7 @@ impl PackedGraph {
             syms: g.syms.clone(),
             by_name_off: g.by_name_off.clone(),
             by_name: g.by_name.clone(),
+            owner: g.owner.clone(),
             ..Default::default()
         };
         PackedGraph { base, out, inc }

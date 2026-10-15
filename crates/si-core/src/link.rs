@@ -4,7 +4,7 @@
 use crate::graph::Graph;
 use crate::model::{flag, kind, pack_meta, refkind, root, EdgeHalf, FileFacts, FileRec, MemberHint, Sym, NONE};
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::time::Instant;
 
 /// Upper bound on targets emitted for one ambiguous reference.
@@ -366,6 +366,8 @@ struct Types<'a> {
     aliases: &'a FxHashMap<u32, Vec<u32>>,
     /// Type name of a variable, or of what a function returns, by symbol.
     of_symbol: &'a FxHashMap<u32, u32>,
+    /// C++: what a class derives from.
+    cpp: &'a Cpp,
 }
 
 impl Types<'_> {
@@ -394,21 +396,152 @@ impl Types<'_> {
             }
         };
         let (mut rf, mut ri) = record_of(type_name, fi as u32, closure, self.records, self.aliases)?;
-        let position = |rf: u32, ri: u32, wanted: u32| {
-            let r = &self.files[rf as usize].records[ri as usize];
-            (0..r.fields.len()).find(|&i| r.fields[i] != NONE && self.remap[rf as usize][r.fields[i] as usize] == wanted)
-        };
         for &m in &f.hint_path[hint.path as usize..(hint.path + hint.len) as usize] {
-            let at = position(rf, ri, self.remap[fi][m as usize])?;
-            let t = self.files[rf as usize].records[ri as usize].types[at];
+            let (mf, mi, at) = self.find(rf, ri, self.remap[fi][m as usize], closure, 8)?;
+            let t = self.files[mf as usize].records[mi as usize].types[at];
             if t == NONE {
                 return None;
             }
-            (rf, ri) = record_of(self.remap[rf as usize][t as usize], rf, closure, self.records, self.aliases)?;
+            (rf, ri) = record_of(self.remap[mf as usize][t as usize], mf, closure, self.records, self.aliases)?;
         }
-        let at = position(rf, ri, member)?;
+        let (rf, ri, at) = self.find(rf, ri, member, closure, 8)?;
         let def = self.files[rf as usize].records[ri as usize].defs[at];
         (def != NONE).then(|| g.files[rf as usize].sym_start + def)
+    }
+
+    /// Member `wanted` of a struct or class, or (C++) of a class it
+    /// derives from: (file, record, position).
+    fn find(&self, rf: u32, ri: u32, wanted: u32, closure: &Closure, depth: u32) -> Option<(u32, u32, usize)> {
+        let r = &self.files[rf as usize].records[ri as usize];
+        let remap = &self.remap[rf as usize];
+        if let Some(at) = (0..r.fields.len()).find(|&i| r.fields[i] != NONE && remap[r.fields[i] as usize] == wanted) {
+            return Some((rf, ri, at));
+        }
+        if depth == 0 {
+            return None;
+        }
+        let bases = self.cpp.bases.get(&remap[r.name as usize])?;
+        bases.iter().find_map(|&b| {
+            let (bf, bi) = record_of(b, rf, closure, self.records, self.aliases)?;
+            self.find(bf, bi, wanted, closure, depth - 1)
+        })
+    }
+}
+
+/// What the link knows of C++ classes. Empty where no file is C++.
+#[derive(Default)]
+struct Cpp {
+    /// Symbol -> the class it is a member of, by the class's own name
+    /// (`NONE`: none, or a namespace).
+    class_of: Vec<u32>,
+    /// Class -> the classes it derives from, and the reverse.
+    bases: FxHashMap<u32, Vec<u32>>,
+    derived: FxHashMap<u32, Vec<u32>>,
+    /// (class, name) of the methods declared virtual.
+    virtuals: FxHashSet<(u32, u32)>,
+    /// Names that are namespaces and no class.
+    namespaces: FxHashSet<u32>,
+}
+
+impl Cpp {
+    fn new(files: &[&FileFacts], remap: &[Vec<u32>], g: &mut Graph) -> Cpp {
+        if files.iter().all(|f| f.owners.is_empty() && f.bases.is_empty()) {
+            return Cpp::default();
+        }
+        let n = g.syms.len();
+        let mut c = Cpp { class_of: vec![NONE; n], ..Default::default() };
+        g.owner = vec![NONE; n];
+        c.namespaces.extend(g.syms.iter().filter(|s| s.kind == kind::NAMESPACE).map(|s| s.name));
+        c.namespaces.retain(|&name| !g.syms_named(name).iter().any(|&x| matches!(g.syms[x as usize].kind, kind::CLASS | kind::STRUCT | kind::UNION)));
+        for (fi, f) in files.iter().enumerate() {
+            let base = g.files[fi].sym_start as usize;
+            for &(def, chain, own) in &f.owners {
+                let own = remap[fi][own as usize];
+                g.owner[base + def as usize] = remap[fi][chain as usize];
+                if !c.namespaces.contains(&own) {
+                    c.class_of[base + def as usize] = own;
+                }
+            }
+            for &(class, b) in &f.bases {
+                let (class, b) = (remap[fi][class as usize], remap[fi][b as usize]);
+                if class != b {
+                    c.bases.entry(class).or_default().push(b);
+                    c.derived.entry(b).or_default().push(class);
+                }
+            }
+        }
+        for v in c.bases.values_mut().chain(c.derived.values_mut()) {
+            v.sort_unstable();
+            v.dedup();
+        }
+        for (i, s) in g.syms.iter().enumerate() {
+            if s.flags & flag::VIRTUAL != 0 && c.class_of[i] != NONE {
+                c.virtuals.insert((c.class_of[i], s.name));
+            }
+        }
+        c
+    }
+
+    fn on(&self) -> bool {
+        !self.class_of.is_empty()
+    }
+
+    fn class(&self, sym: u32) -> u32 {
+        self.class_of.get(sym as usize).copied().unwrap_or(NONE)
+    }
+
+    /// The class and those it derives from, nearest first.
+    fn lineage(&self, class: u32, out: &mut Vec<u32>) {
+        out.clear();
+        out.push(class);
+        let mut i = 0;
+        while i < out.len() && out.len() < 64 {
+            for &b in self.bases.get(&out[i]).into_iter().flatten() {
+                if !out.contains(&b) {
+                    out.push(b);
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// The classes that derive from `class`, at any depth.
+    fn descendants(&self, class: u32, out: &mut Vec<u32>) {
+        out.clear();
+        let mut i = 0;
+        let mut todo = vec![class];
+        while i < todo.len() && todo.len() < 512 {
+            for &d in self.derived.get(&todo[i]).into_iter().flatten() {
+                if !todo.contains(&d) {
+                    todo.push(d);
+                    out.push(d);
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// Is method `name` of `class` virtual, declared so there or in a base?
+    fn is_virtual(&self, class: u32, name: u32, scratch: &mut Vec<u32>) -> bool {
+        self.lineage(class, scratch);
+        scratch.iter().any(|&c| self.virtuals.contains(&(c, name)))
+    }
+
+    /// Of `cands`, those of the class nearest in `class`'s lineage that has
+    /// any (`class` `NONE`: those of no class).
+    fn nearest(&self, cands: &[u32], class: u32, lineage: &mut Vec<u32>, out: &mut Vec<u32>) {
+        out.clear();
+        if class == NONE {
+            out.extend(cands.iter().filter(|&&c| self.class(c) == NONE));
+            return;
+        }
+        self.lineage(class, lineage);
+        for &cls in lineage.iter() {
+            out.extend(cands.iter().filter(|&&c| self.class(c) == cls));
+            if !out.is_empty() {
+                return;
+            }
+        }
     }
 }
 
@@ -502,7 +635,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     g.syms.reserve(n_syms);
     g.by_name_off = vec![0u32; names.len() + 1];
     for (fi, f) in files.iter().enumerate() {
-        let header = if f.path.ends_with(".h") { flag::HEADER } else { 0 };
+        let header = if crate::is_header(&f.path) { flag::HEADER } else { 0 };
         g.files.push(FileRec { hash: f.hash, path: remap[fi][f.defs[0].name as usize], sym_start: g.syms.len() as u32 });
         for d in &f.defs {
             let name = remap[fi][d.name as usize];
@@ -530,6 +663,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     }
     stats.syms_ms = ms(t);
     crate::mem_mark("symbols");
+    let cpp = Cpp::new(files, &remap, &mut g);
 
     // Which members can hold a function: those declared as function
     // pointers, and those of a typedef type that is one (or that is not
@@ -553,9 +687,13 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     let mut records: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
     let mut aliases: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let mut renames: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+    // (C++: a class in a class is what its short name means only where no
+    // class outside any has that name.)
+    let mut nested: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
     for (fi, f) in files.iter().enumerate() {
         for (i, r) in f.records.iter().enumerate() {
-            records.entry(remap[fi][r.name as usize]).or_default().push((fi as u32, i as u32));
+            let to = if r.nested { &mut nested } else { &mut records };
+            to.entry(remap[fi][r.name as usize]).or_default().push((fi as u32, i as u32));
         }
         for &(alias, tag) in &f.aliases {
             aliases.entry(remap[fi][alias as usize]).or_default().push(remap[fi][tag as usize]);
@@ -572,13 +710,17 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         }
     }
 
+    for (name, list) in nested {
+        records.entry(name).or_insert(list);
+    }
+
     let mut of_symbol: FxHashMap<u32, u32> = FxHashMap::default();
     for (fi, f) in files.iter().enumerate() {
         for &(def, t) in &f.typed {
             of_symbol.insert(g.files[fi].sym_start + def, remap[fi][t as usize]);
         }
     }
-    let types = Types { files, remap: &remap, records: &records, aliases: &aliases, of_symbol: &of_symbol };
+    let types = Types { files, remap: &remap, records: &records, aliases: &aliases, of_symbol: &of_symbol, cpp: &cpp };
 
     // Functions that call through a parameter: symbol -> (position, line).
     let mut through_param: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
@@ -610,6 +752,16 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
             for &(r, h) in &f.ref_hints {
                 hint_of[r as usize] = h;
             }
+            // C++: what each name was called with (`X::f`).
+            let in_cpp = f.cpp && cpp.on();
+            let mut qual_of = Vec::new();
+            if in_cpp {
+                qual_of = vec![NONE; f.refs.len()];
+                for &(r, q) in &f.ref_quals {
+                    qual_of[r as usize] = remap[fi][q as usize];
+                }
+            }
+            let (mut pick, mut lineage, mut overrides, mut descendants) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for (ri, r) in f.refs.iter().enumerate() {
                 let (kind, maybe) = (r.kind & !refkind::MAYBE, r.kind & refkind::MAYBE != 0);
                 let cands = g.syms_named(remap[fi][r.name as usize]);
@@ -633,10 +785,83 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 let typed = (member && hint_of[ri] != NONE)
                     .then(|| types.member(&f.hints[hint_of[ri] as usize], remap[fi][r.name as usize], fi, &g, base..end, closure, &mut scratch))
                     .flatten();
+                let qual = if in_cpp { qual_of[ri] } else { NONE };
+                let mut edge_kind = kind;
+                // A method chosen by its name alone, the object's type not
+                // known (or not one of the corpus's: `name.c_str ()` of a
+                // `std::string`), is a guess, however few there are.
+                let mut guessed = false;
                 match typed {
+                    Some(sym) if in_cpp && syms[sym as usize].kind == kind::FUNCTION => {
+                        // A method: wherever its class defines it.
+                        let class = cpp.class(sym);
+                        tmp.clear();
+                        tmp.extend(cands.iter().filter(|&&c| syms[c as usize].kind == kind::FUNCTION && cpp.class(c) == class));
+                        if tmp.is_empty() {
+                            tmp.push(sym);
+                        }
+                    }
                     Some(sym) => {
                         tmp.clear();
                         tmp.push(sym);
+                    }
+                    None if in_cpp && through => {
+                        // `x.f ()` of a type not known: any method of that
+                        // name (of the class written, `p->Base::f ()`), and
+                        // any member that holds a function.
+                        pick.clear();
+                        if qual != NONE && !g.name(qual).is_empty() {
+                            cpp.nearest(cands, qual, &mut lineage, &mut pick);
+                        }
+                        if pick.is_empty() {
+                            pick.extend(cands.iter().filter(|&&c| syms[c as usize].kind == kind::FUNCTION && cpp.class(c) != NONE));
+                        }
+                        pick.extend(cands.iter().filter(|&&c| want(&syms[c as usize])));
+                        let seen = |c: &&u32| {
+                            let s = &syms[**c as usize];
+                            s.file == fi as u32 || closure.member[s.file as usize] || s.flags & flag::STATIC == 0 || s.flags & flag::HEADER != 0
+                        };
+                        tmp.clear();
+                        tmp.extend(pick.iter().filter(seen));
+                        guessed = true;
+                    }
+                    None if in_cpp && !member => {
+                        // `f ()` in a method: its class's, or a base's, before
+                        // anything else; `X::f ()`: X's (a namespace's, or
+                        // `::f`: one of no class); elsewhere, one of no class.
+                        let caller_class = cpp.class(base + r.scope);
+                        if qual != NONE && (g.name(qual).is_empty() || cpp.namespaces.contains(&qual)) {
+                            cpp.nearest(cands, NONE, &mut lineage, &mut pick);
+                        } else if qual != NONE {
+                            cpp.nearest(cands, qual, &mut lineage, &mut pick);
+                            if pick.is_empty() {
+                                cpp.nearest(cands, NONE, &mut lineage, &mut pick);
+                            }
+                        } else {
+                            cpp.nearest(cands, caller_class, &mut lineage, &mut pick);
+                            if pick.is_empty() && caller_class != NONE {
+                                cpp.nearest(cands, NONE, &mut lineage, &mut pick);
+                            }
+                        }
+                        if pick.is_empty() {
+                            pick.extend_from_slice(cands);
+                        }
+                        in_sight(&pick, syms, base..end, closure, &sure.member, want, &mut tmp);
+                        // `T (a)`, `T x (a)`: a class named is made, by its
+                        // constructor if it has one written; else the class
+                        // is only used.
+                        let class_kind = |c: &u32| matches!(syms[*c as usize].kind, kind::CLASS | kind::STRUCT | kind::UNION);
+                        if kind == refkind::CALL && !tmp.is_empty() && tmp.iter().all(class_kind) {
+                            let name = remap[fi][r.name as usize];
+                            let ctors = cands.iter().filter(|&&c| syms[c as usize].kind == kind::FUNCTION && cpp.class(c) == name);
+                            pick.clear();
+                            pick.extend(ctors);
+                            if pick.is_empty() {
+                                edge_kind = refkind::USE;
+                            } else {
+                                std::mem::swap(&mut tmp, &mut pick);
+                            }
+                        }
                     }
                     None => in_sight(cands, syms, base..end, closure, &sure.member, want, &mut tmp),
                 }
@@ -668,10 +893,48 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     let s = &syms[*c as usize];
                     s.kind == kind::MACRO && (s.flags & flag::CONDITIONAL != 0 || s.file != fi as u32 && !sure.member[s.file as usize])
                 };
-                let ambiguous = tmp.len() > 1 || maybe || tmp.iter().any(optional);
+                // (C++: overloads are one function, of one class in one file.)
+                let several = if in_cpp {
+                    let first = (syms[tmp[0] as usize].file, cpp.class(tmp[0]));
+                    tmp.iter().any(|&c| (syms[c as usize].file, cpp.class(c)) != first)
+                } else {
+                    tmp.len() > 1
+                };
+                let ambiguous = several || maybe || guessed || tmp.iter().any(optional);
                 counts[ambiguous as usize] += 1;
-                let meta = pack_meta(r.line, ambiguous, kind);
-                edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta]));
+                if in_cpp && through {
+                    // A method reached through an object is called, not a
+                    // function stored in a member.
+                    let meta = |to: u32, amb: bool| {
+                        let k = if syms[to as usize].kind == kind::FUNCTION { refkind::CALL } else { kind };
+                        pack_meta(r.line, amb, k)
+                    };
+                    edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta(to, ambiguous)]));
+                } else {
+                    let meta = pack_meta(r.line, ambiguous, edge_kind);
+                    edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta]));
+                }
+                // A virtual method called on an object may run an override:
+                // those of the classes derived from its class.
+                if in_cpp && (through || (!member && qual == NONE)) && edge_kind != refkind::USE {
+                    overrides.clear();
+                    for &t in tmp.iter() {
+                        let (s, class) = (&syms[t as usize], cpp.class(t));
+                        if s.kind != kind::FUNCTION || class == NONE || !cpp.is_virtual(class, s.name, &mut lineage) {
+                            continue;
+                        }
+                        cpp.descendants(class, &mut descendants);
+                        for &c in g.syms_named(s.name) {
+                            let o = &syms[c as usize];
+                            if o.kind == kind::FUNCTION && o.flags & flag::DECL == 0 && descendants.contains(&cpp.class(c)) && !tmp.contains(&c) && !overrides.contains(&c) {
+                                overrides.push(c);
+                            }
+                        }
+                    }
+                    overrides.truncate(MAX_CANDIDATES);
+                    let meta = pack_meta(r.line, true, refkind::CALL);
+                    edges.extend(overrides.iter().map(|&to| [base + r.scope, to, meta]));
+                }
             }
 
             // Functions stored in members and variables: an edge from the

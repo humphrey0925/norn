@@ -15,6 +15,9 @@ pub mod kind {
     pub const GLOBAL: u8 = 8;
     /// A member of a struct or union.
     pub const FIELD: u8 = 9;
+    /// C++.
+    pub const CLASS: u8 = 10;
+    pub const NAMESPACE: u8 = 11;
 
     pub fn name(k: u8) -> &'static str {
         match k {
@@ -28,6 +31,8 @@ pub mod kind {
             TYPEDEF => "typedef",
             GLOBAL => "global",
             FIELD => "field",
+            CLASS => "class",
+            NAMESPACE => "namespace",
             _ => "?",
         }
     }
@@ -45,6 +50,9 @@ pub mod flag {
     pub const CALLABLE: u8 = 8;
     /// A macro defined under an `#if`: it may not be defined at all.
     pub const CONDITIONAL: u8 = 16;
+    /// A C++ method declared `virtual` (or `override`, `final`): a call of
+    /// it may run an override.
+    pub const VIRTUAL: u8 = 32;
 }
 
 pub mod refkind {
@@ -177,6 +185,8 @@ pub struct Record {
     /// or a typedef (else `NONE`), and its definition in this file.
     pub types: Vec<u32>,
     pub defs: Vec<u32>,
+    /// C++: a class in a class, called by its short name only in there.
+    pub nested: bool,
 }
 
 /// What a member access is made on, as far as the text says: something of a
@@ -275,6 +285,18 @@ pub struct FileFacts {
     pub locals: Vec<Local>,
     /// Where each is used: (index into `locals`, line), in source order.
     pub local_uses: Vec<(u32, u32)>,
+    /// Read as C++.
+    pub cpp: bool,
+    /// C++: the class a definition is a member of, as (definition, the
+    /// scope as written, the class's own name): `DBImpl::Get` defined
+    /// inside `namespace leveldb` or written `leveldb::DBImpl::Get` has
+    /// the scope `DBImpl` or `leveldb::DBImpl`, and the class `DBImpl`.
+    pub owners: Vec<(u32, u32, u32)>,
+    /// C++: (class, base class), by their own names.
+    pub bases: Vec<(u32, u32)>,
+    /// C++: (reference, qualifier) of a name called as `X::f`: the last
+    /// part of the scope written before it (`""` for `::f`).
+    pub ref_quals: Vec<(u32, u32)>,
 }
 
 /// A parameter or a local variable.
@@ -446,6 +468,9 @@ impl FileFacts {
         exact(&mut self.records);
         exact(&mut self.aliases);
         exact(&mut self.field_types);
+        exact(&mut self.owners);
+        exact(&mut self.bases);
+        exact(&mut self.ref_quals);
         exact(&mut self.param_calls);
         exact(&mut self.arg_passes);
         exact(&mut self.hints);
@@ -475,8 +500,8 @@ impl FileFacts {
             ("sites", of(&self.sites) + of(&self.inits)),
             ("macros", of(&self.macros) + of(&self.defined_names)),
             ("binds", of(&self.binds)),
-            ("records", records + of(&self.aliases) + of(&self.field_types) + of(&self.typed)),
-            ("hints", of(&self.hints) + of(&self.hint_path) + of(&self.ref_hints)),
+            ("records", records + of(&self.aliases) + of(&self.field_types) + of(&self.typed) + of(&self.owners) + of(&self.bases)),
+            ("hints", of(&self.hints) + of(&self.hint_path) + of(&self.ref_hints) + of(&self.ref_quals)),
             ("calls through", of(&self.param_calls) + of(&self.arg_passes)),
             ("locals", of(&self.locals)),
             ("local uses", of(&self.local_uses)),

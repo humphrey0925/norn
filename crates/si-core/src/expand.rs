@@ -266,7 +266,7 @@ fn tokenize(s: &[u8], origin: Origin) -> Vec<T> {
                 let two = [b, at(i + 1)];
                 i += if at(i + 1) == b'.' && at(i + 2) == b'.' && b == b'.' {
                     3
-                } else if matches!(&two, b"##" | b"->" | b"==" | b"!=" | b"<=" | b">=" | b"&&" | b"||" | b"<<" | b">>") {
+                } else if matches!(&two, b"##" | b"->" | b"::" | b"==" | b"!=" | b"<=" | b">=" | b"&&" | b"||" | b"<<" | b">>") {
                     2
                 } else {
                     1
@@ -534,7 +534,7 @@ impl<'a> Engine<'a> {
                 // any file, a source file only itself. If several headers
                 // define the name differently there is no telling which is
                 // meant.
-                let header = |d: &&(u32, u32, u32)| self.table.files[d.0 as usize].path.ends_with(".h");
+                let header = |d: &&(u32, u32, u32)| crate::is_header(&self.table.files[d.0 as usize].path);
                 let mut headers = all.iter().filter(header);
                 if let Some(first) = headers.next() {
                     let (mut one_file, mut one_text) = (true, true);
@@ -874,7 +874,7 @@ impl Found {
 }
 
 /// Read the names out of one expansion of the use `s` of `macro_name`.
-fn recognise(toks: &[T], s: &Site, macro_name: &str) -> Found {
+fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
     let mut found = Found::default();
     let n = toks.len();
     if n == 1 {
@@ -947,6 +947,34 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str) -> Found {
         let next = toks.get(i + 1);
         let next_is = |s: &str| next.is_some_and(|x| x.is(s));
         let name = || t.text.to_string();
+        if cpp && !in_fn && paren == 0 && brace == 0 && prev.is_some_and(|p| p.is("::")) && next_is("(") {
+            // C++: `A::B::f (...)`, a member defined apart (what gtest's
+            // `TEST (Suite, Name)` ends in: `Suite_Name_Test::TestBody ()`),
+            // named with its classes.
+            let mut parts = vec![name()];
+            let mut j = i;
+            while j >= 2 && toks[j - 1].is("::") && toks[j - 2].k == K::Ident {
+                parts.push(toks[j - 2].text.to_string());
+                j -= 2;
+            }
+            parts.reverse();
+            let mut depth = 0;
+            let close = toks[i + 1..].iter().position(|x| {
+                depth += x.is("(") as i32 - x.is(")") as i32;
+                depth == 0
+            });
+            // After the parameters, `const`, `override` and the like may come.
+            let after = close.and_then(|c| toks[i + 2 + c..].iter().find(|x| !(x.k == K::Ident && matches!(&*x.text, "const" | "override" | "final" | "noexcept"))));
+            let defined = match after {
+                Some(a) => a.is("{"),
+                None => s.flags & site::BRACE_FOLLOWS != 0,
+            };
+            found.decls.push((parts.join("::"), kind::FUNCTION, if defined { 0 } else { flag::DECL }));
+            if after.is_some_and(|a| a.is("{")) {
+                owner = Some(parts.join("::"));
+            }
+            continue;
+        }
         if let Some(p) = prev.filter(|p| p.is("->") || p.is(".")) {
             // A member the expansion names. One written at the use, operator
             // and all, the parser has seen.
@@ -1048,6 +1076,18 @@ struct Names {
 impl Names {
     fn id(&mut self, f: &mut FileFacts, s: &str) -> u32 {
         *self.ids.entry(crate::names::id(s)).or_insert_with(|| f.push_name(s))
+    }
+
+    /// C++: a name an expansion defines as `A::B::f`: `f`, and its classes
+    /// as written and the last (`A::B`, `B`).
+    fn member(&mut self, f: &mut FileFacts, s: &str) -> (u32, Option<(u32, u32)>) {
+        match s.rsplit_once("::") {
+            Some((chain, own)) if !chain.is_empty() => {
+                let class = chain.rsplit("::").next().unwrap_or(chain);
+                (self.id(f, own), Some((self.id(f, chain), self.id(f, class))))
+            }
+            _ => (self.id(f, s), None),
+        }
     }
 }
 
@@ -1214,7 +1254,7 @@ fn roots(file: u32, files: &[FileFacts], rev: &[Vec<u32>]) -> Vec<u32> {
     let mut stack = vec![file];
     let mut out = Vec::new();
     while let Some(f) = stack.pop() {
-        if rev[f as usize].is_empty() || files[f as usize].path.ends_with(".c") {
+        if rev[f as usize].is_empty() || crate::is_unit(&files[f as usize].path) {
             out.push(f);
         }
         stack.extend(rev[f as usize].iter().copied().filter(|&r| !std::mem::replace(&mut seen[r as usize], true)));
@@ -1305,9 +1345,9 @@ fn expand_file(
                 add_name(&mut named, macro_name, (ei, Choice::default()));
             }
             let mut known = FxHashSet::default();
-            let novel = |exp: &[T]| recognise(exp, s, macro_name).novel(&mut known);
+            let novel = |exp: &[T]| recognise(exp, s, macro_name, f.cpp).novel(&mut known);
             for (exp, choice) in eng.variants(&toks, &Choice::default(), novel) {
-                if let Some(n) = recognise(&exp, s, macro_name).def_name() {
+                if let Some(n) = recognise(&exp, s, macro_name, f.cpp).def_name() {
                     add_name(&mut named, n, (ei, choice));
                 }
             }
@@ -1317,7 +1357,7 @@ fn expand_file(
         }
         let base = out.defs[s.def as usize];
         for (i, (n, contexts)) in named.into_iter().enumerate() {
-            let name = names.id(&mut out, &n);
+            let (name, classes) = names.member(&mut out, &n);
             let idx = if i == 0 {
                 out.defs[s.def as usize].name = name;
                 s.def
@@ -1325,6 +1365,9 @@ fn expand_file(
                 out.defs.push(Def { name, ..base });
                 (out.defs.len() - 1) as u32
             };
+            if let Some((chain, class)) = classes {
+                out.owners.push((idx, chain, class));
+            }
             variants.entry(s.def).or_default().push((idx, contexts));
         }
     }
@@ -1365,9 +1408,9 @@ fn expand_file(
                 for (ei, pinned) in contexts {
                     let maybe = engines[*ei].maybe_undefined(macro_name);
                     let mut known = FxHashSet::default();
-                    let novel = |exp: &[T]| recognise(exp, s, macro_name).novel(&mut known);
+                    let novel = |exp: &[T]| recognise(exp, s, macro_name, f.cpp).novel(&mut known);
                     for (exp, _) in engines[*ei].variants(&toks, pinned, novel) {
-                        let mut found = recognise(&exp, s, macro_name);
+                        let mut found = recognise(&exp, s, macro_name, f.cpp);
                         // A use that names a definition: what else it makes,
                         // and what that calls; not its own name (a call of
                         // itself, from its own body).
@@ -1411,14 +1454,19 @@ fn expand_file(
     let mut seen_binds: FxHashSet<Bind> = FxHashSet::default();
     for m in made {
         for (n, kind, flags) in m.found.decls {
-            let name = names.id(&mut out, &n);
+            // (Known to the uses inside it by its whole name, `A::f`.)
+            let whole = names.id(&mut out, &n);
+            let (name, classes) = names.member(&mut out, &n);
             // Made where it may not be compiled (`_PCI_NOP_ALL(read, *)` in
             // `#else /* CONFIG_PCI is not enabled */`): as one written there.
             let undecided = kind == kind::FUNCTION && f.undecided.iter().any(|&(a, b, _)| a <= m.line && m.line <= b);
             let flags = flags | if undecided { flag::CONDITIONAL } else { 0 };
             let def = Def { name, line: m.line, end_line: m.line, kind, flags };
             if m.first && seen_defs.insert(key(&def)) {
-                made_here.insert((name, m.line), out.defs.len() as u32);
+                made_here.insert((whole, m.line), out.defs.len() as u32);
+                if let Some((chain, class)) = classes {
+                    out.owners.push((out.defs.len() as u32, chain, class));
+                }
                 out.defs.push(def);
             }
         }
@@ -1533,6 +1581,9 @@ fn expand_file(
     }
     for t in &mut out.typed {
         t.0 = new_index[t.0 as usize];
+    }
+    for o in &mut out.owners {
+        o.0 = new_index[o.0 as usize];
     }
     for d in out.records.iter_mut().flat_map(|r| r.defs.iter_mut()).filter(|d| **d != NONE) {
         *d = new_index[*d as usize];
@@ -1782,7 +1833,7 @@ pub fn expand(files: &[FileFacts], includes: &[Vec<u32>], sure_includes: &[Vec<u
             let mut all: Vec<(u64, usize)> = spent.iter().enumerate().map(|(i, s)| (s.load(std::sync::atomic::Ordering::Relaxed), i)).collect();
             all.sort_unstable_by(|a, b| b.cmp(a));
             let total: u64 = all.iter().map(|a| a.0).sum();
-            let headers: u64 = all.iter().filter(|a| files[a.1].path.ends_with(".h")).map(|a| a.0).sum();
+            let headers: u64 = all.iter().filter(|a| crate::is_header(&files[a.1].path)).map(|a| a.0).sum();
             let at = |i: usize| SPENT[i].load(std::sync::atomic::Ordering::Relaxed);
             eprintln!("  expanding {:.1} s, recognising new {:.1} s, engines and live {:.1} s; {} runs, {} tokens out", at(0) as f64 / 1e9, at(1) as f64 / 1e9, at(2) as f64 / 1e9, at(4), at(5));
             eprintln!("expand: {:.1} cpu-s in all, {:.1} in headers; top 1% of files {:.1}", total as f64 / 1e6, headers as f64 / 1e6, all.iter().take(all.len() / 100).map(|a| a.0).sum::<u64>() as f64 / 1e6);

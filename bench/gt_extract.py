@@ -35,6 +35,20 @@ initializer, positional or designated, or by an assignment. Joining the two
 on (record, field) gives the calls a field-based, type-aware analysis finds;
 it is an upper bound on what runs, not a record of it.
 
+C++ (a translation unit compiled as C++): a function's name is qualified
+by the classes it is in, not by namespaces nor template arguments
+(`DBImpl::Get`, `Writer::Rep::~Rep`); overloads share it. Methods,
+constructors, destructors, operators and templates are functions. A call
+row has a ninth column, its form: "call" (the callee's name is written at
+the site), "virtual" (a call of a virtual method, which may run any
+override), "ctor" (a constructor: `T x(a)`, `new T`, implicit ones too) or
+"operator" (an overloaded operator or a conversion), "lambda" (a call of a
+lambda through the variable holding it). A call into a
+specialization of a template is a call of the template. Also:
+  overrides [method usr, name, file, base usr, base name, base file]
+  dependent_calls   calls in templates that clang cannot bind until the
+                    template is instantiated (a count)
+
 `file` is relative to the source root; generated files are `<build>/...`.
 A line is inactive when every translation unit that read the file skipped it
 (`#if` not taken), so nothing can be expected of an indexer there.
@@ -60,6 +74,27 @@ LIB = cindex.conf.lib
 LIB.clang_getAllSkippedRanges.argtypes = [cindex.TranslationUnit]
 LIB.clang_getAllSkippedRanges.restype = ctypes.POINTER(RangeList)
 LIB.clang_disposeSourceRangeList.argtypes = [ctypes.POINTER(RangeList)]
+LIB.clang_getSpecializedCursorTemplate.argtypes = [cindex.Cursor]
+LIB.clang_getSpecializedCursorTemplate.restype = cindex.Cursor
+LIB.clang_getOverriddenCursors.argtypes = [cindex.Cursor, ctypes.POINTER(ctypes.POINTER(cindex.Cursor)), ctypes.POINTER(ctypes.c_uint)]
+LIB.clang_getOverriddenCursors.restype = None
+LIB.clang_disposeOverriddenCursors.argtypes = [ctypes.POINTER(cindex.Cursor)]
+LIB.clang_disposeOverriddenCursors.restype = None
+
+# The Python bindings may be older than the library: a kind of cursor they
+# do not know (C++20's concepts, say) is read as an expression they do not
+# expose, and its children are walked.
+_from_id = CursorKind.from_id.__func__
+
+
+def _kind(cls, kind_id):
+    try:
+        return _from_id(cls, kind_id)
+    except ValueError:
+        return CursorKind.UNEXPOSED_EXPR
+
+
+CursorKind.from_id = classmethod(_kind)
 
 DROP_WITH_VALUE = {"-o", "-MT", "-MF", "-MQ"}
 DROP = {"-c", "-MD", "-MP", "-MMD"}
@@ -288,6 +323,134 @@ def calls_in(fn, caller, out, icalls, binds, stats):
         stack.extend(c.get_children())
 
 
+# --- C++ ---------------------------------------------------------------------
+FUNCS = {CursorKind.FUNCTION_DECL, CursorKind.CXX_METHOD, CursorKind.CONSTRUCTOR, CursorKind.DESTRUCTOR,
+         CursorKind.CONVERSION_FUNCTION, CursorKind.FUNCTION_TEMPLATE}
+RECORDS = {CursorKind.STRUCT_DECL, CursorKind.CLASS_DECL, CursorKind.UNION_DECL, CursorKind.CLASS_TEMPLATE,
+           CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION}
+# Where definitions are, below the translation unit.
+SCOPES = RECORDS | {CursorKind.NAMESPACE, CursorKind.LINKAGE_SPEC, CursorKind.UNEXPOSED_DECL}
+
+
+def is_cpp(entry):
+    words = entry["arguments"] if "arguments" in entry else shlex.split(entry["command"])
+    return words[0].endswith("++") or os.path.splitext(entry["file"])[1] in (".cc", ".cpp", ".cxx", ".c++", ".C")
+
+
+def primary(c):
+    """The template a specialization was made from (or `c`)."""
+    for _ in range(4):
+        t = LIB.clang_getSpecializedCursorTemplate(c)
+        if t is None or t.kind.is_invalid() or t == c:
+            break
+        t._tu = c._tu  # (a cursor libclang returns knows its unit only so)
+        c = t
+    return c
+
+
+def bare(name):
+    """A name without template arguments, as written where it is defined:
+    clang spells a template's constructor `List<T>` (an operator keeps its
+    `<`: `operator<`)."""
+    return name if name.startswith("operator") else name.split("<", 1)[0]
+
+
+def qualified(c):
+    """`Outer::Inner::name`: the classes, not the namespaces."""
+    parts, p = [bare(c.spelling)], c.semantic_parent
+    while p is not None and p.kind in RECORDS:
+        parts.append(bare(p.spelling) or "(anonymous)")
+        p = p.semantic_parent
+    return "::".join(reversed(parts))
+
+
+def overridden(c):
+    out, n = ctypes.POINTER(cindex.Cursor)(), ctypes.c_uint()
+    LIB.clang_getOverriddenCursors(c, ctypes.byref(out), ctypes.byref(n))
+    found = [out[i] for i in range(n.value)]
+    for b in found:
+        b._tu = c._tu
+    bases = [(b.get_usr(), qualified(b), site(b.location)) for b in found]
+    if n.value:
+        LIB.clang_disposeOverriddenCursors(out)
+    return bases
+
+
+def form(callee, call):
+    if callee.semantic_parent is not None and callee.semantic_parent.spelling.startswith("(lambda"):
+        return "lambda"
+    if callee.kind == CursorKind.CONSTRUCTOR:
+        return "ctor"
+    if callee.kind == CursorKind.CONVERSION_FUNCTION or (callee.spelling.startswith("operator") and not callee.spelling[8:9].isalnum()
+                                                          and callee.spelling[8:9] != "_"):
+        return "operator"
+    if callee.kind == CursorKind.CXX_METHOD and callee.is_virtual_method():
+        # `Base::f ()` so written runs that one, not an override.
+        kids = list(call.get_children())
+        head = kids[0] if kids else None
+        return "call" if head is not None and any(t.spelling == "::" for t in head.get_tokens()) else "virtual"
+    return "call"
+
+
+def cpp_calls_in(fn, caller, out, icalls, binds, stats):
+    stack = list(fn.get_children())
+    while stack:
+        c = stack.pop()
+        if c.kind == CursorKind.CALL_EXPR:
+            callee = c.referenced
+            if callee is not None and callee.kind in FUNCS:
+                callee = primary(callee)
+                loc = c.location
+                d = callee.get_definition()
+                home = rel(d.location.file.name) if d is not None and d.location.file else None
+                out.add((*caller, callee.get_usr(), qualified(callee), home, site(loc), loc.line, form(callee, c)))
+                for i, arg in enumerate(c.get_arguments()):
+                    bind((f"<param {callee.get_usr()}>", str(i)), arg, binds)
+            else:
+                target = target_of(c)
+                if target == OTHER:
+                    # Mostly a call in a template that depends on its
+                    # parameters: bound only when instantiated.
+                    kids = list(c.get_children())
+                    head = kids[0].kind.name if kids else ""
+                    # `T (a, b)`, `std::string (p, n)`: an object made, with
+                    # no constructor libclang names (a "ctor" all the same).
+                    made = not c.spelling and c.type.get_canonical().kind == cindex.TypeKind.RECORD
+                    stats["dependent"].add((site(c.location), c.location.line, "construct" if made else head))
+                else:
+                    stats["indirect"] += 1
+                    icalls.add((*caller, *target, site(c.location), c.location.line))
+        stack.extend(c.get_children())
+
+
+def deleted_or_defaulted(c):
+    if c.kind not in (CursorKind.CXX_METHOD, CursorKind.CONSTRUCTOR, CursorKind.DESTRUCTOR):
+        return False
+    deleted = getattr(c, "is_deleted_method", None)
+    return c.is_default_method() or (deleted is not None and deleted())
+
+
+def cpp_walk(root, defs, calls, icalls, binds, overrides, stats):
+    for c in root.get_children():
+        if c.location.file is None:
+            continue
+        if c.kind in SCOPES:
+            cpp_walk(c, defs, calls, icalls, binds, overrides, stats)
+            continue
+        file = rel(c.location.file.name)
+        if file is None or c.kind not in FUNCS | {CursorKind.VAR_DECL}:
+            continue
+        binds_in(c, binds)
+        if c.kind == CursorKind.VAR_DECL or not c.is_definition() or deleted_or_defaulted(c):
+            continue
+        name = qualified(c)
+        defs.add((c.get_usr(), name, file, c.location.line, c.linkage == cindex.LinkageKind.INTERNAL))
+        if c.kind == CursorKind.CXX_METHOD and c.is_virtual_method():
+            for base in overridden(c):
+                overrides.add((c.get_usr(), name, file, *base))
+        cpp_calls_in(c, (file, name, c.location.line), calls, icalls, binds, stats)
+
+
 def one(entry):
     os.chdir(entry["directory"])
     path = os.path.join(entry["directory"], entry["file"])
@@ -296,8 +459,12 @@ def one(entry):
     except cindex.TranslationUnitLoadError:
         return {"file": entry["file"], "failed": True}
     errors = [d.spelling for d in tu.diagnostics if d.severity >= cindex.Diagnostic.Error]
-    defs, calls, icalls, binds, stats = set(), set(), set(), set(), collections.Counter()
-    for c in tu.cursor.get_children():
+    defs, calls, icalls, binds, overrides, stats = set(), set(), set(), set(), set(), collections.Counter()
+    stats["dependent"] = set()
+    cpp = is_cpp(entry)
+    if cpp:
+        cpp_walk(tu.cursor, defs, calls, icalls, binds, overrides, stats)
+    for c in ([] if cpp else tu.cursor.get_children()):
         if c.location.file is None or c.kind not in (CursorKind.FUNCTION_DECL, CursorKind.VAR_DECL):
             continue
         file = rel(c.location.file.name)
@@ -328,8 +495,8 @@ def one(entry):
             skipped[file].append((r.start.line, r.end.line))
     LIB.clang_disposeSourceRangeList(ranges)
     return {"file": entry["file"], "errors": errors[:3], "defs": list(defs), "calls": list(calls), "icalls": list(icalls),
-            "binds": list(binds), "read": list(read),
-            "skipped": skipped, "indirect": stats["indirect"]}
+            "binds": list(binds), "overrides": list(overrides), "read": list(read),
+            "skipped": skipped, "indirect": stats["indirect"], "dependent": list(stats["dependent"]), "cpp": cpp}
 
 
 def main():
@@ -343,7 +510,8 @@ def main():
     entries = json.load(open(os.path.join(BUILD, "compile_commands.json")))
     entries = list({(e["directory"], e["file"]): e for e in entries}.values())
 
-    defs, calls, icalls, binds, indirect, failed, with_errors = set(), set(), set(), set(), 0, [], []
+    defs, calls, icalls, binds, overrides, indirect, dependent, failed, with_errors = set(), set(), set(), set(), set(), 0, set(), [], []
+    cpp_units = 0
     tus = collections.Counter()
     skips = collections.defaultdict(collections.Counter)
     with multiprocessing.Pool() as pool:
@@ -357,7 +525,10 @@ def main():
             calls.update(map(tuple, r["calls"]))
             icalls.update(map(tuple, r["icalls"]))
             binds.update(map(tuple, r["binds"]))
+            overrides.update(map(tuple, r["overrides"]))
             indirect += r["indirect"]
+            dependent.update(map(tuple, r["dependent"]))
+            cpp_units += r["cpp"]
             for f in r["read"]:
                 tus[f] += 1
             for f, ranges in r["skipped"].items():
@@ -380,11 +551,16 @@ def main():
         files[f] = {"tus": n, "inactive": runs}
     json.dump({"translation_units": len(entries), "failed": failed, "with_errors": with_errors, "indirect_calls": indirect,
                "defs": sorted(defs), "calls": sorted(calls, key=str), "icalls": sorted(icalls, key=str),
-               "binds": sorted(binds, key=str), "files": files},
+               "binds": sorted(binds, key=str), "files": files,
+               **({"cpp_translation_units": cpp_units, "overrides": sorted(overrides, key=str), "dependent_calls": sum(d[2] != "construct" for d in dependent),
+                      "dependent_by_head": collections.Counter(d[2] for d in dependent).most_common(),
+                      # Where they are: what an indexer says is called there cannot be judged.
+                      "dependent_sites": sorted({(d[0], d[1]) for d in dependent if d[0] and d[2] != "construct"})}
+                  if cpp_units else {})},
               open(args.out, "w"))
     print(f"{len(entries)} TUs, {len(failed)} failed, {len(with_errors)} with errors, "
           f"{len(defs)} definitions, {len(calls)} call sites, {indirect} indirect calls "
-          f"({len(icalls)} distinct), {len(binds)} bindings")
+          f"({len(icalls)} distinct), {len(binds)} bindings, {len(overrides)} overrides, {sum(d[2] != 'construct' for d in dependent)} dependent calls")
 
 
 if __name__ == "__main__":

@@ -35,13 +35,19 @@ import compare_clangd
 import run
 
 ROOT = Path(__file__).resolve().parent.parent
-TRUTH = {"c-only": "truth.json", "git-c": "truth-git.json", "redis": "truth-redis-src.json", "linux": "truth-linux.json"}
+TRUTH = {"c-only": "truth.json", "git-c": "truth-git.json", "redis": "truth-redis-src.json", "linux": "truth-linux.json",
+         "leveldb": "truth-leveldb.json", "fmt": "truth-fmt.json", "bitcoin": "truth-bitcoin.json"}
 WSL_TOOLS = ("ctags", "cscope", "gtags")
 ALL_TOOLS = ("si", "cbm", "clangd", *WSL_TOOLS)
 SKIP_DIRS = (".git", ".si", ".norn")
 # Where the Windows tools run, as the results say it.
 HOST = "Windows, NTFS" if os.name == "nt" else "Linux (WSL2), ext4"
 EDIT = b"\n/* bench edit */\n"
+
+
+# C and C++ sources and headers.
+SOURCE_SUFFIXES = (".c", ".h", ".cc", ".cpp", ".cxx", ".c++", ".hh", ".hpp", ".hxx", ".h++", ".ipp", ".inl", ".tcc")
+UNIT_SUFFIXES = (".c", ".cc", ".cpp", ".cxx", ".c++")
 
 
 def main_checkout():
@@ -121,9 +127,9 @@ class Ctx:
         self.files = []
         for d, dirs, fs in os.walk(self.corpus):
             dirs[:] = sorted(x for x in dirs if x not in SKIP_DIRS)
-            self.files += [(Path(d) / f).relative_to(self.corpus).as_posix() for f in fs if f.endswith((".c", ".h"))]
+            self.files += [(Path(d) / f).relative_to(self.corpus).as_posix() for f in fs if f.endswith(SOURCE_SUFFIXES)]
         self.files.sort()
-        self.c_files = [f for f in self.files if f.endswith(".c")]
+        self.c_files = [f for f in self.files if f.endswith(UNIT_SUFFIXES)]
         # The file every tool sees edited: the .c file of median size.
         by_size = sorted(self.c_files, key=lambda f: ((self.corpus / f).stat().st_size, f))
         self.edit_file = args.edit_file or by_size[len(by_size) // 2]
@@ -167,11 +173,11 @@ def query_names(ctx, si_index_dir):
         text = {}
         out = []
         for _usr, name, file, line, *_ in sorted(t["defs"], key=lambda d: sha(d[1])):
-            if count[name] != 1 or name not in called or not file.endswith(".c") or not (ctx.corpus / file).is_file():
+            if count[name] != 1 or name not in called or not file.endswith(UNIT_SUFFIXES) or not (ctx.corpus / file).is_file():
                 continue
             if file not in text:
                 text[file] = (ctx.corpus / file).read_bytes().decode("latin-1").split("\n")
-            if line <= len(text[file]) and name in text[file][line - 1]:
+            if line <= len(text[file]) and name.rsplit("::", 1)[-1] in text[file][line - 1]:
                 out.append({"name": name, "file": file, "line": line})
             if len(out) == n:
                 break
@@ -534,7 +540,12 @@ def tool_wsl(tool):
             res["accuracy"] = NO_TRUTH
             return
         d = json.loads(dump.read_text(encoding="utf-8"))
-        score = check_truth.score(ctx.truth, None, ctx.corpus, loaded=wsl_loaded(d))[0]
+        # cscope and global do not say which class a function is in: they
+        # are scored on unqualified names (`Get` for `DBImpl::Get`).
+        short = tool in ("cscope", "gtags")
+        score = check_truth.score(ctx.truth, None, ctx.corpus, loaded=wsl_loaded(d), short=short)[0]
+        if short and score["calls"].get("truth_call_sites_by_form"):
+            score["note"] = "scored on unqualified names: the tool does not record which class a function is in"
         acc = accuracy(ctx, score)
         if not d["typed"]:
             acc["definitions"].update({"precision": None, "si_in_compiled_lines": None, "si_not_in_truth": None})
