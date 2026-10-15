@@ -344,7 +344,8 @@ impl Unit<'_> {
 pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -> Option<Verdicts> {
     let n = paths.len();
     // The names a condition can be asked about: those the conditions
-    // name, and those the values of such names name.
+    // name, and those the values of such names name (in the sources or
+    // in the settings: `-DPLAT=PLAT_B` asks about `PLAT_B`).
     let mut asked: FxHashSet<&[u8]> = FxHashSet::default();
     for op in scripts.iter().flat_map(|s| &s.ops) {
         if let Op::If { expr, .. } | Op::Elif { expr, .. } = op {
@@ -353,6 +354,10 @@ pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -
     }
     loop {
         let before = asked.len();
+        let set: Vec<&[u8]> = asked.iter().filter_map(|n| conditions.setting(n)).collect();
+        for value in set {
+            names_in(value, |name| _ = asked.insert(name));
+        }
         for op in scripts.iter().flat_map(|s| &s.ops) {
             if let Op::Define { name, value } = op {
                 if asked.contains(&name[..]) {
@@ -574,9 +579,13 @@ mod tests {
     use super::*;
 
     fn told(files: &[(&str, &str)]) -> Vec<Vec<(String, bool)>> {
+        told_under(files, &Conditions::default())
+    }
+
+    fn told_under(files: &[(&str, &str)], conditions: &Conditions) -> Vec<Vec<(String, bool)>> {
         let paths: Vec<String> = files.iter().map(|f| f.0.to_string()).collect();
         let scripts: Vec<Script> = files.iter().map(|f| crate::mask::script(f.1.as_bytes())).collect();
-        let verdicts = verdicts(&paths, &scripts, &Conditions::default()).unwrap();
+        let verdicts = verdicts(&paths, &scripts, conditions).unwrap();
         let line = |f: usize, at: u32| files[f].1[at as usize..].lines().next().unwrap().to_string();
         verdicts.iter().enumerate().map(|(f, v)| v.iter().map(|&(at, holds)| (line(f, at), holds)).collect()).collect()
     }
@@ -628,5 +637,26 @@ mod tests {
             ("h.h", "#define H\n"),
         ]);
         assert_eq!(got[0], []);
+    }
+
+    #[test]
+    fn a_value_the_settings_give_is_followed_into_the_sources() {
+        // `PLAT_B` is only ever defined: the setting is what names it.
+        let files = [
+            ("main.c", "#include \"cfg.h\"
+#define SEL (PLAT)
+#define IS_A (SEL == PLAT_A)
+#if (IS_A)
+#endif
+"),
+            ("cfg.h", "#define PLAT_A (17)
+#define PLAT_B (23)
+"),
+        ];
+        for (plat, holds) in [("PLAT_B", false), ("PLAT_A", true)] {
+            let mut c = Conditions::default();
+            c.define("PLAT", plat);
+            assert_eq!(told_under(&files, &c)[0], [one("#if (IS_A)", holds)]);
+        }
     }
 }

@@ -995,6 +995,11 @@ impl Conditions {
         self.defined.contains_key(name) || self.undefined.contains(name)
     }
 
+    /// The value the settings give `name`, when they define it.
+    pub fn setting(&self, name: &[u8]) -> Option<&[u8]> {
+        self.defined.get(name).map(|v| &v[..])
+    }
+
     pub fn source(&self) -> Option<&std::sync::Arc<Source>> {
         self.source.as_ref()
     }
