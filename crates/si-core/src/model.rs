@@ -310,6 +310,8 @@ pub struct Cxx {
     /// (record, member, its elements' type) of members that are containers
     /// (`std::vector<T> v`: `T`; of a map, its values').
     pub elems: Vec<(u32, u32, u32)>,
+    /// (record, member, its keys' type) of members that are maps.
+    pub keys: Vec<(u32, u32, u32)>,
     /// The references that make an object (`T x (a)`, `new T`, `: Base (a)`,
     /// `: member_ (a)`): calls of a constructor of the class named, or of
     /// the member's type.
@@ -332,6 +334,7 @@ static NO_CXX: Cxx = Cxx {
     namespace_aliases: Vec::new(),
     nested: Vec::new(),
     elems: Vec::new(),
+    keys: Vec::new(),
     constructs: Vec::new(),
     operators: Vec::new(),
     operator_params: Vec::new(),
@@ -528,6 +531,7 @@ impl FileFacts {
             exact(&mut c.namespace_aliases);
             exact(&mut c.nested);
             exact(&mut c.elems);
+            exact(&mut c.keys);
             exact(&mut c.constructs);
             exact(&mut c.operators);
             exact(&mut c.operator_params);

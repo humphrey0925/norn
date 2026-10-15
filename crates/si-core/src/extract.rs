@@ -370,8 +370,10 @@ struct Walk<'a> {
     /// C++: of an `auto` local, where a member access on it starts (as a
     /// member hint's root and path): what it was made from.
     local_roots: FxHashMap<&'a [u8], (u8, u32, Vec<u32>)>,
-    /// C++: of a local container, its elements' type.
+    /// C++: of a local container, its elements' type; of a local map, its
+    /// keys'.
     local_elems: FxHashMap<&'a [u8], u32>,
+    local_keys: FxHashMap<&'a [u8], u32>,
     /// Hints worked out at a member access, for the reference its member
     /// name is about to become (by the name's position).
     pending_hints: FxHashMap<usize, u32>,
@@ -492,6 +494,7 @@ impl Extractor {
             local_types: FxHashMap::default(),
             local_roots: FxHashMap::default(),
             local_elems: FxHashMap::default(),
+            local_keys: FxHashMap::default(),
             pending_hints: FxHashMap::default(),
             open_records: Vec::new(),
             cpp,
@@ -846,6 +849,7 @@ impl<'a> Walk<'a> {
         self.local_types.clear();
         self.local_roots.clear();
         self.local_elems.clear();
+        self.local_keys.clear();
     }
 
     /// The name of a declaration's type when it is a struct, a union or a
@@ -1117,6 +1121,43 @@ impl<'a> Walk<'a> {
             Some(a) => self.type_name(a),
             None => NONE,
         }
+    }
+
+    /// C++: the type of the keys of a map type (`std::map<K, V>`: `K`), or
+    /// `NONE`.
+    fn key_type(&mut self, t: Node<'a>) -> u32 {
+        let ids = self.ids;
+        let t = if t.kind_id() == ids.qualified_identifier { self.qualified_parts(t).1 } else { t };
+        if t.kind_id() != ids.template_type || !t.child_by_field_id(ids.f_name).is_some_and(|n| MAPS.contains(&self.text(n))) {
+            return NONE;
+        }
+        let arg = t.child_by_field_id(ids.f_arguments).and_then(|a| a.named_child(0)).filter(|a| a.kind_id() == ids.type_descriptor);
+        match arg.and_then(|a| a.child_by_field_id(ids.f_type)) {
+            Some(a) => self.type_name(a),
+            None => NONE,
+        }
+    }
+
+    /// C++: the names a structured binding declares (`auto& [k, v]`), if
+    /// `d` is one.
+    fn binding_names(&self, d: Node<'a>) -> Option<Vec<Node<'a>>> {
+        let mut n = d;
+        for _ in 0..4 {
+            if n.kind() == "structured_binding_declarator" {
+                let mut c = n.walk();
+                return Some(n.named_children(&mut c).filter(|x| x.kind_id() == self.ids.identifier).collect());
+            }
+            n = n.child_by_field_id(self.ids.f_declarator.get()).or_else(|| n.named_child(0))?;
+        }
+        None
+    }
+
+    /// C++: the `i`th of what a structured binding of `whole` (a root and
+    /// path) declares: its `i`th member (`#i`).
+    fn binding_root(&mut self, whole: Option<(u8, u32, Vec<u32>)>, i: usize) -> Option<(u8, u32, Vec<u32>)> {
+        let (kind, root, mut path) = whole?;
+        path.push(self.intern_str(&format!("#{i}")));
+        Some((kind, root, path))
     }
 
     /// C++: where a member access on an element of `container` starts: of a
@@ -1500,7 +1541,7 @@ impl<'a> Walk<'a> {
     /// The members of a struct body in order, each with its type's name
     /// (see `type_name_of`). The members of an unnamed struct or union
     /// member are members of this one.
-    fn member_names(&mut self, body: Node<'a>, names: &mut Vec<u32>, types: &mut Vec<u32>, elems: &mut Vec<u32>) {
+    fn member_names(&mut self, body: Node<'a>, names: &mut Vec<u32>, types: &mut Vec<u32>, elems: &mut Vec<(u32, u32)>) {
         let ids = self.ids;
         let mut c = body.walk();
         // (A C++ class's methods are members too, declared or defined in it,
@@ -1523,15 +1564,15 @@ impl<'a> Walk<'a> {
                     None => {
                         names.push(NONE);
                         types.push(NONE);
-                        elems.push(NONE);
+                        elems.push((NONE, NONE));
                     }
                 }
                 continue;
             }
             let t = self.type_name_of(decl);
-            let e = match decl.child_by_field_id(ids.f_type).filter(|_| cpp) {
-                Some(ty) => self.element_type(ty),
-                None => NONE,
+            let (e, key) = match decl.child_by_field_id(ids.f_type).filter(|_| cpp) {
+                Some(ty) => (self.element_type(ty), self.key_type(ty)),
+                None => (NONE, NONE),
             };
             for d in ds {
                 // A member that is a function pointer has no struct type,
@@ -1543,7 +1584,7 @@ impl<'a> Walk<'a> {
                 };
                 names.push(name);
                 types.push(t);
-                elems.push(if self.declares_function(d) { NONE } else { e });
+                elems.push(if self.declares_function(d) { (NONE, NONE) } else { (e, key) });
             }
         }
     }
@@ -1553,8 +1594,13 @@ impl<'a> Walk<'a> {
         self.member_names(body, &mut fields, &mut types, &mut elems);
         let defs = vec![NONE; fields.len()];
         let record = self.out.records.len() as u32;
-        for (at, &e) in elems.iter().enumerate().filter(|e| *e.1 != NONE) {
-            self.out.cxx_mut().elems.push((record, at as u32, e));
+        for (at, &(e, key)) in elems.iter().enumerate() {
+            if e != NONE {
+                self.out.cxx_mut().elems.push((record, at as u32, e));
+            }
+            if key != NONE {
+                self.out.cxx_mut().keys.push((record, at as u32, key));
+            }
         }
         self.open_records.push((node.end_byte(), self.out.records.len()));
         self.out.records.push(Record { name, fields, types, defs });
@@ -1992,17 +2038,36 @@ impl<'a> Walk<'a> {
             if self.in_fn() {
                 let declared = self.type_name_of(node);
                 for d in self.declarators(node) {
+                    if let Some(names) = self.binding_names(d).filter(|_| self.cpp) {
+                        // `auto [a, b] = expr;`: the members of what it is, in order.
+                        let value = d.child_by_field_id(ids.f_value).filter(|_| d.kind_id() == ids.init_declarator);
+                        let whole = value.and_then(|v| self.value_root(v));
+                        for (i, n) in names.into_iter().enumerate() {
+                            self.skip.insert(n.start_byte());
+                            let text = self.text(n);
+                            self.local_types.remove(text);
+                            match self.binding_root(whole.clone(), i) {
+                                Some(root) => self.local_roots.insert(text, root),
+                                None => self.local_roots.remove(text),
+                            };
+                            self.note_local(n, false);
+                        }
+                        continue;
+                    }
                     if let Some((name, _)) = self.decl_name(d) {
                         self.skip.insert(name.start_byte());
                         self.local_roots.remove(self.text(name));
                         self.local_elems.remove(self.text(name));
+                        self.local_keys.remove(self.text(name));
                         if self.cpp && !self.declares_function(d) {
-                            let e = match node.child_by_field_id(ids.f_type) {
-                                Some(ty) => self.element_type(ty),
-                                None => NONE,
-                            };
-                            if e != NONE {
-                                self.local_elems.insert(self.text(name), e);
+                            if let Some(ty) = node.child_by_field_id(ids.f_type) {
+                                let (e, key) = (self.element_type(ty), self.key_type(ty));
+                                if e != NONE {
+                                    self.local_elems.insert(self.text(name), e);
+                                }
+                                if key != NONE {
+                                    self.local_keys.insert(self.text(name), key);
+                                }
                             }
                         }
                         if declared != NONE && !self.declares_function(d) {
@@ -2093,12 +2158,14 @@ impl<'a> Walk<'a> {
                 self.skip.insert(name.start_byte());
                 if self.in_fn() {
                     if self.cpp {
-                        let e = match node.child_by_field_id(ids.f_type) {
-                            Some(ty) => self.element_type(ty),
-                            None => NONE,
-                        };
-                        if e != NONE {
-                            self.local_elems.insert(self.text(name), e);
+                        if let Some(ty) = node.child_by_field_id(ids.f_type) {
+                            let (e, key) = (self.element_type(ty), self.key_type(ty));
+                            if e != NONE {
+                                self.local_elems.insert(self.text(name), e);
+                            }
+                            if key != NONE {
+                                self.local_keys.insert(self.text(name), key);
+                            }
                         }
                     }
                     // (A lambda's: its function's are typed already.)
@@ -2183,6 +2250,33 @@ impl<'a> Walk<'a> {
         if self.cpp && self.in_fn() && node.kind() == "for_range_loop" {
             // `for (const auto& tx : block.vtx)`: an element of the container
             // (of a type written, that type). (Not `auto& [k, v]`.)
+            let binding = node.child_by_field_id(ids.f_declarator.get()).and_then(|d| self.binding_names(d));
+            if let (Some(names), Some(right)) = (binding, node.child_by_field_id(ids.f_right)) {
+                // `for (auto& [k, v] : m)`: of a map, its key and its value;
+                // of another container, the members of its element, in order.
+                let local = Some(self.strip(right)).filter(|r| r.kind_id() == ids.identifier && self.locals.contains(self.text(*r))).map(|r| self.text(r));
+                let element = match local {
+                    Some(l) => self.local_elems.get(l).map(|&e| (root::TYPE, e, Vec::new())),
+                    None => self.element_of(right),
+                };
+                let key = local.and_then(|l| self.local_keys.get(l).copied());
+                for (i, n) in names.into_iter().enumerate() {
+                    self.skip.insert(n.start_byte());
+                    let text = self.text(n);
+                    self.local_types.remove(text);
+                    let root = match (key, element.clone()) {
+                        (Some(k), _) if i == 0 => Some((root::TYPE, k, Vec::new())),
+                        (Some(_), e) if i == 1 => e,
+                        (_, e) => self.binding_root(e, i),
+                    };
+                    match root {
+                        Some(root) => self.local_roots.insert(text, root),
+                        None => self.local_roots.remove(text),
+                    };
+                    self.note_local(n, false);
+                }
+                return true;
+            }
             let declared = node.child_by_field_id(ids.f_declarator.get()).and_then(|d| self.decl_name(d));
             if let (Some((name, _)), Some(right)) = (declared, node.child_by_field_id(ids.f_right)) {
                 let text = self.text(name);

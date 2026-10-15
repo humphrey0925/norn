@@ -456,6 +456,8 @@ impl Types<'_> {
         let element = g.name_id("[]");
         let mut t = type_name;
         let mut i = 0;
+        // (C++: `#i` marks the `i`th of a structured binding.)
+        let position = |m: u32| g.name(m).strip_prefix('#').and_then(|n| n.parse::<usize>().ok());
         while i < path.len() {
             let m = self.remap[fi][path[i] as usize];
             if Some(m) == element {
@@ -463,10 +465,35 @@ impl Types<'_> {
                 i += 1;
                 continue;
             }
+            if let Some(n) = position(m) {
+                // `auto [a, b] = x`: the `n`th data member of x.
+                let (rf, ri) = self.layout_of(t, fi, closure)?;
+                let r = &self.files[rf as usize].records[ri as usize];
+                let defs = &self.files[rf as usize].defs;
+                let at = (0..r.fields.len()).filter(|&a| r.defs[a] != NONE && defs[r.defs[a] as usize].kind == kind::FIELD).nth(n)?;
+                let next = r.types[at];
+                if next == NONE {
+                    return None;
+                }
+                t = self.remap[rf as usize][next as usize];
+                i += 1;
+                continue;
+            }
             let (rf, ri) = self.layout_of(t, fi, closure)?;
             let (mf, mi, at) = self.find(rf, ri, m, closure, 8)?;
             let r = &self.files[mf as usize].records[mi as usize];
             let of_element = path.get(i + 1).is_some_and(|&n| Some(self.remap[fi][n as usize]) == element);
+            // `for (auto& [k, v] : m_map)`: of a map's element, the key or the value.
+            let key = || self.files[mf as usize].cxx().keys.iter().find(|e| e.0 == mi && e.1 == at as u32).map(|e| e.2);
+            if let Some(n) = of_element.then(|| path.get(i + 2).and_then(|&p| position(self.remap[fi][p as usize]))).flatten() {
+                if let Some(k) = key() {
+                    let element_type = self.files[mf as usize].cxx().elems.iter().find(|e| e.0 == mi && e.1 == at as u32).map(|e| e.2);
+                    let next = if n == 0 { Some(k) } else { element_type };
+                    t = self.remap[mf as usize][next? as usize];
+                    i += 3;
+                    continue;
+                }
+            }
             let element_type = || self.files[mf as usize].cxx().elems.iter().find(|e| e.0 == mi && e.1 == at as u32).map(|e| e.2);
             let next = match of_element.then(element_type).flatten() {
                 Some(e) => e,
@@ -2048,6 +2075,45 @@ int lit() { return 3_k; }
         // `*p` of a pointer is no call.
         assert_eq!(calls_of("deref"), []);
         assert_eq!(calls_of("lit"), [(r#"operator""_k"#.to_string(), true, 6)]);
+    }
+
+    #[test]
+    fn a_structured_binding_is_of_its_part_of_what_it_binds() {
+        let h = r#"#include <map>
+#include <vector>
+class Net { public: int Id() const { return 1; } };
+class Count { public: int Value() const { return 2; } };
+struct Entry { Net net; Count count; };
+class Book {
+ public:
+  std::map<Net, Count> m_counts;
+  std::vector<Entry> m_entries;
+};
+Entry Make();
+"#;
+        let cc = r#"#include "b.h"
+int a(const Book& b) { int n = 0; for (const auto& [net, count] : b.m_counts) n += net.Id() + count.Value(); return n; }
+int c(const std::map<Net, Count>& m) { int n = 0; for (const auto& [k, v] : m) n += k.Id() + v.Value(); return n; }
+int d(const Book& b) { int n = 0; for (const auto& [x, y] : b.m_entries) n += x.Id() + y.Value(); return n; }
+int e() { auto [p, q] = Make(); return p.Id() + q.Value(); }
+"#;
+        let g = graph(&[("b.h", h), ("b.cc", cc)]);
+        let q = crate::graph::Qualifier::new(&g);
+        let certain = |caller: &str| -> Vec<String> {
+            let mut v: Vec<String> = g
+                .find(caller)
+                .iter()
+                .flat_map(|&s| g.refs_from(s))
+                .filter(|e| e.kind() == refkind::CALL && !e.ambiguous() && matches!(g.sym_name(e.other), "Id" | "Value"))
+                .map(|e| q.name(&g, e.other).into_owned())
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        for f in ["a", "c", "d", "e"] {
+            assert_eq!(certain(f), ["Count::Value", "Net::Id"], "{f}");
+        }
     }
 
     #[test]
