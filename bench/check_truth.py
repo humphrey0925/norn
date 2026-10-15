@@ -22,6 +22,11 @@ GENERATED = {"<build>/bfd/bfd.h": "bfd/bfd-in2.h", "<build>/bfd/bfd_stdint.h": "
 
 SI = Path(__file__).resolve().parent.parent / "target" / "release" / "norn.exe"
 
+# C++ calls scored: by the callee's name, of a virtual method, of a
+# constructor (`T x (a)`, `new T`), of an overloaded operator (`a == b`).
+# A lambda called through the variable that holds it is counted apart.
+SCORED_FORMS = ("call", "virtual", "ctor", "operator")
+
 
 def si_lines(cmd, index):
     """The rows `si <cmd>` prints, one at a time: the kernel's calls are
@@ -170,18 +175,18 @@ def score(truth_path, index, corpus, cbm=False, loaded=None, callers=None, short
     forms = collections.Counter()
     by_form = collections.defaultdict(set)  # form -> edges, for the forms not in the score
     unscored = set()  # (caller file, caller name, callee name) of those forms
+    scored_by_form = collections.defaultdict(set)  # form -> edges of the score
     for cf, cn, _cl, usr, callee_name, home, _site_file, _site_line, *form in t.calls:
         cf = GENERATED.get(cf, cf)
         if cf not in si_files or (callers is not None and (cf, cn) not in callers):
             continue
         form = form[0] if form else "call"
         forms[form] += 1
-        if form not in ("call", "virtual"):
+        if form not in SCORED_FORMS:
             homes = {GENERATED.get(home, home)} if home else t.homes.get(usr, set())
             if len(homes) == 1 and homes <= si_files:
                 by_form[form].add((cf, cn, *homes, callee_name))
-            # (A call of a constructor or operator found is no error, only
-            # not scored: it is no call written by the callee's name.)
+            # (A lambda's call found is no error, only not scored.)
             unscored.add((cf, cn, callee_name))
             continue
         names_called[cf, cn].add(callee_name)
@@ -192,6 +197,7 @@ def score(truth_path, index, corpus, cbm=False, loaded=None, callers=None, short
             external += 1
         elif callees is None or (next(iter(homes)), callee_name) in callees:
             want_calls.add((cf, cn, *homes, callee_name))
+            scored_by_form[form].add((cf, cn, *homes, callee_name))
     want_calls = {k for k in want_calls if (k[0], k[1], k[3]) not in per_program}
 
     certain, any_, to_decl = set(), set(), set()
@@ -236,6 +242,11 @@ def score(truth_path, index, corpus, cbm=False, loaded=None, callers=None, short
                     want_virtual.add((cf, cn, f, n))
     other_forms = {f: {"truth_edges": len(e), "found_any": len(e & any_), "recall_any": len(e & any_) / max(1, len(e))}
                    for f, e in sorted(by_form.items())}
+    recall_by_form = {f: {"truth_edges": len(e & want_calls), "found_any": len(e & want_calls & any_),
+                          "found_certain": len(e & want_calls & certain),
+                          "recall_any": len(e & want_calls & any_) / max(1, len(e & want_calls)),
+                          "recall_certain": len(e & want_calls & certain) / max(1, len(e & want_calls))}
+                      for f, e in sorted(scored_by_form.items())}
     if want_virtual:
         other_forms["virtual_overrides"] = {"truth_edges": len(want_virtual), "found_any": len(want_virtual & any_),
                                             "recall_any": len(want_virtual & any_) / max(1, len(want_virtual))}
@@ -249,7 +260,7 @@ def score(truth_path, index, corpus, cbm=False, loaded=None, callers=None, short
              "no_such_call": len(phantom),
              "precision_certain": len(right) / max(1, len(judged_keys) - len(undefined)),
              "si_edges_to_prototypes": len(to_decl),
-             **({"truth_call_sites_by_form": dict(forms), "other_forms": other_forms,
+             **({"truth_call_sites_by_form": dict(forms), "recall_by_form": recall_by_form, "other_forms": other_forms,
                  "dependent_calls_in_templates": t.raw.get("dependent_calls", 0)} if "cpp_translation_units" in t.raw else {})}
     # --- calls through struct members -----------------------------------------
     # What clang's types say: a call through member M of struct S may reach

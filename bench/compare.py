@@ -435,7 +435,7 @@ def tool_clangd(ctx, res):
 def clangd_accuracy(ctx, client, deadline):
     # (Its call hierarchy names a method without its class, as cscope does.)
     t = check_truth.Truth(ctx.truth, short=True)
-    n = ctx.args.clangd_sample
+    n = ctx.args.sample_fraction
     text = {}
 
     def written(file, line, name):
@@ -461,7 +461,8 @@ def clangd_accuracy(ctx, client, deadline):
     # program's cmd_main, say) and answers with the calls of all of them.
     times_defined = collections.Counter(name for name, _file, _line in t.defs)
     merged = sum(times_defined[k[1]] > 1 for k in detail["phantom"])
-    how = (f"sampled: the {len(functions)} functions of lowest SHA-1(file, name) among the {len(pool)} that clang saw "
+    how = (f"sampled: {len(functions)} functions, {n:.0%} of the {len(pool)} that clang saw, drawn by lowest SHA-1(file, name), "
+           "among those "
            "defined in a source file (not a header) with the name written on the line")
     return {
         "definitions": {"truth": len(functions), "found": len(found_defs), "recall": len(found_defs) / max(1, len(functions)),
@@ -645,7 +646,9 @@ def main():
     ap.add_argument("--cbm-mode", default="full", choices=["fast", "moderate", "full"])
     ap.add_argument("--clangd", default=shutil.which("clangd") or "C:/Program Files/LLVM/bin/clangd.exe")
     ap.add_argument("--clangd-flags", default="", help="extra compiler flags for every entry of the synthetic database")
-    ap.add_argument("--clangd-sample", type=int, default=300, help="functions whose outgoing calls are scored")
+    ap.add_argument("--sample-fraction", type=float, default=0.10,
+                    help="what part of the functions clang saw is drawn (at random, seeded) for a tool whose calls are "
+                         "asked one function at a time (clangd, Source Insight)")
     ap.add_argument("--wsl-distro", default="Ubuntu-24.04")
     ap.add_argument("--wsl-dir", default="si-bench", help="directory for the WSL copy, relative to its home")
     args = ap.parse_args()

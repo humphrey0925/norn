@@ -5,6 +5,7 @@ clangd is given a synthetic compilation database (one `clang -c <file>` per
 its index next to that database, in `.cache/clangd/index`.
 """
 import hashlib
+import math
 import json
 import os
 import queue
@@ -185,10 +186,13 @@ class Clangd:
         self.log.close()
 
 
-def sample(functions, n):
-    """A fixed pseudo-random `n` of (file, name, line): lowest SHA-1 first."""
+def sample(functions, fraction):
+    """A fixed pseudo-random part of (file, name, line), `fraction` of them:
+    those of lowest SHA-1(file, name), which orders them as a random draw
+    with a fixed seed would, and the same on every machine."""
     key = lambda f: hashlib.sha1(f"{f[0]}\0{f[1]}".encode()).hexdigest()
-    return sorted(sorted(set(functions)), key=key)[:n]
+    pool = sorted(sorted(set(functions)), key=key)
+    return pool[:max(1, math.ceil(len(pool) * fraction))] if pool else []
 
 
 def index(exe, db_dir, root, log, deadline, first_file):
