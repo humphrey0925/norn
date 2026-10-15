@@ -1582,3 +1582,54 @@ mod cpp_tests {
         assert_eq!(calls(&g, "go", "helper"), [("a.c".to_string(), true)]);
     }
 }
+
+#[cfg(test)]
+mod test_framework_tests {
+    use super::*;
+    use crate::extract::Extractor;
+    use crate::mask::MacroSets;
+
+    fn named(files: &[(&str, &str)]) -> Vec<String> {
+        let mut ex = Extractor::new();
+        let t = MacroSets::default();
+        let facts: Vec<FileFacts> = files.iter().map(|(path, src)| ex.extract(path, src.as_bytes(), &t)).collect();
+        let g = link(&facts).0;
+        let q = crate::graph::Qualifier::new(&g);
+        let mut out: Vec<String> = (0..g.syms.len() as u32).filter(|&s| g.syms[s as usize].kind == kind::FUNCTION).map(|s| q.name(&g, s).into_owned()).collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_boost_test_is_its_case_s_test_method_of_its_suite_s_fixture() {
+        let src = "struct Setup { int Count() { return 1; } };\n\
+                   BOOST_FIXTURE_TEST_SUITE(addrman_tests, Setup)\n\
+                   BOOST_AUTO_TEST_CASE(simple)\n{\n  Count();\n}\n\
+                   BOOST_AUTO_TEST_SUITE_END()\n\
+                   BOOST_FIXTURE_TEST_CASE(other, Setup)\n{\n  Count();\n}\n\
+                   BOOST_AUTO_TEST_CASE(plain)\n{\n}\n";
+        assert_eq!(named(&[("t.cpp", src)]), ["Setup::Count", "other::test_method", "plain::test_method", "simple::test_method"]);
+        // What the fixture has, the test calls.
+        let mut ex = Extractor::new();
+        let g = link(&[ex.extract("t.cpp", src.as_bytes(), &MacroSets::default())]).0;
+        let count = g.find("Count")[0];
+        assert_eq!(g.refs_to(count).iter().filter(|e| e.kind() == refkind::CALL).count(), 2);
+    }
+
+    #[test]
+    fn a_googletest_test_is_its_test_body() {
+        let src = "class DBTest { public: void Put(); };\nTEST(Coding, Fixed32) {\n}\nTEST_F(DBTest, Empty) {\n  Put();\n}\n";
+        assert_eq!(named(&[("t.cc", src)]), ["Coding_Fixed32_Test::TestBody", "DBTest::Put", "DBTest_Empty_Test::TestBody"]);
+    }
+
+    #[test]
+    fn a_test_macro_the_corpus_defines_is_expanded_not_guessed() {
+        // A macro of that name of the corpus's own: what it makes is read
+        // from its expansion, and nothing is made of the name.
+        let src = "#define TEST(a, b) void a##_##b(void)\nTEST(x, y) {\n}\n";
+        let sets = MacroSets::from_defines(crate::mask::defines(src.as_bytes(), &crate::cond::Conditions::default()));
+        let mut ex = Extractor::new();
+        let g = link(&[ex.extract("t.cc", src.as_bytes(), &sets)]).0;
+        assert!(g.find("TestBody").is_empty());
+    }
+}

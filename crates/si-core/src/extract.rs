@@ -372,6 +372,8 @@ struct Walk<'a> {
     /// C++: the file's namespaces, by where they start: (start, end, name;
     /// "" for an anonymous one). See `namespace_spans`.
     namespaces: Vec<(usize, usize, String)>,
+    /// C++: the Boost.Test suites of the file: (start, end, fixture).
+    suites: Vec<(usize, usize, Option<String>)>,
     /// C++: where the macros that make a definition are named (`TEST_F`
     /// of `TEST_F (A, b) { ... }`).
     defining_macros: FxHashSet<usize>,
@@ -475,6 +477,7 @@ impl Extractor {
             friend_end: 0,
             made_names: FxHashMap::default(),
             namespaces: if cpp { namespace_spans(&lexed.masked, &lexed.blocks) } else { Vec::new() },
+            suites: if cpp { test_suites(&lexed.masked) } else { Vec::new() },
             defining_macros: lexed
                 .events
                 .iter()
@@ -685,6 +688,47 @@ impl<'a> Walk<'a> {
         self.out.owners.push((def, chain, own));
         // (A function only in a namespace has no class for `this`.)
         if member { own } else { NONE }
+    }
+
+    /// C++: a test written with Boost.Test's or GoogleTest's macros where the
+    /// corpus does not define them (their headers are the system's): the
+    /// class the macro makes, the method the body is, and the class that
+    /// derives from (the fixture). `TEST_F (Suite, Name) { ... }` is
+    /// `Suite_Name_Test::TestBody`, `BOOST_AUTO_TEST_CASE (name) { ... }`
+    /// is `name::test_method`, of the fixture of the suite it is in.
+    fn test_case(&self, name: Node<'a>, def: Node<'a>) -> Option<(String, &'static str, Option<String>)> {
+        if self.site_defs.contains_key(&name.start_byte()) {
+            // (The macro is the corpus's own, and is expanded.)
+            return None;
+        }
+        let ids = self.ids;
+        let macro_name = self.text(name);
+        if !matches!(macro_name, b"BOOST_AUTO_TEST_CASE" | b"BOOST_FIXTURE_TEST_CASE" | b"TEST" | b"TEST_F" | b"TEST_P") {
+            return None;
+        }
+        let params = def.child_by_field_id(ids.f_declarator.get())?.child_by_field_id(ids.f_parameters)?;
+        let mut c = params.walk();
+        let args: Vec<String> = params
+            .named_children(&mut c)
+            .map(|p| String::from_utf8_lossy(self.text(p)).split_whitespace().collect::<String>())
+            .collect();
+        // A name, of a class or a test (of a qualified one, the last part).
+        let arg = |i: usize| {
+            let a = args.get(i)?.rsplit("::").next()?.to_string();
+            (!a.is_empty() && a.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')).then_some(a)
+        };
+        match macro_name {
+            b"BOOST_AUTO_TEST_CASE" => Some((arg(0)?, "test_method", self.fixture_at(def.start_byte()))),
+            b"BOOST_FIXTURE_TEST_CASE" => Some((arg(0)?, "test_method", arg(1))),
+            b"TEST" => Some((format!("{}_{}_Test", arg(0)?, arg(1)?), "TestBody", None)),
+            _ => Some((format!("{}_{}_Test", arg(0)?, arg(1)?), "TestBody", arg(0))),
+        }
+    }
+
+    /// The fixture of the Boost.Test suite `pos` is in, if it has one.
+    fn fixture_at(&self, pos: usize) -> Option<String> {
+        // (A suite with none has its enclosing suite's.)
+        self.suites.iter().rev().filter(|s| s.0 <= pos && pos < s.1).find_map(|s| s.2.clone())
     }
 
     /// C++: is `pos` in an anonymous namespace? What is defined there is
@@ -1569,9 +1613,21 @@ impl<'a> Walk<'a> {
                 let def = self.push_def(name, node, kind::FUNCTION, flags);
                 self.method_class = NONE;
                 if self.cpp {
-                    self.method_class = self.note_owner(def, &scope, class, node.start_byte());
-                    if class.is_some() {
-                        self.place_in_record(def, node.start_byte());
+                    if let Some((test, method, base)) = self.test_case(name, node) {
+                        // A test of a framework the corpus does not define
+                        // the macros of: named as they name it.
+                        self.out.defs[def as usize].name = self.intern_str(method);
+                        let own = self.note_owner(def, &[test.as_bytes()], None, node.start_byte());
+                        self.method_class = own;
+                        if let Some(base) = base {
+                            let base = self.intern_str(&base);
+                            self.out.bases.push((own, base));
+                        }
+                    } else {
+                        self.method_class = self.note_owner(def, &scope, class, node.start_byte());
+                        if class.is_some() {
+                            self.place_in_record(def, node.start_byte());
+                        }
                     }
                 }
                 let returns = self.type_name_of(node);
@@ -1905,6 +1961,53 @@ fn namespace_spans(src: &[u8], blocks: &[(u32, u32, u32)]) -> Vec<(usize, usize,
         out.push((start, end, name));
         i = brace + 1;
     }
+    out
+}
+
+/// C++: Boost.Test's suites, `BOOST_FIXTURE_TEST_SUITE (name, Fixture)` or
+/// `BOOST_AUTO_TEST_SUITE (name)` to `BOOST_AUTO_TEST_SUITE_END ()`, as
+/// (start, end, fixture), by where they start.
+fn test_suites(src: &[u8]) -> Vec<(usize, usize, Option<String>)> {
+    const OPEN: &[u8] = b"_TEST_SUITE";
+    if !src.windows(OPEN.len()).any(|w| w == OPEN) {
+        return Vec::new();
+    }
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let (mut out, mut open) = (Vec::new(), Vec::new());
+    let mut i = 0;
+    while i < src.len() {
+        if !ident(src[i]) || (i > 0 && ident(src[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < src.len() && ident(src[i]) {
+            i += 1;
+        }
+        let word = &src[start..i];
+        let args = || {
+            let open = i + src[i..].iter().position(|b| !b.is_ascii_whitespace())?;
+            (src.get(open) == Some(&b'(')).then_some(())?;
+            let close = open + src[open..].iter().position(|&b| b == b')')?;
+            Some(String::from_utf8_lossy(&src[open + 1..close]).into_owned())
+        };
+        match word {
+            b"BOOST_FIXTURE_TEST_SUITE" | b"BOOST_AUTO_TEST_SUITE" => {
+                if let Some(a) = args() {
+                    let fixture = a.split(',').nth(1).map(|f| f.trim().rsplit("::").next().unwrap_or("").to_string()).filter(|f| !f.is_empty());
+                    open.push((start, fixture));
+                }
+            }
+            b"BOOST_AUTO_TEST_SUITE_END" => {
+                if let Some((s, fixture)) = open.pop() {
+                    out.push((s, start, fixture));
+                }
+            }
+            _ => {}
+        }
+    }
+    out.extend(open.into_iter().map(|(s, fixture)| (s, src.len(), fixture)));
+    out.sort_unstable_by_key(|s| s.0);
     out
 }
 
