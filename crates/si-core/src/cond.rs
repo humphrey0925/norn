@@ -755,16 +755,18 @@ impl View<'_> {
     /// The value of a name in an `#if`: its definition if that is a number,
     /// or a name or an expression that has one (`(0 && OTHER)` is 0 whatever
     /// OTHER is), 0 if it is known not to be defined.
-    fn value(&self, name: &[u8], depth: u8) -> Option<i64> {
+    fn value(&self, name: &[u8], depth: u8) -> Option<Int> {
         match self.text(name)? {
-            None => Some(0),
+            None => Some(Int::signed(0)),
+            // (A macro with parameters named without arguments: no value.)
+            Some(v) if v.first() == Some(&0) => None,
             Some(v) if v.is_empty() || v == name || depth > 8 => number(v),
             Some(v) => number(v).or_else(|| {
                 // Read as an `#if` would read it, its names in turn.
                 let toks = tokens(v);
                 let inner = View { c: self.c, local: self.local, at: self.at, depth: depth + 1 };
                 let mut p = Parser { c: inner, toks: &toks, at: 0 };
-                let value = p.or();
+                let value = p.ternary();
                 (p.at == toks.len()).then_some(value).flatten()
             }),
         }
@@ -830,9 +832,21 @@ impl Conditions {
         c
     }
 
+    /// `NAME` as `value`; `NAME(a, b)` (`-D'MAX(a,b)=...'`) a macro with
+    /// parameters.
     pub fn define(&mut self, name: &str, value: &str) {
+        let (name, value) = match name.split_once('(') {
+            Some((n, rest)) => {
+                if rest.contains("...") {
+                    return;
+                }
+                let params: Vec<&[u8]> = rest.trim_end().trim_end_matches(')').split(',').map(|p| p.trim().as_bytes()).filter(|p| !p.is_empty()).collect();
+                (n.trim(), function_value(&params, value.as_bytes()).unwrap_or_else(|| b"(".to_vec()))
+            }
+            None => (name, value.trim().as_bytes().to_vec()),
+        };
         self.undefined.remove(name.as_bytes());
-        self.defined.insert(name.as_bytes().to_vec(), value.trim().as_bytes().to_vec());
+        self.defined.insert(name.as_bytes().to_vec(), value);
     }
 
     pub fn undefine(&mut self, name: &str) {
@@ -874,8 +888,12 @@ impl Conditions {
                 if let Some(d) = rest.strip_prefix("define").filter(|d| d.starts_with([' ', '\t'])) {
                     let d = d.trim_start();
                     let end = d.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(d.len());
-                    // A macro with parameters says nothing a condition can use.
-                    if end > 0 && !d[end..].starts_with('(') {
+                    if end > 0 && d[end..].starts_with('(') {
+                        // A macro with parameters, called in a condition.
+                        if let Some(close) = d[end..].find(')') {
+                            self.define(&d[..end + close + 1], d[end + close + 1..].split("/*").next().unwrap_or(""));
+                        }
+                    } else if end > 0 {
                         self.define(&d[..end], d[end..].split("/*").next().unwrap_or(""));
                     }
                 } else if let Some(u) = rest.strip_prefix("undef").filter(|u| u.starts_with([' ', '\t'])) {
@@ -995,7 +1013,7 @@ impl Conditions {
     pub fn eval_in(&self, local: &Local, at: Option<(u32, u32)>, expr: &[u8]) -> Tri {
         let toks = tokens(expr);
         let mut p = Parser { c: View { c: self, local, at, depth: 0 }, toks: &toks, at: 0 };
-        let v = p.or();
+        let v = p.ternary();
         if p.at != toks.len() {
             return Tri::Unknown;
         }
@@ -1044,24 +1062,155 @@ pub fn value_of(body: &[u8]) -> Option<Vec<u8>> {
     Some(v.to_vec())
 }
 
-fn number(v: &[u8]) -> Option<i64> {
-    let s = std::str::from_utf8(v).ok()?.trim();
-    let s = s.trim_end_matches(['u', 'U', 'l', 'L']);
-    match s.strip_prefix("0x").or(s.strip_prefix("0X")) {
-        Some(hex) => i64::from_str_radix(hex, 16).ok(),
-        None => s.parse().ok(),
+/// A value in an `#if`: C's `intmax_t`, or `uintmax_t` where `unsigned`
+/// (the bits the same).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Int {
+    v: i64,
+    unsigned: bool,
+}
+
+impl Int {
+    fn signed(v: i64) -> Int {
+        Int { v, unsigned: false }
+    }
+
+    /// Of two operands, as C converts them: unsigned if either is.
+    fn arith(a: Int, b: Int, signed: fn(i64, i64) -> Option<i64>, unsigned: fn(u64, u64) -> Option<u64>) -> Option<Int> {
+        if a.unsigned || b.unsigned {
+            unsigned(a.v as u64, b.v as u64).map(|v| Int { v: v as i64, unsigned: true })
+        } else {
+            signed(a.v, b.v).map(Int::signed)
+        }
+    }
+
+    fn bits(a: Int, b: Int, f: fn(i64, i64) -> i64) -> Option<Int> {
+        Some(Int { v: f(a.v, b.v), unsigned: a.unsigned || b.unsigned })
+    }
+
+    fn compare(a: Int, b: Int, holds: fn(std::cmp::Ordering) -> bool) -> Option<Int> {
+        let order = if a.unsigned || b.unsigned { (a.v as u64).cmp(&(b.v as u64)) } else { a.v.cmp(&b.v) };
+        Some(Int::signed(holds(order) as i64))
+    }
+
+    /// How far a shift goes, if it is one C defines.
+    fn count(b: Int) -> Option<u32> {
+        u32::try_from(b.v).ok().filter(|&c| c < 64 && (b.unsigned || b.v >= 0))
+    }
+
+    /// The text of the value, to read again (in a macro's arguments).
+    fn text(self) -> String {
+        match (self.unsigned, self.v < 0) {
+            (true, _) => format!("{}u", self.v as u64),
+            (false, true) => format!("({})", self.v),
+            (false, false) => self.v.to_string(),
+        }
     }
 }
 
-fn truth(v: Option<i64>) -> Tri {
-    v.map_or(Tri::Unknown, |n| Tri::of(n != 0))
+/// An integer constant as C writes it (decimal, octal `017`, hex `0x1F`,
+/// binary `0b101`; suffixes `u`, `l`, `ll` in any case and order), or a
+/// character constant (`'a'`, `'\n'`, `L'x'`).
+fn number(v: &[u8]) -> Option<Int> {
+    let s = std::str::from_utf8(v).ok()?.trim();
+    if s.ends_with('\'') {
+        return character(s);
+    }
+    let digits = s.trim_end_matches(['u', 'U', 'l', 'L']);
+    let suffix = &s[digits.len()..];
+    let (us, ls) = (suffix.matches(['u', 'U']).count(), suffix.matches(['l', 'L']).count());
+    if us > 1 || ls > 2 || (ls == 2 && !(suffix.contains("ll") || suffix.contains("LL"))) {
+        return None;
+    }
+    let (radix, body) = if let Some(h) = digits.strip_prefix("0x").or(digits.strip_prefix("0X")) {
+        (16, h)
+    } else if let Some(b) = digits.strip_prefix("0b").or(digits.strip_prefix("0B")) {
+        (2, b)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        (8, &digits[1..])
+    } else {
+        (10, digits)
+    };
+    if body.is_empty() || !body.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let n = u64::from_str_radix(body, radix).ok()?;
+    // One too large for `intmax_t` is `uintmax_t`.
+    Some(Int { v: n as i64, unsigned: us == 1 || n > i64::MAX as u64 })
+}
+
+/// `'a'`, `'\x41'`, `'\0'`, `L'a'`: a single character's value, a plain
+/// one as a signed `char` (as gcc and clang have it). One of several
+/// characters (`'ab'`) has no value the standard gives.
+fn character(s: &str) -> Option<Int> {
+    let (wide, rest) = match s.find('\'') {
+        Some(0) => (false, &s[1..]),
+        Some(at) if matches!(&s[..at], "L" | "u" | "U" | "u8") => (&s[..at] != "u8", &s[at + 1..]),
+        _ => return None,
+    };
+    let inner = rest.strip_suffix('\'')?.as_bytes();
+    let (c, used) = match inner {
+        [b'\\', b'x', hex @ ..] if !hex.is_empty() => (u32::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?, inner.len()),
+        [b'\\', b'0'..=b'7', ..] => {
+            let n = inner[1..].iter().take(3).take_while(|b| (b'0'..=b'7').contains(*b)).count();
+            (u32::from_str_radix(std::str::from_utf8(&inner[1..1 + n]).ok()?, 8).ok()?, 1 + n)
+        }
+        [b'\\', e, ..] => (
+            match e {
+                b'n' => 10,
+                b't' => 9,
+                b'r' => 13,
+                b'a' => 7,
+                b'b' => 8,
+                b'f' => 12,
+                b'v' => 11,
+                b'\\' | b'\'' | b'"' | b'?' => *e as u32,
+                _ => return None,
+            },
+            2,
+        ),
+        [c, ..] if c.is_ascii() => (*c as u32, 1),
+        _ => return None,
+    };
+    if used != inner.len() {
+        return None;
+    }
+    let v = if wide { c as i64 } else { u8::try_from(c).ok()? as i8 as i64 };
+    Some(Int::signed(v))
+}
+
+fn truth(v: Option<Int>) -> Tri {
+    v.map_or(Tri::Unknown, |n| Tri::of(n.v != 0))
 }
 
 #[derive(Clone, Debug, PartialEq)]
 enum Tok<'a> {
     Ident(&'a [u8]),
-    Num(i64),
+    Num(Int),
     Op(&'a [u8]),
+}
+
+impl Tok<'_> {
+    fn text(&self) -> std::borrow::Cow<'_, [u8]> {
+        match self {
+            Tok::Ident(t) | Tok::Op(t) => std::borrow::Cow::Borrowed(t),
+            Tok::Num(n) => std::borrow::Cow::Owned(n.text().into_bytes()),
+        }
+    }
+}
+
+/// How a macro with parameters is kept among the values of names: `\0`,
+/// its parameters with commas between, `\0`, its body as `value_of` has it.
+pub fn function_value(params: &[&[u8]], body: &[u8]) -> Option<Vec<u8>> {
+    let body = value_of(body)?;
+    Some([&b"\0"[..], &params.join(&b","[..]), b"\0", &body].concat())
+}
+
+fn function_parts(v: &[u8]) -> Option<(Vec<&[u8]>, &[u8])> {
+    let rest = v.strip_prefix(b"\0")?;
+    let at = rest.iter().position(|&b| b == 0)?;
+    let params = if at == 0 { Vec::new() } else { rest[..at].split(|&b| b == b',').collect() };
+    Some((params, &rest[at + 1..]))
 }
 
 fn tokens(s: &[u8]) -> Vec<Tok<'_>> {
@@ -1079,6 +1228,15 @@ fn tokens(s: &[u8]) -> Vec<Tok<'_>> {
             i += 2;
         } else if b == b'/' && s.get(i + 1) == Some(&b'/') {
             break;
+        } else if let Some(prefix) = char_prefix(&s[i..]) {
+            // A character constant, `L'x'` and the like too.
+            let a = i;
+            i += prefix + 1;
+            while i < s.len() && s[i] != b'\'' {
+                i += if s[i] == b'\\' { 2 } else { 1 };
+            }
+            i = (i + 1).min(s.len());
+            out.push(number(&s[a..i]).map_or(Tok::Op(&s[a..i]), Tok::Num));
         } else if b.is_ascii_alphabetic() || b == b'_' {
             let a = i;
             while i < s.len() && (s[i].is_ascii_alphanumeric() || s[i] == b'_') {
@@ -1093,7 +1251,7 @@ fn tokens(s: &[u8]) -> Vec<Tok<'_>> {
             // A number that cannot be read makes the condition unknown.
             out.push(number(&s[a..i]).map_or(Tok::Op(&s[a..i]), Tok::Num));
         } else {
-            let two = s.get(i..i + 2).filter(|t| matches!(*t, b"&&" | b"||" | b"==" | b"!=" | b"<=" | b">="));
+            let two = s.get(i..i + 2).filter(|t| matches!(*t, b"&&" | b"||" | b"==" | b"!=" | b"<=" | b">=" | b"<<" | b">>"));
             let len = if two.is_some() { 2 } else { 1 };
             out.push(Tok::Op(&s[i..i + len]));
             i += len;
@@ -1102,14 +1260,26 @@ fn tokens(s: &[u8]) -> Vec<Tok<'_>> {
     out
 }
 
-/// `||` over `&&` over comparisons over `!` over primaries, in three-valued
-/// logic: `None` is a value that is not known. Anything else in a condition
-/// (arithmetic, a macro with arguments) is not known either.
+/// Of a character constant at the start of `s` (`'x'`, `L'x'`, `u8'x'`),
+/// how long the prefix before the quote is.
+fn char_prefix(s: &[u8]) -> Option<usize> {
+    [&b""[..], b"u8", b"L", b"u", b"U"].iter().find(|p| s.starts_with(p) && s.get(p.len()) == Some(&b'\'')).map(|p| p.len())
+}
+
+/// The operators of C's `#if`, by their precedence: `?:` over `||` over
+/// `&&` over `|` `^` `&` over comparisons over shifts over `+ -` over
+/// `* / %` over the unary ones over primaries, in three-valued logic:
+/// `None` is a value that is not known (as is one that overflows, or a
+/// division by zero). Anything else in a condition (a macro with arguments
+/// the build does not define) is not known either.
 struct Parser<'a> {
     c: View<'a>,
     toks: &'a [Tok<'a>],
     at: usize,
 }
+
+/// One level of binary operators: each with what it makes of two values.
+type Level = &'static [(&'static [u8], fn(Int, Int) -> Option<Int>)];
 
 impl Parser<'_> {
     fn op(&mut self, text: &[u8]) -> bool {
@@ -1118,7 +1288,30 @@ impl Parser<'_> {
         hit
     }
 
-    fn or(&mut self) -> Option<i64> {
+    /// `c ? a : b`; of a condition not known, the value both give, if they
+    /// give the same.
+    fn ternary(&mut self) -> Option<Int> {
+        let c = self.or();
+        if !self.op(b"?") {
+            return c;
+        }
+        let a = self.ternary();
+        if !self.op(b":") {
+            self.at = usize::MAX / 2;
+            return None;
+        }
+        let b = self.ternary();
+        // (Of the type both arms are converted to.)
+        let unsigned = a.is_some_and(|a| a.unsigned) || b.is_some_and(|b| b.unsigned);
+        let common = |x: Option<Int>| x.map(|x| Int { unsigned, ..x });
+        match truth(c) {
+            Tri::True => common(a),
+            Tri::False => common(b),
+            Tri::Unknown => common(a).filter(|_| a == b),
+        }
+    }
+
+    fn or(&mut self) -> Option<Int> {
         let mut v = self.and();
         while self.op(b"||") {
             let r = self.and();
@@ -1127,41 +1320,94 @@ impl Parser<'_> {
         v
     }
 
-    fn and(&mut self) -> Option<i64> {
-        let mut v = self.compare();
+    fn and(&mut self) -> Option<Int> {
+        let mut v = self.bits();
         while self.op(b"&&") {
-            let r = self.compare();
+            let r = self.bits();
             v = as_value(truth(v).and(truth(r)));
         }
         v
     }
 
-    fn compare(&mut self) -> Option<i64> {
-        let l = self.unary();
-        for (text, f) in [
-            (&b"=="[..], (|a, b| a == b) as fn(i64, i64) -> bool),
-            (b"!=", |a, b| a != b),
-            (b"<=", |a, b| a <= b),
-            (b">=", |a, b| a >= b),
-            (b"<", |a, b| a < b),
-            (b">", |a, b| a > b),
-        ] {
-            if self.op(text) {
-                let r = self.unary();
-                return Some(f(l?, r?) as i64);
+    /// Left to right, the operators of each level over those of the next.
+    fn level(&mut self, levels: &[Level]) -> Option<Int> {
+        let Some((ops, next)) = levels.split_first() else { return self.unary() };
+        let mut v = self.level(next);
+        'more: loop {
+            for (text, f) in ops.iter() {
+                if self.op(text) {
+                    let r = self.level(next);
+                    v = match (v, r) {
+                        (Some(a), Some(b)) => f(a, b),
+                        _ => None,
+                    };
+                    continue 'more;
+                }
             }
+            return v;
         }
-        l
     }
 
-    fn unary(&mut self) -> Option<i64> {
+    fn bits(&mut self) -> Option<Int> {
+        use std::cmp::Ordering;
+        const LEVELS: &[Level] = &[
+            &[(b"|", |a, b| Int::bits(a, b, |a, b| a | b))],
+            &[(b"^", |a, b| Int::bits(a, b, |a, b| a ^ b))],
+            &[(b"&", |a, b| Int::bits(a, b, |a, b| a & b))],
+            &[(b"==", |a, b| Int::compare(a, b, Ordering::is_eq)), (b"!=", |a, b| Int::compare(a, b, Ordering::is_ne))],
+            &[
+                (b"<=", |a, b| Int::compare(a, b, Ordering::is_le)),
+                (b">=", |a, b| Int::compare(a, b, Ordering::is_ge)),
+                (b"<", |a, b| Int::compare(a, b, Ordering::is_lt)),
+                (b">", |a, b| Int::compare(a, b, Ordering::is_gt)),
+            ],
+            // (Of the left operand's type; a negative one shifted left, or
+            // a bit shifted out of a signed one, is no value C defines.)
+            &[
+                (b"<<", |a, b| {
+                    let c = Int::count(b)?;
+                    if a.unsigned {
+                        return Some(Int { v: ((a.v as u64) << c) as i64, unsigned: true });
+                    }
+                    let v = (a.v >= 0).then(|| (a.v as i128) << c)?;
+                    i64::try_from(v).ok().map(Int::signed)
+                }),
+                (b">>", |a, b| {
+                    let c = Int::count(b)?;
+                    Some(if a.unsigned { Int { v: ((a.v as u64) >> c) as i64, unsigned: true } } else { Int::signed(a.v >> c) })
+                }),
+            ],
+            &[
+                (b"+", |a, b| Int::arith(a, b, i64::checked_add, |a, b| Some(a.wrapping_add(b)))),
+                (b"-", |a, b| Int::arith(a, b, i64::checked_sub, |a, b| Some(a.wrapping_sub(b)))),
+            ],
+            &[
+                (b"*", |a, b| Int::arith(a, b, i64::checked_mul, |a, b| Some(a.wrapping_mul(b)))),
+                (b"/", |a, b| Int::arith(a, b, i64::checked_div, u64::checked_div)),
+                (b"%", |a, b| Int::arith(a, b, i64::checked_rem, u64::checked_rem)),
+            ],
+        ];
+        self.level(LEVELS)
+    }
+
+    fn unary(&mut self) -> Option<Int> {
         if self.op(b"!") {
             return as_value(truth(self.unary()).not());
+        }
+        if self.op(b"-") {
+            let v = self.unary()?;
+            return if v.unsigned { Some(Int { v: v.v.wrapping_neg(), unsigned: true }) } else { v.v.checked_neg().map(Int::signed) };
+        }
+        if self.op(b"~") {
+            return self.unary().map(|v| Int { v: !v.v, ..v });
+        }
+        if self.op(b"+") {
+            return self.unary();
         }
         self.primary()
     }
 
-    fn primary(&mut self) -> Option<i64> {
+    fn primary(&mut self) -> Option<Int> {
         match self.toks.get(self.at).cloned() {
             Some(Tok::Num(n)) => {
                 self.at += 1;
@@ -1169,7 +1415,7 @@ impl Parser<'_> {
             }
             Some(Tok::Op(b"(")) => {
                 self.at += 1;
-                let v = self.or();
+                let v = self.ternary();
                 if !self.op(b")") {
                     self.at = usize::MAX / 2; // unbalanced: nothing is known
                 }
@@ -1190,20 +1436,44 @@ impl Parser<'_> {
                 if !self.op(b"(") {
                     return self.c.value(name, self.c.depth);
                 }
-                // A macro with arguments: the kernel's own, or unknown.
-                let arg = match (self.toks.get(self.at).cloned(), self.toks.get(self.at + 1)) {
-                    (Some(Tok::Ident(a)), Some(Tok::Op(b")"))) => Some(a),
-                    _ => None,
-                };
-                let mut depth = 1;
-                while depth > 0 && self.at < self.toks.len() {
+                // A macro with arguments: its arguments, split at the
+                // commas outside parentheses.
+                let mut args: Vec<std::ops::Range<usize>> = Vec::new();
+                let (mut depth, mut from) = (1, self.at);
+                while self.at < self.toks.len() {
                     match &self.toks[self.at] {
                         Tok::Op(b"(") => depth += 1,
-                        Tok::Op(b")") => depth -= 1,
+                        Tok::Op(b")") => {
+                            depth -= 1;
+                            if depth == 0 {
+                                args.push(from..self.at);
+                                self.at += 1;
+                                break;
+                            }
+                        }
+                        Tok::Op(b",") if depth == 1 => {
+                            args.push(from..self.at);
+                            from = self.at + 1;
+                        }
                         _ => {}
                     }
                     self.at += 1;
                 }
+                if depth != 0 {
+                    self.at = usize::MAX / 2;
+                    return None;
+                }
+                if let Some((params, body)) = self.c.text(name).flatten().and_then(function_parts) {
+                    return self.expand(&params, body, &args);
+                }
+                // The kernel's own.
+                let arg = match &args[..] {
+                    [one] if one.len() == 1 => match self.toks[one.start] {
+                        Tok::Ident(a) => Some(a),
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 let arg = arg?;
                 let module = [arg, b"_MODULE"].concat();
                 let (builtin, as_module) = (self.c.defined(arg), self.c.defined(&module));
@@ -1222,10 +1492,43 @@ impl Parser<'_> {
     }
 }
 
-fn as_value(t: Tri) -> Option<i64> {
+impl Parser<'_> {
+    /// A macro with parameters called in a condition: its body with each
+    /// parameter put for by its argument, read as a condition. (Not one
+    /// that pastes or quotes: `#` and `##` make it unknown.)
+    fn expand(&self, params: &[&[u8]], body: &[u8], args: &[std::ops::Range<usize>]) -> Option<Int> {
+        let none = params.is_empty() && args.len() == 1 && args[0].is_empty();
+        if self.c.depth > 8 || (params.len() != args.len() && !none) {
+            return None;
+        }
+        let mut text: Vec<u8> = Vec::new();
+        for t in tokens(body) {
+            match t {
+                Tok::Ident(n) if params.contains(&n) => {
+                    let arg = &args[params.iter().position(|p| *p == n)?];
+                    text.push(b'(');
+                    for t in &self.toks[arg.clone()] {
+                        text.extend_from_slice(&t.text());
+                        text.push(b' ');
+                    }
+                    text.push(b')');
+                }
+                t => text.extend_from_slice(&t.text()),
+            }
+            text.push(b' ');
+        }
+        let toks = tokens(&text);
+        let inner = View { c: self.c.c, local: self.c.local, at: self.c.at, depth: self.c.depth + 1 };
+        let mut p = Parser { c: inner, toks: &toks, at: 0 };
+        let value = p.ternary();
+        (p.at == toks.len()).then_some(value).flatten()
+    }
+}
+
+fn as_value(t: Tri) -> Option<Int> {
     match t {
-        Tri::True => Some(1),
-        Tri::False => Some(0),
+        Tri::True => Some(Int::signed(1)),
+        Tri::False => Some(Int::signed(0)),
         Tri::Unknown => None,
     }
 }
@@ -1241,6 +1544,87 @@ mod tests {
         c
     }
 
+    /// What C99 (6.10.1) lets an `#if` say, and what it comes to.
+    #[test]
+    fn a_condition_is_worked_out_as_c99_has_it() {
+        let mut c = Conditions::default();
+        c.read_file(
+            "#define VER 2\n#define FLAGS 5\n#define NEW (VER + 0 == 2)\n#define MK(a, b) (((a) << 16) | (b))\n\
+             #define KV(a, b, c) (((a) << 16) + ((b) << 8) + (c))\n#define CODE KV(5, 4, 0)\n#define ZERO() 0\n\
+             #define TWICE(x) MK(0, x) * 2\n#define VA(...) 1\n#define OCT 010\n",
+        );
+        c.define("SQ(x)", "((x) * (x))");
+        for (expr, want) in [
+            // Integer constants: decimal, octal, hex, binary; suffixes.
+            ("010 == 8", Tri::True),
+            ("OCT == 8", Tri::True),
+            ("0x1F == 31 && 0X1f == 31", Tri::True),
+            ("0b101 == 5", Tri::True),
+            ("10u == 10 && 10UL == 10 && 10ull == 10 && 10LLU == 10 && 10lu == 10", Tri::True),
+            ("08", Tri::Unknown),
+            ("10uu", Tri::Unknown),
+            ("10lL", Tri::Unknown),
+            ("1.0", Tri::Unknown),
+            // Unsigned arithmetic: the usual conversions.
+            ("-1 > 0u", Tri::True),
+            ("-1 > 0", Tri::False),
+            ("0xFFFFFFFFFFFFFFFF == -1", Tri::True),
+            ("0xFFFFFFFFFFFFFFFF > 0", Tri::True),
+            ("-1u == 0xFFFFFFFFFFFFFFFF", Tri::True),
+            ("0u - 1 > 0", Tri::True),
+            ("(1 ? -1 : 0u) > 0", Tri::True),
+            // Character constants.
+            ("'a' == 97", Tri::True),
+            (r"'\n' == 10 && '\0' == 0 && '\x41' == 65 && '\101' == 65 && '\'' == 39", Tri::True),
+            (r"'\377' < 0", Tri::True),
+            ("L'a' == 97", Tri::True),
+            ("'ab'", Tri::Unknown),
+            // Operators, by precedence.
+            ("VER + 0 == 2", Tri::True),
+            ("NEW", Tri::True),
+            ("(FLAGS & 1) == 1", Tri::True),
+            ("FLAGS & 2", Tri::False),
+            ("2 + 3 * 4 == 14 && (2 + 3) * 4 == 20", Tri::True),
+            ("1 | 2 ^ 3 & 1", Tri::True),
+            ("7 / 2 == 3 && -7 / 2 == -3 && -7 % 2 == -1", Tri::True),
+            ("1 << 4 == 16 && -16 >> 2 == -4 && 0x80000000u >> 31 == 1", Tri::True),
+            ("-VER < 0 && ~0 == -1 && +VER == 2 && !VER == 0", Tri::True),
+            ("1 < 2 == 1", Tri::True),
+            ("VER == 2 ? 1 : 0", Tri::True),
+            ("VER == 3 ? 1 : 0", Tri::False),
+            ("0 ? 1 : 2 ? 3 : 0", Tri::True),
+            // What C leaves undefined, or what is not known, is unknown...
+            ("UNKNOWN + 1", Tri::Unknown),
+            ("1 / 0", Tri::Unknown),
+            ("VER % 0", Tri::Unknown),
+            ("1 << 64", Tri::Unknown),
+            ("1 << -1", Tri::Unknown),
+            ("-1 << 1", Tri::Unknown),
+            ("0x7FFFFFFFFFFFFFFF + 1", Tri::Unknown),
+            ("1, 2", Tri::Unknown),
+            // ...unless what is known decides it.
+            ("0 && UNKNOWN + 1", Tri::False),
+            ("1 || 1 / 0", Tri::True),
+            ("0 && 1 / 0", Tri::False),
+            ("UNKNOWN ? 1 : 1", Tri::True),
+            ("1 ? 2 : 1 / 0", Tri::True),
+            // Macros with parameters.
+            ("MK(1, 2) == 65538", Tri::True),
+            ("CODE >= KV(5, 0, 0) && CODE < KV(6, 0, 0)", Tri::True),
+            ("KV(4, 19, 0) > CODE", Tri::False),
+            ("SQ(VER + 1) == 9", Tri::True),
+            ("TWICE((1, 2))", Tri::Unknown),
+            ("TWICE(3) == 6", Tri::True),
+            ("ZERO() == 0", Tri::True),
+            ("MK(1) == 1", Tri::Unknown),
+            ("VA(1)", Tri::Unknown),
+            ("defined(MK) && defined SQ", Tri::True),
+            ("NOT_DEFINED(1)", Tri::Unknown),
+        ] {
+            assert_eq!(c.eval(expr.as_bytes()), want, "{expr}");
+        }
+    }
+
     #[test]
     fn a_configuration_file_is_read_both_ways() {
         let c = conditions();
@@ -1249,7 +1633,7 @@ mod tests {
         assert_eq!(c.defined(b"CONFIG_DEBUG"), Tri::False);
         assert_eq!(c.defined(b"CONFIG_NEVER_MENTIONED"), Tri::False, "by the prefix");
         assert_eq!((c.defined(b"HAVE_X"), c.defined(b"HAVE_Y"), c.defined(b"HAVE_Z")), (Tri::True, Tri::False, Tri::Unknown));
-        assert_eq!(c.defined(b"MAX"), Tri::Unknown, "a macro with parameters is not a setting");
+        assert_eq!(c.defined(b"MAX"), Tri::True, "a macro with parameters is defined too");
     }
 
     #[test]
@@ -1436,7 +1820,7 @@ mod tests {
             ("0", Tri::False),
             ("1 /* always */", Tri::True),
             ("(ARCH_SIZE == 64", Tri::Unknown),
-            ("ARCH_SIZE + 1 == 65", Tri::Unknown),
+            ("ARCH_SIZE + 1 == 65", Tri::True),
         ] {
             assert_eq!(c.eval(expr.as_bytes()), want, "{expr}");
         }

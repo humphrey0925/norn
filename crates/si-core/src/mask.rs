@@ -237,7 +237,7 @@ pub fn source_of(per_file: &[Vec<Define>], paths: &[String]) -> crate::cond::Sou
     for (f, defines) in per_file.iter().enumerate() {
         for d in defines.iter().filter(|d| !d.include && !d.test && tested.contains(&d.name[..])) {
             let e = said.entry(&d.name).or_default();
-            match d.value.as_deref().filter(|_| !d.undef && !d.function_like && !d.guard && d.certain) {
+            match d.value.as_deref().filter(|_| !d.undef && !d.guard && d.certain) {
                 Some(value) => e.sure.push((value, f as u32)),
                 // A default (`#ifndef X` / `#define X`) leaves things as they are where X is defined.
                 None if d.fallback && !d.undef => {}
@@ -1869,10 +1869,16 @@ impl<'a> Lexer<'a> {
         let conditional = self.conds.iter().any(|c| !c.include_guard && c.compiled != Tri::True);
         let fallback = self.conds.last().is_some_and(|c| !c.include_guard && c.compiled != Tri::True && c.ifndef.as_deref() == Some(&s[a..e]));
         // From here on in this file the name has this value, if the line
-        // is compiled at all. (One with parameters is defined, to nothing
-        // a condition can use.)
-        let value = if function_like { None } else { crate::cond::value_of(&s[body..end]) };
-        let known = if function_like { Some(b"(".to_vec()) } else { value.clone().or(Some(b"(".to_vec())) };
+        // is compiled at all. (One with parameters is kept with them, to be
+        // called in a condition; one with `...` is defined, to nothing a
+        // condition can use.)
+        let variadic = function_like && s[e..body].windows(3).any(|w| w == b"...");
+        let value = match (function_like, variadic) {
+            (false, _) => crate::cond::value_of(&s[body..end]),
+            (true, false) => crate::cond::function_value(&params, &s[body..end]),
+            (true, true) => None,
+        };
+        let known = value.clone().or(Some(b"(".to_vec()));
         self.local.insert(s[a..e].to_vec(), (!conditional).then_some(known));
         if let Some(defines) = &mut self.defines {
             defines.push(Define {
