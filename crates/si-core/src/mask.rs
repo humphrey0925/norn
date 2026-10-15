@@ -1165,6 +1165,8 @@ fn profile(conditions: &Conditions, local: &crate::cond::Local, expr: &[u8], her
 /// One open `#if` group.
 struct Cond {
     nest: Nest,
+    /// C++: the braces open where the group opened (see `open_blocks`).
+    open_blocks: Vec<Option<usize>>,
     /// Its directives so far, to hide them all once one has to be.
     spans: Vec<(usize, usize)>,
     hidden: bool,
@@ -1215,7 +1217,8 @@ struct Lexer<'a> {
     block: Option<usize>,
     /// C++: blocks at every depth are reported (a class or a function is
     /// in a namespace), and here is where each open brace started (`None`
-    /// for an initializer's), one per brace in `nest`.
+    /// for an initializer's), matched on their own: not reset by a brace in
+    /// column 0, restored at `#else` as `nest` is.
     all_blocks: bool,
     open_blocks: Vec<Option<usize>>,
     /// The identifier before the one being read.
@@ -1294,36 +1297,27 @@ impl<'a> Lexer<'a> {
                     }
                     self.nest.braces.push((if init { Brace::Init } else { Brace::Block }, self.nest.parens));
                     if self.all_blocks {
-                        self.open_blocks.truncate(self.nest.braces.len() - 1);
                         self.open_blocks.push((!init).then_some(self.c.i));
                     }
                     self.nest.parens = 0;
                     self.c.i += 1;
                 }
                 b'}' => {
-                    // C++: the block this closes (in column 0, the outermost).
-                    let closed = if !self.all_blocks {
-                        None
-                    } else if col0 {
-                        self.open_blocks.first().copied().flatten()
-                    } else if self.open_blocks.len() == self.nest.braces.len() {
-                        self.open_blocks.last().copied().flatten()
-                    } else {
-                        None
-                    };
+                    // C++: the block this closes. (Matched on a stack of its
+                    // own, which a brace in column 0 does not reset: there
+                    // one closes a namespace as often as a function.)
+                    let closed = if self.all_blocks { self.open_blocks.pop().flatten() } else { None };
                     if col0 {
                         self.nest = Nest::default();
                     } else if let Some((_, parens)) = self.nest.braces.pop() {
                         self.nest.parens = parens;
                     }
                     self.c.i += 1;
-                    if self.all_blocks {
-                        self.open_blocks.truncate(self.nest.braces.len());
-                        if let Some(start) = closed {
-                            self.out.blocks.push((start as u32, self.c.i as u32, self.c.line));
-                        }
+                    if let Some(start) = closed {
+                        self.out.blocks.push((start as u32, self.c.i as u32, self.c.line));
                     }
-                    if self.nest.braces.is_empty() {
+                    // (C++'s are all reported above, matched exactly.)
+                    if self.nest.braces.is_empty() && !self.all_blocks {
                         if let Some(start) = self.block.take() {
                             self.out.blocks.push((start as u32, self.c.i as u32, self.c.line));
                         }
@@ -1722,6 +1716,7 @@ impl<'a> Lexer<'a> {
                 }
                 self.conds.push(Cond {
                     nest: self.nest.clone(),
+                    open_blocks: self.open_blocks.clone(),
                     spans: vec![span],
                     hidden: cuts,
                     test,
@@ -1779,6 +1774,7 @@ impl<'a> Lexer<'a> {
                         self.conds.pop();
                     } else {
                         self.nest = c.nest.clone();
+                        self.open_blocks.clone_from(&c.open_blocks);
                     }
                 }
             }

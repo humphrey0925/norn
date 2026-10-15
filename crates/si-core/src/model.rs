@@ -294,6 +294,8 @@ pub struct FileFacts {
     pub owners: Vec<(u32, u32, u32)>,
     /// C++: (class, base class), by their own names.
     pub bases: Vec<(u32, u32)>,
+    /// C++: the names of the namespaces the file opens.
+    pub namespaces: Vec<u32>,
     /// C++: (reference, qualifier) of a name called as `X::f`: the last
     /// part of the scope written before it (`""` for `::f`).
     pub ref_quals: Vec<(u32, u32)>,
@@ -470,6 +472,7 @@ impl FileFacts {
         exact(&mut self.field_types);
         exact(&mut self.owners);
         exact(&mut self.bases);
+        exact(&mut self.namespaces);
         exact(&mut self.ref_quals);
         exact(&mut self.param_calls);
         exact(&mut self.arg_passes);
@@ -500,7 +503,7 @@ impl FileFacts {
             ("sites", of(&self.sites) + of(&self.inits)),
             ("macros", of(&self.macros) + of(&self.defined_names)),
             ("binds", of(&self.binds)),
-            ("records", records + of(&self.aliases) + of(&self.field_types) + of(&self.typed) + of(&self.owners) + of(&self.bases)),
+            ("records", records + of(&self.aliases) + of(&self.field_types) + of(&self.typed) + of(&self.owners) + of(&self.bases) + of(&self.namespaces)),
             ("hints", of(&self.hints) + of(&self.hint_path) + of(&self.ref_hints) + of(&self.ref_quals)),
             ("calls through", of(&self.param_calls) + of(&self.arg_passes)),
             ("locals", of(&self.locals)),

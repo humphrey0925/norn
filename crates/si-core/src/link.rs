@@ -441,26 +441,44 @@ struct Cpp {
     virtuals: FxHashSet<(u32, u32)>,
     /// Names that are namespaces and no class.
     namespaces: FxHashSet<u32>,
+    /// Symbol -> the innermost namespace it is in (`NONE`: the global one).
+    ns_of: Vec<u32>,
+    /// Names of classes (of any kind of type the corpus defines).
+    types: FxHashSet<u32>,
 }
 
 impl Cpp {
     fn new(files: &[&FileFacts], remap: &[Vec<u32>], g: &mut Graph) -> Cpp {
-        if files.iter().all(|f| f.owners.is_empty() && f.bases.is_empty()) {
+        if files.iter().all(|f| f.owners.is_empty() && f.bases.is_empty() && f.namespaces.is_empty()) {
             return Cpp::default();
         }
         let n = g.syms.len();
-        let mut c = Cpp { class_of: vec![NONE; n], ..Default::default() };
+        let mut c = Cpp { class_of: vec![NONE; n], ns_of: vec![NONE; n], ..Default::default() };
         g.owner = vec![NONE; n];
+        c.types.extend(g.syms.iter().filter(|s| matches!(s.kind, kind::CLASS | kind::STRUCT | kind::UNION | kind::TYPEDEF | kind::ENUM)).map(|s| s.name));
         c.namespaces.extend(g.syms.iter().filter(|s| s.kind == kind::NAMESPACE).map(|s| s.name));
-        c.namespaces.retain(|&name| !g.syms_named(name).iter().any(|&x| matches!(g.syms[x as usize].kind, kind::CLASS | kind::STRUCT | kind::UNION)));
+        for (fi, f) in files.iter().enumerate() {
+            c.namespaces.extend(f.namespaces.iter().map(|&n| remap[fi][n as usize]));
+        }
+        c.namespaces.retain(|name| !c.types.contains(name));
         for (fi, f) in files.iter().enumerate() {
             let base = g.files[fi].sym_start as usize;
             for &(def, chain, own) in &f.owners {
                 let own = remap[fi][own as usize];
-                g.owner[base + def as usize] = remap[fi][chain as usize];
+                let chain = remap[fi][chain as usize];
+                g.owner[base + def as usize] = chain;
                 if !c.namespaces.contains(&own) {
                     c.class_of[base + def as usize] = own;
                 }
+                // The namespaces lead the scope (`wallet::CWallet`): the last of them.
+                let mut ns = NONE;
+                for part in g.name(chain).split("::") {
+                    match g.name_id(part).filter(|id| c.namespaces.contains(id)) {
+                        Some(id) => ns = id,
+                        None => break,
+                    }
+                }
+                c.ns_of[base + def as usize] = ns;
             }
             for &(class, b) in &f.bases {
                 let (class, b) = (remap[fi][class as usize], remap[fi][b as usize]);
@@ -830,20 +848,46 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                         // anything else; `X::f ()`: X's (a namespace's, or
                         // `::f`: one of no class); elsewhere, one of no class.
                         let caller_class = cpp.class(base + r.scope);
-                        if qual != NONE && (g.name(qual).is_empty() || cpp.namespaces.contains(&qual)) {
+                        let caller_ns = cpp.ns_of[(base + r.scope) as usize];
+                        if qual != NONE && g.name(qual).is_empty() {
+                            // `::f`: one of the global namespace.
                             cpp.nearest(cands, NONE, &mut lineage, &mut pick);
-                        } else if qual != NONE {
+                            pick.retain(|&c| cpp.ns_of[c as usize] == NONE);
+                        } else if qual != NONE && cpp.namespaces.contains(&qual) {
+                            // `ns::f`: one of that namespace (or, where the
+                            // namespace is opened by a macro the parser did
+                            // not see through, one of no class).
+                            cpp.nearest(cands, NONE, &mut lineage, &mut pick);
+                            if pick.iter().any(|&c| cpp.ns_of[c as usize] == qual) {
+                                pick.retain(|&c| cpp.ns_of[c as usize] == qual);
+                            } else {
+                                pick.retain(|&c| cpp.ns_of[c as usize] == NONE);
+                            }
+                        } else if qual != NONE && cpp.types.contains(&qual) {
                             cpp.nearest(cands, qual, &mut lineage, &mut pick);
                             if pick.is_empty() {
                                 cpp.nearest(cands, NONE, &mut lineage, &mut pick);
                             }
+                        } else if qual != NONE {
+                            // A scope the corpus does not have (`std::max`):
+                            // only a function of no class, and only a guess.
+                            cpp.nearest(cands, NONE, &mut lineage, &mut pick);
+                            guessed = true;
                         } else {
                             cpp.nearest(cands, caller_class, &mut lineage, &mut pick);
                             if pick.is_empty() && caller_class != NONE {
                                 cpp.nearest(cands, NONE, &mut lineage, &mut pick);
                             }
+                            // A function of the caller's own namespace hides
+                            // those of others.
+                            if caller_ns != NONE && pick.iter().any(|&c| cpp.class(c) == NONE && cpp.ns_of[c as usize] == caller_ns) {
+                                pick.retain(|&c| cpp.class(c) != NONE || cpp.ns_of[c as usize] == caller_ns);
+                            }
                         }
-                        if pick.is_empty() {
+                        // (Qualified with a scope the corpus does not have,
+                        // `std::max`: nothing of the corpus, not anything of
+                        // that name.)
+                        if pick.is_empty() && qual == NONE {
                             pick.extend_from_slice(cands);
                         }
                         in_sight(&pick, syms, base..end, closure, &sure.member, want, &mut tmp);
@@ -1457,5 +1501,84 @@ struct writer w = { .run = do_write };
         let through: Vec<&str> =
             crate::callers_through_macros(&g, g.find("validate")[0]).iter().map(|c| g.sym_name(c.caller)).collect();
         assert!(through.contains(&"CHECK") && through.contains(&"f"), "{through:?}");
+    }
+}
+
+#[cfg(test)]
+mod cpp_tests {
+    use super::*;
+    use crate::extract::Extractor;
+    use crate::mask::MacroSets;
+
+    fn graph(files: &[(&str, &str)]) -> Graph {
+        let mut ex = Extractor::new();
+        let t = MacroSets::default();
+        let facts: Vec<FileFacts> = files.iter().map(|(path, src)| ex.extract(path, src.as_bytes(), &t)).collect();
+        link(&facts).0
+    }
+
+    /// (file of the callee, certain) of what `caller` calls under `name`.
+    fn calls(g: &Graph, caller: &str, name: &str) -> Vec<(String, bool)> {
+        let mut out: Vec<(String, bool)> = g
+            .find(caller)
+            .iter()
+            .flat_map(|&s| g.refs_from(s))
+            .filter(|e| g.sym_name(e.other) == name && e.kind() == refkind::CALL)
+            .map(|e| (g.file_path(g.syms[e.other as usize].file).to_string(), !e.ambiguous()))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn a_call_qualified_with_a_namespace_is_one_of_that_namespace() {
+        // The namespaces closed in column 0, as is usual (a brace there
+        // resynchronizes C, and must not end the outer namespace here).
+        let g = graph(&[
+            ("crc.h", "namespace leveldb {\nnamespace crc32c {\ninline unsigned Value(int n) {\n  return n;\n}\n}  // namespace crc32c\n}  // namespace leveldb\n"),
+            ("other.h", "namespace other {\ninline unsigned Value(int n) { return n; }\n}\n"),
+            ("use.cc", "#include \"crc.h\"\n#include \"other.h\"\nnamespace leveldb {\nunsigned Fix() { return crc32c::Value(1); }\n}\n"),
+        ]);
+        assert_eq!(calls(&g, "Fix", "Value"), [("crc.h".to_string(), true)]);
+    }
+
+    #[test]
+    fn a_scope_the_corpus_does_not_have_is_no_class_of_it() {
+        let g = graph(&[
+            ("r.h", "class Rand {\n public:\n  int max() { return 1; }\n};\n"),
+            ("u.cc", "#include \"r.h\"\nint f(int a, int b) { return std::max(a, b); }\n"),
+        ]);
+        assert_eq!(calls(&g, "f", "max"), []);
+    }
+
+    #[test]
+    fn a_method_is_found_by_the_type_of_the_object_and_its_overrides_too() {
+        let g = graph(&[
+            ("it.h", "class Iterator {\n public:\n  virtual void Next() = 0;\n};\nclass Fast : public Iterator {\n public:\n  void Next() override;\n};\nclass Other {\n public:\n  void Next() {}\n};\n"),
+            ("it.cc", "#include \"it.h\"\nvoid Fast::Next() {}\n"),
+            ("db.cc", "#include \"it.h\"\nclass DB {\n  Iterator* iter_;\n  void Step();\n};\nvoid DB::Step() { iter_->Next(); }\n"),
+        ]);
+        // `Iterator::Next` has no body: the override is what may run, and
+        // `Other::Next`, of another class, is not.
+        assert_eq!(calls(&g, "Step", "Next"), [("it.cc".to_string(), false), ("it.h".to_string(), true)]);
+    }
+
+    #[test]
+    fn a_call_in_a_method_is_of_its_class_before_a_function_of_the_same_name() {
+        let g = graph(&[
+            ("a.h", "int Size();\nclass Box {\n public:\n  int Size() const { return 1; }\n  int Twice() const { return 2 * Size(); }\n};\n"),
+            ("a.cc", "#include \"a.h\"\nint Size() { return 0; }\nint Free() { return Size(); }\n"),
+        ]);
+        assert_eq!(calls(&g, "Twice", "Size"), [("a.h".to_string(), true)]);
+        assert_eq!(calls(&g, "Free", "Size"), [("a.cc".to_string(), true)]);
+    }
+
+    #[test]
+    fn a_c_file_is_linked_as_before() {
+        // No class, no namespace: what C has is unchanged.
+        let g = graph(&[("a.h", "struct ops { int (*run) (int); };\nint helper (int x);\n"), ("a.c", "#include \"a.h\"\nint helper (int x) { return x; }\nint go (struct ops *o) { return helper (o->run (1)); }\n")]);
+        assert!(g.owner.is_empty());
+        assert_eq!(calls(&g, "go", "helper"), [("a.c".to_string(), true)]);
     }
 }

@@ -367,11 +367,11 @@ struct Walk<'a> {
     /// The end of the `friend` declaration being read: what it declares
     /// is no member.
     friend_end: usize,
-    /// The end of the anonymous namespace being read: what is defined in
-    /// it is the translation unit's own, as if `static`.
-    anon_end: usize,
     /// Names made rather than read (`A::B`, `operator==`), once each.
     made_names: FxHashMap<String, u32>,
+    /// C++: the file's namespaces, by where they start: (start, end, name;
+    /// "" for an anonymous one). See `namespace_spans`.
+    namespaces: Vec<(usize, usize, String)>,
     /// C++: where the macros that make a definition are named (`TEST_F`
     /// of `TEST_F (A, b) { ... }`).
     defining_macros: FxHashSet<usize>,
@@ -473,8 +473,8 @@ impl Extractor {
             classes: Vec::new(),
             method_class: NONE,
             friend_end: 0,
-            anon_end: 0,
             made_names: FxHashMap::default(),
+            namespaces: if cpp { namespace_spans(&lexed.masked, &lexed.blocks) } else { Vec::new() },
             defining_macros: lexed
                 .events
                 .iter()
@@ -502,6 +502,13 @@ impl Extractor {
         }
         w.flush_events(usize::MAX);
         w.flush_local_calls();
+        let mut names: Vec<String> = w.namespaces.iter().flat_map(|n| n.2.split("::").map(str::to_string)).filter(|n| !n.is_empty()).collect();
+        names.sort_unstable();
+        names.dedup();
+        for name in names {
+            let id = w.intern_str(&name);
+            w.out.namespaces.push(id);
+        }
         w.out.walk_ns = t.elapsed().as_nanos() as u64;
         let mut out = w.out;
         // A function defined where it may not be compiled (the stub in the
@@ -653,9 +660,18 @@ impl<'a> Walk<'a> {
 
     /// C++: note that `def` is a member of the class `class` (being read)
     /// and of the classes `scope` names. Returns the class's own name.
-    fn note_owner(&mut self, def: u32, scope: &[&[u8]], class: Option<usize>) -> u32 {
-        let mut chain = class.map(|c| self.classes[c].chain.clone()).unwrap_or_default();
-        for part in scope.iter().filter(|p| **p != b"?") {
+    fn note_owner(&mut self, def: u32, scope: &[&[u8]], class: Option<usize>, pos: usize) -> u32 {
+        // The namespaces it is in, then its classes.
+        let mut chain = self
+            .namespaces
+            .iter()
+            .filter(|n| n.0 <= pos && pos < n.1 && !n.2.is_empty())
+            .map(|n| n.2.as_str())
+            .collect::<Vec<_>>()
+            .join("::");
+        let member = class.is_some() || !scope.is_empty();
+        let class_chain = class.map(|c| self.classes[c].chain.clone());
+        for part in class_chain.iter().map(|c| c.as_bytes()).chain(scope.iter().copied().filter(|p| *p != b"?")) {
             if !chain.is_empty() {
                 chain.push_str("::");
             }
@@ -667,8 +683,16 @@ impl<'a> Walk<'a> {
         let own = chain.rsplit("::").next().unwrap_or("").to_string();
         let (chain, own) = (self.intern_str(&chain), self.intern_str(&own));
         self.out.owners.push((def, chain, own));
-        own
+        // (A function only in a namespace has no class for `this`.)
+        if member { own } else { NONE }
     }
+
+    /// C++: is `pos` in an anonymous namespace? What is defined there is
+    /// the translation unit's own, as if `static`.
+    fn anonymous(&self, pos: usize) -> bool {
+        self.namespaces.iter().any(|n| n.2.is_empty() && n.0 <= pos && pos < n.1)
+    }
+
 
     /// C++: is the function declared `virtual`, `override` or `final`?
     fn is_virtual(&self, decl: Node<'a>) -> bool {
@@ -1322,12 +1346,9 @@ impl<'a> Walk<'a> {
 
         if self.cpp {
             if k == ids.namespace_definition {
-                match node.child_by_field_id(ids.f_name).filter(|n| n.kind() == "namespace_identifier" && !n.byte_range().is_empty()) {
-                    Some(name) => {
-                        self.push_def(name, node, kind::NAMESPACE, 0);
-                    }
-                    None if node.child_by_field_id(ids.f_name).is_none() => self.anon_end = self.anon_end.max(node.end_byte()),
-                    None => {}
+                // (What it spans is read from the text: `namespace_spans`.)
+                if let Some(name) = node.child_by_field_id(ids.f_name).filter(|n| n.kind() == "namespace_identifier" && !n.byte_range().is_empty()) {
+                    self.push_def(name, node, kind::NAMESPACE, 0);
                 }
                 return true;
             }
@@ -1487,7 +1508,7 @@ impl<'a> Walk<'a> {
                         let flags = flag::DECL | if self.is_virtual(node) { flag::VIRTUAL } else { 0 };
                         let def = self.push_def(name, node, kind::FUNCTION, flags);
                         let scope = self.declared_scope(d);
-                        self.note_owner(def, &scope, class);
+                        self.note_owner(def, &scope, class, node.start_byte());
                         def
                     } else if self.declares_function(d) {
                         self.push_def(name, node, kind::FIELD, flag::CALLABLE)
@@ -1535,7 +1556,7 @@ impl<'a> Walk<'a> {
                     if self.is_virtual(node) {
                         flags |= flag::VIRTUAL;
                     }
-                } else if node.start_byte() < self.anon_end {
+                } else if self.anonymous(node.start_byte()) {
                     flags |= flag::STATIC;
                 }
                 if self.cpp {
@@ -1548,7 +1569,7 @@ impl<'a> Walk<'a> {
                 let def = self.push_def(name, node, kind::FUNCTION, flags);
                 self.method_class = NONE;
                 if self.cpp {
-                    self.method_class = self.note_owner(def, &scope, class);
+                    self.method_class = self.note_owner(def, &scope, class, node.start_byte());
                     if class.is_some() {
                         self.place_in_record(def, node.start_byte());
                     }
@@ -1614,12 +1635,13 @@ impl<'a> Walk<'a> {
                             if is_fn && self.is_virtual(node) {
                                 flags |= flag::VIRTUAL;
                             }
-                        } else if self.cpp && node.start_byte() < self.anon_end {
+                        } else if self.cpp && self.anonymous(node.start_byte()) {
                             flags |= flag::STATIC;
                         }
                         let def = self.push_def(name, node, kind, flags);
-                        if member {
-                            self.note_owner(def, &scope, class);
+                        if self.cpp {
+                            // (Of a function in a namespace, the namespace.)
+                            self.note_owner(def, &scope, class, node.start_byte());
                             if class.is_some() {
                                 self.place_in_record(def, node.start_byte());
                             }
@@ -1810,6 +1832,82 @@ pub(crate) fn undecided_lines(src: &[u8], undecided: &[(u32, u32, u32)]) -> Vec<
     out
 }
 
+/// C++: the namespaces of a file as its text opens them, `namespace a {`,
+/// `namespace a::b {`, `inline namespace v1 {`, `namespace {` (named ""),
+/// each closed where bracket matching closes its brace: (start, end, name),
+/// in order of where they start. The parser's tree can lose one to error
+/// recovery (in a header full of macros and `#if`s); the text does not.
+fn namespace_spans(src: &[u8], blocks: &[(u32, u32, u32)]) -> Vec<(usize, usize, String)> {
+    let mut out = Vec::new();
+    let n = src.len();
+    let mut i = 0;
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let skip_space = |mut i: usize| {
+        while i < n && src[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    while i < n {
+        let b = src[i];
+        if b == b'/' && src.get(i + 1) == Some(&b'/') {
+            while i < n && src[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && src.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < n && !(src[i] == b'*' && src[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            i += 1;
+            while i < n && src[i] != b && src[i] != b'\n' {
+                if src[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if !ident(b) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && ident(src[i]) {
+            i += 1;
+        }
+        if &src[start..i] != b"namespace" || (start > 0 && ident(src[start - 1])) {
+            continue;
+        }
+        // The name, `a::b`, or none; then the brace.
+        let mut j = skip_space(i);
+        let name_start = j;
+        while j < n && (ident(src[j]) || src[j] == b':') {
+            j += 1;
+        }
+        let name: String = String::from_utf8_lossy(&src[name_start..j]).into_owned();
+        let brace = skip_space(j);
+        if src.get(brace) != Some(&b'{') || name.starts_with(':') || name.ends_with(':') {
+            continue;
+        }
+        let at = blocks.partition_point(|b| (b.0 as usize) < brace);
+        let end = match blocks.get(at) {
+            Some(&(s, e, _)) if s as usize == brace => e as usize,
+            _ => continue,
+        };
+        out.push((start, end, name));
+        i = brace + 1;
+    }
+    out
+}
+
 /// Where the parser sees the name of the definition a macro use makes.
 fn site_def_at(s: &mask::SiteTok) -> usize {
     if s.def_at != 0 { s.def_at as usize } else { s.name.start as usize }
@@ -1867,5 +1965,22 @@ mod tests {
         // arch/arm/nwfpe/fpa11.inl is C.
         assert!(!is_cpp("fpa11.inl", b"static inline unsigned int readFPSR(void) { return 0; }\n"));
         assert!(is_cpp("impl.inl", b"template <class T> void List<T>::push(T x) {}\n"));
+    }
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    #[test]
+    #[ignore]
+    fn print_namespace_spans() {
+        let path = std::env::var("SI_FILE").unwrap();
+        let src = std::fs::read(&path).unwrap();
+        let lexed = crate::mask::lex_file(&src, &crate::mask::MacroSets::default(), Some(&path));
+        let line = |p: usize| src[..p.min(src.len())].iter().filter(|&&b| b == b'\n').count() + 1;
+        for (a, e, name) in super::namespace_spans(&lexed.masked, &lexed.blocks) {
+            println!("{name:?} {}..{}", line(a), line(e));
+        }
+        let opens = src.windows(10).enumerate().filter(|(_, w)| w.starts_with(b"namespace ")).map(|(i, _)| line(i)).collect::<Vec<_>>();
+        println!("namespace words at {opens:?}");
     }
 }
