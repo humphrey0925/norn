@@ -7,7 +7,7 @@
   "icon": "media/icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/humphrey0925/si.git"
+    "url": "https://github.com/humphrey0925/norn.git"
   },
   "engines": {
     "vscode": "^1.85.0"
