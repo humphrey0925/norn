@@ -314,6 +314,14 @@ pub struct Cxx {
     /// `: member_ (a)`): calls of a constructor of the class named, or of
     /// the member's type.
     pub constructs: Vec<u32>,
+    /// Operators used on objects (`a == b`, `s << x`, `v[i]`, `f (x)` of a
+    /// functor): (reference, the left operand's hint, the right's, whether
+    /// it has a right operand), a hint `NONE` for an operand of no known
+    /// type or none.
+    pub operators: Vec<(u32, u32, u32, bool)>,
+    /// Of an operator defined as a function of no class (`bool operator==
+    /// (const A&, const B&)`): (definition, its parameters' types).
+    pub operator_params: Vec<(u32, u32, u32)>,
 }
 
 static NO_CXX: Cxx = Cxx {
@@ -325,6 +333,8 @@ static NO_CXX: Cxx = Cxx {
     nested: Vec::new(),
     elems: Vec::new(),
     constructs: Vec::new(),
+    operators: Vec::new(),
+    operator_params: Vec::new(),
 };
 
 /// A parameter or a local variable.
@@ -519,6 +529,8 @@ impl FileFacts {
             exact(&mut c.nested);
             exact(&mut c.elems);
             exact(&mut c.constructs);
+            exact(&mut c.operators);
+            exact(&mut c.operator_params);
         }
         exact(&mut self.param_calls);
         exact(&mut self.arg_passes);

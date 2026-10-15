@@ -392,10 +392,29 @@ def form(callee, call):
     return "call"
 
 
+OPERATORS = {CursorKind.BINARY_OPERATOR, CursorKind.UNARY_OPERATOR, CursorKind.COMPOUND_ASSIGNMENT_OPERATOR}
+
+
+def in_template(fn):
+    """Is `fn` a template, or a member of one (or of a class in one)?"""
+    p = fn
+    while p is not None and p.kind != CursorKind.TRANSLATION_UNIT:
+        if p.kind in (CursorKind.FUNCTION_TEMPLATE, CursorKind.CLASS_TEMPLATE, CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION):
+            return True
+        p = p.semantic_parent
+    return False
+
+
 def cpp_calls_in(fn, caller, out, icalls, binds, stats):
+    # In a template, an operator on operands of a type its parameters make
+    # is bound only once instantiated: clang leaves it an operator, not a
+    # call, and what an indexer says is called there cannot be judged.
+    template = in_template(fn)
     stack = list(fn.get_children())
     while stack:
         c = stack.pop()
+        if template and c.kind in OPERATORS:
+            stats["dependent"].add((site(c.location), c.location.line, "operator"))
         if c.kind == CursorKind.CALL_EXPR:
             callee = c.referenced
             if callee is not None and callee.kind in FUNCS:

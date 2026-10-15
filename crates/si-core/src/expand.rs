@@ -1587,6 +1587,9 @@ fn expand_file(
         for o in &mut c.owners {
             o.0 = new_index[o.0 as usize];
         }
+        for p in &mut c.operator_params {
+            p.0 = new_index[p.0 as usize];
+        }
     }
     for d in out.records.iter_mut().flat_map(|r| r.defs.iter_mut()).filter(|d| **d != NONE) {
         *d = new_index[*d as usize];

@@ -294,6 +294,12 @@ const SMART_POINTERS: &[&[u8]] = &[
     b"ComPtr", b"optional", b"reference_wrapper", b"not_null",
 ];
 
+/// C++ operators a class can define, as written between operands.
+const BINARY_OPERATORS: &[&[u8]] = &[
+    b"+", b"-", b"*", b"/", b"%", b"^", b"&", b"|", b"<", b">", b"<=", b">=", b"==", b"!=", b"<=>", b"<<", b">>", b"&&", b"||",
+];
+const ASSIGNMENT_OPERATORS: &[&[u8]] = &[b"=", b"+=", b"-=", b"*=", b"/=", b"%=", b"^=", b"&=", b"|=", b"<<=", b">>="];
+
 /// C++ containers whose elements are their first template argument, and
 /// those (maps) whose values are their second.
 const CONTAINERS: &[&[u8]] = &[
@@ -857,9 +863,15 @@ impl<'a> Walk<'a> {
         if k == ids.type_identifier {
             self.intern(self.text(t))
         } else if self.cpp && k == ids.qualified_identifier {
-            // `ns::Type`: the type.
+            // `ns::Type`: the type. (Not `std::map<K, V>::iterator`, nor
+            // `std::string`: a name in a template's or the library's scope is
+            // no class of the corpus that happens to have it.)
             let name = self.qualified_parts(t).1;
-            if name.id() == t.id() { NONE } else { self.type_name(name) }
+            let foreign = || {
+                let text = self.text(t);
+                text.starts_with(b"std::") || text.starts_with(b"::std::") || text.contains(&b'<')
+            };
+            if name.id() == t.id() || (name.kind_id() == ids.type_identifier && foreign()) { NONE } else { self.type_name(name) }
         } else if self.cpp && k == ids.template_type {
             // What a smart pointer points to is what `->` reaches; any
             // other template is taken for the class it names.
@@ -997,6 +1009,57 @@ impl<'a> Walk<'a> {
         let mut path = Vec::new();
         let (kind, root) = self.object_root(v, &mut path)?;
         Some((kind, root, path))
+    }
+
+    /// C++: where a member access on an operand would start, as a hint, or
+    /// `NONE` (a literal, an expression of no known type).
+    fn operand_hint(&mut self, n: Node<'a>) -> u32 {
+        let mut path = Vec::new();
+        match self.object_root(n, &mut path) {
+            Some((kind, root)) => self.push_hint(kind, root, &path),
+            None => NONE,
+        }
+    }
+
+    /// C++: `operator<op>` used at `at` on `left` (and `right`): a call of
+    /// the class's member of that name, or of a function of no class taking
+    /// operands of their types; which, the link tells. Nothing is noted of
+    /// operands of no known type: nothing would tell.
+    fn push_operator(&mut self, op: &[u8], left: Node<'a>, right: Option<Node<'a>>, at: Node<'a>) {
+        let (l, r) = (self.operand_hint(left), right.map_or(NONE, |r| self.operand_hint(r)));
+        if l == NONE && r == NONE {
+            return;
+        }
+        let name = self.intern_str(&format!("operator{}", String::from_utf8_lossy(op)));
+        let scope = self.scope.map_or(0, |s| s.def);
+        self.out.refs.push(Ref { name, line: at.start_position().row as u32 + 1, scope, kind: refkind::CALL });
+        let at = self.out.refs.len() as u32 - 1;
+        self.out.cxx_mut().operators.push((at, l, r, right.is_some()));
+    }
+
+    /// C++: of a function named `operator...` of no class, its parameters'
+    /// types (`NONE` where not known), for which operands it takes.
+    fn note_operator_params(&mut self, def: u32, declarator: Option<Node<'a>>) {
+        let ids = self.ids;
+        let Some(mut n) = declarator else { return };
+        for _ in 0..8 {
+            if n.kind_id() == ids.function_declarator {
+                break;
+            }
+            // (`Status& operator= (...)`: a reference's declarator has no field name.)
+            match n.child_by_field_id(ids.f_declarator.get()).or_else(|| n.named_child(0)) {
+                Some(inner) => n = inner,
+                None => return,
+            }
+        }
+        let Some(list) = n.child_by_field_id(ids.f_parameters) else { return };
+        let mut c = list.walk();
+        let params: Vec<Node<'a>> = list.named_children(&mut c).filter(|p| p.kind_id() == ids.parameter_declaration).collect();
+        let p0 = params.first().map_or(NONE, |&p| self.type_name_of(p));
+        let p1 = params.get(1).map_or(NONE, |&p| self.type_name_of(p));
+        if p0 != NONE || p1 != NONE {
+            self.out.cxx_mut().operator_params.push((def, p0, p1));
+        }
     }
 
     /// C++: the class an object of type `t` is made of, for its constructor:
@@ -1475,7 +1538,7 @@ impl<'a> Walk<'a> {
                 // whatever its return type is.
                 let (name, t) = match self.decl_name(d) {
                     // (A C++ method's: what it returns, for `x.Get ().f ()`.)
-                    Some((name, is_fn)) => (self.intern(self.text(name)), if self.declares_function(d) && !(self.cpp && is_fn) { NONE } else { t }),
+                    Some((name, is_fn)) => (self.def_name(name), if self.declares_function(d) && !(self.cpp && is_fn) { NONE } else { t }),
                     None => (NONE, NONE),
                 };
                 names.push(name);
@@ -1700,6 +1763,10 @@ impl<'a> Walk<'a> {
                 Some(f) if f.kind_id() == ids.identifier => {
                     self.skip.insert(f.start_byte());
                     if self.in_fn() && self.locals.contains(self.text(f)) {
+                        if self.cpp && (self.local_types.contains_key(self.text(f)) || self.local_roots.contains_key(self.text(f))) {
+                            // A local object called: its `operator()`.
+                            self.push_operator(b"()", f, None, node);
+                        }
                         self.out.indirect_calls += 1;
                         self.local_calls.push((self.text(f), f.start_position().row as u32 + 1));
                     } else {
@@ -1770,6 +1837,16 @@ impl<'a> Walk<'a> {
             return true;
         }
         if k == ids.assignment_expression {
+            if self.cpp && self.in_fn() {
+                if let (Some(l), Some(op), Some(r)) =
+                    (node.child_by_field_id(ids.f_left), node.child_by_field_id(ids.f_operator), node.child_by_field_id(ids.f_right))
+                {
+                    let op = self.text(op);
+                    if ASSIGNMENT_OPERATORS.contains(&op) {
+                        self.push_operator(op, l, Some(r), node);
+                    }
+                }
+            }
             let plain = node.child_by_field_id(ids.f_operator).is_some_and(|o| self.text(o) == b"=");
             if let (true, Some(left), Some(right)) = (plain, node.child_by_field_id(ids.f_left), node.child_by_field_id(ids.f_right)) {
                 let left = self.strip(left);
@@ -1803,6 +1880,9 @@ impl<'a> Walk<'a> {
                         let def = self.push_def(name, node, kind::FUNCTION, flags);
                         let scope = self.declared_scope(d);
                         self.note_owner(def, &scope, class, node.start_byte());
+                        if self.text(name).starts_with(b"operator") {
+                            self.note_operator_params(def, Some(d));
+                        }
                         def
                     } else if self.declares_function(d) {
                         self.push_def(name, node, kind::FIELD, flag::CALLABLE)
@@ -1863,6 +1943,9 @@ impl<'a> Walk<'a> {
                 let def = self.push_def(name, node, kind::FUNCTION, flags);
                 self.method_class = NONE;
                 if self.cpp {
+                    if self.text(name).starts_with(b"operator") {
+                        self.note_operator_params(def, node.child_by_field_id(ids.f_declarator.get()));
+                    }
                     if let Some((test, method, base)) = self.test_case(name, node) {
                         // A test of a framework the corpus does not define
                         // the macros of: named as they name it.
@@ -1979,6 +2062,9 @@ impl<'a> Walk<'a> {
                             flags |= flag::STATIC;
                         }
                         let def = self.push_def(name, node, kind, flags);
+                        if self.cpp && is_fn && self.text(name).starts_with(b"operator") {
+                            self.note_operator_params(def, Some(d));
+                        }
                         if self.cpp {
                             // (Of a function in a namespace, the namespace.)
                             self.note_owner(def, &scope, class, node.start_byte());
@@ -2026,6 +2112,50 @@ impl<'a> Walk<'a> {
                 }
             }
             return true;
+        }
+        if self.cpp && self.in_fn() {
+            match node.kind() {
+                "binary_expression" => {
+                    if let (Some(l), Some(op), Some(r)) =
+                        (node.child_by_field_id(ids.f_left), node.child_by_field_id(ids.f_operator), node.child_by_field_id(ids.f_right))
+                    {
+                        let op = self.text(op);
+                        if BINARY_OPERATORS.contains(&op) {
+                            self.push_operator(op, l, Some(r), node);
+                        }
+                    }
+                }
+                "unary_expression" | "pointer_expression" => {
+                    if let (Some(op), Some(arg)) = (node.child_by_field_id(ids.f_operator), node.child_by_field_id(ids.f_argument)) {
+                        let op = self.text(op);
+                        if matches!(op, b"!" | b"~" | b"-" | b"+" | b"*") {
+                            self.push_operator(op, arg, None, node);
+                        }
+                    }
+                }
+                "update_expression" => {
+                    if let (Some(op), Some(arg)) = (node.child_by_field_id(ids.f_operator), node.child_by_field_id(ids.f_argument)) {
+                        let op = self.text(op);
+                        self.push_operator(op, arg, None, node);
+                    }
+                }
+                "subscript_expression" => {
+                    if let Some(arg) = node.child_by_field_id(ids.f_argument) {
+                        self.push_operator(b"[]", arg, None, node);
+                    }
+                }
+                "user_defined_literal" => {
+                    // `"ff"_hex`: `operator""_hex`.
+                    let mut c = node.walk();
+                    let suffix = node.named_children(&mut c).find(|n| n.kind() == "literal_suffix");
+                    if let Some(suffix) = suffix {
+                        let name = self.intern_str(&format!("operator\"\"{}", String::from_utf8_lossy(self.text(suffix))));
+                        let scope = self.scope.map_or(0, |s| s.def);
+                        self.out.refs.push(Ref { name, line: node.start_position().row as u32 + 1, scope, kind: refkind::CALL });
+                    }
+                }
+                _ => {}
+            }
         }
         if self.cpp && self.in_fn() && matches!(node.kind(), "new_expression" | "compound_literal_expression") {
             // `new T (a)`, `T {a}`: a T made.

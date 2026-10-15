@@ -384,21 +384,40 @@ impl Types<'_> {
         closure: &Closure,
         scratch: &mut Vec<u32>,
     ) -> Option<u32> {
+        let t = self.type_of(hint, fi, g, own, closure, scratch)?;
+        let (rf, ri) = self.layout_of(t, fi, closure)?;
+        let (rf, ri, at) = self.find(rf, ri, member, closure, 8)?;
+        let def = self.files[rf as usize].records[ri as usize].defs[at];
+        (def != NONE).then(|| g.files[rf as usize].sym_start + def)
+    }
+
+    /// The type (its name) of what `hint`, written in file `fi`, says a
+    /// member access is made on.
+    #[allow(clippy::too_many_arguments)]
+    fn type_of(
+        &self,
+        hint: &MemberHint,
+        fi: usize,
+        g: &Graph,
+        own: std::ops::Range<u32>,
+        closure: &Closure,
+        scratch: &mut Vec<u32>,
+    ) -> Option<u32> {
         let f = self.files[fi];
         let path = &f.hint_path[hint.path as usize..(hint.path + hint.len) as usize];
         let name = self.remap[fi][hint.root as usize];
         let found = match hint.root_kind {
-            root::TYPE => self.member_from(name, path, member, fi, g, closure),
+            root::TYPE => self.follow(name, path, fi, g, closure),
             kind_of_root => {
                 // C++: `T ()`, a class made, is of that class.
                 if kind_of_root == root::FUNC && self.cpp.types.contains(&name) {
-                    return self.member_from(name, path, member, fi, g, closure);
+                    return self.follow(name, path, fi, g, closure);
                 }
                 // The variable or function the name means here, then its type.
                 let wanted = if kind_of_root == root::VAR { kind::GLOBAL } else { kind::FUNCTION };
                 in_sight(g.syms_named(name), &g.syms, own.clone(), closure, &[], |s| s.kind == wanted, scratch);
                 let type_name = *scratch.iter().find_map(|s| self.of_symbol.get(s))?;
-                self.member_from(type_name, path, member, fi, g, closure)
+                self.follow(type_name, path, fi, g, closure)
             }
         };
         if found.is_some() || hint.root_kind != root::TYPE || path.is_empty() || !self.cpp.on() {
@@ -410,18 +429,32 @@ impl Types<'_> {
         let first = self.remap[fi][path[0] as usize];
         in_sight(g.syms_named(first), &g.syms, own, closure, &[], |s| s.kind == kind::GLOBAL, scratch);
         let type_name = *scratch.iter().find_map(|s| self.of_symbol.get(s))?;
-        self.member_from(type_name, &path[1..], member, fi, g, closure)
+        self.follow(type_name, &path[1..], fi, g, closure)
     }
 
-    /// Member `member` of what `path` leads to from the type `type_name`.
-    fn member_from(&self, type_name: u32, path: &[u32], member: u32, fi: usize, g: &Graph, closure: &Closure) -> Option<u32> {
-        // (C++: a class with no layout of its own, a test case of a fixture,
-        // has its base's.)
-        let (mut rf, mut ri) = record_of(type_name, fi as u32, closure, self.records, self.aliases).or_else(|| {
+    /// C++: the member `member` (a method, an operator) of the class
+    /// `type_name` or of a class it derives from.
+    fn class_member(&self, type_name: u32, member: u32, fi: usize, g: &Graph, closure: &Closure) -> Option<u32> {
+        let (rf, ri) = self.layout_of(type_name, fi, closure)?;
+        let (rf, ri, at) = self.find(rf, ri, member, closure, 8)?;
+        let def = self.files[rf as usize].records[ri as usize].defs[at];
+        (def != NONE).then(|| g.files[rf as usize].sym_start + def)
+    }
+
+    /// The layout of the struct or class `type_name` as seen from `fi`
+    /// (C++: of a class with none of its own, a test case of a fixture, its
+    /// base's).
+    fn layout_of(&self, type_name: u32, fi: usize, closure: &Closure) -> Option<(u32, u32)> {
+        record_of(type_name, fi as u32, closure, self.records, self.aliases).or_else(|| {
             self.cpp.bases.get(&type_name)?.iter().find_map(|&b| record_of(b, fi as u32, closure, self.records, self.aliases))
-        })?;
+        })
+    }
+
+    /// The type (its name) that the members `path` lead to from `type_name`.
+    fn follow(&self, type_name: u32, path: &[u32], fi: usize, g: &Graph, closure: &Closure) -> Option<u32> {
         // (C++: `[]` after a member marks an element of it, a container.)
         let element = g.name_id("[]");
+        let mut t = type_name;
         let mut i = 0;
         while i < path.len() {
             let m = self.remap[fi][path[i] as usize];
@@ -430,23 +463,22 @@ impl Types<'_> {
                 i += 1;
                 continue;
             }
+            let (rf, ri) = self.layout_of(t, fi, closure)?;
             let (mf, mi, at) = self.find(rf, ri, m, closure, 8)?;
             let r = &self.files[mf as usize].records[mi as usize];
             let of_element = path.get(i + 1).is_some_and(|&n| Some(self.remap[fi][n as usize]) == element);
             let element_type = || self.files[mf as usize].cxx().elems.iter().find(|e| e.0 == mi && e.1 == at as u32).map(|e| e.2);
-            let t = match of_element.then(element_type).flatten() {
+            let next = match of_element.then(element_type).flatten() {
                 Some(e) => e,
                 None => r.types[at],
             };
-            if t == NONE {
+            if next == NONE {
                 return None;
             }
-            (rf, ri) = record_of(self.remap[mf as usize][t as usize], mf, closure, self.records, self.aliases)?;
+            t = self.remap[mf as usize][next as usize];
             i += 1 + of_element as usize;
         }
-        let (rf, ri, at) = self.find(rf, ri, member, closure, 8)?;
-        let def = self.files[rf as usize].records[ri as usize].defs[at];
-        (def != NONE).then(|| g.files[rf as usize].sym_start + def)
+        Some(t)
     }
 
     /// C++: the type of member `member` of the class `type_name` (or of a
@@ -498,6 +530,8 @@ struct Cpp {
     types: FxHashSet<u32>,
     /// Another name for a namespace -> its own (`tfm` -> `tinyformat`).
     namespace_aliases: FxHashMap<u32, u32>,
+    /// An operator of no class -> the types of its parameters.
+    operator_params: FxHashMap<u32, (u32, u32)>,
 }
 
 impl Cpp {
@@ -546,6 +580,10 @@ impl Cpp {
                 if ns != NONE {
                     c.ns_of.insert(sym, ns);
                 }
+            }
+            for &(def, p0, p1) in &f.cxx().operator_params {
+                let t = |p: u32| if p == NONE { NONE } else { remap[fi][p as usize] };
+                c.operator_params.insert((base + def as usize) as u32, (t(p0), t(p1)));
             }
             for &(class, b) in &f.cxx().bases {
                 let (class, b) = (remap[fi][class as usize], remap[fi][b as usize]);
@@ -855,7 +893,108 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
             }
             let (mut pick, mut lineage, mut overrides, mut descendants) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             let constructs: FxHashSet<u32> = f.cxx().constructs.iter().copied().collect();
+            let operands: FxHashMap<u32, (u32, u32, bool)> = f.cxx().operators.iter().map(|&(r, l, rr, binary)| (r, (l, rr, binary))).collect();
             for (ri, r) in f.refs.iter().enumerate() {
+                if let Some(&(lh, rh, binary)) = operands.get(&(ri as u32)).filter(|_| in_cpp) {
+                    // An operator used on objects: the left operand's
+                    // class's (or a base's) member of that name, else a
+                    // function of no class taking operands of their types.
+                    // (C++20: `a < b` may be `a <=> b`, `a != b` `a == b`.)
+                    let type_of = |h: u32, scratch: &mut Vec<u32>| {
+                        (h != NONE).then(|| types.type_of(&f.hints[h as usize], fi, &g, base..end, closure, scratch)).flatten()
+                    };
+                    let (lt, rt) = (type_of(lh, &mut scratch), type_of(rh, &mut scratch));
+                    let name = remap[fi][r.name as usize];
+                    let assign = g.name(name) == "operator=";
+                    let rewritten = match g.name(name) {
+                        "operator<" | "operator>" | "operator<=" | "operator>=" => g.name_id("operator<=>"),
+                        "operator!=" => g.name_id("operator=="),
+                        _ => None,
+                    };
+                    // How well a parameter of type `p` takes an operand of
+                    // type `t`: not (`None`); as a template's `T`, or an operand
+                    // of no known type, does (1); as its type or a base (2).
+                    // Of the overloads, those that fit best are the ones.
+                    let fit = |p: u32, t: Option<u32>, lineage: &mut Vec<u32>| -> Option<u8> {
+                        let Some(t) = t else { return Some(1) };
+                        if p == NONE {
+                            return None;
+                        }
+                        if !cpp.types.contains(&p) {
+                            return Some(1);
+                        }
+                        cpp.lineage(t, lineage);
+                        (lineage.contains(&p) || aliases.get(&p).is_some_and(|a| a.iter().any(|x| lineage.contains(x)))).then_some(2)
+                    };
+                    // `a = b` of one type: the copy (or move) its class has
+                    // written, or else the compiler's, which is no call here.
+                    let right = if assign && (rt.is_none() || rt == lt) { lt } else { rt };
+                    tmp.clear();
+                    let mut best = 0u8;
+                    let mut keep = |c: u32, score: u8, tmp: &mut Vec<u32>| {
+                        if score > best {
+                            best = score;
+                            tmp.clear();
+                        }
+                        if score == best {
+                            tmp.push(c);
+                        }
+                    };
+                    for name in std::iter::once(name).chain(rewritten) {
+                        if let Some(sym) = lt.and_then(|l| types.class_member(l, name, fi, &g, closure)).filter(|&s| syms[s as usize].kind == kind::FUNCTION) {
+                            // The class's: its overloads, of a binary one those
+                            // taking the right operand best.
+                            let class = cpp.class(sym);
+                            for &c in g.syms_named(name) {
+                                if syms[c as usize].kind != kind::FUNCTION || cpp.class(c) != class {
+                                    continue;
+                                }
+                                let score = if !binary {
+                                    Some(1)
+                                } else {
+                                    match cpp.operator_params.get(&c) {
+                                        Some(_) if assign && right.is_none() => None,
+                                        Some(&(p0, _)) => fit(p0, right, &mut lineage),
+                                        None if assign => None,
+                                        None => Some(1),
+                                    }
+                                };
+                                if let Some(score) = score {
+                                    keep(c, score, &mut tmp);
+                                }
+                            }
+                        } else if binary && !assign && (lt.is_some() || rt.is_some()) {
+                            // (A unary one on an object of no class with it is
+                            // a built-in: `*p` of a pointer.)
+                            for &c in g.syms_named(name) {
+                                if syms[c as usize].kind != kind::FUNCTION || cpp.class(c) != NONE {
+                                    continue;
+                                }
+                                let Some(&(p0, p1)) = cpp.operator_params.get(&c) else { continue };
+                                if let (Some(a), Some(b)) = (fit(p0, lt, &mut lineage), fit(p1, rt, &mut lineage)) {
+                                    keep(c, a + b, &mut tmp);
+                                }
+                            }
+                        }
+                        if !tmp.is_empty() {
+                            break;
+                        }
+                    }
+                    let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
+                    if tmp.iter().any(is_def) {
+                        tmp.retain(is_def);
+                    }
+                    if tmp.is_empty() {
+                        counts[2] += 1;
+                        continue;
+                    }
+                    let first = (syms[tmp[0] as usize].file, cpp.class(tmp[0]));
+                    let ambiguous = tmp.iter().any(|&c| (syms[c as usize].file, cpp.class(c)) != first);
+                    counts[ambiguous as usize] += 1;
+                    let meta = pack_meta(r.line, ambiguous, refkind::CALL);
+                    edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta]));
+                    continue;
+                }
                 // (`T (a)`, `fmt::string_view (p, n)`: a type called, of
                 // which no function but its constructors has the name, is
                 // one made.)
@@ -1854,6 +1993,61 @@ void e() { HOLD(4); }
         // A macro whose text declares an object of the class.
         let held: Vec<String> = g.find("HOLD").iter().flat_map(|&m| g.refs_from(m)).filter(|e| e.kind() == refkind::CALL).map(|e| q.name(&g, e.other).into_owned()).collect();
         assert_eq!(held, ["Bar::Bar"]);
+    }
+
+    #[test]
+    fn an_operator_on_objects_is_a_call_of_the_one_their_types_take() {
+        let h = r#"class Writer {
+ public:
+  Writer& operator<<(int v);
+};
+class Key {
+ public:
+  Key& operator=(const Key& k);
+  int x;
+};
+class Plain { public: int y; };
+class Other { public: int z; };
+bool operator==(const Key& a, const Key& b);
+bool operator==(const Other& a, const Other& b);
+int operator""_k(unsigned long long v);
+"#;
+        let cc = r#"#include "o.h"
+Writer& Writer::operator<<(int v) { return *this; }
+Key& Key::operator=(const Key& k) { return *this; }
+bool operator==(const Key& a, const Key& b) { return a.x == b.x; }
+bool operator==(const Other& a, const Other& b) { return true; }
+int operator""_k(unsigned long long v) { return 1; }
+void w(Writer& out) { out << 1; }
+void eq(const Key& a, const Key& b) { if (a == b) {} }
+void assign(Key& a, const Key& b) { a = b; }
+void plain(Plain& a, const Plain& b) { a = b; }
+void deref(Key* p) { Key k = *p; }
+int lit() { return 3_k; }
+"#;
+        let g = graph(&[("o.h", h), ("o.cc", cc)]);
+        let q = crate::graph::Qualifier::new(&g);
+        let calls_of = |caller: &str| -> Vec<(String, bool, u32)> {
+            let mut v: Vec<(String, bool, u32)> = g
+                .find(caller)
+                .iter()
+                .flat_map(|&s| g.refs_from(s))
+                .filter(|e| e.kind() == refkind::CALL && g.sym_name(e.other).starts_with("operator"))
+                .map(|e| (q.name(&g, e.other).into_owned(), !e.ambiguous(), g.syms[e.other as usize].line))
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        assert_eq!(calls_of("w"), [("Writer::operator<<".to_string(), true, 2)]);
+        // Of two `operator==`, the one taking Keys.
+        assert_eq!(calls_of("eq"), [("operator==".to_string(), true, 4)]);
+        // The copy written is called; a class's the compiler makes is none.
+        assert_eq!(calls_of("assign"), [("Key::operator=".to_string(), true, 3)]);
+        assert_eq!(calls_of("plain"), []);
+        // `*p` of a pointer is no call.
+        assert_eq!(calls_of("deref"), []);
+        assert_eq!(calls_of("lit"), [(r#"operator""_k"#.to_string(), true, 6)]);
     }
 
     #[test]
