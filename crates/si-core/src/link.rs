@@ -433,9 +433,10 @@ impl Types<'_> {
             let (mf, mi, at) = self.find(rf, ri, m, closure, 8)?;
             let r = &self.files[mf as usize].records[mi as usize];
             let of_element = path.get(i + 1).is_some_and(|&n| Some(self.remap[fi][n as usize]) == element);
-            let t = match r.elems.get(at) {
-                Some(&e) if of_element && e != NONE => e,
-                _ => r.types[at],
+            let element_type = || self.files[mf as usize].cxx().elems.iter().find(|e| e.0 == mi && e.1 == at as u32).map(|e| e.2);
+            let t = match of_element.then(element_type).flatten() {
+                Some(e) => e,
+                None => r.types[at],
             };
             if t == NONE {
                 return None;
@@ -470,9 +471,11 @@ impl Types<'_> {
 /// What the link knows of C++ classes. Empty where no file is C++.
 #[derive(Default)]
 struct Cpp {
+    /// Is any file C++?
+    on: bool,
     /// Symbol -> the class it is a member of, by the class's own name
-    /// (`NONE`: none, or a namespace).
-    class_of: Vec<u32>,
+    /// (none: of none, or of a namespace).
+    class_of: FxHashMap<u32, u32>,
     /// Class -> the classes it derives from, and the reverse.
     bases: FxHashMap<u32, Vec<u32>>,
     derived: FxHashMap<u32, Vec<u32>>,
@@ -480,8 +483,8 @@ struct Cpp {
     virtuals: FxHashSet<(u32, u32)>,
     /// Names that are namespaces and no class.
     namespaces: FxHashSet<u32>,
-    /// Symbol -> the innermost namespace it is in (`NONE`: the global one).
-    ns_of: Vec<u32>,
+    /// Symbol -> the innermost namespace it is in (none: the global one).
+    ns_of: FxHashMap<u32, u32>,
     /// Names of classes (of any kind of type the corpus defines).
     types: FxHashSet<u32>,
     /// Another name for a namespace -> its own (`tfm` -> `tinyformat`).
@@ -490,36 +493,38 @@ struct Cpp {
 
 impl Cpp {
     fn new(files: &[&FileFacts], remap: &[Vec<u32>], g: &mut Graph) -> Cpp {
-        if files.iter().all(|f| f.owners.is_empty() && f.bases.is_empty() && f.namespaces.is_empty()) {
+        if !files.iter().any(|f| f.cpp()) {
             return Cpp::default();
         }
-        let n = g.syms.len();
-        let mut c = Cpp { class_of: vec![NONE; n], ns_of: vec![NONE; n], ..Default::default() };
-        g.owner = vec![NONE; n];
+        let mut c = Cpp { on: true, ..Default::default() };
+        // (A definition a macro makes is given its class after where it is:
+        // the later says.)
+        let mut owner: FxHashMap<u32, u32> = FxHashMap::default();
         c.types.extend(g.syms.iter().filter(|s| matches!(s.kind, kind::CLASS | kind::STRUCT | kind::UNION | kind::TYPEDEF | kind::ENUM)).map(|s| s.name));
         c.namespaces.extend(g.syms.iter().filter(|s| s.kind == kind::NAMESPACE).map(|s| s.name));
         for (fi, f) in files.iter().enumerate() {
-            c.namespaces.extend(f.namespaces.iter().map(|&n| remap[fi][n as usize]));
-            c.namespace_aliases.extend(f.namespace_aliases.iter().map(|&(a, t)| (remap[fi][a as usize], remap[fi][t as usize])));
+            c.namespaces.extend(f.cxx().namespaces.iter().map(|&n| remap[fi][n as usize]));
+            c.namespace_aliases.extend(f.cxx().namespace_aliases.iter().map(|&(a, t)| (remap[fi][a as usize], remap[fi][t as usize])));
         }
         // An alias is what a name means only where no namespace of that
         // name is opened (bitcoin's `fs`, and one test's `namespace fs =
         // std::filesystem;`).
         let mut opened: FxHashSet<u32> = g.syms.iter().filter(|s| s.kind == kind::NAMESPACE).map(|s| s.name).collect();
         for (fi, f) in files.iter().enumerate() {
-            let aliases: FxHashSet<u32> = f.namespace_aliases.iter().map(|a| a.0).collect();
-            opened.extend(f.namespaces.iter().filter(|n| !aliases.contains(n)).map(|&n| remap[fi][n as usize]));
+            let aliases: FxHashSet<u32> = f.cxx().namespace_aliases.iter().map(|a| a.0).collect();
+            opened.extend(f.cxx().namespaces.iter().filter(|n| !aliases.contains(n)).map(|&n| remap[fi][n as usize]));
         }
         c.namespace_aliases.retain(|a, _| !opened.contains(a));
         c.namespaces.retain(|name| !c.types.contains(name));
         for (fi, f) in files.iter().enumerate() {
             let base = g.files[fi].sym_start as usize;
-            for &(def, chain, own) in &f.owners {
+            for &(def, chain, own) in &f.cxx().owners {
                 let own = remap[fi][own as usize];
                 let chain = remap[fi][chain as usize];
-                g.owner[base + def as usize] = chain;
+                let sym = (base + def as usize) as u32;
+                owner.insert(sym, chain);
                 if !c.namespaces.contains(&own) {
-                    c.class_of[base + def as usize] = own;
+                    c.class_of.insert(sym, own);
                 }
                 // The namespaces lead the scope (`wallet::CWallet`): the last of them.
                 let mut ns = NONE;
@@ -529,9 +534,11 @@ impl Cpp {
                         None => break,
                     }
                 }
-                c.ns_of[base + def as usize] = ns;
+                if ns != NONE {
+                    c.ns_of.insert(sym, ns);
+                }
             }
-            for &(class, b) in &f.bases {
+            for &(class, b) in &f.cxx().bases {
                 let (class, b) = (remap[fi][class as usize], remap[fi][b as usize]);
                 if class != b {
                     c.bases.entry(class).or_default().push(b);
@@ -543,20 +550,27 @@ impl Cpp {
             v.sort_unstable();
             v.dedup();
         }
-        for (i, s) in g.syms.iter().enumerate() {
-            if s.flags & flag::VIRTUAL != 0 && c.class_of[i] != NONE {
-                c.virtuals.insert((c.class_of[i], s.name));
+        g.owner = owner.into_iter().map(|(sym, chain)| [sym, chain]).collect();
+        g.owner.sort_unstable_by_key(|o| o[0]);
+        for (&sym, &class) in &c.class_of {
+            let s = &g.syms[sym as usize];
+            if s.flags & flag::VIRTUAL != 0 {
+                c.virtuals.insert((class, s.name));
             }
         }
         c
     }
 
     fn on(&self) -> bool {
-        !self.class_of.is_empty()
+        self.on
     }
 
     fn class(&self, sym: u32) -> u32 {
-        self.class_of.get(sym as usize).copied().unwrap_or(NONE)
+        self.class_of.get(&sym).copied().unwrap_or(NONE)
+    }
+
+    fn ns(&self, sym: u32) -> u32 {
+        self.ns_of.get(&sym).copied().unwrap_or(NONE)
     }
 
     /// The class and those it derives from, nearest first.
@@ -761,7 +775,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     let mut nested: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
     for (fi, f) in files.iter().enumerate() {
         for (i, r) in f.records.iter().enumerate() {
-            let to = if r.nested { &mut nested } else { &mut records };
+            let to = if f.cxx().nested.contains(&(i as u32)) { &mut nested } else { &mut records };
             to.entry(remap[fi][r.name as usize]).or_default().push((fi as u32, i as u32));
         }
         for &(alias, tag) in &f.aliases {
@@ -822,11 +836,11 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 hint_of[r as usize] = h;
             }
             // C++: what each name was called with (`X::f`).
-            let in_cpp = f.cpp && cpp.on();
+            let in_cpp = f.cpp() && cpp.on();
             let mut qual_of = Vec::new();
             if in_cpp {
                 qual_of = vec![NONE; f.refs.len()];
-                for &(r, q) in &f.ref_quals {
+                for &(r, q) in &f.cxx().ref_quals {
                     qual_of[r as usize] = remap[fi][q as usize];
                 }
             }
@@ -901,20 +915,20 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                         // anything else; `X::f ()`: X's (a namespace's, or
                         // `::f`: one of no class); elsewhere, one of no class.
                         let caller_class = cpp.class(base + r.scope);
-                        let caller_ns = cpp.ns_of[(base + r.scope) as usize];
+                        let caller_ns = cpp.ns(base + r.scope);
                         if qual != NONE && g.name(qual).is_empty() {
                             // `::f`: one of the global namespace.
                             cpp.nearest(cands, NONE, &mut lineage, &mut pick);
-                            pick.retain(|&c| cpp.ns_of[c as usize] == NONE);
+                            pick.retain(|&c| cpp.ns(c) == NONE);
                         } else if qual != NONE && cpp.namespaces.contains(&qual) {
                             // `ns::f`: one of that namespace (or, where the
                             // namespace is opened by a macro the parser did
                             // not see through, one of no class).
                             cpp.nearest(cands, NONE, &mut lineage, &mut pick);
-                            if pick.iter().any(|&c| cpp.ns_of[c as usize] == qual) {
-                                pick.retain(|&c| cpp.ns_of[c as usize] == qual);
+                            if pick.iter().any(|&c| cpp.ns(c) == qual) {
+                                pick.retain(|&c| cpp.ns(c) == qual);
                             } else {
-                                pick.retain(|&c| cpp.ns_of[c as usize] == NONE);
+                                pick.retain(|&c| cpp.ns(c) == NONE);
                             }
                         } else if qual != NONE && cpp.types.contains(&qual) {
                             cpp.nearest(cands, qual, &mut lineage, &mut pick);
@@ -933,8 +947,8 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                             }
                             // A function of the caller's own namespace hides
                             // those of others.
-                            if caller_ns != NONE && pick.iter().any(|&c| cpp.class(c) == NONE && cpp.ns_of[c as usize] == caller_ns) {
-                                pick.retain(|&c| cpp.class(c) != NONE || cpp.ns_of[c as usize] == caller_ns);
+                            if caller_ns != NONE && pick.iter().any(|&c| cpp.class(c) == NONE && cpp.ns(c) == caller_ns) {
+                                pick.retain(|&c| cpp.class(c) != NONE || cpp.ns(c) == caller_ns);
                             }
                         }
                         // (Qualified with a scope the corpus does not have,

@@ -142,7 +142,7 @@ fn symbol_kind(k: u8) -> u32 {
 /// How a symbol is shown: a C++ member with its classes (`DBImpl::Get`).
 /// (Looked up again by its own name, which `data` carries.)
 fn display_name(g: &Graph, sym: u32) -> String {
-    if g.owner.get(sym as usize).is_none_or(|&o| o == si_core::model::NONE) {
+    if g.owner_of(sym).is_none() {
         return g.sym_name(sym).to_string();
     }
     si_core::graph::Qualifier::new(g).name(g, sym).into_owned()

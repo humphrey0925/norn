@@ -25,9 +25,10 @@ pub struct Graph {
     /// symbol -> incoming references (CSR).
     pub in_off: Vec<u32>,
     pub inc: Vec<EdgeHalf>,
-    /// C++: symbol -> the scope it is a member of as written (a name id,
-    /// `NONE` for none). Empty when no symbol has one.
-    pub owner: Vec<u32>,
+    /// C++: (symbol, the scope it is in as written, a name id), of those
+    /// that are in one, by symbol. (A few among millions in a C tree with
+    /// a C++ file or two: kept only for those.)
+    pub owner: Vec<[u32; 2]>,
 }
 
 /// Names a C++ symbol with the classes it is in, not the namespaces:
@@ -68,8 +69,8 @@ impl Qualifier {
 
     pub fn name<'g>(&self, g: &'g Graph, sym: u32) -> std::borrow::Cow<'g, str> {
         let name = g.sym_name(sym);
-        match g.owner.get(sym as usize).filter(|&&o| o != crate::model::NONE) {
-            Some(&o) => match self.classes(g, o) {
+        match g.owner_of(sym) {
+            Some(o) => match self.classes(g, o) {
                 "" => name.into(),
                 classes => format!("{classes}::{name}").into(),
             },
@@ -106,6 +107,12 @@ impl Graph {
 
     pub fn sym_name(&self, sym: u32) -> &str {
         self.name(self.syms[sym as usize].name)
+    }
+
+    /// C++: the scope `sym` is in, as written (`leveldb::DBImpl`).
+    pub fn owner_of(&self, sym: u32) -> Option<u32> {
+        let at = self.owner.binary_search_by_key(&sym, |o| o[0]).ok()?;
+        Some(self.owner[at][1])
     }
 
     pub fn file_path(&self, file: u32) -> &str {
@@ -189,7 +196,7 @@ impl Graph {
             + self.files.len() * std::mem::size_of::<FileRec>()
             + self.syms.len() * std::mem::size_of::<Sym>()
             + (self.out.len() + self.inc.len()) * std::mem::size_of::<EdgeHalf>()
-            + self.owner.len() * 4
+            + self.owner.len() * 8
     }
 
     /// The tables shared by every graph layout: names, files, symbols, name index.

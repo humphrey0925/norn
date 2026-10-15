@@ -432,7 +432,9 @@ impl Extractor {
         out.undecided = undecided_lines(src, &lexed.undecided);
         out.mask_ns = t.elapsed().as_nanos() as u64;
         let cpp = is_cpp(path, src);
-        out.cpp = cpp;
+        if cpp {
+            out.cxx = Some(Box::default());
+        }
         let (parser, ids) = if cpp {
             let c = self.cpp.get_or_insert_with(|| {
                 let lang: Language = tree_sitter_cpp::LANGUAGE.into();
@@ -527,11 +529,11 @@ impl Extractor {
         names.dedup();
         for name in names {
             let id = w.intern_str(&name);
-            w.out.namespaces.push(id);
+            w.out.cxx_mut().namespaces.push(id);
         }
         for (alias, target) in aliases {
             let (alias, target) = (w.intern_str(&alias), w.intern_str(&target));
-            w.out.namespace_aliases.push((alias, target));
+            w.out.cxx_mut().namespace_aliases.push((alias, target));
         }
         w.out.walk_ns = t.elapsed().as_nanos() as u64;
         let mut out = w.out;
@@ -706,7 +708,7 @@ impl<'a> Walk<'a> {
         }
         let own = chain.rsplit("::").next().unwrap_or("").to_string();
         let (chain, own) = (self.intern_str(&chain), self.intern_str(&own));
-        self.out.owners.push((def, chain, own));
+        self.out.cxx_mut().owners.push((def, chain, own));
         // (A function only in a namespace has no class for `this`.)
         if member { own } else { NONE }
     }
@@ -1123,8 +1125,8 @@ impl<'a> Walk<'a> {
                         // the body, read as text: what it is qualified with.
                         if self.cpp {
                             if let Some(q) = self.qualifier_before(t.start as usize) {
-                                let q = self.intern(q);
-                                self.out.ref_quals.push((self.out.refs.len() as u32 - 1, q));
+                                let (q, at) = (self.intern(q), self.out.refs.len() as u32 - 1);
+                                self.out.cxx_mut().ref_quals.push((at, q));
                             }
                         }
                     }
@@ -1398,12 +1400,13 @@ impl<'a> Walk<'a> {
     fn push_record(&mut self, name: u32, node: Node<'a>, body: Node<'a>) {
         let (mut fields, mut types, mut elems) = (Vec::new(), Vec::new(), Vec::new());
         self.member_names(body, &mut fields, &mut types, &mut elems);
-        if elems.iter().all(|&e| e == NONE) {
-            elems = Vec::new();
-        }
         let defs = vec![NONE; fields.len()];
+        let record = self.out.records.len() as u32;
+        for (at, &e) in elems.iter().enumerate().filter(|e| *e.1 != NONE) {
+            self.out.cxx_mut().elems.push((record, at as u32, e));
+        }
         self.open_records.push((node.end_byte(), self.out.records.len()));
-        self.out.records.push(Record { name, fields, types, defs, nested: false, elems });
+        self.out.records.push(Record { name, fields, types, defs });
     }
 
     /// A braced initializer of an object of struct type `type_name` (or of
@@ -1637,8 +1640,8 @@ impl<'a> Walk<'a> {
                         self.skip.insert(name.start_byte());
                         self.push_ref(name, refkind::CALL);
                         if let Some(q) = parts.last().filter(|_| qualified) {
-                            let q = self.intern(q);
-                            self.out.ref_quals.push((self.out.refs.len() as u32 - 1, q));
+                            let (q, at) = (self.intern(q), self.out.refs.len() as u32 - 1);
+                            self.out.cxx_mut().ref_quals.push((at, q));
                         }
                     }
                 }
@@ -1662,7 +1665,7 @@ impl<'a> Walk<'a> {
                                 // `p->Base::f ()`.
                                 if let Some(q) = parts.last().filter(|q| !q.is_empty()) {
                                     let q = self.intern(q);
-                                    self.out.ref_quals.push((at, q));
+                                    self.out.cxx_mut().ref_quals.push((at, q));
                                 }
                             }
                         }
@@ -1780,7 +1783,7 @@ impl<'a> Walk<'a> {
                         self.method_class = own;
                         if let Some(base) = base {
                             let base = self.intern_str(&base);
-                            self.out.bases.push((own, base));
+                            self.out.cxx_mut().bases.push((own, base));
                         }
                     } else {
                         self.method_class = self.note_owner(def, &scope, class, node.start_byte());
@@ -2014,9 +2017,8 @@ impl<'a> Walk<'a> {
                         let nested = outer.is_some() || scope.iter().any(|p| !p.is_empty());
                         self.push_record(record, node, body);
                         if nested {
-                            if let Some(r) = self.out.records.last_mut() {
-                                r.nested = true;
-                            }
+                            let r = self.out.records.len() as u32 - 1;
+                            self.out.cxx_mut().nested.push(r);
                         }
                         if self.cpp {
                             // What its members are members of, and what it
@@ -2036,7 +2038,7 @@ impl<'a> Walk<'a> {
                                 for b in named {
                                     let base = self.type_name(b);
                                     if base != NONE {
-                                        self.out.bases.push((record, base));
+                                        self.out.cxx_mut().bases.push((record, base));
                                     }
                                 }
                             }

@@ -1345,9 +1345,9 @@ fn expand_file(
                 add_name(&mut named, macro_name, (ei, Choice::default()));
             }
             let mut known = FxHashSet::default();
-            let novel = |exp: &[T]| recognise(exp, s, macro_name, f.cpp).novel(&mut known);
+            let novel = |exp: &[T]| recognise(exp, s, macro_name, f.cpp()).novel(&mut known);
             for (exp, choice) in eng.variants(&toks, &Choice::default(), novel) {
-                if let Some(n) = recognise(&exp, s, macro_name, f.cpp).def_name() {
+                if let Some(n) = recognise(&exp, s, macro_name, f.cpp()).def_name() {
                     add_name(&mut named, n, (ei, choice));
                 }
             }
@@ -1366,7 +1366,7 @@ fn expand_file(
                 (out.defs.len() - 1) as u32
             };
             if let Some((chain, class)) = classes {
-                out.owners.push((idx, chain, class));
+                out.cxx_mut().owners.push((idx, chain, class));
             }
             variants.entry(s.def).or_default().push((idx, contexts));
         }
@@ -1408,9 +1408,9 @@ fn expand_file(
                 for (ei, pinned) in contexts {
                     let maybe = engines[*ei].maybe_undefined(macro_name);
                     let mut known = FxHashSet::default();
-                    let novel = |exp: &[T]| recognise(exp, s, macro_name, f.cpp).novel(&mut known);
+                    let novel = |exp: &[T]| recognise(exp, s, macro_name, f.cpp()).novel(&mut known);
                     for (exp, _) in engines[*ei].variants(&toks, pinned, novel) {
-                        let mut found = recognise(&exp, s, macro_name, f.cpp);
+                        let mut found = recognise(&exp, s, macro_name, f.cpp());
                         // A use that names a definition: what else it makes,
                         // and what that calls; not its own name (a call of
                         // itself, from its own body).
@@ -1465,7 +1465,8 @@ fn expand_file(
             if m.first && seen_defs.insert(key(&def)) {
                 made_here.insert((whole, m.line), out.defs.len() as u32);
                 if let Some((chain, class)) = classes {
-                    out.owners.push((out.defs.len() as u32, chain, class));
+                    let at = out.defs.len() as u32;
+                    out.cxx_mut().owners.push((at, chain, class));
                 }
                 out.defs.push(def);
             }
@@ -1582,8 +1583,10 @@ fn expand_file(
     for t in &mut out.typed {
         t.0 = new_index[t.0 as usize];
     }
-    for o in &mut out.owners {
-        o.0 = new_index[o.0 as usize];
+    if let Some(c) = out.cxx.as_mut() {
+        for o in &mut c.owners {
+            o.0 = new_index[o.0 as usize];
+        }
     }
     for d in out.records.iter_mut().flat_map(|r| r.defs.iter_mut()).filter(|d| **d != NONE) {
         *d = new_index[*d as usize];

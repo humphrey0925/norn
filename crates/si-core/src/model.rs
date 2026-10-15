@@ -185,12 +185,6 @@ pub struct Record {
     /// or a typedef (else `NONE`), and its definition in this file.
     pub types: Vec<u32>,
     pub defs: Vec<u32>,
-    /// C++: a class in a class, called by its short name only in there.
-    pub nested: bool,
-    /// C++: for each member that is a container (`std::vector<T> v`), the
-    /// name of its elements' type (`T`; of a map, its values'), else `NONE`.
-    /// Empty where none is.
-    pub elems: Vec<u32>,
 }
 
 /// What a member access is made on, as far as the text says: something of a
@@ -289,23 +283,44 @@ pub struct FileFacts {
     pub locals: Vec<Local>,
     /// Where each is used: (index into `locals`, line), in source order.
     pub local_uses: Vec<(u32, u32)>,
-    /// Read as C++.
-    pub cpp: bool,
-    /// C++: the class a definition is a member of, as (definition, the
-    /// scope as written, the class's own name): `DBImpl::Get` defined
-    /// inside `namespace leveldb` or written `leveldb::DBImpl::Get` has
-    /// the scope `DBImpl` or `leveldb::DBImpl`, and the class `DBImpl`.
+    /// What a C++ file says that C has no words for (`None`: a C file).
+    pub cxx: Option<Box<Cxx>>,
+}
+
+/// What a C++ file says that C has no words for. Apart from the rest, so
+/// that a C file pays one pointer for it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Cxx {
+    /// The class (or namespace) a definition is in, as (definition, the
+    /// scope as written, its own name): `DBImpl::Get` defined inside
+    /// `namespace leveldb` has the scope `leveldb::DBImpl`, and `DBImpl`.
     pub owners: Vec<(u32, u32, u32)>,
-    /// C++: (class, base class), by their own names.
+    /// (class, base class), by their own names.
     pub bases: Vec<(u32, u32)>,
-    /// C++: the names of the namespaces the file opens, or names another
-    /// way: `namespace tfm = tinyformat;` as (`tfm`, `tinyformat`).
+    /// (reference, qualifier) of a name called as `X::f`: the last part of
+    /// the scope written before it (`""` for `::f`).
+    pub ref_quals: Vec<(u32, u32)>,
+    /// The names of the namespaces the file opens, or names another way:
+    /// `namespace tfm = tinyformat;` as (`tfm`, `tinyformat`).
     pub namespaces: Vec<u32>,
     pub namespace_aliases: Vec<(u32, u32)>,
-    /// C++: (reference, qualifier) of a name called as `X::f`: the last
-    /// part of the scope written before it (`""` for `::f`).
-    pub ref_quals: Vec<(u32, u32)>,
+    /// The records that are classes in classes, called by their short
+    /// name only in there.
+    pub nested: Vec<u32>,
+    /// (record, member, its elements' type) of members that are containers
+    /// (`std::vector<T> v`: `T`; of a map, its values').
+    pub elems: Vec<(u32, u32, u32)>,
 }
+
+static NO_CXX: Cxx = Cxx {
+    owners: Vec::new(),
+    bases: Vec::new(),
+    ref_quals: Vec::new(),
+    namespaces: Vec::new(),
+    namespace_aliases: Vec::new(),
+    nested: Vec::new(),
+    elems: Vec::new(),
+};
 
 /// A parameter or a local variable.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -406,6 +421,20 @@ impl FileFacts {
         FileFacts { path, ..Default::default() }
     }
 
+    /// Read as C++?
+    pub fn cpp(&self) -> bool {
+        self.cxx.is_some()
+    }
+
+    /// What it says as C++ (nothing, of a C file).
+    pub fn cxx(&self) -> &Cxx {
+        self.cxx.as_deref().unwrap_or(&NO_CXX)
+    }
+
+    pub fn cxx_mut(&mut self) -> &mut Cxx {
+        self.cxx.get_or_insert_with(Default::default)
+    }
+
     /// A name: an identifier, a path, anything other files say too.
     pub fn push_name(&mut self, s: &str) -> u32 {
         self.names.ids.push(crate::names::id(s));
@@ -472,16 +501,19 @@ impl FileFacts {
             exact(&mut r.fields);
             exact(&mut r.types);
             exact(&mut r.defs);
-            exact(&mut r.elems);
         }
         exact(&mut self.records);
         exact(&mut self.aliases);
         exact(&mut self.field_types);
-        exact(&mut self.owners);
-        exact(&mut self.bases);
-        exact(&mut self.namespaces);
-        exact(&mut self.namespace_aliases);
-        exact(&mut self.ref_quals);
+        if let Some(c) = self.cxx.as_mut() {
+            exact(&mut c.owners);
+            exact(&mut c.bases);
+            exact(&mut c.ref_quals);
+            exact(&mut c.namespaces);
+            exact(&mut c.namespace_aliases);
+            exact(&mut c.nested);
+            exact(&mut c.elems);
+        }
         exact(&mut self.param_calls);
         exact(&mut self.arg_passes);
         exact(&mut self.hints);
@@ -511,8 +543,10 @@ impl FileFacts {
             ("sites", of(&self.sites) + of(&self.inits)),
             ("macros", of(&self.macros) + of(&self.defined_names)),
             ("binds", of(&self.binds)),
-            ("records", records + of(&self.aliases) + of(&self.field_types) + of(&self.typed) + of(&self.owners) + of(&self.bases) + of(&self.namespaces)),
-            ("hints", of(&self.hints) + of(&self.hint_path) + of(&self.ref_hints) + of(&self.ref_quals)),
+            ("records", records + of(&self.aliases) + of(&self.field_types) + of(&self.typed) + self.cxx.as_ref().map_or(0, |c| {
+                std::mem::size_of::<Cxx>() + of(&c.owners) + of(&c.bases) + of(&c.ref_quals) + of(&c.namespaces) + of(&c.namespace_aliases) + of(&c.nested) + of(&c.elems)
+            })),
+            ("hints", of(&self.hints) + of(&self.hint_path) + of(&self.ref_hints)),
             ("calls through", of(&self.param_calls) + of(&self.arg_passes)),
             ("locals", of(&self.locals)),
             ("local uses", of(&self.local_uses)),
