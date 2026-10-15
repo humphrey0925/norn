@@ -469,6 +469,8 @@ struct Cpp {
     ns_of: Vec<u32>,
     /// Names of classes (of any kind of type the corpus defines).
     types: FxHashSet<u32>,
+    /// Another name for a namespace -> its own (`tfm` -> `tinyformat`).
+    namespace_aliases: FxHashMap<u32, u32>,
 }
 
 impl Cpp {
@@ -483,7 +485,17 @@ impl Cpp {
         c.namespaces.extend(g.syms.iter().filter(|s| s.kind == kind::NAMESPACE).map(|s| s.name));
         for (fi, f) in files.iter().enumerate() {
             c.namespaces.extend(f.namespaces.iter().map(|&n| remap[fi][n as usize]));
+            c.namespace_aliases.extend(f.namespace_aliases.iter().map(|&(a, t)| (remap[fi][a as usize], remap[fi][t as usize])));
         }
+        // An alias is what a name means only where no namespace of that
+        // name is opened (bitcoin's `fs`, and one test's `namespace fs =
+        // std::filesystem;`).
+        let mut opened: FxHashSet<u32> = g.syms.iter().filter(|s| s.kind == kind::NAMESPACE).map(|s| s.name).collect();
+        for (fi, f) in files.iter().enumerate() {
+            let aliases: FxHashSet<u32> = f.namespace_aliases.iter().map(|a| a.0).collect();
+            opened.extend(f.namespaces.iter().filter(|n| !aliases.contains(n)).map(|&n| remap[fi][n as usize]));
+        }
+        c.namespace_aliases.retain(|a, _| !opened.contains(a));
         c.namespaces.retain(|name| !c.types.contains(name));
         for (fi, f) in files.iter().enumerate() {
             let base = g.files[fi].sym_start as usize;
@@ -827,7 +839,9 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 let typed = (member && hint_of[ri] != NONE)
                     .then(|| types.member(&f.hints[hint_of[ri] as usize], remap[fi][r.name as usize], fi, &g, base..end, closure, &mut scratch))
                     .flatten();
+                // (`tfm::format`, with `namespace tfm = tinyformat;`: `tinyformat`.)
                 let qual = if in_cpp { qual_of[ri] } else { NONE };
+                let qual = cpp.namespace_aliases.get(&qual).copied().unwrap_or(qual);
                 let mut edge_kind = kind;
                 // A method chosen by its name alone, the object's type not
                 // known (or not one of the corpus's: `name.c_str ()` of a
@@ -1596,6 +1610,48 @@ mod cpp_tests {
         ]);
         assert_eq!(calls(&g, "Twice", "Size"), [("a.h".to_string(), true)]);
         assert_eq!(calls(&g, "Free", "Size"), [("a.cc".to_string(), true)]);
+    }
+
+    #[test]
+    fn a_namespace_alias_is_its_namespace_where_no_namespace_has_its_name() {
+        let g = graph(&[
+            ("tf.h", "namespace tinyformat {
+inline int format(int x) { return x; }
+}
+namespace tfm = tinyformat;
+"),
+            ("fs.h", "namespace fs {
+inline int format(int x) { return x; }
+}
+"),
+            ("t.cc", "#include \"tf.h\"
+#include \"fs.h\"
+namespace fs = std::filesystem;
+int a() { return tfm::format(1); }
+int b() { return fs::format(2); }
+"),
+        ]);
+        assert_eq!(calls(&g, "a", "format"), [("tf.h".to_string(), true)]);
+        // `fs` is opened as a namespace: the alias in one file does not
+        // make every `fs::` another.
+        assert_eq!(calls(&g, "b", "format"), [("fs.h".to_string(), true)]);
+    }
+
+    #[test]
+    fn a_call_qualified_in_a_macro_body_is_resolved_as_written() {
+        let g = graph(&[
+            ("h.h", "namespace testing {
+struct EqHelper { static bool Compare(int a, int b) { return a == b; } };
+struct Other { static bool Compare(int a, int b) { return a < b; } };
+}
+#define CHECK_EQ(a, b) ::testing::EqHelper::Compare(a, b)
+"),
+            ("t.cc", "#include \"h.h\"
+bool t() { return CHECK_EQ(1, 2); }
+"),
+        ]);
+        let compare: Vec<String> = g.find("CHECK_EQ").iter().flat_map(|&m| g.refs_from(m)).filter(|e| e.kind() == refkind::CALL && !e.ambiguous()).map(|e| g.sym_name(e.other).to_string()).collect();
+        assert_eq!(compare, ["Compare"]);
     }
 
     #[test]

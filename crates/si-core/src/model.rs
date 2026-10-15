@@ -294,8 +294,10 @@ pub struct FileFacts {
     pub owners: Vec<(u32, u32, u32)>,
     /// C++: (class, base class), by their own names.
     pub bases: Vec<(u32, u32)>,
-    /// C++: the names of the namespaces the file opens.
+    /// C++: the names of the namespaces the file opens, or names another
+    /// way: `namespace tfm = tinyformat;` as (`tfm`, `tinyformat`).
     pub namespaces: Vec<u32>,
+    pub namespace_aliases: Vec<(u32, u32)>,
     /// C++: (reference, qualifier) of a name called as `X::f`: the last
     /// part of the scope written before it (`""` for `::f`).
     pub ref_quals: Vec<(u32, u32)>,
@@ -473,6 +475,7 @@ impl FileFacts {
         exact(&mut self.owners);
         exact(&mut self.bases);
         exact(&mut self.namespaces);
+        exact(&mut self.namespace_aliases);
         exact(&mut self.ref_quals);
         exact(&mut self.param_calls);
         exact(&mut self.arg_passes);

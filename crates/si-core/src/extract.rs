@@ -506,11 +506,17 @@ impl Extractor {
         w.flush_events(usize::MAX);
         w.flush_local_calls();
         let mut names: Vec<String> = w.namespaces.iter().flat_map(|n| n.2.split("::").map(str::to_string)).filter(|n| !n.is_empty()).collect();
+        let aliases = if w.cpp { namespace_aliases(&lexed.masked) } else { Vec::new() };
+        names.extend(aliases.iter().map(|a| a.0.clone()));
         names.sort_unstable();
         names.dedup();
         for name in names {
             let id = w.intern_str(&name);
             w.out.namespaces.push(id);
+        }
+        for (alias, target) in aliases {
+            let (alias, target) = (w.intern_str(&alias), w.intern_str(&target));
+            w.out.namespace_aliases.push((alias, target));
         }
         w.out.walk_ns = t.elapsed().as_nanos() as u64;
         let mut out = w.out;
@@ -1011,6 +1017,14 @@ impl<'a> Walk<'a> {
                     let scope = (self.out.defs.len() - 1) as u32;
                     for t in &m.refs {
                         self.push_tok_ref(t, scope);
+                        // C++: `::testing::internal::EqHelper::Compare (...)` in
+                        // the body, read as text: what it is qualified with.
+                        if self.cpp {
+                            if let Some(q) = self.qualifier_before(t.start as usize) {
+                                let q = self.intern(q);
+                                self.out.ref_quals.push((self.out.refs.len() as u32 - 1, q));
+                            }
+                        }
                     }
                     if m.keep {
                         let text = String::from_utf8_lossy(&self.orig[m.name.end as usize..m.end as usize]);
@@ -1050,6 +1064,29 @@ impl<'a> Walk<'a> {
                 }
             }
         }
+    }
+
+    /// C++: the name before `::` before `pos` in the text (`B` of `A::B::f`,
+    /// "" of `::f`), if `::` is there.
+    fn qualifier_before(&self, pos: usize) -> Option<&'a [u8]> {
+        let s = self.orig;
+        let mut i = pos;
+        while i > 0 && matches!(s[i - 1], b' ' | b'\t') {
+            i -= 1;
+        }
+        if i < 2 || &s[i - 2..i] != b"::" {
+            return None;
+        }
+        i -= 2;
+        while i > 0 && matches!(s[i - 1], b' ' | b'\t') {
+            i -= 1;
+        }
+        let end = i;
+        while i > 0 && (s[i - 1].is_ascii_alphanumeric() || s[i - 1] == b'_') {
+            i -= 1;
+        }
+        // (`Base<T>::f`: the template's arguments are no name.)
+        Some(&s[i..end])
     }
 
     fn tok_text(&self, t: &Tok) -> &'a [u8] {
@@ -1993,6 +2030,47 @@ fn namespace_spans(src: &[u8], blocks: &[(u32, u32, u32)]) -> Vec<(usize, usize,
         };
         out.push((start, end, name));
         i = brace + 1;
+    }
+    out
+}
+
+/// C++: `namespace tfm = tinyformat;`, as (alias, the namespace's own name).
+fn namespace_aliases(src: &[u8]) -> Vec<(String, String)> {
+    const WORD: &[u8] = b"namespace";
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(at) = src[i..].windows(WORD.len()).position(|w| w == WORD) {
+        let start = i + at;
+        i = start + WORD.len();
+        if (start > 0 && ident(src[start - 1])) || src.get(i).is_some_and(|&b| ident(b)) {
+            continue;
+        }
+        let skip = |mut j: usize| {
+            while j < src.len() && matches!(src[j], b' ' | b'\t') {
+                j += 1;
+            }
+            j
+        };
+        let a = skip(i);
+        let mut e = a;
+        while e < src.len() && ident(src[e]) {
+            e += 1;
+        }
+        let eq = skip(e);
+        if e == a || src.get(eq) != Some(&b'=') {
+            continue;
+        }
+        let t = skip(eq + 1);
+        let mut te = t;
+        while te < src.len() && (ident(src[te]) || src[te] == b':') {
+            te += 1;
+        }
+        let target = String::from_utf8_lossy(&src[t..te]);
+        let last = target.rsplit("::").next().unwrap_or("");
+        if !last.is_empty() && src.get(skip(te)) == Some(&b';') {
+            out.push((String::from_utf8_lossy(&src[a..e]).into_owned(), last.to_string()));
+        }
     }
     out
 }
