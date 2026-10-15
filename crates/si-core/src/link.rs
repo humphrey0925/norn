@@ -1655,6 +1655,35 @@ bool t() { return CHECK_EQ(1, 2); }
     }
 
     #[test]
+    fn an_auto_variable_is_of_what_it_is_made_from() {
+        let g = graph(&[
+            ("k.h", "class Key {
+ public:
+  int Size() const { return 1; }
+};
+class Box {
+ public:
+  int Size() const { return 2; }
+  Key Get() const { return Key(); }
+};
+"),
+            ("k.cc", "#include \"k.h\"
+int a() { auto k = std::make_unique<Key>(); return k->Size(); }
+int b(const Box& box) { auto key = box.Get(); return key.Size(); }
+int c() { auto* p = new Box(); return p->Size(); }
+"),
+        ]);
+        assert_eq!(calls(&g, "a", "Size"), [("k.h".to_string(), true)]);
+        let class_of = |caller: &str| -> Vec<String> {
+            let q = crate::graph::Qualifier::new(&g);
+            g.find(caller).iter().flat_map(|&s| g.refs_from(s)).filter(|e| g.sym_name(e.other) == "Size" && !e.ambiguous()).map(|e| q.name(&g, e.other).into_owned()).collect()
+        };
+        assert_eq!(class_of("a"), ["Key::Size"]);
+        assert_eq!(class_of("b"), ["Key::Size"]);
+        assert_eq!(class_of("c"), ["Box::Size"]);
+    }
+
+    #[test]
     fn a_c_file_is_linked_as_before() {
         // No class, no namespace: what C has is unchanged.
         let g = graph(&[("a.h", "struct ops { int (*run) (int); };\nint helper (int x);\n"), ("a.c", "#include \"a.h\"\nint helper (int x) { return x; }\nint go (struct ops *o) { return helper (o->run (1)); }\n")]);

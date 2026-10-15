@@ -353,6 +353,9 @@ struct Walk<'a> {
     params: FxHashMap<&'a [u8], u32>,
     /// The struct, union or typedef type of each local of that function.
     local_types: FxHashMap<&'a [u8], u32>,
+    /// C++: of an `auto` local, where a member access on it starts (as a
+    /// member hint's root and path): what it was made from.
+    local_roots: FxHashMap<&'a [u8], (u8, u32, Vec<u32>)>,
     /// Hints worked out at a member access, for the reference its member
     /// name is about to become (by the name's position).
     pending_hints: FxHashMap<usize, u32>,
@@ -469,6 +472,7 @@ impl Extractor {
             local_calls: Vec::new(),
             params: FxHashMap::default(),
             local_types: FxHashMap::default(),
+            local_roots: FxHashMap::default(),
             pending_hints: FxHashMap::default(),
             open_records: Vec::new(),
             cpp,
@@ -821,6 +825,7 @@ impl<'a> Walk<'a> {
         self.local_sources.clear();
         self.params.clear();
         self.local_types.clear();
+        self.local_roots.clear();
     }
 
     /// The name of a declaration's type when it is a struct, a union or a
@@ -894,6 +899,10 @@ impl<'a> Walk<'a> {
         if k == ids.identifier {
             let text = self.text(n);
             if self.in_fn() && self.locals.contains(text) {
+                if let Some((kind, root, prefix)) = self.local_roots.get(text) {
+                    path.extend_from_slice(prefix);
+                    return Some((*kind, *root));
+                }
                 return self.local_types.get(text).map(|&t| (root::TYPE, t));
             }
             if self.cpp && self.in_fn() && self.method_class != NONE {
@@ -930,6 +939,38 @@ impl<'a> Walk<'a> {
             return (name != NONE).then_some((root::TYPE, name));
         }
         None
+    }
+
+    /// C++: what an `auto` variable is made from, as where a member access on
+    /// it starts: `new T`, `T {...}`, `std::make_unique<T> (...)` a T; a
+    /// call, a variable or a member, as a member access on them would.
+    fn value_root(&mut self, v: Node<'a>) -> Option<(u8, u32, Vec<u32>)> {
+        let ids = self.ids;
+        let v = self.strip(v);
+        match v.kind() {
+            "new_expression" | "compound_literal_expression" => {
+                let t = self.type_name(v.child_by_field_id(ids.f_type)?);
+                return (t != NONE).then(|| (root::TYPE, t, Vec::new()));
+            }
+            _ => {}
+        }
+        if v.kind_id() == ids.call_expression {
+            // (`std::make_unique<T>`: through the scope to the template.)
+            let mut f = v.child_by_field_id(ids.f_function)?;
+            while f.kind_id() == ids.qualified_identifier {
+                f = f.child_by_field_id(ids.f_name)?;
+            }
+            if f.kind_id() == ids.template_function
+                && matches!(f.child_by_field_id(ids.f_name).map(|n| self.text(n)), Some(b"make_unique" | b"make_shared" | b"allocate_shared"))
+            {
+                let arg = f.child_by_field_id(ids.f_arguments)?.named_child(0).filter(|a| a.kind_id() == ids.type_descriptor)?;
+                let t = self.type_name(arg.child_by_field_id(ids.f_type)?);
+                return (t != NONE).then(|| (root::TYPE, t, Vec::new()));
+            }
+        }
+        let mut path = Vec::new();
+        let (kind, root) = self.object_root(v, &mut path)?;
+        Some((kind, root, path))
     }
 
     /// The hint for the member of a member access, or `NONE`.
@@ -1709,10 +1750,16 @@ impl<'a> Walk<'a> {
                 for d in self.declarators(node) {
                     if let Some((name, _)) = self.decl_name(d) {
                         self.skip.insert(name.start_byte());
+                        self.local_roots.remove(self.text(name));
                         if declared != NONE && !self.declares_function(d) {
                             self.local_types.insert(self.text(name), declared);
                         } else {
                             self.local_types.remove(self.text(name));
+                            // C++: `auto x = ...`: of what it is made from.
+                            let value = d.child_by_field_id(ids.f_value).filter(|_| self.cpp && d.kind_id() == ids.init_declarator);
+                            if let Some(root) = value.and_then(|v| self.value_root(v)) {
+                                self.local_roots.insert(self.text(name), root);
+                            }
                         }
                         self.note_local(name, false);
                         if let Some(value) = d.child_by_field_id(ids.f_value).filter(|_| d.kind_id() == ids.init_declarator) {
