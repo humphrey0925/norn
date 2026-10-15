@@ -24,8 +24,19 @@ SI = Path(__file__).resolve().parent.parent / "target" / "release" / "norn.exe"
 
 # C++ calls scored: by the callee's name, of a virtual method, of a
 # constructor (`T x (a)`, `new T`), of an overloaded operator (`a == b`).
-# A lambda called through the variable that holds it is counted apart.
+# A lambda called through the variable that holds it is counted apart, and
+# so is an implicit conversion (`if (result)` of `operator bool`): nothing
+# at the site names either.
 SCORED_FORMS = ("call", "virtual", "ctor", "operator")
+
+
+def is_conversion(name):
+    """Is `name` (`Class::operator bool`) a conversion function's?"""
+    for i in range(len(name)):
+        if name.startswith("operator ", i) and (i == 0 or name[i - 2:i] == "::"):
+            rest = name[i + 9:]
+            return bool(rest) and (rest[0].isalpha() or rest[0] == "_") and rest.split("[")[0] not in ("new", "delete")
+    return False
 
 
 def si_lines(cmd, index):
@@ -181,6 +192,8 @@ def score(truth_path, index, corpus, cbm=False, loaded=None, callers=None, short
         if cf not in si_files or (callers is not None and (cf, cn) not in callers):
             continue
         form = form[0] if form else "call"
+        if form == "operator" and is_conversion(callee_name):
+            form = "conversion"
         forms[form] += 1
         if form not in SCORED_FORMS:
             homes = {GENERATED.get(home, home)} if home else t.homes.get(usr, set())

@@ -1198,6 +1198,11 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     }
                     None => in_sight(cands, syms, base..end, closure, &sure.member, want, &mut tmp),
                 }
+                // C names no member of a C++ class (`write` is not
+                // `RedisQtAdapter::write`).
+                if !in_cpp && !cpp.class_of.is_empty() {
+                    tmp.retain(|&c| cpp.class(c) == NONE);
+                }
                 if tmp.is_empty() {
                     counts[2] += 1;
                     continue;
@@ -1804,6 +1809,25 @@ mod cpp_tests {
         let t = MacroSets::default();
         let facts: Vec<FileFacts> = files.iter().map(|(path, src)| ex.extract(path, src.as_bytes(), &t)).collect();
         link(&facts).0
+    }
+    #[test]
+    fn a_member_call_in_a_macro_body_of_an_object_it_declares_is_of_its_class() {
+        let g = graph(&[
+            ("g.h", r#"namespace testing {
+class AssertionResult { public: const char* failure_message() const { return ""; } };
+class Other { public: const char* failure_message() const { return ""; } };
+}
+#define GTEST_ASSERT_(expression, on_failure)   if (const ::testing::AssertionResult gtest_ar = (expression))     ;   else     on_failure(gtest_ar.failure_message())
+"#),
+        ]);
+        let called: Vec<(String, bool)> = g
+            .find("GTEST_ASSERT_")
+            .iter()
+            .flat_map(|&m| g.refs_from(m))
+            .filter(|e| e.kind() == refkind::CALL)
+            .map(|e| (crate::graph::Qualifier::new(&g).name(&g, e.other).into_owned(), e.ambiguous()))
+            .collect();
+        assert_eq!(called, [("AssertionResult::failure_message".to_string(), false)]);
     }
 
     /// (file of the callee, certain) of what `caller` calls under `name`.

@@ -1259,6 +1259,15 @@ impl<'a> Walk<'a> {
                     let scope = (self.out.defs.len() - 1) as u32;
                     for t in &m.refs {
                         self.push_tok_ref(t, scope);
+                        // C++: `gtest_ar.failure_message ()` of a `gtest_ar`
+                        // the body declares: of its class.
+                        if self.cpp && t.member {
+                            if let Some(ty) = self.declared_in_body(t.start as usize, m.name.end as usize, m.end as usize) {
+                                let (ty, at) = (self.intern(ty), self.out.refs.len() as u32 - 1);
+                                let hint = self.push_hint(root::TYPE, ty, &[]);
+                                self.out.ref_hints.push((at, hint));
+                            }
+                        }
                         // C++: `::testing::internal::EqHelper::Compare (...)` in
                         // the body, read as text: what it is qualified with.
                         if self.cpp {
@@ -1314,6 +1323,64 @@ impl<'a> Walk<'a> {
                 }
             }
         }
+    }
+
+    /// C++: of the object of the member at `member` in a macro body
+    /// `s[start..end]` (`gtest_ar` of `gtest_ar.failure_message`), the type
+    /// the body declares it of (`const AssertionResult gtest_ar = ...`).
+    fn declared_in_body(&self, member: usize, start: usize, end: usize) -> Option<&'a [u8]> {
+        let s = self.orig;
+        let back = |mut i: usize| {
+            while i > start && matches!(s[i - 1], b' ' | b'\t' | b'\\' | b'\n' | b'\r') {
+                i -= 1;
+            }
+            i
+        };
+        let word_before = |i: usize| {
+            let mut a = i;
+            while a > start && (s[a - 1].is_ascii_alphanumeric() || s[a - 1] == b'_') {
+                a -= 1;
+            }
+            (a < i && !s[a].is_ascii_digit()).then_some(a)
+        };
+        let mut i = back(member);
+        if i > start && s[i - 1] == b'.' {
+            i -= 1;
+        } else if i > start + 1 && &s[i - 2..i] == b"->" {
+            i -= 2;
+        } else {
+            return None;
+        }
+        let i = back(i);
+        let object = &s[word_before(i)?..i];
+        let body = &s[start..end];
+        let mut from = 0;
+        while let Some(at) = body[from..].windows(object.len()).position(|w| w == object).map(|p| p + from) {
+            from = at + object.len();
+            let (a, e) = (start + at, start + at + object.len());
+            let whole = (a == start || !(s[a - 1].is_ascii_alphanumeric() || s[a - 1] == b'_'))
+                && !(e < end && (s[e].is_ascii_alphanumeric() || s[e] == b'_'));
+            if !whole {
+                continue;
+            }
+            let mut j = e;
+            while j < end && matches!(s[j], b' ' | b'\t') {
+                j += 1;
+            }
+            if !matches!(s.get(j), Some(b'=' | b'(' | b'{' | b';')) || s.get(j + 1) == Some(&b'=') {
+                continue;
+            }
+            let k = back(a);
+            if k == a {
+                continue;
+            }
+            let Some(t) = word_before(k) else { continue };
+            let ty = &s[t..k];
+            if !crate::mask::is_keyword(ty) && !matches!(ty, b"return" | b"new" | b"delete" | b"throw" | b"case" | b"goto") {
+                return Some(ty);
+            }
+        }
+        None
     }
 
     /// C++: does the text at `pos`, after a name, declare an object of it:

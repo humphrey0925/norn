@@ -474,8 +474,12 @@ const WIDELY_READ: usize = 1024;
 const WIDELY_READ_FROM_SOURCE: usize = 8192;
 
 /// What a macro may expand to and still be dropped: attributes, and
-/// `inline`, which says nothing an index needs.
-const ATTRIBUTE_KEYWORDS: [&[u8]; 8] = [
+/// `inline` and (C++, C23) `constexpr` and the like, which say nothing an
+/// index needs.
+const ATTRIBUTE_KEYWORDS: [&[u8]; 11] = [
+    b"constexpr",
+    b"consteval",
+    b"constinit",
     b"__attribute__",
     b"__attribute",
     b"__declspec",
@@ -1878,12 +1882,17 @@ impl<'a> Lexer<'a> {
         scan_refs(s, body, end, line, &params, &mut refs);
         let name = Tok { start: a as u32, end: e as u32, line, call: function_like, member: false };
         // `#ifndef FOO_H` / `#define FOO_H` with nothing or `1` after it,
-        // around the whole file.
+        // around the whole file; or, named as a header's and with nothing
+        // after it, within guards only (a header made of many, each with
+        // its own: gmock's).
         let mut guard = false;
-        if self.conds.len() == 1 && self.conds[0].ifndef.as_deref() == Some(&s[a..e]) {
+        if let Some((last, outer)) = self.conds.split_last_mut() {
             let text = s[body..end].trim_ascii();
-            if !function_like && (text.is_empty() || text == b"1") {
-                self.conds[0].include_guard = true;
+            let name = s[a..e].trim_ascii_end();
+            let names_header = [&b"_H"[..], b"_H_", b"_H__", b"_HPP", b"_HPP_", b"_INCLUDED", b"_INCLUDED_"].iter().any(|x| name.ends_with(x));
+            let fits = if outer.is_empty() { text.is_empty() || text == b"1" } else { text.is_empty() && names_header };
+            if last.ifndef.as_deref() == Some(&s[a..e]) && !function_like && fits && outer.iter().all(|c| c.include_guard) {
+                last.include_guard = true;
                 guard = true;
             }
         }
@@ -1961,6 +1970,12 @@ fn transparent_deps(s: &[u8], start: usize, end: usize, refs: &[Tok]) -> Option<
         c.skip_space(true);
         if c.i >= end {
             return Some(deps);
+        }
+        if c.peek(0) == b'[' && c.peek(1) == b'[' {
+            // `[[nodiscard]]`: a standard attribute.
+            let Some(close) = s[c.i..end].windows(2).position(|w| w == b"]]") else { return None };
+            c.i += close + 2;
+            continue;
         }
         if !is_ident_start(c.s[c.i]) {
             return None;
@@ -2351,5 +2366,37 @@ struct s { int a; };
         let l = lex(src.as_bytes(), &MacroSets::default());
         let got: Vec<&str> = l.includes.iter().map(|&(a, e, _)| &src[a as usize..e as usize]).collect();
         assert_eq!(got, ["a/b.h", "c.h"]);
+    }
+
+    #[test]
+    fn a_guard_within_guards_is_one_and_a_default_is_not() {
+        // gmock's header, made of many with their own guards.
+        let src = "#ifndef GMOCK_H_
+#define GMOCK_H_
+#ifndef GMOCK_PORT_H_
+#define GMOCK_PORT_H_
+#include \"gtest.h\"
+#endif
+                   #ifndef MODE_T
+#define MODE_T
+#include \"mode.h\"
+#endif
+#endif
+";
+        let l = lex(src.as_bytes(), &MacroSets::default());
+        let got: Vec<(&str, bool)> = l.includes.iter().map(|&(a, e, c)| (&src[a as usize..e as usize], c)).collect();
+        assert_eq!(got, [("gtest.h", false), ("mode.h", true)]);
+    }
+
+    #[test]
+    fn constexpr_and_standard_attribute_macros_are_transparent() {
+        let t = transparent("#define FMT_CONSTEXPR constexpr
+#define FMT_CONSTEXPR
+#define NODISCARD [[nodiscard]]
+#define BOTH [[nodiscard]] inline
+");
+        for name in ["FMT_CONSTEXPR", "NODISCARD", "BOTH"] {
+            assert!(t.contains(name.as_bytes()), "{name}");
+        }
     }
 }
