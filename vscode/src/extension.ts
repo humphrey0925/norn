@@ -56,7 +56,7 @@ const ICONS: Record<string, string> = {
   function: "symbol-function", macro: "symbol-constant", struct: "symbol-struct", union: "symbol-struct",
   enum: "symbol-enum", enum_const: "symbol-enum-member", typedef: "symbol-class", global: "symbol-variable",
   field: "symbol-field", file: "symbol-file", local: "symbol-variable", parameter: "symbol-parameter",
-  class: "symbol-class", namespace: "symbol-namespace",
+  class: "symbol-class", namespace: "symbol-namespace", prototype: "symbol-interface", declaration: "symbol-reference",
 };
 /** C and C++ sources and headers, as the server reads them. */
 const SOURCE = /\.(c|h|cc|cpp|cxx|c\+\+|hh|hpp|hxx|h\+\+|inl|ipp|tcc)$/i;
@@ -65,8 +65,14 @@ const SOURCE_GLOB = "**/*.{c,h,cc,cpp,cxx,c++,hh,hpp,hxx,h++,inl,ipp,tcc}";
 const KIND_NAMES: Record<string, string> = {
   function: "function", macro: "macro", struct: "struct", union: "union", enum: "enum", enum_const: "enumerator",
   typedef: "typedef", global: "variable", field: "member", local: "local variable", parameter: "parameter",
-  class: "class", namespace: "namespace",
+  class: "class", namespace: "namespace", prototype: "prototype", declaration: "declaration",
 };
+
+/** What a listing calls a symbol: a function only declared is a prototype,
+ *  anything else only declared (`extern int x;`) a declaration. */
+function listedKind(e: { kind: string; declaration?: boolean }): string {
+  return e.declaration ? (e.kind === "function" ? "prototype" : "declaration") : e.kind;
+}
 
 function isSource(doc: vscode.TextDocument): boolean {
   return doc.uri.scheme === "file" && SOURCE.test(doc.fileName);
@@ -951,6 +957,10 @@ const STYLE = `
   .k-function { color: var(--vscode-symbolIcon-functionForeground, var(--vscode-charts-purple)); }
   .k-macro { color: var(--vscode-symbolIcon-constantForeground, var(--vscode-charts-orange)); }
   .k-field { color: var(--vscode-symbolIcon-fieldForeground, var(--vscode-charts-blue)); }
+  .k-prototype, .k-declaration { opacity: 0.75; }
+  .tag { flex: none; padding: 0 4px; border-radius: 3px; font-size: 0.8em; line-height: 14px; color: var(--vscode-badge-foreground); background: var(--vscode-badge-background); opacity: 0.8; }
+  .k-prototype { color: var(--vscode-symbolIcon-interfaceForeground, var(--vscode-charts-purple)); }
+  .k-declaration { color: var(--vscode-symbolIcon-referenceForeground, var(--vscode-charts-blue)); }
   .k-global { color: var(--vscode-symbolIcon-variableForeground, var(--vscode-charts-blue)); }
   .k-struct, .k-union, .k-enum, .k-typedef { color: var(--vscode-symbolIcon-structForeground, var(--vscode-charts-yellow)); }
   .k-enum_const { color: var(--vscode-symbolIcon-enumeratorMemberForeground, var(--vscode-charts-blue)); }
@@ -991,7 +1001,7 @@ class Search implements vscode.WebviewViewProvider {
     view.webview.html = page(
       view.webview,
       `<div class="wrap"><input id="q" placeholder="Fragments or initials: init cache, bci" spellcheck="false">
-       <div id="bar"><span id="count"></span><span id="order" role="group" aria-label="Sort"><button data-order="name" title="Sort by name">Name</button><button data-order="kind" title="Functions together, then macros, types, variables and members; each by name">Kind</button></span></div></div>
+       <div id="bar"><span id="count"></span><span id="order" role="group" aria-label="Sort"><button data-order="name" title="Sort by name">Name</button><button data-order="kind" title="Functions together, then prototypes, macros, types, variables, declarations and members; each by name">Kind</button></span></div></div>
        <div id="scroll"><div id="space"></div><div id="list"></div></div>`,
       `
       const q = document.getElementById("q"), list = document.getElementById("list"), space = document.getElementById("space");
@@ -1002,7 +1012,7 @@ class Search implements vscode.WebviewViewProvider {
       // typed: the matches, best first.
       let timer, query = "", results = [], total = 0, pages = new Map(), asked = new Set(), epoch = 0;
       let order = (vscode.getState() || {}).order || "name";
-      const RANK = { function: 0, macro: 1, class: 2, struct: 2, union: 3, enum: 4, enum_const: 5, typedef: 6, namespace: 7, global: 7, field: 8 };
+      const RANK = { function: 0, prototype: 1, macro: 2, class: 3, struct: 3, union: 4, enum: 5, enum_const: 6, typedef: 7, namespace: 8, global: 8, declaration: 9, field: 10 };
       // Matches come best first; by kind, the best of each kind first.
       const arranged = (found) => (order === "kind" ? found.map((r, i) => [r, i]).sort((a, b) => RANK[a[0].kind] - RANK[b[0].kind] || a[1] - b[1]).map((x) => x[0]) : found);
       let found = [];
@@ -1025,7 +1035,7 @@ class Search implements vscode.WebviewViewProvider {
       const item = (i) => (query ? results[i] : pages.get(Math.floor(i / PAGE))?.[i % PAGE]);
       function row(r, i, w) {
         if (!r) return '<div class="row" style="top:' + i * ROW + 'px"><span class="dim">…</span></div>';
-        return '<div class="row" tabindex="0" data-i="' + i + '" style="top:' + i * ROW + 'px" title="' + esc(r.kindName + " " + r.name + "\\n" + r.file + ":" + r.line) + '"><span class="codicon codicon-' + r.icon + " k-" + r.kind + '"></span><span class="name">' + mark(r.name, w) + '</span><span class="dim">' + esc(r.file.split("/").pop()) + ":" + r.line + "</span></div>";
+        return '<div class="row" tabindex="0" data-i="' + i + '" style="top:' + i * ROW + 'px" title="' + esc(r.kindName + " " + r.name + "\\n" + r.file + ":" + r.line) + '"><span class="codicon codicon-' + r.icon + " k-" + r.kind + '"></span><span class="name">' + mark(r.name, w) + '</span>' + (r.declaration ? '<span class="tag">' + esc(r.kindName) + '</span>' : '') + '<span class="dim">' + esc(r.file.split("/").pop()) + ":" + r.line + "</span></div>";
       }
       function render() {
         const n = query ? results.length : total;
@@ -1087,7 +1097,10 @@ class Search implements vscode.WebviewViewProvider {
       reset();
       q.focus();`,
     );
-    const decorate = <T extends { kind: string }>(e: T) => ({ ...e, kindName: KIND_NAMES[e.kind] ?? e.kind, icon: ICONS[e.kind] ?? "symbol-misc" });
+    const decorate = <T extends { kind: string; declaration?: boolean }>(e: T) => {
+      const kind = listedKind(e);
+      return { ...e, kind, kindName: KIND_NAMES[kind] ?? kind, icon: ICONS[kind] ?? "symbol-misc" };
+    };
     view.webview.onDidReceiveMessage(async (m: { query?: string; page?: number; size?: number; epoch?: number; order?: string; open?: { file: string; line: number; name: string }; beside?: boolean }) => {
       if (m.open) {
         // A listing carries no columns: ask where the name is written.
@@ -1097,7 +1110,7 @@ class Search implements vscode.WebviewViewProvider {
         }
       } else if (m.page !== undefined) {
         const size = m.size ?? 200;
-        const r = await ask<{ total: number; items: { name: string; kind: string; file: string; line: number }[] }>("si/symbols", { offset: m.page * size, limit: size, order: m.order ?? "name" });
+        const r = await ask<{ total: number; items: { name: string; kind: string; declaration?: boolean; file: string; line: number }[] }>("si/symbols", { offset: m.page * size, limit: size, order: m.order ?? "name" });
         void view.webview.postMessage({ type: "page", page: m.page, epoch: m.epoch, total: r?.total ?? 0, items: (r?.items ?? []).map(decorate) });
       } else if (m.query !== undefined) {
         const found = (await ask<Entry[]>("si/search", { query: m.query, limit: 200 })) ?? [];

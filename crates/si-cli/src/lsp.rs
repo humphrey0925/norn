@@ -708,30 +708,32 @@ impl Server {
     /// (`offset`, `limit`), with how many there are. Prototypes are left to
     /// their definitions; a list this long is fetched as it is scrolled.
     fn symbols(&mut self, params: &Value) -> Value {
-        // `order`: "name", or "kind" (functions together, then macros, and
-        // so on, each kind by name).
+        // `order`: "name", or "kind" (functions together, then their
+        // prototypes, macros, and so on, each kind by name).
         let by_kind = params["order"].as_str() == Some("kind");
         if self.listing[by_kind as usize].is_none() {
             let g = self.g();
             let mut all: Vec<u32> = (0..g.syms.len() as u32)
-                .filter(|&s| g.syms[s as usize].kind != kind::FILE && g.syms[s as usize].flags & flag::DECL == 0)
+                .filter(|&s| g.syms[s as usize].kind != kind::FILE)
                 .collect();
-            let rank = |k: u8| match k {
-                kind::FUNCTION => 0,
-                kind::MACRO => 1,
-                kind::STRUCT => 2,
-                kind::UNION => 3,
-                kind::ENUM => 4,
-                kind::ENUM_CONST => 5,
-                kind::TYPEDEF => 6,
-                kind::GLOBAL => 7,
-                _ => 8,
+            let rank = |k: u8, flags: u8| match (k, flags & flag::DECL != 0) {
+                (kind::FUNCTION, false) => 0,
+                (kind::FUNCTION, true) => 1,
+                (kind::MACRO, _) => 2,
+                (kind::STRUCT, _) => 3,
+                (kind::UNION, _) => 4,
+                (kind::ENUM, _) => 5,
+                (kind::ENUM_CONST, _) => 6,
+                (kind::TYPEDEF, _) => 7,
+                (kind::GLOBAL, false) => 8,
+                (kind::GLOBAL, true) => 9,
+                _ => 10,
             };
             // Without regard to case, as a person looks a name up; then by
             // the name itself and by place, so the order is always the same.
             all.sort_by_cached_key(|&s| {
                 let sym = &g.syms[s as usize];
-                (if by_kind { rank(sym.kind) } else { 0 }, g.sym_name(s).to_ascii_lowercase(), g.sym_name(s).to_string(), sym.file, sym.line)
+                (if by_kind { rank(sym.kind, sym.flags) } else { 0 }, g.sym_name(s).to_ascii_lowercase(), g.sym_name(s).to_string(), sym.flags & flag::DECL, sym.file, sym.line)
             });
             self.listing[by_kind as usize] = Some(all);
         }
@@ -744,7 +746,7 @@ impl Server {
             .iter()
             .map(|&s| {
                 let sym = &g.syms[s as usize];
-                json!({ "name": q.name(g, s), "kind": kind::name(sym.kind), "file": g.file_path(sym.file), "line": sym.line })
+                json!({ "name": q.name(g, s), "kind": kind::name(sym.kind), "declaration": sym.flags & flag::DECL != 0, "file": g.file_path(sym.file), "line": sym.line })
             })
             .collect();
         json!({ "total": all.len(), "offset": offset, "items": items })

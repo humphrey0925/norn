@@ -103,8 +103,8 @@ pub fn score(name: &str, words: &[Vec<u8>]) -> Option<i32> {
     Some(total - (name.len() / 4) as i32)
 }
 
-/// The symbols whose names match `query`, best first: definitions, each
-/// with its score.
+/// The symbols whose names match `query`, best first, each with its
+/// score: of one name, definitions before prototypes and declarations.
 pub fn search(g: &Graph, query: &str, limit: usize) -> Vec<(i32, u32)> {
     let words: Vec<Vec<u8>> = query.split_whitespace().map(|w| w.to_ascii_lowercase().into_bytes()).collect();
     if words.is_empty() {
@@ -118,10 +118,9 @@ pub fn search(g: &Graph, query: &str, limit: usize) -> Vec<(i32, u32)> {
     for (s, n) in names {
         let syms = g.syms_named(n);
         let wanted = |&&x: &&u32| g.syms[x as usize].kind != kind::FILE;
-        let defined = |x: &&u32| g.syms[**x as usize].flags & flag::DECL == 0;
-        // A prototype only stands in when there is no definition.
-        let any_def = syms.iter().filter(wanted).any(|x| defined(&x));
-        out.extend(syms.iter().filter(wanted).filter(|x| !any_def || defined(x)).map(|&x| (s, x)));
+        let declared = |x: &&u32| g.syms[**x as usize].flags & flag::DECL != 0;
+        out.extend(syms.iter().filter(wanted).filter(|x| !declared(x)).map(|&x| (s, x)));
+        out.extend(syms.iter().filter(wanted).filter(declared).map(|&x| (s, x)));
         if out.len() >= limit {
             out.truncate(limit);
             break;
