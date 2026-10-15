@@ -138,14 +138,16 @@ impl Ids {
     }
 }
 
-/// Is the file C++? By its name, and a header by what it says: C has no
-/// `namespace`, `template <`, `class X {`, access labels, `std::` or
-/// `extern "C++"`. (Not `::`: a C file's `asm` has it.)
+/// Is the file C++? By its name, and a header (or a file for including,
+/// `.inl`, which may be C) by what it says: C has no `namespace`,
+/// `template <`, `class X {`, access labels, `std::` or `extern "C++"`.
+/// (Not `::`: a C file's `asm` has it.) What a C header has for C++ only,
+/// under `#ifdef __cplusplus`, does not count.
 pub fn is_cpp(path: &str, src: &[u8]) -> bool {
     let ext = path.rsplit_once('.').map_or("", |(_, e)| e);
     match ext {
-        "cc" | "cpp" | "cxx" | "c++" | "C" | "hh" | "hpp" | "hxx" | "h++" | "ipp" | "inl" | "tcc" | "ixx" | "cppm" => true,
-        "h" | "H" => looks_cpp(src),
+        "cc" | "cpp" | "cxx" | "c++" | "C" | "hh" | "hpp" | "hxx" | "h++" | "ixx" | "cppm" => true,
+        "h" | "H" | "inl" | "ipp" | "tcc" => looks_cpp(src),
         _ => false,
     }
 }
@@ -155,6 +157,15 @@ fn looks_cpp(src: &[u8]) -> bool {
     let mut i = 0;
     let n = src.len();
     let mut line_start = true;
+    // Inside `#ifdef __cplusplus`: how many `#if`s deep.
+    let mut for_cpp = 0u32;
+    let skip_comment = |i: &mut usize| {
+        *i += 2;
+        while *i + 1 < n && !(src[*i] == b'*' && src[*i + 1] == b'/') {
+            *i += 1;
+        }
+        *i += 2;
+    };
     while i < n {
         let b = src[i];
         if b == b'\n' {
@@ -173,21 +184,51 @@ fn looks_cpp(src: &[u8]) -> bool {
             continue;
         }
         if b == b'/' && i + 1 < n && src[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < n && !(src[i] == b'*' && src[i + 1] == b'/') {
-                i += 1;
-            }
-            i += 2;
+            skip_comment(&mut i);
             continue;
         }
         if b == b'#' && line_start {
-            // A directive (and its continuation lines) says nothing.
-            while i < n && !(src[i] == b'\n' && src[i - 1] != b'\\') {
-                i += 1;
+            // A directive, its continuation lines and comments (which may
+            // go on past its end) included.
+            i += 1;
+            let mut text = Vec::new();
+            while i < n && src[i] != b'\n' {
+                if src[i] == b'\\' && src.get(i + 1) == Some(&b'\n') {
+                    i += 2;
+                } else if src[i] == b'/' && src.get(i + 1) == Some(&b'*') {
+                    skip_comment(&mut i);
+                    text.push(b' ');
+                } else if src[i] == b'/' && src.get(i + 1) == Some(&b'/') {
+                    while i < n && src[i] != b'\n' {
+                        i += 1;
+                    }
+                } else {
+                    text.push(src[i]);
+                    i += 1;
+                }
+            }
+            let text = text.trim_ascii();
+            let word_end = text.iter().position(|c| !c.is_ascii_alphabetic()).unwrap_or(text.len());
+            let (word, rest) = text.split_at(word_end);
+            let mentions = |s: &[u8]| s.windows(11).any(|w| w == b"__cplusplus");
+            if for_cpp > 0 {
+                match word {
+                    b"if" | b"ifdef" | b"ifndef" => for_cpp += 1,
+                    b"endif" => for_cpp -= 1,
+                    b"else" | b"elif" if for_cpp == 1 => for_cpp = 0,
+                    _ => {}
+                }
+            } else if (word == b"ifdef" || word == b"if" || word == b"elif") && mentions(rest) && !rest.contains(&b'!') {
+                for_cpp = 1;
             }
             continue;
         }
+        let first_on_line = line_start;
         line_start = false;
+        if for_cpp > 0 {
+            i += 1;
+            continue;
+        }
         if b == b'"' || b == b'\'' {
             let q = b;
             let start = i;
@@ -211,9 +252,11 @@ fn looks_cpp(src: &[u8]) -> bool {
                 i += 1;
             }
             let w = &src[start..i];
-            if (w == b"public" || w == b"private" || w == b"protected") && src[i..].iter().find(|c| !c.is_ascii_whitespace()) == Some(&b':') {
+            // An access label stands first on its line (`unsigned public: 1;`
+            // is a C bit field).
+            if first_on_line && (w == b"public" || w == b"private" || w == b"protected") {
                 let colon = i + src[i..].iter().position(|c| !c.is_ascii_whitespace()).unwrap_or(0);
-                if src.get(colon + 1) != Some(&b':') {
+                if src.get(colon) == Some(&b':') && src.get(colon + 1) != Some(&b':') {
                     return true;
                 }
             }
@@ -1770,4 +1813,59 @@ pub(crate) fn undecided_lines(src: &[u8], undecided: &[(u32, u32, u32)]) -> Vec<
 /// Where the parser sees the name of the definition a macro use makes.
 fn site_def_at(s: &mask::SiteTok) -> usize {
     if s.def_at != 0 { s.def_at as usize } else { s.name.start as usize }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_cpp;
+
+    #[test]
+    fn a_source_is_cpp_by_its_name() {
+        assert!(is_cpp("a.cc", b"int x;"));
+        assert!(is_cpp("a.cpp", b""));
+        assert!(is_cpp("a.hpp", b""));
+        assert!(!is_cpp("a.c", b"namespace x {"));
+    }
+
+    #[test]
+    fn a_header_is_cpp_by_what_it_says() {
+        assert!(is_cpp("a.h", b"namespace leveldb {\nclass DB;\n}"));
+        assert!(is_cpp("a.h", b"template <typename T> T max(T a, T b);"));
+        assert!(is_cpp("a.h", b"class Writer : public Base {\n public:\n  void f();\n};"));
+        assert!(is_cpp("a.h", b"bool parse(const std::string& s);"));
+        assert!(is_cpp("a.h", b"extern \"C++\" { int f(); }"));
+        assert!(!is_cpp("a.h", b"struct point { int x, y; };\nint f(struct point *p);"));
+    }
+
+    #[test]
+    fn what_a_c_header_says_only_for_cpp_does_not_make_it_cpp() {
+        // nedmalloc.h: a namespace for C++ users.
+        assert!(!is_cpp("a.h", b"#ifdef __cplusplus\nnamespace nedalloc {\n#endif\nvoid *nedmalloc(size_t);\n#ifdef __cplusplus\n}\n#endif\n"));
+        assert!(!is_cpp("a.h", b"#if defined(__cplusplus)\nextern \"C\" {\nnamespace x {}\n#endif\nint f(void);\n"));
+        // ... but the other branch counts.
+        assert!(is_cpp("a.h", b"#ifndef __cplusplus\nint f(void);\n#else\n#endif\nnamespace y {}\n"));
+    }
+
+    #[test]
+    fn c_words_that_are_cpp_keywords_are_not_cpp() {
+        // The kernel's driver model, and a bit field called `public`.
+        assert!(!is_cpp("a.h", b"struct class {\n\tconst char *name;\n};\nextern struct class *class_create(const char *name);\n"));
+        assert!(!is_cpp("a.h", b"struct sym {\n  unsigned int public:      1;\n  unsigned int new: 1;\n};\n"));
+        // An `asm` with `::` in it.
+        assert!(!is_cpp("a.h", b"static inline void barrier(void) { asm volatile(\"\" ::: \"memory\"); }\n"));
+    }
+
+    #[test]
+    fn code_in_a_comment_does_not_count() {
+        // A comment opened on a directive's line goes on past it (hp-symtab.h).
+        assert!(!is_cpp("a.h", b"#define X 1 /* for example:\n    class c {\n      template <class T> class q;\n */\nint f(void);\n"));
+        assert!(!is_cpp("a.h", b"/* namespace n { */\n// class c { };\nint g;\n"));
+    }
+
+    #[test]
+    fn a_file_for_including_is_judged_by_what_it_says() {
+        // arch/arm/nwfpe/fpa11.inl is C.
+        assert!(!is_cpp("fpa11.inl", b"static inline unsigned int readFPSR(void) { return 0; }\n"));
+        assert!(is_cpp("impl.inl", b"template <class T> void List<T>::push(T x) {}\n"));
+    }
 }
