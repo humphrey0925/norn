@@ -449,6 +449,15 @@ impl Types<'_> {
         (def != NONE).then(|| g.files[rf as usize].sym_start + def)
     }
 
+    /// C++: the type of member `member` of the class `type_name` (or of a
+    /// class it derives from), by its own name.
+    fn member_type(&self, type_name: u32, member: u32, fi: usize, closure: &Closure) -> Option<u32> {
+        let (rf, ri) = record_of(type_name, fi as u32, closure, self.records, self.aliases)?;
+        let (mf, mi, at) = self.find(rf, ri, member, closure, 8)?;
+        let t = self.files[mf as usize].records[mi as usize].types[at];
+        (t != NONE).then(|| self.remap[mf as usize][t as usize])
+    }
+
     /// Member `wanted` of a struct or class, or (C++) of a class it
     /// derives from: (file, record, position).
     fn find(&self, rf: u32, ri: u32, wanted: u32, closure: &Closure, depth: u32) -> Option<(u32, u32, usize)> {
@@ -845,7 +854,54 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 }
             }
             let (mut pick, mut lineage, mut overrides, mut descendants) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let constructs: FxHashSet<u32> = f.cxx().constructs.iter().copied().collect();
             for (ri, r) in f.refs.iter().enumerate() {
+                // (`T (a)`, `fmt::string_view (p, n)`: a type called, of
+                // which no function but its constructors has the name, is
+                // one made.)
+                let type_called = in_cpp
+                    && r.kind == refkind::CALL
+                    && cpp.types.contains(&remap[fi][r.name as usize])
+                    && !g.syms_named(remap[fi][r.name as usize]).iter().any(|&c| syms[c as usize].kind == kind::FUNCTION && cpp.class(c) != syms[c as usize].name);
+                if in_cpp && (type_called || constructs.contains(&(ri as u32))) {
+                    // An object made: a constructor of the class named, or
+                    // of the type of the member of the class so named
+                    // (`: member_ (a)`), or of what a type's alias names.
+                    let name = remap[fi][r.name as usize];
+                    let mut class = if cpp.types.contains(&name) {
+                        name
+                    } else if hint_of[ri] != NONE {
+                        let h = &f.hints[hint_of[ri] as usize];
+                        types.member_type(remap[fi][h.root as usize], name, fi, closure).unwrap_or(NONE)
+                    } else {
+                        NONE
+                    };
+                    let ctor_of = |c: u32, class: u32| syms[c as usize].kind == kind::FUNCTION && cpp.class(c) == class;
+                    let has_ctor = |class: u32| g.syms_named(class).iter().any(|&c| ctor_of(c, class));
+                    if class != NONE && !has_ctor(class) {
+                        if let Some(tag) = aliases.get(&class).into_iter().flatten().copied().find(|&t| has_ctor(t)) {
+                            class = tag;
+                        }
+                    }
+                    tmp.clear();
+                    if class != NONE {
+                        tmp.extend(g.syms_named(class).iter().copied().filter(|&c| ctor_of(c, class)));
+                    }
+                    let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
+                    if tmp.iter().any(is_def) {
+                        tmp.retain(is_def);
+                    }
+                    if tmp.is_empty() {
+                        counts[2] += 1;
+                        continue;
+                    }
+                    let first = syms[tmp[0] as usize].file;
+                    let ambiguous = tmp.iter().any(|&c| syms[c as usize].file != first);
+                    counts[ambiguous as usize] += 1;
+                    let meta = pack_meta(r.line, ambiguous, refkind::CALL);
+                    edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta]));
+                    continue;
+                }
                 let (kind, maybe) = (r.kind & !refkind::MAYBE, r.kind & refkind::MAYBE != 0);
                 let cands = g.syms_named(remap[fi][r.name as usize]);
                 // A member name can only mean a member, and nothing else can.
@@ -1745,6 +1801,59 @@ int e(const std::vector<Peer>& peers) { int n = 0; for (const auto& p : peers) n
             assert_eq!(certain(f), ["Tx::Hash"], "{f}");
         }
         assert_eq!(certain("e"), ["Peer::Hash"]);
+    }
+
+    #[test]
+    fn an_object_made_is_a_call_of_a_constructor_of_its_class() {
+        let g = graph(&[
+            ("c.h", "class Bar {
+ public:
+  Bar(int x) {}
+};
+class Base {
+ public:
+  Base(int x) {}
+};
+class Foo : public Base {
+ public:
+  Foo(int x);
+ private:
+  Bar m_bar;
+};
+using Alias = Bar;
+struct Plain { int x; };
+#define HOLD(v) Bar held_##v(v)
+"),
+            ("c.cc", "#include \"c.h\"
+Foo::Foo(int x) : Base(x), m_bar(x) {}
+void a() { Foo f(1); }
+void b() { Foo* p = new Foo(2); }
+void c() { Alias(3); }
+void d() { Plain p; Foo* q; Foo& r = *q; }
+void e() { HOLD(4); }
+"),
+        ]);
+        let q = crate::graph::Qualifier::new(&g);
+        let made = |caller: &str| -> Vec<String> {
+            let mut v: Vec<String> = g.find(caller).iter().flat_map(|&s| g.refs_from(s)).filter(|e| e.kind() == refkind::CALL).map(|e| q.name(&g, e.other).into_owned()).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        assert_eq!(made("a"), ["Foo::Foo"]);
+        assert_eq!(made("b"), ["Foo::Foo"]);
+        assert_eq!(made("c"), ["Bar::Bar"]);
+        // A struct with no constructor, a pointer and a reference make none.
+        assert!(made("d").is_empty(), "{:?}", made("d"));
+        // The constructor's initializers: its base, and its member's type.
+        let init: Vec<String> = g.find("Foo").iter().filter(|&&s| g.syms[s as usize].kind == kind::FUNCTION && g.syms[s as usize].flags & flag::DECL == 0)
+            .flat_map(|&s| g.refs_from(s)).filter(|e| e.kind() == refkind::CALL).map(|e| q.name(&g, e.other).into_owned()).collect();
+        let mut init = init;
+        init.sort();
+        assert_eq!(init, ["Bar::Bar", "Base::Base"]);
+        // A macro whose text declares an object of the class.
+        let held: Vec<String> = g.find("HOLD").iter().flat_map(|&m| g.refs_from(m)).filter(|e| e.kind() == refkind::CALL).map(|e| q.name(&g, e.other).into_owned()).collect();
+        assert_eq!(held, ["Bar::Bar"]);
     }
 
     #[test]

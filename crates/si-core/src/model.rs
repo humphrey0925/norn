@@ -310,6 +310,10 @@ pub struct Cxx {
     /// (record, member, its elements' type) of members that are containers
     /// (`std::vector<T> v`: `T`; of a map, its values').
     pub elems: Vec<(u32, u32, u32)>,
+    /// The references that make an object (`T x (a)`, `new T`, `: Base (a)`,
+    /// `: member_ (a)`): calls of a constructor of the class named, or of
+    /// the member's type.
+    pub constructs: Vec<u32>,
 }
 
 static NO_CXX: Cxx = Cxx {
@@ -320,6 +324,7 @@ static NO_CXX: Cxx = Cxx {
     namespace_aliases: Vec::new(),
     nested: Vec::new(),
     elems: Vec::new(),
+    constructs: Vec::new(),
 };
 
 /// A parameter or a local variable.
@@ -513,6 +518,7 @@ impl FileFacts {
             exact(&mut c.namespace_aliases);
             exact(&mut c.nested);
             exact(&mut c.elems);
+            exact(&mut c.constructs);
         }
         exact(&mut self.param_calls);
         exact(&mut self.arg_passes);

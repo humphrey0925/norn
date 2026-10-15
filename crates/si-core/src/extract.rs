@@ -999,6 +999,40 @@ impl<'a> Walk<'a> {
         Some((kind, root, path))
     }
 
+    /// C++: the class an object of type `t` is made of, for its constructor:
+    /// its name, through scopes, not into a template's arguments (a
+    /// `std::unique_ptr<T>` is no `T`), or `NONE`.
+    fn constructed_class(&mut self, t: Node<'a>) -> u32 {
+        let ids = self.ids;
+        let mut t = t;
+        for _ in 0..4 {
+            let k = t.kind_id();
+            if k == ids.qualified_identifier {
+                t = self.qualified_parts(t).1;
+            } else if k == ids.template_type {
+                match t.child_by_field_id(ids.f_name) {
+                    Some(n) => t = n,
+                    None => return NONE,
+                }
+            } else {
+                break;
+            }
+        }
+        if t.kind_id() == ids.type_identifier { self.intern(self.text(t)) } else { NONE }
+    }
+
+    /// C++: a call of a constructor of `class` (or of the type of the member
+    /// so named, with `hint` saying whose) made at `at`.
+    fn push_construction(&mut self, class: u32, at: Node<'a>, hint: u32) {
+        let scope = self.scope.map_or(0, |s| s.def);
+        self.out.refs.push(Ref { name: class, line: at.start_position().row as u32 + 1, scope, kind: refkind::CALL });
+        let r = self.out.refs.len() as u32 - 1;
+        if hint != NONE {
+            self.out.ref_hints.push((r, hint));
+        }
+        self.out.cxx_mut().constructs.push(r);
+    }
+
     /// C++: the type of the elements of a container type (`std::vector<T>`:
     /// `T`; a map's: its values'), or `NONE`.
     fn element_type(&mut self, t: Node<'a>) -> u32 {
@@ -1128,6 +1162,14 @@ impl<'a> Walk<'a> {
                                 let (q, at) = (self.intern(q), self.out.refs.len() as u32 - 1);
                                 self.out.cxx_mut().ref_quals.push((at, q));
                             }
+                            // `UniqueLock<T> name (...)` in the body (bitcoin's
+                            // `LOCK`): an object of that class made, if it is one.
+                            if self.declares_object_after(t.end as usize) {
+                                let name = self.intern(self.tok_text(t));
+                                self.out.refs.push(Ref { name, line: t.line, scope, kind: refkind::CALL });
+                                let r = self.out.refs.len() as u32 - 1;
+                                self.out.cxx_mut().constructs.push(r);
+                            }
                         }
                     }
                     if m.keep {
@@ -1168,6 +1210,52 @@ impl<'a> Walk<'a> {
                 }
             }
         }
+    }
+
+    /// C++: does the text at `pos`, after a name, declare an object of it:
+    /// template arguments maybe, a name, then `(`, `{` or `;`?
+    fn declares_object_after(&self, pos: usize) -> bool {
+        let s = self.orig;
+        let skip = |mut i: usize| {
+            while i < s.len() && (s[i].is_ascii_whitespace() || (s[i] == b'\\' && s.get(i + 1).is_some_and(|b| *b == b'\n' || *b == b'\r'))) {
+                i += 1;
+            }
+            i
+        };
+        let mut i = skip(pos);
+        if s.get(i) == Some(&b'<') {
+            let mut depth = 0;
+            while i < s.len() {
+                match s[i] {
+                    b'<' => depth += 1,
+                    b'>' => depth -= 1,
+                    b';' | b'{' | b'}' => return false,
+                    _ => {}
+                }
+                i += 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            i = skip(i);
+        }
+        let start = i;
+        loop {
+            while i < s.len() && (s[i].is_ascii_alphanumeric() || s[i] == b'_') {
+                i += 1;
+            }
+            // (`held_##v`: a name pasted.)
+            let j = skip(i);
+            if s.get(j..j + 2) == Some(b"##") {
+                i = skip(j + 2);
+                continue;
+            }
+            break;
+        }
+        if i == start || s[start].is_ascii_digit() {
+            return false;
+        }
+        matches!(s.get(skip(i)), Some(b'(' | b'{' | b';'))
     }
 
     /// C++: the name before `::` before `pos` in the text (`B` of `A::B::f`,
@@ -1845,6 +1933,24 @@ impl<'a> Walk<'a> {
                             }
                         }
                         self.note_local(name, false);
+                        if self.cpp && !self.declares_function(d) {
+                            // `T x;`, `T x (a);`, `T x {a};` (not `T x = y;`,
+                            // a copy, nor a pointer or a reference) make a T.
+                            let (inner, value) = if d.kind_id() == ids.init_declarator {
+                                (d.child_by_field_id(ids.f_declarator.get()), d.child_by_field_id(ids.f_value))
+                            } else {
+                                (Some(d), None)
+                            };
+                            let object = inner.is_some_and(|i| i.kind_id() == ids.identifier || i.kind_id() == ids.array_declarator);
+                            let made = value.is_none_or(|v| matches!(v.kind(), "argument_list" | "initializer_list"));
+                            let class = match node.child_by_field_id(ids.f_type) {
+                                Some(t) if object && made => self.constructed_class(t),
+                                _ => NONE,
+                            };
+                            if class != NONE {
+                                self.push_construction(class, d, NONE);
+                            }
+                        }
                         if let Some(value) = d.child_by_field_id(ids.f_value).filter(|_| d.kind_id() == ids.init_declarator) {
                             self.local_source(self.text(name), value);
                         }
@@ -1917,6 +2023,29 @@ impl<'a> Walk<'a> {
                         }
                     }
                     self.note_local(name, true);
+                }
+            }
+            return true;
+        }
+        if self.cpp && self.in_fn() && matches!(node.kind(), "new_expression" | "compound_literal_expression") {
+            // `new T (a)`, `T {a}`: a T made.
+            if let Some(t) = node.child_by_field_id(ids.f_type) {
+                let class = self.constructed_class(t);
+                if class != NONE {
+                    self.push_construction(class, node, NONE);
+                }
+            }
+            return true;
+        }
+        if self.cpp && node.kind() == "field_initializer" {
+            // `: Base (a)`, `: member_ (a)`: a base, or a member of the
+            // class, made (which, the link tells).
+            if let Some(first) = node.named_child(0) {
+                let (_, name) = self.qualified_parts(first);
+                if matches!(name.kind(), "field_identifier" | "type_identifier" | "identifier") {
+                    let class = self.intern(self.text(name));
+                    let hint = if self.method_class != NONE { self.push_hint(root::TYPE, self.method_class, &[]) } else { NONE };
+                    self.push_construction(class, node, hint);
                 }
             }
             return true;

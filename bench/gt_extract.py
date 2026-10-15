@@ -400,6 +400,14 @@ def cpp_calls_in(fn, caller, out, icalls, binds, stats):
             callee = c.referenced
             if callee is not None and callee.kind in FUNCS:
                 callee = primary(callee)
+                # A member the compiler makes (`Plain p;` of a struct with no
+                # constructor written; a copy no one wrote) is in no source:
+                # no index has it. It sits where its class is.
+                parent = callee.semantic_parent
+                if parent is not None and parent.kind in RECORDS and callee.location == parent.location:
+                    stats["implicit"] += 1
+                    stack.extend(c.get_children())
+                    continue
                 loc = c.location
                 d = callee.get_definition()
                 home = rel(d.location.file.name) if d is not None and d.location.file else None
@@ -496,7 +504,7 @@ def one(entry):
     LIB.clang_disposeSourceRangeList(ranges)
     return {"file": entry["file"], "errors": errors[:3], "defs": list(defs), "calls": list(calls), "icalls": list(icalls),
             "binds": list(binds), "overrides": list(overrides), "read": list(read),
-            "skipped": skipped, "indirect": stats["indirect"], "dependent": list(stats["dependent"]), "cpp": cpp}
+            "skipped": skipped, "indirect": stats["indirect"], "dependent": list(stats["dependent"]), "implicit": stats["implicit"], "cpp": cpp}
 
 
 def main():
@@ -512,6 +520,7 @@ def main():
 
     defs, calls, icalls, binds, overrides, indirect, dependent, failed, with_errors = set(), set(), set(), set(), set(), 0, set(), [], []
     cpp_units = 0
+    implicit = 0
     tus = collections.Counter()
     skips = collections.defaultdict(collections.Counter)
     with multiprocessing.Pool() as pool:
@@ -528,6 +537,7 @@ def main():
             overrides.update(map(tuple, r["overrides"]))
             indirect += r["indirect"]
             dependent.update(map(tuple, r["dependent"]))
+            implicit += r["implicit"]
             cpp_units += r["cpp"]
             for f in r["read"]:
                 tus[f] += 1
@@ -552,7 +562,7 @@ def main():
     json.dump({"translation_units": len(entries), "failed": failed, "with_errors": with_errors, "indirect_calls": indirect,
                "defs": sorted(defs), "calls": sorted(calls, key=str), "icalls": sorted(icalls, key=str),
                "binds": sorted(binds, key=str), "files": files,
-               **({"cpp_translation_units": cpp_units, "overrides": sorted(overrides, key=str), "dependent_calls": sum(d[2] != "construct" for d in dependent),
+               **({"cpp_translation_units": cpp_units, "implicit_member_calls": implicit, "overrides": sorted(overrides, key=str), "dependent_calls": sum(d[2] != "construct" for d in dependent),
                       "dependent_by_head": collections.Counter(d[2] for d in dependent).most_common(),
                       # Where they are: what an indexer says is called there cannot be judged.
                       "dependent_sites": sorted({(d[0], d[1]) for d in dependent if d[0] and d[2] != "construct"})}
