@@ -109,11 +109,13 @@ class Truth:
         return i < 0 or line > info["inactive"][i][1]
 
 
-def score(truth_path, index, corpus, cbm=False, loaded=None, callers=None, short=False):
+def score(truth_path, index, corpus, cbm=False, loaded=None, callers=None, short=False, callees=None):
     """`loaded`: (files, defs, call rows, indirect rows) of some other tool, in
     the shape si_index returns; it is then scored as codebase-memory-mcp is (one
     kind of call edge, no stores). `callers`: score calls only from these
-    (file, function) pairs, for a tool whose calls were sampled."""
+    (file, function) pairs, for a tool whose calls were sampled; `callees`:
+    only to these (file, function) pairs, for one that answers "who calls
+    it" and not "what does it call" (Source Insight)."""
     t = Truth(truth_path, short)
     corpus = Path(corpus)
     # files, (file, name) -> lines, call rows
@@ -126,6 +128,8 @@ def score(truth_path, index, corpus, cbm=False, loaded=None, callers=None, short
         si_files, si_defs, call_rows, indirect_rows = cbm_index(index) if cbm else si_index(index, scored)
     if callers is not None:
         call_rows = [r for r in call_rows if (r[3], r[2]) in callers]
+    if callees is not None:
+        call_rows = [r for r in call_rows if (r[5], r[4]) in callees]
 
     # --- definitions -------------------------------------------------------
     text = {}
@@ -186,7 +190,7 @@ def score(truth_path, index, corpus, cbm=False, loaded=None, callers=None, short
             per_program.add((cf, cn, callee_name))
         elif not homes or not homes <= si_files:
             external += 1
-        else:
+        elif callees is None or (next(iter(homes)), callee_name) in callees:
             want_calls.add((cf, cn, *homes, callee_name))
     want_calls = {k for k in want_calls if (k[0], k[1], k[3]) not in per_program}
 
