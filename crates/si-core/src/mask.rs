@@ -494,11 +494,18 @@ impl MacroSets {
     /// A macro is transparent when every one of its definitions is, which is
     /// a fixed point because attribute macros are defined in terms of others.
     pub fn from_defines(defines: impl IntoIterator<Item = Define>) -> Self {
-        let mut by_name: FxHashMap<Vec<u8>, (bool, Vec<Option<Vec<Vec<u8>>>>)> = FxHashMap::default();
+        let defines: Vec<Define> = defines.into_iter().collect();
+        MacroSets::of_defines(&defines)
+    }
+
+    /// The same, of definitions kept elsewhere (none copied: the kernel's
+    /// are millions).
+    pub fn of_defines<'a>(defines: impl IntoIterator<Item = &'a Define>) -> Self {
+        let mut by_name: FxHashMap<&[u8], (bool, Vec<Option<&[Vec<u8>]>>)> = FxHashMap::default();
         // name -> (takes arguments, hides names, names its bodies refer to)
-        let mut bodies: FxHashMap<Vec<u8>, (bool, bool, Vec<Vec<u8>>)> = FxHashMap::default();
+        let mut bodies: FxHashMap<&[u8], (bool, bool, Vec<&[u8]>)> = FxHashMap::default();
         // (name, first word of the body) of each macro with arguments.
-        let mut loop_heads: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut loop_heads: Vec<(&[u8], &[u8])> = Vec::new();
         for d in defines {
             // `#define inline` and the like: the keyword still matters to us.
             if is_keyword(&d.name) || d.undef || d.include || d.test {
@@ -506,44 +513,61 @@ impl MacroSets {
             }
             // (One in a `.c` file is that file's.)
             if d.function_like && !d.local {
-                loop_heads.push((d.name.clone(), d.head.clone()));
+                loop_heads.push((&d.name, &d.head));
             }
-            let b = bodies.entry(d.name.clone()).or_default();
+            let b = bodies.entry(&d.name).or_default();
             b.0 |= d.function_like;
             b.1 |= d.hides;
-            b.2.extend(d.refs);
+            b.2.extend(d.refs.iter().map(|r| &r[..]));
             // (One in a `.c` file is that file's: see `Lexer::define`.)
             if d.local {
                 continue;
             }
-            let e = by_name.entry(d.name).or_default();
+            let e = by_name.entry(&d.name).or_default();
             e.0 |= d.function_like;
-            e.1.push(d.deps);
+            e.1.push(d.deps.as_deref());
         }
-        let mut set: FxHashMap<Vec<u8>, bool> = FxHashMap::default();
-        loop {
-            let mut added = Vec::new();
-            for (name, (function_like, bodies)) in &by_name {
-                let ok = |b: &Option<Vec<Vec<u8>>>| b.as_ref().is_some_and(|deps| deps.iter().all(|d| set.contains_key(d)));
-                if !set.contains_key(name) && bodies.iter().all(ok) {
-                    added.push((name.clone(), *function_like));
+        // Transparent: least fixed point over "every body is only
+        // transparent macros", each name counting down what it waits for.
+        let mut set: FxHashMap<&[u8], bool> = FxHashMap::default();
+        let mut waits: FxHashMap<&[u8], usize> = FxHashMap::default();
+        let mut waiting: FxHashMap<&[u8], Vec<&[u8]>> = FxHashMap::default();
+        let mut ready: Vec<&[u8]> = Vec::new();
+        for (&name, (_, bodies)) in &by_name {
+            if bodies.iter().any(Option::is_none) {
+                continue;
+            }
+            let mut count = 0;
+            for d in bodies.iter().flatten().flat_map(|deps| deps.iter()) {
+                waiting.entry(&d[..]).or_default().push(name);
+                count += 1;
+            }
+            if count == 0 {
+                ready.push(name);
+            }
+            waits.insert(name, count);
+        }
+        while let Some(name) = ready.pop() {
+            if set.insert(name, by_name[name].0).is_some() {
+                continue;
+            }
+            for &user in waiting.get(name).into_iter().flatten() {
+                let w = waits.get_mut(user).unwrap();
+                *w -= 1;
+                if *w == 0 {
+                    ready.push(user);
                 }
             }
-            if added.is_empty() {
-                break;
-            }
-            set.extend(added);
         }
         // Expanding: least fixed point over "uses an expanding macro".
         let mut users: FxHashMap<&[u8], Vec<&[u8]>> = FxHashMap::default();
-        for (name, (_, _, refs)) in &bodies {
-            for r in refs {
+        for (&name, (_, _, refs)) in &bodies {
+            for &r in refs {
                 users.entry(r).or_default().push(name);
             }
         }
         let mut expanding: FxHashMap<Vec<u8>, bool> = FxHashMap::default();
-        let mut work: Vec<&[u8]> =
-            bodies.iter().filter(|(n, b)| b.1 && !set.contains_key(*n)).map(|(n, _)| &n[..]).collect();
+        let mut work: Vec<&[u8]> = bodies.iter().filter(|(n, b)| b.1 && !set.contains_key(*n)).map(|(n, _)| *n).collect();
         while let Some(name) = work.pop() {
             if expanding.insert(name.to_vec(), bodies[name].0).is_none() {
                 work.extend(users.get(name).into_iter().flatten().filter(|u| !set.contains_key(**u)));
@@ -554,15 +578,16 @@ impl MacroSets {
         let mut work: Vec<&[u8]> = expanding.keys().map(|n| &n[..]).collect();
         while let Some(name) = work.pop() {
             if let Some((key, b)) = bodies.get_key_value(name) {
-                if kept.insert(key.clone()) {
-                    work.extend(b.2.iter().map(|r| &r[..]));
+                if kept.insert(key.to_vec()) {
+                    work.extend(b.2.iter().copied());
                 }
             }
         }
+        let set: FxHashMap<Vec<u8>, bool> = set.into_iter().map(|(n, f)| (n.to_vec(), f)).collect();
         // Loops: least fixed point over "begins with a loop".
         let mut heads: FxHashMap<&[u8], Vec<&[u8]>> = FxHashMap::default();
         for d in &loop_heads {
-            heads.entry(&d.0).or_default().push(&d.1);
+            heads.entry(d.0).or_default().push(d.1);
         }
         let mut loops: FxHashSet<Vec<u8>> = FxHashSet::default();
         loop {
@@ -585,12 +610,12 @@ impl MacroSets {
     /// `#define kfree(p) free(p)` (in `tools/`) is no attribute or
     /// expansion of the kernel's `kfree`.
     pub fn of_files(per_file: &[Vec<Define>], paths: &[String]) -> MacroSets {
-        let mut sets = MacroSets::from_defines(per_file.iter().flatten().cloned());
+        let mut sets = MacroSets::of_defines(per_file.iter().flatten());
         sets.scope(per_file, paths);
         sets
     }
 
-    fn scope(&mut self, per_file: &[Vec<Define>], paths: &[String]) {
+    pub(crate) fn scope(&mut self, per_file: &[Vec<Define>], paths: &[String]) {
         use rayon::prelude::*;
         let n = paths.len();
         // Who reads whom, as the link will find it: each file's `#include`s

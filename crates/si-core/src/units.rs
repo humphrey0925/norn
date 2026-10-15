@@ -122,7 +122,7 @@ fn join(dir: &str, rel: &str) -> String {
     parts.join("/")
 }
 
-fn names_in<'a>(text: &'a [u8], mut each: impl FnMut(&'a [u8])) {
+pub(crate) fn names_in<'a>(text: &'a [u8], mut each: impl FnMut(&'a [u8])) {
     let mut i = 0;
     while i < text.len() {
         if text[i].is_ascii_alphabetic() || text[i] == b'_' {
