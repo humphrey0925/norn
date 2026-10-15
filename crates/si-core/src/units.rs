@@ -46,10 +46,11 @@ const DEEPEST: u32 = 200;
 /// Ways one condition is kept worked out, at most, on each thread.
 const KEPT_WAYS: usize = 8;
 
-/// A condition worked out: the names it depends on, each with how it was
-/// (see [`state`]), and what it came to.
+/// A condition worked out: the names it depends on (of those some step
+/// defines or undefines: how the others are does not change), each with
+/// how it was (see [`defined_at`]), and what it came to.
 struct Kept {
-    names: Box<[(Box<[u8]>, u64)]>,
+    names: Box<[(u32, u64)]>,
     unseen: bool,
     holds: Tri,
 }
@@ -60,27 +61,27 @@ thread_local! {
     /// defined: their conditions come out the same, and working each out
     /// (its macros expanded, their values read, again and again) was most
     /// of the time.
-    static KEPT: std::cell::RefCell<FxHashMap<(u32, u32), Vec<Kept>>> = Default::default();
+    static KEPT: std::cell::RefCell<Vec<Vec<Kept>>> = Default::default();
 }
 
-/// How a name is in a compilation, as one number.
-fn state(local: &Local, name: &[u8]) -> u64 {
-    match local.get(name) {
-        None => 0,
-        Some(None) => 1,
-        Some(Some(None)) => 2,
-        Some(Some(Some(v))) => xxhash_rust::xxh3::xxh3_64(v) | 3 << 62,
-    }
+/// How a name is in a compilation, as one number: not mentioned (0), not
+/// known (1), undefined (2), or defined by the `#define` at this file and
+/// step (the same line in every compilation, so the same number).
+fn defined_at(file: u32, step: usize) -> u64 {
+    (file as u64 + 1) << 32 | step as u64
 }
 
 enum Step {
     /// `kind`: 0 an expression, 1 `defined`, 2 `!defined`.
-    If { at: u32, kind: u8, expr: Box<[u8]> },
-    Elif { at: u32, kind: u8, expr: Box<[u8]> },
+    /// `slot`: the condition's number among all the tree's expressions
+    /// (`kind` 0), where it is kept worked out.
+    If { at: u32, kind: u8, expr: Box<[u8]>, slot: u32 },
+    Elif { at: u32, kind: u8, expr: Box<[u8]>, slot: u32 },
     Else,
     Endif,
-    Define { name: Box<[u8]>, value: Box<[u8]> },
-    Undef { name: Box<[u8]> },
+    /// `id`: the name's number in [`World::ids`].
+    Define { id: u32, name: Box<[u8]>, value: Box<[u8]> },
+    Undef { id: u32, name: Box<[u8]> },
     Include { files: Box<[u32]> },
     /// An include, in quotes, of nothing in the tree.
     Unseen,
@@ -88,6 +89,10 @@ enum Step {
 
 struct World<'a> {
     steps: Vec<Vec<Step>>,
+    /// The names some step defines or undefines, numbered.
+    ids: FxHashMap<Box<[u8]>, u32>,
+    /// How many expressions there are (see `Step::If`).
+    slots: usize,
     /// Files read once in a compilation, however often they are included.
     once: Vec<bool>,
     plain: &'a Conditions,
@@ -149,6 +154,11 @@ struct Unit<'a> {
     /// Files being read, with how many times over (a file may include
     /// itself, having defined something to read itself differently).
     reading: FxHashMap<u32, u8>,
+    /// How each name of [`World::ids`] is, as [`defined_at`] says.
+    states: Vec<u64>,
+    /// For `SI_COND_PROFILE`: conditions found worked out, worked out
+    /// anew, and worked out with no room left to keep them.
+    kept: std::cell::Cell<[u64; 3]>,
     spent: u64,
     /// For `SI_COND_PROFILE`: conditions worked out and the ns they took,
     /// definitions kept and their ns, includes followed.
@@ -160,9 +170,9 @@ impl Unit<'_> {
         if self.unseen { self.w.plain } else { &self.w.told }
     }
 
-    fn holds(&self, file: u32, step: usize, kind: u8, expr: &[u8]) -> Tri {
+    fn holds(&self, slot: u32, kind: u8, expr: &[u8]) -> Tri {
         match kind {
-            0 => self.worked_out(file, step, expr),
+            0 => self.worked_out(slot, expr),
             1 => self.conditions().defined_in(&self.local, None, expr),
             _ => self.conditions().defined_in(&self.local, None, expr).not(),
         }
@@ -170,30 +180,43 @@ impl Unit<'_> {
 
     /// An `#if` expression, as worked out before where the names it
     /// depends on are as they were then.
-    fn worked_out(&self, file: u32, step: usize, expr: &[u8]) -> Tri {
-        let key = (file, step as u32);
+    fn worked_out(&self, slot: u32, expr: &[u8]) -> Tri {
         let found = KEPT.with(|k| {
-            k.borrow().get(&key).and_then(|ways| {
-                ways.iter().find(|w| w.unseen == self.unseen && w.names.iter().all(|(n, s)| state(&self.local, n) == *s)).map(|w| w.holds)
-            })
+            let mut k = k.borrow_mut();
+            if k.len() < self.w.slots {
+                k.resize_with(self.w.slots, Vec::new);
+            }
+            k[slot as usize].iter().find(|w| w.unseen == self.unseen && w.names.iter().all(|&(n, s)| self.states[n as usize] == s)).map(|w| w.holds)
         });
+        let mut kept = self.kept.get();
         if let Some(holds) = found {
+            kept[0] += 1;
+            self.kept.set(kept);
             return holds;
         }
+        kept[1] += 1;
         let noted = std::cell::RefCell::new(Vec::new());
         let holds = self.conditions().eval_noting(&self.local, None, expr, Some(&noted));
-        let mut names = noted.into_inner();
+        let mut names: Vec<u32> = noted.into_inner().iter().filter_map(|n| self.w.ids.get(&n[..]).copied()).collect();
         names.sort_unstable();
         names.dedup();
-        let names = names.into_iter().map(|n| { let s = state(&self.local, &n); (n.into_boxed_slice(), s) }).collect();
+        let names = names.into_iter().map(|n| (n, self.states[n as usize])).collect();
         KEPT.with(|k| {
             let mut k = k.borrow_mut();
-            let ways = k.entry(key).or_default();
+            let ways = &mut k[slot as usize];
             if ways.len() < KEPT_WAYS {
                 ways.push(Kept { names, unseen: self.unseen, holds });
+            } else {
+                kept[2] += 1;
             }
         });
+        self.kept.set(kept);
         holds
+    }
+
+    fn set(&mut self, id: u32, name: &[u8], value: Option<Option<Vec<u8>>>, state: u64) {
+        self.local.insert(name.to_vec(), value);
+        self.states[id as usize] = state;
     }
 
     /// Read `file`; `maybe`: it is not known to be read at all.
@@ -221,9 +244,9 @@ impl Unit<'_> {
         let mut live = Tri::True;
         for (i, step) in steps.iter().enumerate() {
             match step {
-                Step::If { kind, expr, .. } => {
+                Step::If { kind, expr, slot, .. } => {
                     let t = self.prof.map(|_| std::time::Instant::now());
-                    let holds = if live == Tri::False { Tri::False } else { self.holds(file, i, *kind, expr) };
+                    let holds = if live == Tri::False { Tri::False } else { self.holds(*slot, *kind, expr) };
                     if let (Some(p), Some(t)) = (&mut self.prof, t) {
                         p[0] += 1;
                         p[1] += t.elapsed().as_nanos() as u64;
@@ -234,14 +257,14 @@ impl Unit<'_> {
                     open.push((holds, holds, live));
                     live = live.and(holds);
                 }
-                Step::Elif { kind, expr, .. } => {
+                Step::Elif { kind, expr, slot, .. } => {
                     let Some(group) = open.last_mut() else { continue };
                     let outer = group.2;
                     let t = self.prof.map(|_| std::time::Instant::now());
                     let own = if outer == Tri::False || group.0 == Tri::True {
                         Tri::False
                     } else {
-                        let own = self.holds(file, i, *kind, expr);
+                        let own = self.holds(*slot, *kind, expr);
                         w.seen[file as usize][i].fetch_or(1 << own as u8, Relaxed);
                         own
                     };
@@ -265,7 +288,7 @@ impl Unit<'_> {
                     }
                 }
                 _ if live == Tri::False => {}
-                Step::Define { name, value } => {
+                Step::Define { id, name, value } => {
                     let t = self.prof.map(|_| std::time::Instant::now());
                     if let Some(p) = &mut self.prof {
                         p[2] += 1;
@@ -276,19 +299,19 @@ impl Unit<'_> {
                                 outright.insert(name.to_vec());
                             }
                         }
-                        self.local.insert(name.to_vec(), Some(Some(value.to_vec())));
+                        self.set(*id, name, Some(Some(value.to_vec())), defined_at(file, i));
                     } else if self.local.get(&name[..]).is_none_or(|v| v.as_ref().and_then(|v| v.as_deref()) != Some(&value[..])) {
-                        self.local.insert(name.to_vec(), None);
+                        self.set(*id, name, None, 1);
                     }
                     if let (Some(p), Some(t)) = (&mut self.prof, t) {
                         p[3] += t.elapsed().as_nanos() as u64;
                     }
                 }
-                Step::Undef { name } => {
+                Step::Undef { id, name } => {
                     if live == Tri::True && !maybe {
-                        self.local.insert(name.to_vec(), Some(None));
+                        self.set(*id, name, Some(None), 2);
                     } else if self.local.get(&name[..]) != Some(&Some(None)) {
-                        self.local.insert(name.to_vec(), None);
+                        self.set(*id, name, None, 1);
                     }
                 }
                 Step::Unseen => self.unseen = true,
@@ -365,8 +388,16 @@ pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -
         let nearest = fitting.iter().map(|&c| near(c)).max();
         fitting.into_iter().filter(|&c| Some(near(c)) == nearest).collect()
     };
+    let mut ids: FxHashMap<Box<[u8]>, u32> = FxHashMap::default();
+    for op in scripts.iter().flat_map(|s| &s.ops) {
+        if let Op::Define { name, .. } | Op::Undef { name } = op {
+            if asked.contains(&name[..]) && !conditions.settles(name) && !ids.contains_key(&name[..]) {
+                ids.insert(name[..].into(), ids.len() as u32);
+            }
+        }
+    }
     let mut included = vec![false; n];
-    let steps: Vec<Vec<Step>> = scripts
+    let mut steps: Vec<Vec<Step>> = scripts
         .par_iter()
         .zip(paths)
         .map(|(script, path)| {
@@ -376,13 +407,13 @@ pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -
                 .iter()
                 .filter_map(|op| {
                     Some(match op {
-                        Op::If { at, kind, expr } => Step::If { at: *at, kind: *kind, expr: cut(expr) },
-                        Op::Elif { at, kind, expr } => Step::Elif { at: *at, kind: *kind, expr: cut(expr) },
+                        Op::If { at, kind, expr } => Step::If { at: *at, kind: *kind, expr: cut(expr), slot: u32::MAX },
+                        Op::Elif { at, kind, expr } => Step::Elif { at: *at, kind: *kind, expr: cut(expr), slot: u32::MAX },
                         Op::Else => Step::Else,
                         Op::Endif => Step::Endif,
                         // (What the settings say of a name has the last word.)
-                        Op::Define { name, value } if asked.contains(&name[..]) && !conditions.settles(name) => Step::Define { name: cut(name), value: cut(value) },
-                        Op::Undef { name } if asked.contains(&name[..]) && !conditions.settles(name) => Step::Undef { name: cut(name) },
+                        Op::Define { name, value } if asked.contains(&name[..]) && !conditions.settles(name) => Step::Define { id: ids[&name[..]], name: cut(name), value: cut(value) },
+                        Op::Undef { name } if asked.contains(&name[..]) && !conditions.settles(name) => Step::Undef { id: ids[&name[..]], name: cut(name) },
                         Op::Define { .. } | Op::Undef { .. } => return None,
                         Op::Include { name, quoted } => match files_of(path, name) {
                             files if !files.is_empty() => Step::Include { files: files.into() },
@@ -404,7 +435,16 @@ pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -
     let roots: Vec<u32> = (0..n as u32).filter(|&i| !crate::is_header(&paths[i as usize]) || !included[i as usize]).collect();
     let sizes: Vec<usize> = steps.iter().map(Vec::len).collect();
     let seen = || sizes.iter().map(|&n| (0..n).map(|_| AtomicU8::new(0)).collect()).collect();
+    let mut slots = 0;
+    for step in steps.iter_mut().flatten() {
+        if let Step::If { kind: 0, slot, .. } | Step::Elif { kind: 0, slot, .. } = step {
+            *slot = slots;
+            slots += 1;
+        }
+    }
     let mut w = World {
+        ids,
+        slots: slots as usize,
         once: scripts.iter().map(|s| s.once).collect(),
         plain: conditions,
         told: conditions.clone(),
@@ -418,6 +458,7 @@ pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -
     let profile = std::env::var_os("SI_COND_PROFILE").is_some();
     // (Per compilation: ms, steps, local names, and the counts of `prof`.)
     let profiled: std::sync::Mutex<Vec<(f64, u64, usize, u32, [u64; 5])>> = Default::default();
+    let kept_counts: std::sync::Mutex<[u64; 3]> = Default::default();
     let read_all = |w: &World, first: bool| -> (FxHashSet<Vec<u8>>, Vec<u32>) {
         // (What was worked out under other conditions does not hold now.)
         rayon::broadcast(|_| KEPT.with(|k| k.borrow_mut().clear()));
@@ -435,12 +476,17 @@ pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -
                     read: FxHashMap::default(),
                     outright: first.then(FxHashSet::default),
                     reading: FxHashMap::default(),
+                    states: vec![0; w.ids.len()],
+                    kept: Default::default(),
                     spent: 0,
                     prof: profile.then_some([0; 5]),
                 };
                 unit.read.insert(root, true);
                 unit.read(root, false, 0);
                 if let Some(p) = unit.prof {
+                    let mut k = kept_counts.lock().unwrap();
+                    (0..3).for_each(|i| k[i] += unit.kept.get()[i]);
+                    drop(k);
                     profiled.lock().unwrap().push((t.elapsed().as_secs_f64() * 1000.0, unit.spent, unit.local.len(), root, p));
                 }
                 if unit.spent > MOST_IN_ONE {
@@ -466,6 +512,9 @@ pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -
         let (values, bytes) = rayon::broadcast(|_| crate::cond::COUNTS.with(|c| c.take())).into_iter().chain([crate::cond::COUNTS.with(|c| c.take())]).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
         let ms: f64 = rows.iter().map(|r| r.0).sum();
         eprintln!("unitsprof {ms:.0} ms in all units; {} conditions {:.0} ms; {} defines {:.0} ms; {} includes; {values} macro values read; {bytes} bytes tokenized", sum[0], sum[1] as f64 / 1e6, sum[2], sum[3] as f64 / 1e6, sum[4]);
+        let k = kept_counts.lock().unwrap();
+        eprintln!("unitskept {} found worked out, {} worked out anew, {} of them with no room to keep", k[0], k[1], k[2]);
+        drop(k);
         rows.sort_by(|a, b| b.0.total_cmp(&a.0));
         for r in rows.iter().take(5) {
             eprintln!("unitslow  {:.0} ms, {} steps, {} names, {} conditions {:.0} ms, {} defines {:.0} ms, {} includes: {}", r.0, r.1, r.2, r.4[0], r.4[1] as f64 / 1e6, r.4[2], r.4[3] as f64 / 1e6, r.4[4], paths[r.3 as usize]);
