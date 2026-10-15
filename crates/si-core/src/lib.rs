@@ -288,22 +288,38 @@ pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions)
         // does (its value is read for it), and with it what a file's
         // conditions come to where they name either.
         let (mut changed, includes) = conditions.source().map_or_else(|| (Default::default(), vec![true; files.len()]), |s| s.changes(&source));
-        loop {
-            let before = changed.len();
-            for d in defines.iter().flatten().filter(|d| !d.include && !d.test) {
-                let mut names = d.refs.iter().map(|r| &r[..]).chain(d.deps.iter().flatten().map(|r| &r[..])).collect::<Vec<_>>();
-                if let Some(v) = &d.value {
-                    units::names_in(v, |n| names.push(n));
-                }
-                if !changed.contains(&d.name) && names.iter().any(|n| changed.contains(*n)) {
-                    changed.insert(d.name.clone());
-                }
+        // (Where most files are read again whatever is found, all are.)
+        let most = includes.iter().filter(|c| **c).count() * 2 > files.len();
+        if !changed.is_empty() && !most {
+            // Who names whom, in a value: (named, naming), file by file.
+            let named: Vec<Vec<(&[u8], &[u8])>> = defines
+                .par_iter()
+                .map(|list| {
+                    let mut out = Vec::new();
+                    for d in list.iter().filter(|d| !d.include && !d.test) {
+                        out.extend(d.refs.iter().chain(d.deps.iter().flatten()).map(|r| (&r[..], &d.name[..])));
+                        if let Some(v) = &d.value {
+                            units::names_in(v, |n| out.push((n, &d.name[..])));
+                        }
+                    }
+                    out
+                })
+                .collect();
+            let mut users: rustc_hash::FxHashMap<&[u8], Vec<&[u8]>> = Default::default();
+            for (n, user) in named.iter().flatten() {
+                users.entry(n).or_default().push(user);
             }
-            if changed.len() == before {
-                break;
+            let mut work: Vec<Vec<u8>> = changed.iter().cloned().collect();
+            while let Some(n) = work.pop() {
+                for &user in users.get(&n[..]).into_iter().flatten() {
+                    if !changed.contains(user) {
+                        changed.insert(user.to_vec());
+                        work.push(user.to_vec());
+                    }
+                }
             }
         }
-        let again: Vec<bool> = (0..files.len()).map(|i| includes.get(i).copied().unwrap_or(true) || tested[i].iter().any(|n| changed.contains(*n))).collect();
+        let again: Vec<bool> = (0..files.len()).map(|i| most || includes.get(i).copied().unwrap_or(true) || tested[i].iter().any(|n| changed.contains(*n))).collect();
         conditions.set_source(Some(std::sync::Arc::new(source)));
         if std::env::var_os("SI_SETTLE_CHECK").is_some() {
             let mut some = defines.clone();
