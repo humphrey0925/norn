@@ -173,24 +173,69 @@ pub fn conditions_of(root: &Path, files: &[PathBuf]) -> cond::Conditions {
     conditions
 }
 
+/// What each step of the last prescan took, in milliseconds, in order: for
+/// the report of `index`, since one step can come to most of the time.
+pub static PRESCAN_STEPS: std::sync::Mutex<Vec<(&'static str, f64)>> = std::sync::Mutex::new(Vec::new());
+
+/// The files whose `#define`s took longest to read, with how long (ms) and
+/// their size: (step, path, ms, bytes), at most a few for each step.
+pub static PRESCAN_SLOWEST: std::sync::Mutex<Vec<(&'static str, String, f64, usize)>> = std::sync::Mutex::new(Vec::new());
+
+fn slowest(what: &'static str, mut times: Vec<(f64, usize, &String)>) {
+    times.sort_by(|a, b| b.0.total_cmp(&a.0));
+    PRESCAN_SLOWEST.lock().unwrap().extend(times.into_iter().take(5).map(|(ms, bytes, path)| (what, path.clone(), ms, bytes)));
+}
+
+fn step(what: &'static str, since: &mut std::time::Instant) {
+    PRESCAN_STEPS.lock().unwrap().push((what, since.elapsed().as_secs_f64() * 1000.0));
+    *since = std::time::Instant::now();
+}
+
 /// Every file's `#define`s under `conditions`, with what the sources settle
 /// about macros put into `conditions` on the way: which definitions are
 /// compiled depends on that, and that on which are compiled, so it is done
 /// until nothing changes.
 pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions) -> Vec<Vec<mask::Define>> {
+    PRESCAN_STEPS.lock().unwrap().clear();
+    PRESCAN_SLOWEST.lock().unwrap().clear();
+    let mut t = std::time::Instant::now();
     conditions.set_source(None);
     let paths: Vec<String> = files.iter().map(|p| rel_path(root, p)).collect();
     let read = |c: &cond::Conditions| -> Vec<Vec<mask::Define>> {
-        files.par_iter().zip(&paths).map(|(p, rel)| mask::defines_of(&std::fs::read(p).unwrap_or_default(), c, Some(rel))).collect()
+        let (defines, times): (Vec<_>, Vec<_>) = files
+            .par_iter()
+            .zip(&paths)
+            .map(|(p, rel)| {
+                let src = std::fs::read(p).unwrap_or_default();
+                let t = std::time::Instant::now();
+                let d = mask::defines_of(&src, c, Some(rel));
+                (d, (t.elapsed().as_secs_f64() * 1000.0, src.len(), rel))
+            })
+            .unzip();
+        slowest("defines", times);
+        defines
     };
     if !conditions.uses_source() {
-        return read(conditions);
+        let defines = read(conditions);
+        step("defines", &mut t);
+        return defines;
     }
     // What each condition comes to compilation by compilation, first:
     // which definitions are compiled depends on it.
-    let scripts: Vec<mask::Script> = files.par_iter().map(|p| mask::script(&std::fs::read(p).unwrap_or_default())).collect();
+    let (scripts, times): (Vec<mask::Script>, Vec<_>) = files
+        .par_iter()
+        .zip(&paths)
+        .map(|(p, rel)| {
+            let src = std::fs::read(p).unwrap_or_default();
+            let t = std::time::Instant::now();
+            (mask::script(&src), (t.elapsed().as_secs_f64() * 1000.0, src.len(), rel))
+        })
+        .unzip();
+    slowest("scripts", times);
+    step("scripts", &mut t);
     let verdicts = std::sync::Arc::new(units::verdicts(&paths, &scripts, conditions).unwrap_or_default());
     drop(scripts);
+    step("verdicts", &mut t);
     if std::env::var_os("SI_COND_PROFILE").is_some() {
         eprintln!("decided   {} conditions, by reading each compilation", verdicts.iter().map(Vec::len).sum::<usize>());
         for (file, told) in files.iter().zip(verdicts.iter()).filter(|x| !x.1.is_empty()) {
@@ -207,14 +252,17 @@ pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions)
         conditions.set_source(Some(std::sync::Arc::new(first)));
     }
     let mut defines = read(conditions);
+    step("defines", &mut t);
     for _ in 0..4 {
         let mut source = mask::source_of(&defines, &paths);
         source.set_verdicts(verdicts.clone());
+        step("source", &mut t);
         if conditions.source().map_or(source.is_empty(), |s| **s == source) {
             break;
         }
         conditions.set_source(Some(std::sync::Arc::new(source)));
         defines = read(conditions);
+        step("defines", &mut t);
     }
     defines
 }
@@ -224,8 +272,10 @@ pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions)
 /// `conditions` come back with what the sources settle added.
 pub fn prescan_under(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions) -> MacroSets {
     let defines = settle(root, files, conditions);
+    let mut t = std::time::Instant::now();
     let paths: Vec<String> = files.iter().map(|p| rel_path(root, p)).collect();
     let sets = MacroSets::of_files(&defines, &paths).with_conditions(conditions.clone());
+    step("sets", &mut t);
     trim_memory();
     sets
 }

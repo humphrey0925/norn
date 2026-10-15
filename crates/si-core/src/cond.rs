@@ -712,6 +712,7 @@ impl Source {
 pub type Local = FxHashMap<Vec<u8>, Option<Option<Vec<u8>>>>;
 
 /// The conditions as seen from a place in a file.
+#[derive(Clone, Copy)]
 struct View<'a> {
     c: &'a Conditions,
     local: &'a Local,
@@ -720,6 +721,12 @@ struct View<'a> {
     /// How many macro values deep this is being read (a macro whose value
     /// names itself, or one that names it, is not read forever).
     depth: u8,
+    /// The values of names worked out so far in this condition, each once:
+    /// macros whose values name others, which name the same ones in turn,
+    /// would otherwise be read over and over, as many times as there are
+    /// ways down to them (exponentially many). A name being worked out is
+    /// in it with no value, so one whose value comes back to it has none.
+    memo: &'a std::cell::RefCell<FxHashMap<Vec<u8>, Option<Int>>>,
 }
 
 impl View<'_> {
@@ -760,14 +767,20 @@ impl View<'_> {
             None => Some(Int::signed(0)),
             // (A macro with parameters named without arguments: no value.)
             Some(v) if v.first() == Some(&0) => None,
-            Some(v) if v.is_empty() || v == name || depth > 8 => number(v),
+            Some(v) if v.is_empty() || v == name || depth > 32 => number(v),
             Some(v) => number(v).or_else(|| {
+                if let Some(known) = self.memo.borrow().get(name) {
+                    return *known;
+                }
+                self.memo.borrow_mut().insert(name.to_vec(), None);
                 // Read as an `#if` would read it, its names in turn.
                 let toks = tokens(v);
-                let inner = View { c: self.c, local: self.local, at: self.at, depth: depth + 1 };
+                let inner = View { depth: depth + 1, ..*self };
                 let mut p = Parser { c: inner, toks: &toks, at: 0 };
                 let value = p.ternary();
-                (p.at == toks.len()).then_some(value).flatten()
+                let value = (p.at == toks.len()).then_some(value).flatten();
+                self.memo.borrow_mut().insert(name.to_vec(), value);
+                value
             }),
         }
     }
@@ -1012,7 +1025,8 @@ impl Conditions {
     /// above it. `at` is the file (as the [`Source`] numbers it) and line.
     pub fn eval_in(&self, local: &Local, at: Option<(u32, u32)>, expr: &[u8]) -> Tri {
         let toks = tokens(expr);
-        let mut p = Parser { c: View { c: self, local, at, depth: 0 }, toks: &toks, at: 0 };
+        let memo = Default::default();
+        let mut p = Parser { c: View { c: self, local, at, depth: 0, memo: &memo }, toks: &toks, at: 0 };
         let v = p.ternary();
         if p.at != toks.len() {
             return Tri::Unknown;
@@ -1021,7 +1035,7 @@ impl Conditions {
     }
 
     pub fn defined_in(&self, local: &Local, at: Option<(u32, u32)>, name: &[u8]) -> Tri {
-        View { c: self, local, at, depth: 0 }.defined(name)
+        View { c: self, local, at, depth: 0, memo: &Default::default() }.defined(name)
     }
 }
 
@@ -1518,7 +1532,7 @@ impl Parser<'_> {
             text.push(b' ');
         }
         let toks = tokens(&text);
-        let inner = View { c: self.c.c, local: self.c.local, at: self.c.at, depth: self.c.depth + 1 };
+        let inner = View { depth: self.c.depth + 1, ..self.c };
         let mut p = Parser { c: inner, toks: &toks, at: 0 };
         let value = p.ternary();
         (p.at == toks.len()).then_some(value).flatten()

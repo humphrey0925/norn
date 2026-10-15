@@ -275,6 +275,8 @@ fn index(root: &Path, out: &Path, stores: &str, stride: usize, options: &si_core
         "threads": rayon::current_num_threads(),
         "transparent_macros": transparent.len(),
         "conditions_known": conditions.len(),
+        "prescan_steps": si_core::PRESCAN_STEPS.lock().unwrap().iter().map(|(what, ms)| json!([what, ms])).collect::<Vec<_>>(),
+        "prescan_slowest": si_core::PRESCAN_SLOWEST.lock().unwrap().iter().map(|(what, path, ms, bytes)| json!([what, path, ms, bytes])).collect::<Vec<_>>(),
         "expanding_macros": transparent.expanding_len(),
         "expansion": { "sites": ls.sites, "defs_added": ls.expanded_defs, "refs_added": ls.expanded_refs },
         "names": g.n_names(),
