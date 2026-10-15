@@ -385,18 +385,42 @@ impl Types<'_> {
         scratch: &mut Vec<u32>,
     ) -> Option<u32> {
         let f = self.files[fi];
+        let path = &f.hint_path[hint.path as usize..(hint.path + hint.len) as usize];
         let name = self.remap[fi][hint.root as usize];
-        let type_name = match hint.root_kind {
-            root::TYPE => name,
+        let found = match hint.root_kind {
+            root::TYPE => self.member_from(name, path, member, fi, g, closure),
             kind_of_root => {
+                // C++: `T ()`, a class made, is of that class.
+                if kind_of_root == root::FUNC && self.cpp.types.contains(&name) {
+                    return self.member_from(name, path, member, fi, g, closure);
+                }
                 // The variable or function the name means here, then its type.
                 let wanted = if kind_of_root == root::VAR { kind::GLOBAL } else { kind::FUNCTION };
-                in_sight(g.syms_named(name), &g.syms, own, closure, &[], |s| s.kind == wanted, scratch);
-                *scratch.iter().find_map(|s| self.of_symbol.get(s))?
+                in_sight(g.syms_named(name), &g.syms, own.clone(), closure, &[], |s| s.kind == wanted, scratch);
+                let type_name = *scratch.iter().find_map(|s| self.of_symbol.get(s))?;
+                self.member_from(type_name, path, member, fi, g, closure)
             }
         };
-        let (mut rf, mut ri) = record_of(type_name, fi as u32, closure, self.records, self.aliases)?;
-        for &m in &f.hint_path[hint.path as usize..(hint.path + hint.len) as usize] {
+        if found.is_some() || hint.root_kind != root::TYPE || path.is_empty() || !self.cpp.on() {
+            return found;
+        }
+        // C++: in a method, a name not local was taken for a member of its
+        // class (`m_chain.Tip ()`); if the class has none of that name, it is
+        // a variable of the namespace or the file (`gArgs.GetDataDirNet ()`).
+        let first = self.remap[fi][path[0] as usize];
+        in_sight(g.syms_named(first), &g.syms, own, closure, &[], |s| s.kind == kind::GLOBAL, scratch);
+        let type_name = *scratch.iter().find_map(|s| self.of_symbol.get(s))?;
+        self.member_from(type_name, &path[1..], member, fi, g, closure)
+    }
+
+    /// Member `member` of what `path` leads to from the type `type_name`.
+    fn member_from(&self, type_name: u32, path: &[u32], member: u32, fi: usize, g: &Graph, closure: &Closure) -> Option<u32> {
+        // (C++: a class with no layout of its own, a test case of a fixture,
+        // has its base's.)
+        let (mut rf, mut ri) = record_of(type_name, fi as u32, closure, self.records, self.aliases).or_else(|| {
+            self.cpp.bases.get(&type_name)?.iter().find_map(|&b| record_of(b, fi as u32, closure, self.records, self.aliases))
+        })?;
+        for &m in path {
             let (mf, mi, at) = self.find(rf, ri, self.remap[fi][m as usize], closure, 8)?;
             let t = self.files[mf as usize].records[mi as usize].types[at];
             if t == NONE {

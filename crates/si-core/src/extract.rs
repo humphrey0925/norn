@@ -905,7 +905,17 @@ impl<'a> Walk<'a> {
             return Some(r);
         }
         if k == ids.call_expression {
-            let f = n.child_by_field_id(ids.f_function).filter(|f| f.kind_id() == ids.identifier)?;
+            let f = n.child_by_field_id(ids.f_function)?;
+            if self.cpp && f.kind_id() == ids.field_expression {
+                // `x.Get ().f ()`: what the method returns, as if a member.
+                let r = self.object_root(f.child_by_field_id(ids.f_argument)?, path)?;
+                let (_, method) = self.qualified_parts(f.child_by_field_id(ids.f_field)?);
+                path.push(self.intern(self.text(method)));
+                return Some(r);
+            }
+            // (`ns::Make ()`, `T ()`: by the name.)
+            let f = if self.cpp { self.qualified_parts(f).1 } else { f };
+            let f = Some(f).filter(|f| f.kind_id() == ids.identifier || (self.cpp && f.kind_id() == ids.type_identifier))?;
             return Some((root::FUNC, self.intern(self.text(f))));
         }
         if k == ids.cast_expression {
@@ -1230,7 +1240,8 @@ impl<'a> Walk<'a> {
                 // A member that is a function pointer has no struct type,
                 // whatever its return type is.
                 let (name, t) = match self.decl_name(d) {
-                    Some((name, _)) => (self.intern(self.text(name)), if self.declares_function(d) { NONE } else { t }),
+                    // (A C++ method's: what it returns, for `x.Get ().f ()`.)
+                    Some((name, is_fn)) => (self.intern(self.text(name)), if self.declares_function(d) && !(self.cpp && is_fn) { NONE } else { t }),
                     None => (NONE, NONE),
                 };
                 names.push(name);
@@ -1722,15 +1733,37 @@ impl<'a> Walk<'a> {
             if let Some((name, _)) = named {
                 self.skip.insert(name.start_byte());
                 if self.in_fn() {
+                    // (A lambda's: its function's are typed already.)
+                    if self.cpp && !self.local_types.contains_key(self.text(name)) {
+                        let t = self.type_name_of(node);
+                        if t != NONE {
+                            self.local_types.insert(self.text(name), t);
+                        }
+                    }
                     self.note_local(name, true);
                 }
             }
             return true;
         }
+        if self.cpp && node.kind() == "alias_declaration" {
+            // `using Base = prevector<36, unsigned char>;`: another name.
+            if let (Some(name), Some(t)) = (node.child_by_field_id(ids.f_name), node.child_by_field_id(ids.f_type).and_then(|d| d.child_by_field_id(ids.f_type))) {
+                self.push_def(name, node, kind::TYPEDEF, 0);
+                let (alias, tag) = (self.intern(self.text(name)), self.type_name(t));
+                if tag != NONE && tag != alias {
+                    self.out.aliases.push((alias, tag));
+                }
+            }
+            return true;
+        }
         if k == ids.type_definition {
-            let record = node
-                .child_by_field_id(ids.f_type)
-                .filter(|t| t.kind_id() == ids.struct_specifier || t.kind_id() == ids.union_specifier);
+            // (C++: `typedef prevector<36, unsigned char> CScriptBase;` names a
+            // class as well.)
+            let record = node.child_by_field_id(ids.f_type).filter(|t| {
+                t.kind_id() == ids.struct_specifier
+                    || t.kind_id() == ids.union_specifier
+                    || (self.cpp && (t.kind_id() == ids.template_type || t.kind_id() == ids.type_identifier || t.kind_id() == ids.qualified_identifier))
+            });
             for d in self.declarators(node) {
                 if let Some((name, _)) = self.decl_name(d) {
                     let callable = if self.declares_function(d) { flag::CALLABLE } else { 0 };
