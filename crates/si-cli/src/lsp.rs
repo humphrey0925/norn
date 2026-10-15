@@ -133,8 +133,19 @@ fn symbol_kind(k: u8) -> u32 {
         kind::TYPEDEF => 5,
         kind::GLOBAL => 13,
         kind::FIELD => 8,
+        kind::CLASS => 5,
+        kind::NAMESPACE => 3,
         _ => 13,
     }
+}
+
+/// How a symbol is shown: a C++ member with its classes (`DBImpl::Get`).
+/// (Looked up again by its own name, which `data` carries.)
+fn display_name(g: &Graph, sym: u32) -> String {
+    if g.owner.get(sym as usize).is_none_or(|&o| o == si_core::model::NONE) {
+        return g.sym_name(sym).to_string();
+    }
+    si_core::graph::Qualifier::new(g).name(g, sym).into_owned()
 }
 
 struct Server {
@@ -365,7 +376,7 @@ impl Server {
         let (name, k, container) = {
             let g = self.g();
             let s = &g.syms[sym as usize];
-            (g.sym_name(sym).to_string(), s.kind, g.file_path(s.file).to_string())
+            (display_name(g, sym), s.kind, g.file_path(s.file).to_string())
         };
         json!({ "name": name, "kind": symbol_kind(k), "location": self.sym_location(sym), "containerName": container })
     }
@@ -391,7 +402,7 @@ impl Server {
         let loc = self.sym_location(sym);
         let g = self.g();
         let s = &g.syms[sym as usize];
-        json!({ "name": g.sym_name(sym), "kind": symbol_kind(s.kind), "detail": g.file_path(s.file),
+        json!({ "name": display_name(g, sym), "kind": symbol_kind(s.kind), "detail": g.file_path(s.file),
                 "uri": loc["uri"], "range": loc["range"], "selectionRange": loc["range"],
                 "data": { "file": g.file_path(s.file), "line": s.line, "name": g.sym_name(sym) } })
     }
@@ -461,7 +472,7 @@ impl Server {
         let loc = self.sym_location(sym);
         let g = self.g();
         let s = &g.syms[sym as usize];
-        json!({ "name": g.sym_name(sym), "kind": kind::name(s.kind), "file": g.file_path(s.file), "line": s.line,
+        json!({ "name": display_name(g, sym), "kind": kind::name(s.kind), "file": g.file_path(s.file), "line": s.line,
                 "endLine": s.end_line, "declaration": s.flags & flag::DECL != 0, "uri": loc["uri"], "range": loc["range"],
                 "data": { "file": g.file_path(s.file), "line": s.line, "name": g.sym_name(sym) } })
     }
@@ -728,11 +739,12 @@ impl Server {
         let offset = (params["offset"].as_u64().unwrap_or(0) as usize).min(all.len());
         let limit = params["limit"].as_u64().unwrap_or(200).min(2000) as usize;
         let g = self.g();
+        let q = si_core::graph::Qualifier::new(g);
         let items: Vec<Value> = all[offset..(offset + limit).min(all.len())]
             .iter()
             .map(|&s| {
                 let sym = &g.syms[s as usize];
-                json!({ "name": g.sym_name(s), "kind": kind::name(sym.kind), "file": g.file_path(sym.file), "line": sym.line })
+                json!({ "name": q.name(g, s), "kind": kind::name(sym.kind), "file": g.file_path(sym.file), "line": sym.line })
             })
             .collect();
         json!({ "total": all.len(), "offset": offset, "items": items })

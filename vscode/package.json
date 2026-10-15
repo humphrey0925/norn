@@ -19,7 +19,9 @@
   "activationEvents": [
     "onLanguage:c",
     "onLanguage:cpp",
-    "workspaceContains:**/*.c"
+    "workspaceContains:**/*.c",
+    "workspaceContains:**/*.cpp",
+    "workspaceContains:**/*.cc"
   ],
   "contributes": {
     "viewsContainers": {

@@ -60,6 +60,13 @@ async function main() {
     fs.mkdirSync(path.dirname(path.join(work, rel)), { recursive: true });
     fs.copyFileSync(path.join(corpus, rel), path.join(work, rel));
   }
+  // And a little C++.
+  if (!demo) {
+    fs.mkdirSync(path.join(work, "cpp"));
+    for (const [name, text] of Object.entries(CPP)) {
+      fs.writeFileSync(path.join(work, "cpp", name), text);
+    }
+  }
   fs.mkdirSync(path.join(work, ".vscode"));
   // A scope on file: the first-time question is for people, not for a test.
   fs.mkdirSync(path.join(work, ".norn"));
@@ -83,6 +90,35 @@ async function main() {
     }
   }
 }
+
+/** A class, a virtual method defined apart, a call through a reference. */
+const CPP: Record<string, string> = {
+  "shapes.h": `#pragma once
+namespace geo {
+class Shape {
+ public:
+  virtual ~Shape() = default;
+  virtual double Area() const = 0;
+  double Twice() const { return 2 * Area(); }
+};
+class Circle : public Shape {
+ public:
+  explicit Circle(double r) : r_(r) {}
+  double Area() const override;
+ private:
+  double r_;
+};
+}  // namespace geo
+`,
+  "shapes.cc": `#include "shapes.h"
+namespace geo {
+double Circle::Area() const { return 3.14 * r_ * r_; }
+}  // namespace geo
+`,
+  "main.cc": `#include "shapes.h"
+double Total(const geo::Shape& s) { return s.Area() + s.Twice(); }
+`,
+};
 
 main().catch((e) => {
   console.error(e);

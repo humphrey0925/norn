@@ -272,6 +272,18 @@ export async function run(): Promise<void> {
   }
   await vscode.commands.executeCommand("norn.resetLayout");
 
+  // C++: a method is named with its class, and a call of one on an object
+  // leads to it.
+  await until("the C++ method", async () => {
+    const s = await vscode.commands.executeCommand<vscode.SymbolInformation[]>("vscode.executeWorkspaceSymbolProvider", "Area");
+    return s?.some((x) => x.name === "Circle::Area");
+  });
+  const ccDoc = await vscode.workspace.openTextDocument(path.join(folder, "cpp", "main.cc"));
+  await vscode.window.showTextDocument(ccDoc);
+  const twice = await vscode.commands.executeCommand<vscode.Location[]>("vscode.executeDefinitionProvider", ccDoc.uri, find(ccDoc, "Twice()"));
+  assert.ok(twice.length >= 1 && twice[0].uri.fsPath.endsWith("shapes.h") && twice[0].range.start.line === 6, JSON.stringify(twice));
+  await vscode.window.showTextDocument(doc);
+
   // Saving an edit re-indexes it.
   const edit = new vscode.WorkspaceEdit();
   edit.insert(doc.uri, new vscode.Position(doc.lineCount, 0), "\nint si_probe (void) { return 0; }\n");

@@ -56,14 +56,20 @@ const ICONS: Record<string, string> = {
   function: "symbol-function", macro: "symbol-constant", struct: "symbol-struct", union: "symbol-struct",
   enum: "symbol-enum", enum_const: "symbol-enum-member", typedef: "symbol-class", global: "symbol-variable",
   field: "symbol-field", file: "symbol-file", local: "symbol-variable", parameter: "symbol-parameter",
+  class: "symbol-class", namespace: "symbol-namespace",
 };
+/** C and C++ sources and headers, as the server reads them. */
+const SOURCE = /\.(c|h|cc|cpp|cxx|c\+\+|hh|hpp|hxx|h\+\+|inl|ipp|tcc)$/i;
+const SOURCE_GLOB = "**/*.{c,h,cc,cpp,cxx,c++,hh,hpp,hxx,h++,inl,ipp,tcc}";
+
 const KIND_NAMES: Record<string, string> = {
   function: "function", macro: "macro", struct: "struct", union: "union", enum: "enum", enum_const: "enumerator",
   typedef: "typedef", global: "variable", field: "member", local: "local variable", parameter: "parameter",
+  class: "class", namespace: "namespace",
 };
 
 function isSource(doc: vscode.TextDocument): boolean {
-  return doc.uri.scheme === "file" && /\.[ch]$/i.test(doc.fileName);
+  return doc.uri.scheme === "file" && SOURCE.test(doc.fileName);
 }
 
 function positionParams(editor: vscode.TextEditor) {
@@ -996,7 +1002,7 @@ class Search implements vscode.WebviewViewProvider {
       // typed: the matches, best first.
       let timer, query = "", results = [], total = 0, pages = new Map(), asked = new Set(), epoch = 0;
       let order = (vscode.getState() || {}).order || "name";
-      const RANK = { function: 0, macro: 1, struct: 2, union: 3, enum: 4, enum_const: 5, typedef: 6, global: 7, field: 8 };
+      const RANK = { function: 0, macro: 1, class: 2, struct: 2, union: 3, enum: 4, enum_const: 5, typedef: 6, namespace: 7, global: 7, field: 8 };
       // Matches come best first; by kind, the best of each kind first.
       const arranged = (found) => (order === "kind" ? found.map((r, i) => [r, i]).sort((a, b) => RANK[a[0].kind] - RANK[b[0].kind] || a[1] - b[1]).map((x) => x[0]) : found);
       let found = [];
@@ -1452,7 +1458,7 @@ export async function activate(context: vscode.ExtensionContext) {
   status.command = "norn.sync";
   status.show();
 
-  const selector: vscode.DocumentSelector = [{ scheme: "file", pattern: "**/*.{c,h}" }];
+  const selector: vscode.DocumentSelector = [{ scheme: "file", pattern: SOURCE_GLOB }];
 
   async function refreshStatus() {
     const s = await ask<{ files: number; symbols: number; loaded: number; parsed: number; cache: string | null; loading?: boolean }>("si/status", {});
@@ -1710,7 +1716,7 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
     const serverOptions: ServerOptions = { command, args, options: { cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath } };
     const clientOptions: LanguageClientOptions = {
       documentSelector: selector as LanguageClientOptions["documentSelector"],
-      synchronize: { fileEvents: vscode.workspace.createFileSystemWatcher("**/*.{c,h}") },
+      synchronize: { fileEvents: vscode.workspace.createFileSystemWatcher(SOURCE_GLOB) },
     };
     client = new LanguageClient("norn", "Norn", serverOptions, clientOptions);
     client.onNotification("si/progress", progress);
