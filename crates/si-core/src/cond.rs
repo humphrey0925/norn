@@ -1078,6 +1078,16 @@ impl Conditions {
         truth(v)
     }
 
+    /// The value of an expression as an `#if` works it out, names taking
+    /// their values from `local`: the number, and whether it is unsigned.
+    pub fn number_in(&self, local: &Local, expr: &[u8]) -> Option<(i64, bool)> {
+        let toks = tokens(expr);
+        let memo = Default::default();
+        let mut p = Parser { c: View { c: self, local, at: None, depth: 0, memo: &memo, noted: None }, toks: &toks, at: 0 };
+        let v = p.ternary()?;
+        (p.at == toks.len()).then_some((v.v, v.unsigned))
+    }
+
     pub fn defined_in(&self, local: &Local, at: Option<(u32, u32)>, name: &[u8]) -> Tri {
         View { c: self, local, at, depth: 0, memo: &Default::default(), noted: None }.defined(name)
     }

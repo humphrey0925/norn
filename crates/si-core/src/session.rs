@@ -1093,6 +1093,33 @@ mod tests {
     }
 
     #[test]
+    fn a_macro_s_value_is_worked_out_as_an_enumerator_s_is() {
+        let d = Dir::new("macro-values");
+        d.write("reg.h", "typedef unsigned int U32;\n#define BUF_BASE (0x1000u)\n#define BUF_STRIDE ((U32)4)\n#define BUF_Q(n) (BUF_BASE + (n) * BUF_STRIDE)\n#define BUF_Q3 BUF_Q(3)\nenum q { Q_A, Q_B = 5, Q_C,\n  Q_D = Q_C * 2 };\n#define WITH_ENUM (Q_D + 1)\n#ifdef BIG\n#define WIDTH 64\n#else\n#define WIDTH 32\n#endif\n#define NAMED_ELSEWHERE (UNKNOWN_THING + 1)\n#define TWICE_W (WIDTH * 2)\n");
+        d.write("a.c", "#include \"reg.h\"\n");
+        let (s, _) = Session::open_cached(&d.0, Options::default(), d.0.join("cache-outside-scan"));
+        let g = &s.graph;
+        let root = d.0.clone();
+        let mut read = |p: &str| std::fs::read(root.join(p)).ok().map(std::sync::Arc::new);
+        let mut values = crate::value::Values::new(g, &mut read);
+        let mut of = |name: &str| {
+            let sym = g.find(name).iter().copied().find(|&x| matches!(g.syms[x as usize].kind, kind::MACRO | kind::ENUM_CONST))?;
+            if g.syms[sym as usize].kind == kind::ENUM_CONST { values.enumerator(sym) } else { values.of_macro(sym).map(|v| v.number) }
+        };
+        assert_eq!(of("BUF_BASE"), Some(0x1000));
+        assert_eq!(of("BUF_Q3"), Some(0x1000 + 12));
+        assert_eq!((of("Q_A"), of("Q_C"), of("Q_D")), (Some(0), Some(6), Some(12)));
+        assert_eq!(of("WITH_ENUM"), Some(13));
+        assert_eq!(of("NAMED_ELSEWHERE"), None);
+        // Naming a macro defined two ways: no one value.
+        assert_eq!(of("TWICE_W"), None);
+        // Defined two ways, the build deciding: each its own.
+        let mut widths: Vec<Option<i64>> = g.find("WIDTH").iter().map(|&w| values.of_macro(w).map(|v| v.number)).collect();
+        widths.sort();
+        assert_eq!(widths, [Some(32), Some(64)]);
+    }
+
+    #[test]
     fn a_call_under_the_if_a_header_is_included_under_reaches_it_for_sure() {
         // A whole file inside `#if FEATURE_EN`, its includes too: where the
         // call is compiled, the macro's header was read.

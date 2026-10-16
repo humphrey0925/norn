@@ -320,6 +320,156 @@ impl Server {
         json!(out)
     }
 
+    /// `textDocument/hover` on a macro or an enumerator: what it is
+    /// defined as, and the number it comes to (an `#if`'s arithmetic over
+    /// the definitions the index has).
+    fn hover(&mut self, params: &Value) -> Value {
+        // A macro with arguments, written with them here: `BUF_Q(3)`.
+        let used = self.at(params).and_then(|(file, line, name)| {
+            let text = self.line_text(&file, line);
+            let b = text.as_bytes();
+            let mut from = 0;
+            while let Some(i) = text[from..].find(&name).map(|i| from + i) {
+                from = i + name.len();
+                if i > 0 && is_ident(b[i - 1]) || b.get(from).is_some_and(|&c| is_ident(c)) {
+                    continue;
+                }
+                let open = from + text[from..].len() - text[from..].trim_start().len();
+                if b.get(open) != Some(&b'(') {
+                    continue;
+                }
+                let mut depth = 0;
+                for (j, &c) in b.iter().enumerate().skip(open) {
+                    depth += (c == b'(') as i32 - (c == b')') as i32;
+                    if depth == 0 {
+                        return Some(format!("{name}{}", &text[open..=j]));
+                    }
+                }
+            }
+            None
+        });
+        let mut found = self.targets(params);
+        let g = &self.session.graph;
+        found.retain(|&s| matches!(g.syms[s as usize].kind, kind::MACRO | kind::ENUM_CONST) && g.syms[s as usize].flags & flag::DECL == 0);
+        if found.is_empty() {
+            return Value::Null;
+        }
+        // Certainly compiled first.
+        found.sort_by_key(|&s| (g.syms[s as usize].flags & flag::CONDITIONAL != 0, s));
+        found.truncate(6);
+        let (root, open) = (self.root.clone(), &self.open);
+        let mut read_files: HashMap<String, std::sync::Arc<Vec<u8>>> = HashMap::new();
+        let mut read = |p: &str| -> Option<std::sync::Arc<Vec<u8>>> {
+            if let Some(b) = read_files.get(p) {
+                return Some(b.clone());
+            }
+            let path = root.join(p);
+            let bytes = std::sync::Arc::new(match open.get(&path) {
+                Some(text) => text.as_bytes().to_vec(),
+                None => std::fs::read(&path).ok()?,
+            });
+            read_files.insert(p.to_string(), bytes.clone());
+            Some(bytes)
+        };
+        let mut values = si_core::value::Values::new(g, &mut read);
+        let shown = |n: i64, unsigned: bool| {
+            let dec = if unsigned { (n as u64).to_string() } else { n.to_string() };
+            if (0..10).contains(&n) { format!("= {dec}") } else { format!("= {dec} (0x{:X})", n as u64) }
+        };
+        let several = found.len() > 1;
+        let mut parts = Vec::new();
+        for s in found {
+            let sym = &g.syms[s as usize];
+            let at = format!("{}:{}", g.file_path(sym.file), sym.line);
+            let name = g.sym_name(s).to_string();
+            let maybe = if sym.flags & flag::CONDITIONAL != 0 { " · only where an #if not known holds" } else { "" };
+            if sym.kind == kind::ENUM_CONST {
+                let v = values.enumerator(s).map_or(String::new(), |n| format!("
+
+`{}`", shown(n, false)));
+                parts.push(format!("```c
+{name}
+```{v}
+
+{at}{maybe}"));
+                continue;
+            }
+            let Some(d) = values.define(s) else { continue };
+            let head = match &d.params {
+                Some(p) => format!("#define {}({}) {}", d.name, p.join(", "), d.body),
+                None => format!("#define {} {}", d.name, d.body),
+            };
+            let mut v = values.of_macro(s).map_or(String::new(), |v| format!("
+
+`{}`", shown(v.number, v.unsigned)));
+            if let (Some(_), Some(here)) = (&d.params, &used) {
+                if let Some(n) = values.of(here) {
+                    v = format!("
+
+`{here}` `{}`", shown(n.number, n.unsigned));
+                }
+            }
+            parts.push(format!("```c
+{head}
+```{v}
+
+{at}{maybe}"));
+        }
+        if parts.is_empty() {
+            return Value::Null;
+        }
+        let sep = if several { "
+
+---
+
+" } else { "" };
+        json!({ "contents": { "kind": "markdown", "value": parts.join(sep) } })
+    }
+
+    /// `textDocument/completion`: the names the index has that the word
+    /// being typed matches, best first.
+    fn completion(&mut self, params: &Value) -> Value {
+        let empty = json!({ "isIncomplete": true, "items": [] });
+        let Some(path) = params["textDocument"]["uri"].as_str().map(uri_to_path) else { return empty };
+        let Some(file) = self.relative(&path) else { return empty };
+        let (Some(line), Some(character)) = (params["position"]["line"].as_u64(), params["position"]["character"].as_u64()) else { return empty };
+        let text = self.line_text(&file, line as u32 + 1);
+        let b = text.as_bytes();
+        let at = (character as usize).min(b.len());
+        let start = (0..at).rev().take_while(|&i| is_ident(b[i])).last().unwrap_or(at);
+        let word = &text[start..at];
+        if word.is_empty() || word.as_bytes()[0].is_ascii_digit() {
+            return empty;
+        }
+        let g = self.g();
+        let mut seen = std::collections::HashSet::new();
+        let mut items = Vec::new();
+        for (rank, (_, s)) in si_core::search::search(g, word, 300).into_iter().enumerate() {
+            let sym = &g.syms[s as usize];
+            let name = g.sym_name(s);
+            if !seen.insert(name) {
+                continue;
+            }
+            // (LSP's CompletionItemKind.)
+            let kind = match sym.kind {
+                kind::FUNCTION => 3,
+                kind::MACRO => 21,
+                kind::STRUCT | kind::UNION => 22,
+                kind::ENUM => 13,
+                kind::ENUM_CONST => 20,
+                kind::TYPEDEF | kind::CLASS => 7,
+                kind::FIELD => 5,
+                kind::NAMESPACE => 9,
+                _ => 6,
+            };
+            items.push(json!({ "label": name, "kind": kind, "detail": format!("{}:{}", g.file_path(sym.file), sym.line), "sortText": format!("{rank:04}") }));
+            if items.len() >= 100 {
+                break;
+            }
+        }
+        json!({ "isIncomplete": true, "items": items })
+    }
+
     fn definition(&mut self, params: &Value) -> Value {
         if let Some(h) = self.local_at(params) {
             return json!([self.location(&h.file, h.line, &h.name)]);
@@ -866,6 +1016,7 @@ impl Server {
         let from_position = matches!(
             method,
             "textDocument/definition"
+                | "textDocument/hover"
                 | "textDocument/declaration"
                 | "textDocument/typeDefinition"
                 | "textDocument/implementation"
@@ -885,6 +1036,8 @@ impl Server {
         }
         Some(match method {
             "textDocument/definition" => self.definition(params),
+            "textDocument/hover" => self.hover(params),
+            "textDocument/completion" => self.completion(params),
             "textDocument/declaration" => self.declaration(params),
             "textDocument/typeDefinition" => self.type_definition(params),
             "textDocument/implementation" => self.implementation(params),
@@ -1052,6 +1205,7 @@ pub fn run(
                 "textDocumentSync": { "openClose": true, "change": 1, "save": true },
                 "definitionProvider": true, "declarationProvider": true, "typeDefinitionProvider": true, "implementationProvider": true, "referencesProvider": true,
                 "documentSymbolProvider": true, "workspaceSymbolProvider": true, "callHierarchyProvider": true,
+                "hoverProvider": true, "completionProvider": { "resolveProvider": false },
             });
             let result = json!({ "capabilities": capabilities, "serverInfo": { "name": "norn", "version": env!("CARGO_PKG_VERSION") } });
             write_message(out, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));

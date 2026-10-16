@@ -17,6 +17,7 @@ pub mod session;
 pub mod sqlite;
 pub mod store;
 pub mod units;
+pub mod value;
 
 use mask::MacroSets;
 use model::FileFacts;

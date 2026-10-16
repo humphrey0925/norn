@@ -310,6 +310,17 @@ export async function run(): Promise<void> {
   assert.ok(twice.length >= 1 && twice[0].uri.fsPath.endsWith("shapes.h") && twice[0].range.start.line === 6, JSON.stringify(twice));
   editor = await vscode.window.showTextDocument(doc);
 
+  // A macro shows the number it comes to, the macros it names read too.
+  const bfdh = await vscode.workspace.openTextDocument(path.join(folder, "bfd", "bfd-in2.h"));
+  const hovers = await vscode.commands.executeCommand<vscode.Hover[]>("vscode.executeHoverProvider", bfdh.uri, find(bfdh, "BSF_EXPORT "));
+  const hoverText = hovers.flatMap((h) => h.contents.map((c) => (typeof c === "string" ? c : c.value))).join("\n");
+  assert.ok(/#define BSF_EXPORT BSF_GLOBAL/.test(hoverText) && /= 2\b/.test(hoverText), hoverText);
+
+  // The names the index has complete the word being typed.
+  const typing = doc.getText().indexOf("bfd_set_error (bfd_error_invalid_operation)");
+  const completions = await vscode.commands.executeCommand<vscode.CompletionList>("vscode.executeCompletionItemProvider", doc.uri, doc.positionAt(typing + "bfd_set_err".length));
+  assert.ok(completions.items.some((i) => (typeof i.label === "string" ? i.label : i.label.label) === "bfd_set_error"), completions.items.map((i) => i.label).slice(0, 20).join(" "));
+
   // Saving an edit re-indexes it.
   const edit = new vscode.WorkspaceEdit();
   edit.insert(doc.uri, new vscode.Position(doc.lineCount, 0), "\nint si_probe (void) { return 0; }\n");
