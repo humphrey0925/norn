@@ -26,7 +26,7 @@ function find(doc: vscode.TextDocument, needle: string): vscode.Position {
 export async function run(): Promise<void> {
   const folder = vscode.workspace.workspaceFolders![0].uri.fsPath;
   const doc = await vscode.workspace.openTextDocument(path.join(folder, "bfd", "bfdio.c"));
-  const editor = await vscode.window.showTextDocument(doc);
+  let editor = await vscode.window.showTextDocument(doc);
   const ext = vscode.extensions.all.find((e) => e.packageJSON.name === "norn")!;
   await ext.activate();
 
@@ -41,6 +41,26 @@ export async function run(): Promise<void> {
   const call = find(doc, "bfd_set_error (bfd_error_invalid_operation)");
   const defs = await vscode.commands.executeCommand<vscode.Location[]>("vscode.executeDefinitionProvider", doc.uri, call);
   assert.ok(defs.length >= 1 && defs[0].uri.fsPath.endsWith("bfd-in2.h"), JSON.stringify(defs));
+
+  // Norn's own go-to commands (the editor menu, F12): the index's answer alone.
+  editor.selection = new vscode.Selection(call, call);
+  await vscode.commands.executeCommand("norn.goToDefinition");
+  await until("Norn: Go to Definition", async () => vscode.window.activeTextEditor?.document.uri.fsPath.endsWith("bfd-in2.h"));
+  editor = await vscode.window.showTextDocument(doc);
+  // Of a member that holds functions, the functions stored in it; of what
+  // `abfd->iovec` is, its struct.
+  const bread = find(doc, "bread (abfd, ptr, size)");
+  const stored = await vscode.commands.executeCommand<vscode.Location[]>("vscode.executeImplementationProvider", doc.uri, bread);
+  // (GNU style: the return type on a line of its own, the name on the next.)
+  const lineOf = async (l: vscode.Location) => {
+    const d = await vscode.workspace.openTextDocument(l.uri);
+    return d.getText(new vscode.Range(l.range.start.line, 0, Math.min(l.range.start.line + 1, d.lineCount - 1), 1000));
+  };
+  const storedLines = await Promise.all(stored.map(lineOf));
+  assert.ok(storedLines.some((t) => t.includes("cache_bread")), storedLines.join(" | "));
+  const iovec = find(doc, "iovec->bread (abfd, ptr, size)");
+  const typed = await vscode.commands.executeCommand<vscode.Location[]>("vscode.executeTypeDefinitionProvider", doc.uri, iovec);
+  assert.ok(typed.length >= 1 && (await lineOf(typed[0])).includes("struct bfd_iovec"), JSON.stringify(typed));
 
   // Call hierarchy through a function pointer: bfd_read calls iovec->bread.
   const read = find(doc, "bfd_read (void *ptr");
@@ -282,7 +302,7 @@ export async function run(): Promise<void> {
   await vscode.window.showTextDocument(ccDoc);
   const twice = await vscode.commands.executeCommand<vscode.Location[]>("vscode.executeDefinitionProvider", ccDoc.uri, find(ccDoc, "Twice()"));
   assert.ok(twice.length >= 1 && twice[0].uri.fsPath.endsWith("shapes.h") && twice[0].range.start.line === 6, JSON.stringify(twice));
-  await vscode.window.showTextDocument(doc);
+  editor = await vscode.window.showTextDocument(doc);
 
   // Saving an edit re-indexes it.
   const edit = new vscode.WorkspaceEdit();

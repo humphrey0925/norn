@@ -280,6 +280,26 @@
       {
         "command": "norn.fileSymbols.tree",
         "title": "Norn: File Symbols tree"
+      },
+      {
+        "command": "norn.goToDefinition",
+        "title": "Norn: Go to Definition"
+      },
+      {
+        "command": "norn.goToDeclaration",
+        "title": "Norn: Go to Declaration"
+      },
+      {
+        "command": "norn.goToTypeDefinition",
+        "title": "Norn: Go to Type Definition"
+      },
+      {
+        "command": "norn.goToImplementations",
+        "title": "Norn: Go to Implementations"
+      },
+      {
+        "command": "norn.goToReferences",
+        "title": "Norn: Go to References"
       }
     ],
     "menus": {
@@ -484,6 +504,26 @@
         {
           "command": "norn.fileSymbols.tree",
           "when": "false"
+        },
+        {
+          "command": "norn.goToDefinition",
+          "when": "editorLangId =~ /^(c|cpp)$/"
+        },
+        {
+          "command": "norn.goToDeclaration",
+          "when": "editorLangId =~ /^(c|cpp)$/"
+        },
+        {
+          "command": "norn.goToTypeDefinition",
+          "when": "editorLangId =~ /^(c|cpp)$/"
+        },
+        {
+          "command": "norn.goToImplementations",
+          "when": "editorLangId =~ /^(c|cpp)$/"
+        },
+        {
+          "command": "norn.goToReferences",
+          "when": "editorLangId =~ /^(c|cpp)$/"
         }
       ],
       "explorer/context": [
@@ -501,6 +541,33 @@
           "command": "norn.scope.only",
           "when": "explorerResourceIsFolder",
           "group": "si@3"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "norn.goToDefinition",
+          "when": "editorLangId =~ /^(c|cpp)$/",
+          "group": "navigation@0.1"
+        },
+        {
+          "command": "norn.goToDeclaration",
+          "when": "editorLangId =~ /^(c|cpp)$/",
+          "group": "navigation@0.2"
+        },
+        {
+          "command": "norn.goToTypeDefinition",
+          "when": "editorLangId =~ /^(c|cpp)$/",
+          "group": "navigation@0.3"
+        },
+        {
+          "command": "norn.goToImplementations",
+          "when": "editorLangId =~ /^(c|cpp)$/",
+          "group": "navigation@0.4"
+        },
+        {
+          "command": "norn.goToReferences",
+          "when": "editorLangId =~ /^(c|cpp)$/",
+          "group": "navigation@0.5"
         }
       ]
     },
@@ -548,7 +615,23 @@
         }
       }
     },
-    "keybindings": []
+    "keybindings": [
+      {
+        "command": "norn.goToDefinition",
+        "key": "f12",
+        "when": "editorTextFocus && editorLangId =~ /^(c|cpp)$/"
+      },
+      {
+        "command": "norn.goToImplementations",
+        "key": "ctrl+f12",
+        "when": "editorTextFocus && editorLangId =~ /^(c|cpp)$/"
+      },
+      {
+        "command": "norn.goToReferences",
+        "key": "shift+f12",
+        "when": "editorTextFocus && editorLangId =~ /^(c|cpp)$/"
+      }
+    ]
   },
   "scripts": {
     "compile": "tsc -p ./ && npm run bundle",

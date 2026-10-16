@@ -323,6 +323,77 @@ impl Server {
         json!(found.into_iter().take(LIMIT).map(|s| self.sym_location(s)).collect::<Vec<_>>())
     }
 
+    /// The prototypes and other declarations, when there are any; else
+    /// the definition.
+    fn declaration(&mut self, params: &Value) -> Value {
+        if let Some(h) = self.local_at(params) {
+            return json!([self.location(&h.file, h.line, &h.name)]);
+        }
+        let mut found = self.targets(params);
+        if found.iter().any(|&s| self.g().syms[s as usize].flags & flag::DECL != 0) {
+            found.retain(|&s| self.g().syms[s as usize].flags & flag::DECL != 0);
+        }
+        json!(found.into_iter().take(LIMIT).map(|s| self.sym_location(s)).collect::<Vec<_>>())
+    }
+
+    /// Where the type of what is under the cursor is defined: of a variable,
+    /// a parameter or a member, its type; of a function, what it returns;
+    /// of a type, itself.
+    fn type_definition(&mut self, params: &Value) -> Value {
+        let mut types: Vec<String> = Vec::new();
+        if let Some(h) = self.local_at(params) {
+            types.extend(h.type_name);
+        } else {
+            for s in self.targets(params) {
+                let g = self.g();
+                let sym = g.syms[s as usize];
+                let path = g.file_path(sym.file).to_string();
+                let def = s - g.files[sym.file as usize].sym_start;
+                match sym.kind {
+                    kind::STRUCT | kind::UNION | kind::ENUM | kind::TYPEDEF | kind::CLASS => types.push(g.sym_name(s).to_string()),
+                    _ => {
+                        let Some(f) = self.session.facts_of(&path) else { continue };
+                        let named = if sym.kind == kind::FIELD {
+                            f.records.iter().find_map(|r| r.defs.iter().position(|&d| d == def).map(|i| r.types[i]))
+                        } else {
+                            f.typed.iter().find(|t| t.0 == def).map(|t| t.1)
+                        };
+                        types.extend(named.filter(|&t| t != si_core::model::NONE).map(|t| f.name(t as usize).to_string()));
+                    }
+                }
+            }
+        }
+        types.sort();
+        types.dedup();
+        let g = self.g();
+        let is_type = |s: u32| matches!(g.syms[s as usize].kind, kind::STRUCT | kind::UNION | kind::ENUM | kind::TYPEDEF | kind::CLASS);
+        let mut found: Vec<u32> = types.iter().flat_map(|t| g.find(t).iter().copied().filter(|&s| is_type(s))).collect();
+        if found.iter().any(|&s| g.syms[s as usize].flags & flag::DECL == 0) {
+            found.retain(|&s| g.syms[s as usize].flags & flag::DECL == 0);
+        }
+        json!(found.into_iter().take(LIMIT).map(|s| self.sym_location(s)).collect::<Vec<_>>())
+    }
+
+    /// What carries out what is under the cursor: of a prototype or a
+    /// function, its definitions (of a virtual method, those of every class
+    /// that has one); of a member or variable that holds functions, the
+    /// functions stored in it.
+    fn implementation(&mut self, params: &Value) -> Value {
+        let targets = self.targets(params);
+        let g = self.g();
+        let mut found: Vec<u32> = Vec::new();
+        let slots: Vec<u32> = targets.iter().copied().filter(|&s| matches!(g.syms[s as usize].kind, kind::FIELD | kind::GLOBAL)).collect();
+        for b in self.session.stats.bind_sites.iter().filter(|b| slots.contains(&b[2])) {
+            found.push(b[3]);
+        }
+        for &t in targets.iter().filter(|&&t| g.syms[t as usize].kind == kind::FUNCTION) {
+            found.extend(g.find(g.sym_name(t)).iter().copied().filter(|&s| g.syms[s as usize].kind == kind::FUNCTION && g.syms[s as usize].flags & flag::DECL == 0));
+        }
+        found.sort_unstable();
+        found.dedup();
+        json!(found.into_iter().take(LIMIT).map(|s| self.sym_location(s)).collect::<Vec<_>>())
+    }
+
     fn references(&mut self, params: &Value) -> Value {
         if let Some(h) = self.local_at(params) {
             // Within its function: where it is declared, and each line it is used on.
@@ -774,7 +845,16 @@ impl Server {
         // means is not what the same name means where it is compiled.
         let from_position = matches!(
             method,
-            "textDocument/definition" | "textDocument/declaration" | "textDocument/references" | "textDocument/prepareCallHierarchy" | "si/context" | "si/relation" | "si/assignments" | "si/references"
+            "textDocument/definition"
+                | "textDocument/declaration"
+                | "textDocument/typeDefinition"
+                | "textDocument/implementation"
+                | "textDocument/references"
+                | "textDocument/prepareCallHierarchy"
+                | "si/context"
+                | "si/relation"
+                | "si/assignments"
+                | "si/references"
         );
         if let Some((first, last)) = from_position.then(|| self.inactive_at(params)).flatten() {
             return Some(match method {
@@ -784,7 +864,10 @@ impl Server {
             });
         }
         Some(match method {
-            "textDocument/definition" | "textDocument/declaration" => self.definition(params),
+            "textDocument/definition" => self.definition(params),
+            "textDocument/declaration" => self.declaration(params),
+            "textDocument/typeDefinition" => self.type_definition(params),
+            "textDocument/implementation" => self.implementation(params),
             "textDocument/references" => self.references(params),
             "textDocument/documentSymbol" => self.document_symbols(params),
             "workspace/symbol" => self.workspace_symbols(params),
@@ -947,7 +1030,7 @@ pub fn run(
             *server = Some(Server { session, opened: (0, 0), root: dir, open: HashMap::new(), lines: HashMap::new(), listing: [None, None], loading: true, waiting: Vec::new() });
             let capabilities = json!({
                 "textDocumentSync": { "openClose": true, "change": 1, "save": true },
-                "definitionProvider": true, "declarationProvider": true, "referencesProvider": true,
+                "definitionProvider": true, "declarationProvider": true, "typeDefinitionProvider": true, "implementationProvider": true, "referencesProvider": true,
                 "documentSymbolProvider": true, "workspaceSymbolProvider": true, "callHierarchyProvider": true,
             });
             let result = json!({ "capabilities": capabilities, "serverInfo": { "name": "norn", "version": env!("CARGO_PKG_VERSION") } });

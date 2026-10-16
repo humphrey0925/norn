@@ -94,6 +94,26 @@ async function ask<T>(method: string, params: unknown): Promise<T | undefined> {
   }
 }
 
+/** Go where the index says, from the cursor: `method` the request, `nothing` what to say
+ *  when there is no such place. Without the index (not started, or stopped), the
+ *  editor's own command `fallback` answers instead. */
+async function goTo(method: string, fallback: string, nothing: string) {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    return;
+  }
+  const found = await ask<{ uri: string; range: Entry["range"] }[] | null>(method, { ...positionParams(editor), context: { includeDeclaration: true } });
+  if (found === undefined) {
+    await vscode.commands.executeCommand(fallback);
+    return;
+  }
+  const at = (p: { line: number; character: number }) => new vscode.Position(p.line, p.character);
+  const places = (found ?? []).map((l) => new vscode.Location(vscode.Uri.parse(l.uri), new vscode.Range(at(l.range.start), at(l.range.end))));
+  // (References are always listed, as the editor lists them; elsewhere one place is gone to.)
+  const mode = method === "textDocument/references" ? "peek" : "goto";
+  await vscode.commands.executeCommand("editor.action.goToLocations", editor.document.uri, editor.selection.active, places, mode, nothing);
+}
+
 /** Show a place: in the group of the editor the views follow, or beside it. */
 async function open(uri: string, line: number, character = 0, beside = false) {
   const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(uri));
@@ -1815,6 +1835,11 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
     vscode.commands.registerCommand("norn.openToSide", (n: Node) => n?.target && open(n.target.uri, n.target.line, n.target.character, true)),
     vscode.commands.registerCommand("norn.relation.tree", () => relation.setView("tree")),
     vscode.commands.registerCommand("norn.relation.graph", () => relation.setView("graph")),
+    vscode.commands.registerCommand("norn.goToDefinition", () => goTo("textDocument/definition", "editor.action.revealDefinition", "No definition found")),
+    vscode.commands.registerCommand("norn.goToDeclaration", () => goTo("textDocument/declaration", "editor.action.revealDeclaration", "No declaration found")),
+    vscode.commands.registerCommand("norn.goToTypeDefinition", () => goTo("textDocument/typeDefinition", "editor.action.goToTypeDefinition", "No type definition found")),
+    vscode.commands.registerCommand("norn.goToImplementations", () => goTo("textDocument/implementation", "editor.action.goToImplementation", "No implementation found")),
+    vscode.commands.registerCommand("norn.goToReferences", () => goTo("textDocument/references", "editor.action.goToReferences", "No references found")),
     vscode.commands.registerCommand("norn.relation.callers", () => relation.setMode("callers")),
     vscode.commands.registerCommand("norn.relation.callees", () => relation.setMode("callees")),
     vscode.commands.registerCommand("norn.relation.references", () => relation.setMode("references")),
