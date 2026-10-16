@@ -60,8 +60,8 @@ jobs:
       - name: zig
         if: matrix.zig
         run: |
-          pip install ziglang==0.13.0
-          cargo install cargo-zigbuild@0.19.8 --locked
+          pip install ziglang==0.16.0
+          cargo install cargo-zigbuild@0.23.4 --locked
       - uses: actions/setup-node@v4
         with:
           node-version: 20
