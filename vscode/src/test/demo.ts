@@ -7,7 +7,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export async function run(): Promise<void> {
   const folder = vscode.workspace.workspaceFolders![0].uri.fsPath;
-  const doc = await vscode.workspace.openTextDocument(path.join(folder, "bfd", "bfdio.c"));
+  const doc = await vscode.workspace.openTextDocument(path.join(folder, ...(process.env.SI_DEMO_FILE ?? "bfd/bfdio.c").split("/")));
   const editor = await vscode.window.showTextDocument(doc);
   await vscode.extensions.all.find((e) => e.packageJSON.name === "norn")!.activate();
   for (let i = 0; i < 60; i++) {
@@ -80,5 +80,14 @@ export async function run(): Promise<void> {
   // (The window says its extensions are off; that is not for the picture.)
   await sleep(1500);
   await vscode.commands.executeCommand("notifications.clearAll");
+  // What the editor shows at the cursor: a hover, a call's parameters, the
+  // completions there.
+  const action = { hover: "editor.action.showHover", signature: "editor.action.triggerParameterHints", suggest: "editor.action.triggerSuggest" }[process.env.SI_DEMO_ACTION ?? ""];
+  if (action) {
+    await vscode.window.showTextDocument(doc, { selection: new vscode.Range(at, at) });
+    await sleep(500);
+    await vscode.commands.executeCommand(action);
+    await sleep(2500);
+  }
   await sleep(Number(process.env.SI_DEMO_HOLD_MS ?? 12000));
 }

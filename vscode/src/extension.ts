@@ -1347,6 +1347,13 @@ class Context implements vscode.WebviewViewProvider {
     this.post(entry, doc);
   }
 
+  /** The index has changed: what the cursor is on is asked again, even
+   *  where it has not moved (asked while the index was still being read,
+   *  the answer may have been nothing). */
+  stale() {
+    this.last = "";
+  }
+
   async follow(editor: vscode.TextEditor, asked = false) {
     if ((this.locked && !asked) || !this.view?.visible) {
       return;
@@ -1880,6 +1887,7 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
       fileSymbols.refresh();
       search.refresh();
       lenses.refresh();
+      contextView.stale();
       follow(vscode.window.activeTextEditor ?? current, true);
       vscode.window.visibleTextEditors.forEach((e) => void dim(e));
     });

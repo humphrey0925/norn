@@ -651,9 +651,17 @@ impl Server {
         } else if !whole && k != kind::MACRO && k != kind::ENUM_CONST && !text.ends_with(';') {
             text.push(';');
         }
-        // The comment above.
+        // The comment above; or, a blank line between (GNU style), the one
+        // above that if it names the symbol (not a file's own comment).
         let mut doc: Vec<String> = Vec::new();
         let mut l = line;
+        let gap = l > 2 && self.line_text(&file, l - 1).trim().is_empty() && {
+            let t = self.line_text(&file, l - 2);
+            t.trim_end().ends_with("*/") || t.trim_start().starts_with("//")
+        };
+        if gap {
+            l -= 1;
+        }
         let above = if l > 1 { self.line_text(&file, l - 1) } else { String::new() };
         if above.trim_end().ends_with("*/") {
             while l > 1 {
@@ -682,6 +690,15 @@ impl Server {
                 l -= 1;
             }
             doc.reverse();
+        }
+        if gap {
+            let names = doc.iter().any(|t| {
+                let b = t.as_bytes();
+                t.match_indices(name.as_str()).any(|(i, _)| (i == 0 || !is_ident(b[i - 1])) && b.get(i + name.len()).is_none_or(|&c| !is_ident(c)))
+            });
+            if !names {
+                doc.clear();
+            }
         }
         // Else after it on its line.
         if doc.is_empty() {
@@ -1858,7 +1875,7 @@ impl Server {
             trace(|| format!("  updated {} files: {} parsed, {:.0} ms", paths.len(), up.extracted, up.extract_ms + up.link_ms));
             self.lines.clear();
             self.listing = [None, None];
-        self.hidden = None;
+            self.hidden = None;
         }
     }
 
@@ -2095,6 +2112,16 @@ pub fn run(
 ) {
     let open = std::sync::Arc::new(open);
     let mut out = std::io::stdout();
+    // A panic goes to the trace too, where it is looked for with the rest
+    // (an editor keeps the server's stderr to itself).
+    if std::env::var_os("NORN_TRACE").is_some() {
+        let before = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let bt = std::backtrace::Backtrace::force_capture();
+            trace(|| format!("PANIC {info}\n{bt}"));
+            before(info);
+        }));
+    }
     // Indexing takes its time; a thread says how far it has got
     // (`si/progress`), and that it is over.
     std::thread::spawn(|| {
@@ -2229,6 +2256,8 @@ pub fn run(
                 s.loading = false;
                 s.lines.clear();
                 s.listing = [None, None];
+                // (Made of the stand-in's files, if asked for while it stood.)
+                s.hidden = None;
                 let ready = json!({ "files": s.session.files(), "symbols": s.g().syms.len(), "edges": s.g().out.len(), "loaded": up.loaded, "parsed": up.extracted });
                 write_message(&mut out, &json!({ "jsonrpc": "2.0", "method": "si/ready", "params": ready }));
                 // What was asked of the index while there was none.

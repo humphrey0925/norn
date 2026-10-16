@@ -26,9 +26,13 @@ function find(doc: vscode.TextDocument, needle: string): vscode.Position {
 export async function run(): Promise<void> {
   const folder = vscode.workspace.workspaceFolders![0].uri.fsPath;
   const doc = await vscode.workspace.openTextDocument(path.join(folder, "bfd", "bfdio.c"));
-  let editor = await vscode.window.showTextDocument(doc);
+  // The cursor on a name before there is an index: Context asks at once.
+  const early = doc.positionAt(doc.getText().indexOf("bfd_seek (abfd, 0, SEEK_CUR)") + 2);
+  let editor = await vscode.window.showTextDocument(doc, { selection: new vscode.Range(early, early) });
   const ext = vscode.extensions.all.find((e) => e.packageJSON.name === "norn")!;
   await ext.activate();
+  await vscode.commands.executeCommand("norn.context.focus");
+  editor = await vscode.window.showTextDocument(doc, { selection: new vscode.Range(early, early) });
 
   // The server is up and has indexed the folder.
   const symbols = await until("workspace symbols", async () => {
@@ -36,6 +40,11 @@ export async function run(): Promise<void> {
     return s?.length ? s : undefined;
   });
   assert.ok(symbols.some((s) => s.name === "bfd_cache_init"));
+  // The index ready, the cursor not moved: Context shows what it is on.
+  const first = await until("Context once the index is ready", async () =>
+    vscode.commands.executeCommand<{ uri: string; line: number } | undefined>("norn.context.shown"),
+  );
+  assert.ok(first.uri.endsWith("bfdio.c"), JSON.stringify(first));
 
   // Go to definition across files.
   const call = find(doc, "bfd_set_error (bfd_error_invalid_operation)");
