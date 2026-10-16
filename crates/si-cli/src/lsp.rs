@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
+mod more;
+
 /// Results sent for one request at most.
 const LIMIT: usize = 2000;
 
@@ -1952,6 +1954,8 @@ impl Server {
                 | "textDocument/typeDefinition"
                 | "textDocument/implementation"
                 | "textDocument/references"
+                | "textDocument/prepareRename"
+                | "textDocument/rename"
                 | "textDocument/prepareCallHierarchy"
                 | "si/context"
                 | "si/relation"
@@ -1990,6 +1994,12 @@ impl Server {
             "si/inactive" => self.inactive(params),
             "si/counterpart" => self.counterpart(params),
             "textDocument/documentLink" => self.document_links(params),
+            "textDocument/foldingRange" => self.folding_ranges(params),
+            "textDocument/semanticTokens/full" => self.semantic_tokens(params),
+            "textDocument/prepareRename" => self.prepare_rename(params),
+            "textDocument/rename" => self.rename(params),
+            "textDocument/inlayHint" => self.inlay_hints(params),
+            "textDocument/codeAction" => self.code_actions(params),
             "textDocument/documentHighlight" => self.document_highlight(params),
             "si/conditions" => self.conditions(),
             "si/setConditions" => {
@@ -2137,14 +2147,22 @@ pub fn run(
                 let _ = events.send(Event::Opened(Box::new(open(&at, have))));
             });
             *server = Some(Server { session, opened: (0, 0), root: dir, open: HashMap::new(), lines: HashMap::new(), listing: [None, None], hidden: None, alongside: params["initializationOptions"]["alongside"].as_bool().unwrap_or(false), loading: true, waiting: Vec::new() });
-            let capabilities = json!({
+            let mut capabilities = json!({
                 "textDocumentSync": { "openClose": true, "change": 1, "save": true },
                 "definitionProvider": true, "declarationProvider": true, "typeDefinitionProvider": true, "implementationProvider": true, "referencesProvider": true,
                 "documentSymbolProvider": true, "workspaceSymbolProvider": true, "callHierarchyProvider": true,
                 "hoverProvider": true, "completionProvider": { "resolveProvider": false, "triggerCharacters": [".", ">", "\"", "<", "/"] },
                 "signatureHelpProvider": { "triggerCharacters": ["(", ","], "retriggerCharacters": [")"] },
                 "documentLinkProvider": { "resolveProvider": false }, "documentHighlightProvider": true,
+                "codeActionProvider": { "codeActionKinds": ["quickfix"] },
             });
+            // What the C/C++ extension gives itself, where it is: not twice.
+            if !params["initializationOptions"]["alongside"].as_bool().unwrap_or(false) {
+                capabilities["foldingRangeProvider"] = json!(true);
+                capabilities["semanticTokensProvider"] = json!({ "legend": { "tokenTypes": more::TOKEN_TYPES, "tokenModifiers": more::TOKEN_MODIFIERS }, "full": true });
+                capabilities["renameProvider"] = json!({ "prepareProvider": true });
+                capabilities["inlayHintProvider"] = json!(true);
+            }
             let result = json!({ "capabilities": capabilities, "serverInfo": { "name": "norn", "version": env!("CARGO_PKG_VERSION") } });
             write_message(out, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));
             return true;

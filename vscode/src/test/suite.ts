@@ -334,6 +334,50 @@ export async function run(): Promise<void> {
   const memberNames = members.items.map((i) => (typeof i.label === "string" ? i.label : i.label.label));
   assert.ok(memberNames.includes("iovec") && memberNames.includes("filename") && !memberNames.includes("bfd_set_error"), memberNames.slice(0, 20).join(" "));
 
+  // Folding: functions' braces, comments.
+  const folds = await vscode.commands.executeCommand<vscode.FoldingRange[]>("vscode.executeFoldingRangeProvider", doc.uri);
+  const fnLine = doc.positionAt(doc.getText().indexOf("\nbfd_read (") + 1).line;
+  assert.ok(folds.some((f) => f.start === fnLine + 1 && f.end > fnLine + 5) && folds.some((f) => f.kind === vscode.FoldingRangeKind.Comment), JSON.stringify(folds.slice(0, 10)));
+
+  // Colour by what a name is: a function called, an enumerator.
+  const legend = await vscode.commands.executeCommand<vscode.SemanticTokensLegend>("vscode.provideDocumentSemanticTokensLegend", doc.uri);
+  const tokens = await vscode.commands.executeCommand<vscode.SemanticTokens>("vscode.provideDocumentSemanticTokens", doc.uri);
+  const kinds = new Map<string, string>();
+  for (let i = 0, line = 0, col = 0; i < tokens.data.length; i += 5) {
+    line += tokens.data[i];
+    col = tokens.data[i] === 0 ? col + tokens.data[i + 1] : tokens.data[i + 1];
+    kinds.set(`${line}:${col}`, legend.tokenTypes[tokens.data[i + 3]]);
+  }
+  const at = (needle: string, skip = 0) => {
+    const p = doc.positionAt(doc.getText().indexOf(needle) + skip);
+    return `${p.line}:${p.character}`;
+  };
+  assert.strictEqual(kinds.get(at("bfd_set_error (bfd_error_invalid_operation)")), "function");
+  assert.strictEqual(kinds.get(at("bfd_error_invalid_operation)")), "enumMember");
+
+  // The parameter's name before an argument.
+  const hints = await vscode.commands.executeCommand<vscode.InlayHint[]>("vscode.executeInlayHintProvider", doc.uri, new vscode.Range(0, 0, doc.lineCount, 0));
+  const hinted = doc.positionAt(doc.getText().indexOf("bfd_error_invalid_operation)"));
+  assert.ok(hints.some((h) => h.position.isEqual(hinted) && /error_tag:/.test(typeof h.label === "string" ? h.label : h.label.map((p) => p.value).join(""))), JSON.stringify(hints.slice(0, 5)));
+
+  // Renaming a function: where it is declared, defined, called; asked,
+  // not done.
+  const renamed = await vscode.commands.executeCommand<vscode.WorkspaceEdit>("vscode.executeDocumentRenameProvider", doc.uri, called, "bfd_set_error_now");
+  const renamedFiles = renamed.entries().map(([u, edits]) => [path.basename(u.fsPath), edits.length] as const);
+  assert.ok(renamedFiles.some(([f]) => f === "bfd-in2.h") && renamedFiles.some(([f, n]) => f === "bfdio.c" && n >= 2), JSON.stringify(renamedFiles));
+  assert.ok(renamed.entries().every(([, edits]) => edits.every((e) => e.newText === "bfd_set_error_now")));
+
+  // A name no header the file reads declares: the #include that would.
+  const actions = await vscode.commands.executeCommand<vscode.CodeAction[]>("vscode.executeCodeActionProvider", doc.uri, new vscode.Range(called, called));
+  assert.ok(actions.some((a) => /#include ".*bfd-in2\.h"/.test(a.title)), JSON.stringify(actions.map((a) => a.title)));
+
+  // Formatting, with clang-format where it is.
+  const clang = [process.env.PATH ?? "", "C:\\Program Files\\LLVM\\bin"].join(path.delimiter).split(path.delimiter).some((d) => d && fs.existsSync(path.join(d, process.platform === "win32" ? "clang-format.exe" : "clang-format")));
+  if (clang) {
+    const formatted = await vscode.commands.executeCommand<vscode.TextEdit[]>("vscode.executeFormatDocumentProvider", doc.uri, { tabSize: 4, insertSpaces: true });
+    assert.ok((formatted?.length ?? 0) > 0, "clang-format gave no edits");
+  }
+
   // An #include leads to the file it means, and is a link to it.
   const included = doc.positionAt(doc.getText().indexOf('#include "libbfd.h"') + 12);
   const includedFile = await vscode.commands.executeCommand<vscode.Location[]>("vscode.executeDefinitionProvider", doc.uri, included);

@@ -6,6 +6,7 @@
 // results open in that editor's group (or beside it, on request), and each
 // view can be locked so it stops following.
 
+import * as cp from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -1512,6 +1513,67 @@ async function dim(editor: vscode.TextEditor | undefined): Promise<void> {
   );
 }
 
+/** clang-format, where it is: on the PATH, else where LLVM installs it. */
+function clangFormat(): string | undefined {
+  const exe = process.platform === "win32" ? "clang-format.exe" : "clang-format";
+  const dirs = (process.env.PATH ?? "").split(path.delimiter).filter((d) => d);
+  if (process.platform === "win32") {
+    dirs.push(path.join(process.env.ProgramFiles ?? "C:\\Program Files", "LLVM", "bin"), path.join(process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)", "LLVM", "bin"));
+  } else {
+    dirs.push("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin");
+  }
+  for (const d of dirs) {
+    const p = path.join(d, exe);
+    try {
+      if (fs.statSync(p).isFile()) {
+        return p;
+      }
+    } catch {
+      // (Not there.)
+    }
+  }
+  return undefined;
+}
+
+/** The C/C++ extension's own style where a project has no `.clang-format`
+ *  (its `clang_format_fallbackStyle`, "Visual Studio"). */
+const VISUAL_STUDIO =
+  "{BasedOnStyle: LLVM, UseTab: Never, IndentWidth: 4, TabWidth: 4, BreakBeforeBraces: Allman, AllowShortIfStatementsOnASingleLine: false, IndentCaseLabels: false, ColumnLimit: 0, AccessModifierOffset: -4, NamespaceIndentation: All, FixNamespaceComments: false}";
+
+/** The text formatted (lines `lines` only, from 1, if given), and the
+ *  edit that makes it so: what lies between what is the same at the start
+ *  and at the end. */
+async function format(doc: vscode.TextDocument, exe: string, lines?: [number, number]): Promise<vscode.TextEdit[]> {
+  let styled = false;
+  for (let dir = path.dirname(doc.fileName); ; dir = path.dirname(dir)) {
+    if ([".clang-format", "_clang-format"].some((f) => fs.existsSync(path.join(dir, f)))) {
+      styled = true;
+      break;
+    }
+    if (path.dirname(dir) === dir) {
+      break;
+    }
+  }
+  const args = [`--style=${styled ? "file" : VISUAL_STUDIO}`, `--assume-filename=${doc.fileName}`, ...(lines ? [`--lines=${lines[0]}:${lines[1]}`] : [])];
+  const text = doc.getText();
+  const out = await new Promise<string | undefined>((resolve) => {
+    const child = cp.execFile(exe, args, { maxBuffer: 64 * 1024 * 1024 }, (err, stdout) => resolve(err ? undefined : stdout));
+    child.stdin?.end(text);
+  });
+  if (out === undefined || out === text) {
+    return [];
+  }
+  let a = 0;
+  while (a < text.length && a < out.length && text[a] === out[a]) {
+    a++;
+  }
+  let e = 0;
+  while (e < text.length - a && e < out.length - a && text[text.length - 1 - e] === out[out.length - 1 - e]) {
+    e++;
+  }
+  return [vscode.TextEdit.replace(new vscode.Range(doc.positionAt(a), doc.positionAt(text.length - e)), out.slice(a, out.length - e))];
+}
+
 export async function activate(context: vscode.ExtensionContext) {
   home = context.extensionUri;
   const relation = new Relation(vscode.Uri.joinPath(context.extensionUri, "media"));
@@ -1526,6 +1588,18 @@ export async function activate(context: vscode.ExtensionContext) {
   status.show();
 
   const selector: vscode.DocumentSelector = [{ scheme: "file", pattern: SOURCE_GLOB }];
+
+  // Formatting, with clang-format, where the C/C++ extension (which does
+  // it itself) is not.
+  const formatter = !vscode.extensions.getExtension("ms-vscode.cpptools") ? clangFormat() : undefined;
+  if (formatter) {
+    context.subscriptions.push(
+      vscode.languages.registerDocumentFormattingEditProvider(selector, { provideDocumentFormattingEdits: (doc) => format(doc, formatter) }),
+      vscode.languages.registerDocumentRangeFormattingEditProvider(selector, {
+        provideDocumentRangeFormattingEdits: (doc, range) => format(doc, formatter, [range.start.line + 1, range.end.line + 1]),
+      }),
+    );
+  }
 
   async function refreshStatus() {
     const s = await ask<{ files: number; symbols: number; loaded: number; parsed: number; cache: string | null; loading?: boolean }>("si/status", {});
