@@ -1836,8 +1836,6 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
     vscode.commands.registerCommand("norn.relation.tree", () => relation.setView("tree")),
     vscode.commands.registerCommand("norn.relation.graph", () => relation.setView("graph")),
     vscode.commands.registerCommand("norn.goToDefinition", () => goTo("textDocument/definition", "editor.action.revealDefinition", "No definition found")),
-    vscode.commands.registerCommand("norn.goToDeclaration", () => goTo("textDocument/declaration", "editor.action.revealDeclaration", "No declaration found")),
-    vscode.commands.registerCommand("norn.goToTypeDefinition", () => goTo("textDocument/typeDefinition", "editor.action.goToTypeDefinition", "No type definition found")),
     vscode.commands.registerCommand("norn.goToImplementations", () => goTo("textDocument/implementation", "editor.action.goToImplementation", "No implementation found")),
     vscode.commands.registerCommand("norn.goToReferences", () => goTo("textDocument/references", "editor.action.goToReferences", "No references found")),
     vscode.commands.registerCommand("norn.relation.callers", () => relation.setMode("callers")),

@@ -286,14 +286,6 @@
         "title": "Norn: Go to Definition"
       },
       {
-        "command": "norn.goToDeclaration",
-        "title": "Norn: Go to Declaration"
-      },
-      {
-        "command": "norn.goToTypeDefinition",
-        "title": "Norn: Go to Type Definition"
-      },
-      {
         "command": "norn.goToImplementations",
         "title": "Norn: Go to Implementations"
       },
@@ -510,14 +502,6 @@
           "when": "editorLangId =~ /^(c|cpp)$/"
         },
         {
-          "command": "norn.goToDeclaration",
-          "when": "editorLangId =~ /^(c|cpp)$/"
-        },
-        {
-          "command": "norn.goToTypeDefinition",
-          "when": "editorLangId =~ /^(c|cpp)$/"
-        },
-        {
           "command": "norn.goToImplementations",
           "when": "editorLangId =~ /^(c|cpp)$/"
         },
@@ -550,24 +534,14 @@
           "group": "navigation@0.1"
         },
         {
-          "command": "norn.goToDeclaration",
+          "command": "norn.goToImplementations",
           "when": "editorLangId =~ /^(c|cpp)$/",
           "group": "navigation@0.2"
         },
         {
-          "command": "norn.goToTypeDefinition",
-          "when": "editorLangId =~ /^(c|cpp)$/",
-          "group": "navigation@0.3"
-        },
-        {
-          "command": "norn.goToImplementations",
-          "when": "editorLangId =~ /^(c|cpp)$/",
-          "group": "navigation@0.4"
-        },
-        {
           "command": "norn.goToReferences",
           "when": "editorLangId =~ /^(c|cpp)$/",
-          "group": "navigation@0.5"
+          "group": "navigation@0.3"
         }
       ]
     },

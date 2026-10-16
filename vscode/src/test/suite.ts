@@ -47,6 +47,12 @@ export async function run(): Promise<void> {
   await vscode.commands.executeCommand("norn.goToDefinition");
   await until("Norn: Go to Definition", async () => vscode.window.activeTextEditor?.document.uri.fsPath.endsWith("bfd-in2.h"));
   editor = await vscode.window.showTextDocument(doc);
+  // On the definition itself: its prototype, a header's.
+  const named = find(doc, "bfd_read (void *ptr");
+  editor.selection = new vscode.Selection(named, named);
+  await vscode.commands.executeCommand("norn.goToDefinition");
+  await until("Norn: Go to Definition, from the definition", async () => vscode.window.activeTextEditor?.document.uri.fsPath.endsWith(".h"));
+  editor = await vscode.window.showTextDocument(doc);
   // Of a member that holds functions, the functions stored in it; of what
   // `abfd->iovec` is, its struct.
   const bread = find(doc, "bread (abfd, ptr, size)");

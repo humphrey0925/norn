@@ -209,15 +209,24 @@ impl Server {
         (end > start).then(|| (file, line, text[start..end].to_string()))
     }
 
-    /// Where `name` is written on a line, as an LSP location.
+    /// Where `name` is written on a line, as an LSP location: on the
+    /// line, or a line or two below it (GNU style: `static int` on a line
+    /// of its own, the name on the next); else the line itself.
     fn location(&mut self, file: &str, line: u32, name: &str) -> Value {
-        let text = self.line_text(file, line);
-        let b = text.as_bytes();
-        let col = text
-            .match_indices(name)
-            .map(|(i, _)| i)
-            .find(|&i| (i == 0 || !is_ident(b[i - 1])) && b.get(i + name.len()).is_none_or(|&c| !is_ident(c)));
-        let (start, end) = col.map_or((0, 0), |c| (c, c + name.len()));
+        let mut found = None;
+        for l in line..line + 3 {
+            let text = self.line_text(file, l);
+            let b = text.as_bytes();
+            let col = text
+                .match_indices(name)
+                .map(|(i, _)| i)
+                .find(|&i| (i == 0 || !is_ident(b[i - 1])) && b.get(i + name.len()).is_none_or(|&c| !is_ident(c)));
+            if let Some(c) = col {
+                found = Some((l, c));
+                break;
+            }
+        }
+        let (line, (start, end)) = found.map_or((line, (0, 0)), |(l, c)| (l, (c, c + name.len())));
         let l = line.saturating_sub(1);
         json!({ "uri": path_to_uri(&self.root.join(file)),
                 "range": { "start": { "line": l, "character": start }, "end": { "line": l, "character": end } } })
@@ -316,9 +325,20 @@ impl Server {
             return json!([self.location(&h.file, h.line, &h.name)]);
         }
         let mut found = self.targets(params);
-        // The definition, when there is one; else the declarations.
-        if found.iter().any(|&s| self.g().syms[s as usize].flags & flag::DECL == 0) {
-            found.retain(|&s| self.g().syms[s as usize].flags & flag::DECL == 0);
+        let decl = |g: &Graph, s: u32| g.syms[s as usize].flags & flag::DECL != 0;
+        // The definition, when there is one; else the declarations. On the
+        // definition itself: the declarations, to go back and forth.
+        let defs: Vec<u32> = found.iter().copied().filter(|&s| !decl(self.g(), s)).collect();
+        let here = self.at(params).map(|(file, line, _)| (file, line));
+        let on_def = defs.iter().any(|&d| {
+            let loc = self.sym_location(d);
+            let at = (uri_to_path(loc["uri"].as_str().unwrap_or("")), loc["range"]["start"]["line"].as_u64().unwrap_or(0) as u32 + 1);
+            here.as_ref().is_some_and(|(file, line)| self.relative(&at.0).as_deref() == Some(file) && at.1 == *line)
+        });
+        if on_def && found.iter().any(|&s| decl(self.g(), s)) {
+            found.retain(|&s| decl(self.g(), s));
+        } else if !defs.is_empty() {
+            found = defs;
         }
         json!(found.into_iter().take(LIMIT).map(|s| self.sym_location(s)).collect::<Vec<_>>())
     }
