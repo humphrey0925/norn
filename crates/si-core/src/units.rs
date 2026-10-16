@@ -205,6 +205,9 @@ struct World<'a> {
     plain: &'a Conditions,
     /// The same, with the names the sources define outright not defined.
     told: Conditions,
+    /// After a header not in the tree: the plain ones, with the files'
+    /// include guards still not defined (no header defines another's).
+    unseen: Conditions,
     /// Per file and step, how its condition came out: 1 held, 2 failed, 4 open.
     seen: Vec<Vec<AtomicU8>>,
     /// The files whose reading each compilation keeps (see [`Readings`]).
@@ -298,7 +301,7 @@ struct Unit<'a> {
 
 impl Unit<'_> {
     fn conditions(&self) -> &Conditions {
-        if self.unseen { self.w.plain } else { &self.w.told }
+        if self.unseen { &self.w.unseen } else { &self.w.told }
     }
 
     fn holds(&self, slot: u32, kind: u8, expr: &[u8]) -> Tri {
@@ -884,6 +887,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         dir,
         plain: conditions,
         told: conditions.clone(),
+        unseen: conditions.clone(),
         seen: seen(),
         traced: vec![false; n],
         steps,
@@ -961,7 +965,15 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
     let (mut outright, mut left) = read_all(&w, true);
     // So is a file's include guard, though more follow its `#endif` or come
     // before its `#ifndef`.
-    outright.extend(scripts.iter().filter_map(|s| crate::mask::guard_of(&s.ops).or_else(|| crate::mask::guard_after(&s.ops))).filter(|g| !conditions.settles(g)));
+    let guards: Vec<Vec<u8>> = scripts
+        .iter()
+        .zip(paths)
+        .filter(|(_, p)| crate::is_header(p))
+        .filter_map(|(s, _)| crate::mask::guard_name(&s.ops))
+        .filter(|g| !conditions.settles(g))
+        .collect();
+    w.unseen = conditions.with_undefined(guards.iter().cloned());
+    outright.extend(guards);
     if profile {
         let mut rows = std::mem::take(&mut *profiled.lock().unwrap());
         let mut sum = [0u64; 5];
@@ -1235,6 +1247,28 @@ int both;
             ("b.c", "#ifdef Q\n#define BUILD_SAYS\n#endif\n"),
         ]);
         assert_eq!(got[0], []);
+    }
+
+    #[test]
+    fn a_header_not_in_the_tree_does_not_define_another_s_guard() {
+        let got = told(&[
+            ("a.c", "#include \"generated.h\"\n#include \"g.h\"\n#if SOC == 1\n#endif\n"),
+            ("g.h", "#ifndef G_H\n#define G_H\n#define SOC 1\n#endif\n#ifdef MORE\n#endif\n"),
+            ("b.c", "#ifdef Q\n#define MORE\n#endif\n"),
+        ]);
+        assert_eq!(got[0], [one("#if SOC == 1", true)]);
+    }
+
+    #[test]
+    fn a_default_is_no_include_guard() {
+        // binutils: `sframe-opt.c` gives `support_sframe_p` a default; a
+        // target's header the build picks may define it.
+        for default in ["#include \"as.h\"\n#ifndef support_p\n#define support_p\n#endif\n", "#include \"as.h\"\n#ifndef support_p\n# define support_p() 0\n#endif\n"] {
+            for at in ["opt.h", "opt.c"] {
+                let got = told(&[("gen.c", "#include \"targ-cpu.h\"\n#ifdef support_p\n#endif\n"), (at, default)]);
+                assert_eq!(got[0], [], "{at}: {default}");
+            }
+        }
     }
 
     #[test]

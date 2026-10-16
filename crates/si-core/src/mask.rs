@@ -367,21 +367,29 @@ pub fn guard_of(ops: &[Op]) -> Option<Vec<u8>> {
     (&g == name).then_some(g)
 }
 
-/// The same, where an `#include` or a `#define` comes before the guard:
-/// then all the rest of the file has to be inside it.
-pub fn guard_after(ops: &[Op]) -> Option<Vec<u8>> {
+/// A file's include guard, where more may come before or after it: the
+/// first group, `#ifndef G` then a bare `#define G`, holding most of the
+/// file (all the rest, if anything comes before it), and more than its
+/// `#define`. (`#ifndef TRUE`, `#define TRUE 1` is no guard but a default;
+/// so is `#ifndef f`, `#define f() 0`.)
+pub fn guard_name(ops: &[Op]) -> Option<Vec<u8>> {
     let start = ops.iter().position(|op| matches!(op, Op::If { .. } | Op::Elif { .. } | Op::Else | Op::Endif))?;
     let g = guard_of(&ops[start..])?;
+    if !matches!(&ops[start + 1], Op::Define { value, .. } if value.is_empty()) {
+        return None;
+    }
     let mut depth = 0;
-    let close = ops[start..].iter().position(|op| {
-        match op {
-            Op::If { .. } => depth += 1,
-            Op::Endif => depth -= 1,
-            _ => {}
-        }
-        depth == 0
-    })?;
-    (start + close == ops.len() - 1).then_some(g)
+    let close = start
+        + ops[start..].iter().position(|op| {
+            match op {
+                Op::If { .. } => depth += 1,
+                Op::Endif => depth -= 1,
+                _ => {}
+            }
+            depth == 0
+        })?;
+    let last = ops.len() - 1;
+    (close > start + 2 && (close == last || start == 0 && (close + 1) * 2 > ops.len())).then_some(g)
 }
 
 /// The directives of `src`, in order.
