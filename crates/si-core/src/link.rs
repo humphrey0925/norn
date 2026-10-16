@@ -1322,9 +1322,9 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 if ambiguous && edge_why.as_deref().is_some_and(|w| g.name(remap[fi][r.name as usize]) == w) {
                     let at = path_of.get(fi).and_then(|&p| readings.paths.get(p as usize)).map_or("?", |p| p.as_str());
                     let c = tmp[0];
-                    let readers = readers.get().map_or(0, |r| r.len());
+                    let n_readers = readers.get().map_or(0, |r| r.len());
                     eprintln!(
-                        "edgewhy   {at}:{}: {} target(s), maybe {maybe}, guessed {guessed}, optional {}, conditional {}, compiled {:?}, in its unit {}, readers {readers}",
+                        "edgewhy   {at}:{}: {} target(s), maybe {maybe}, guessed {guessed}, optional {}, conditional {}, compiled {:?}, in its unit {}, readers {n_readers}",
                         r.line,
                         tmp.len(),
                         tmp.iter().any(optional),
@@ -1334,6 +1334,32 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     );
                     // How its own compilation reads the macro's file.
                     let s = &syms[c as usize];
+                    {
+                        // In a header: what each compilation reading it says
+                        // (yes, no, not known, does not read the macro's file).
+                        use crate::cond::Tri;
+                        let h = header_of.get(s.file as usize).copied().unwrap_or(NONE);
+                        let p = path_of.get(s.file as usize).copied().unwrap_or(NONE);
+                        let say = |u: u32| -> Option<Tri> {
+                            if h != NONE {
+                                return readings.units[u as usize].1.binary_search_by_key(&h, |w| w.0).is_ok().then(|| readings.compiled(u, h, s.line));
+                            }
+                            if p == NONE || !readings.reads(u, p) {
+                                return None;
+                            }
+                            Some(if s.flags & flag::CONDITIONAL == 0 && readings.reads_surely(u, p) { Tri::True } else { Tri::Unknown })
+                        };
+                        let mut n = [0u32; 4];
+                        let mut odd: Vec<&str> = Vec::new();
+                        for &u in readers.get().map_or(&[][..], |r| &r[..]) {
+                            let k = match say(u) { Some(Tri::True) => 0, Some(Tri::False) => 1, Some(Tri::Unknown) => 2, None => 3 };
+                            n[k] += 1;
+                            if (k == 1 || k == 2) && odd.len() < 4 {
+                                odd.push(readings.units[u as usize].0.as_str());
+                            }
+                        }
+                        eprintln!("edgewhy     readers say: yes {}, no {}, not known {}, do not read it {}; e.g. {}", n[0], n[1], n[2], n[3], odd.join(" "));
+                    }
                     let h = header_of.get(s.file as usize).copied().unwrap_or(NONE);
                     let p = path_of.get(s.file as usize).copied().unwrap_or(NONE);
                     let file = p.ne(&NONE).then(|| readings.paths[p as usize].as_str()).unwrap_or("?");
