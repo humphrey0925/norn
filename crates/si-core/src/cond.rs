@@ -593,6 +593,8 @@ pub struct Source {
     /// compilation that reads them (see `units`): where the directive
     /// starts, and whether it holds.
     verdicts: std::sync::Arc<crate::units::Verdicts>,
+    /// How each compilation reads the headers compiled more than one way.
+    readings: std::sync::Arc<crate::units::Readings>,
 }
 
 fn bits_of(flags: &[bool]) -> Vec<u64> {
@@ -614,6 +616,7 @@ impl Source {
             names: FxHashMap::default(),
             includes: vec![Vec::new(); paths.len()],
             verdicts: Default::default(),
+            readings: Default::default(),
         }
     }
 
@@ -641,6 +644,14 @@ impl Source {
 
     pub fn verdicts(&self) -> &std::sync::Arc<crate::units::Verdicts> {
         &self.verdicts
+    }
+
+    pub fn set_readings(&mut self, readings: std::sync::Arc<crate::units::Readings>) {
+        self.readings = readings;
+    }
+
+    pub fn readings(&self) -> &std::sync::Arc<crate::units::Readings> {
+        &self.readings
     }
 
     /// How many conditions are decided that way.

@@ -319,6 +319,9 @@ pub struct Script {
     /// included: `#pragma once`, or an include guard (whose own three
     /// directives are then left out of `ops`).
     pub once: bool,
+    /// The line each `#if`, `#elif`, `#else` and `#endif` of `ops` is on,
+    /// in order.
+    pub lines: Vec<u32>,
 }
 
 /// The directives of `src`, in order.
@@ -326,6 +329,8 @@ pub fn script(src: &[u8]) -> Script {
     let mut out = Script::default();
     let mut c = Cur { s: src, i: 0, line: 1 };
     let mut line_start = true;
+    // (Lines are counted up to each directive as it comes.)
+    let (mut line, mut counted) = (1u32, 0usize);
     while c.i < src.len() {
         match src[c.i] {
             b'\n' => {
@@ -342,6 +347,9 @@ pub fn script(src: &[u8]) -> Script {
             }
             b'#' if line_start => {
                 let at = c.i as u32;
+                line += src[counted..c.i].iter().filter(|&&b| b == b'\n').count() as u32;
+                counted = c.i;
+                let ops = out.ops.len();
                 c.i += 1;
                 c.skip_space(false);
                 let (a, e) = c.ident();
@@ -393,6 +401,9 @@ pub fn script(src: &[u8]) -> Script {
                     b"pragma" if named().0 == b"once" => out.once = true,
                     _ => {}
                 }
+                if matches!(out.ops[ops..], [Op::If { .. } | Op::Elif { .. } | Op::Else | Op::Endif]) {
+                    out.lines.push(line);
+                }
                 line_start = false;
             }
             _ => {
@@ -416,6 +427,8 @@ pub fn script(src: &[u8]) -> Script {
         if expr == name && close == Some(out.ops.len() - 1) {
             out.ops.pop();
             out.ops.drain(..2);
+            out.lines.pop();
+            out.lines.remove(0);
             out.once = true;
         }
     }

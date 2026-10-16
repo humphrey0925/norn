@@ -96,6 +96,9 @@ pub struct Options {
     /// instead, for headers the build generates from a template
     /// (`bfd.h` from `bfd-in2.h`).
     pub include_aliases: Vec<(String, String)>,
+    /// How each compilation reads the headers compiled more than one way
+    /// (see `units`).
+    pub readings: std::sync::Arc<crate::units::Readings>,
 }
 
 /// How an `#include` operand is found among the indexed files, without the
@@ -887,6 +890,19 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         }
     }
 
+    // Per file, the compilation it starts and the header it is, as the
+    // readings number them.
+    let readings = &*options.readings;
+    let numbered = |list: Vec<&str>| -> Vec<u32> {
+        let at: FxHashMap<&str, u32> = list.into_iter().enumerate().map(|(i, p)| (p, i as u32)).collect();
+        files.iter().map(|f| at.get(f.path.as_str()).copied().unwrap_or(NONE)).collect()
+    };
+    let (unit_of, header_of) = if readings.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        (numbered(readings.units.iter().map(|u| u.0.as_str()).collect()), numbered(readings.files.iter().map(|f| f.0.as_str()).collect()))
+    };
+
     // 3. Resolve references. Each file is independent given the symbol table.
     //    A name means, in order: a definition in this file; one in a file it
     //    includes; anything with external visibility.
@@ -1215,6 +1231,19 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 if tmp.iter().any(is_def) {
                     tmp.retain(is_def);
                 }
+                // In a source file: what its own compilation compiles of a
+                // header read one way here and another elsewhere.
+                let unit = unit_of.get(fi).copied().unwrap_or(NONE);
+                let compiled = |c: u32| {
+                    let s = &syms[c as usize];
+                    match header_of.get(s.file as usize) {
+                        Some(&h) if unit != NONE && h != NONE => readings.compiled(unit, h, s.line),
+                        _ => crate::cond::Tri::Unknown,
+                    }
+                };
+                if unit != NONE && tmp.iter().any(|&c| compiled(c) == crate::cond::Tri::False) && tmp.iter().any(|&c| compiled(c) != crate::cond::Tri::False) {
+                    tmp.retain(|&c| compiled(c) != crate::cond::Tri::False);
+                }
                 // Without types, a member name shared by many structs says
                 // nothing about which one is meant.
                 if kind == refkind::MEMBER && tmp.len() > MAX_MEMBER_CANDIDATES {
@@ -1229,7 +1258,9 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 // reading of the name; so is what a call through it reaches.
                 let optional = |c: &u32| {
                     let s = &syms[*c as usize];
-                    s.kind == kind::MACRO && (s.flags & flag::CONDITIONAL != 0 || s.file != fi as u32 && !sure.member[s.file as usize])
+                    s.kind == kind::MACRO
+                        && (s.flags & flag::CONDITIONAL != 0 || s.file != fi as u32 && !sure.member[s.file as usize])
+                        && compiled(*c) != crate::cond::Tri::True
                 };
                 // (C++: overloads are one function, of one class in one file.)
                 let several = if in_cpp {

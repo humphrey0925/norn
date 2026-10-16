@@ -133,6 +133,7 @@ impl Session {
         let defines = Packed::all(defines);
         let facts = crate::extract_all(root, &files, &sets);
         let mut cache = Cache::default();
+        let options = Options { readings: crate::readings_of(&conditions), ..options };
         let (graph, stats) = link_cached(&facts, &options, &mut cache);
         let stamps = files.par_iter().map(|p| stamp(p)).collect();
         Session {
@@ -522,6 +523,7 @@ impl Session {
             let paths: Vec<String> = files.iter().map(|p| crate::rel_path(root, p)).collect();
             let mut source = mask::source_of(&defines, &paths);
             source.set_verdicts(std::sync::Arc::new(manifest.verdicts.clone()));
+            source.set_readings(std::sync::Arc::new(manifest.readings.clone()));
             if !source.is_empty() {
                 conditions.set_source(Some(std::sync::Arc::new(source)));
             }
@@ -562,7 +564,7 @@ impl Session {
             facts,
             sets,
             cache,
-            options: options.clone(),
+            options: Options { readings: crate::readings_of(&conditions), ..options.clone() },
             store: None,
             stamps,
             scope: Scope::load(root),
@@ -599,7 +601,7 @@ impl Session {
             let files = self.files.iter().map(|p| crate::rel_path(&self.root, p)).collect();
             let verdicts = self.conditions.source().map(|s| s.verdicts().as_ref().clone()).unwrap_or_default();
             store.save_sets(&self.sets);
-            store.save_manifest(self.sets.digest(), files, verdicts);
+            store.save_manifest(self.sets.digest(), files, verdicts, crate::readings_of(&self.conditions).as_ref().clone());
         }
     }
 
@@ -775,6 +777,7 @@ impl Session {
         // The graph that was goes first: nobody can ask it anything while
         // this runs, and the link would make the new one beside it.
         self.graph = Graph::default();
+        self.options.readings = crate::readings_of(&self.conditions);
         (self.graph, self.stats) = link_cached(&self.facts, &self.options, &mut self.cache);
         up.link_ms = ms(t);
         self.graph_unsaved = true;

@@ -227,6 +227,7 @@ fn index(root: &Path, out: &Path, stores: &str, stride: usize, options: &si_core
     let facts_bytes: usize = facts.iter().map(FileFacts::heap_bytes).sum();
 
     let t = Instant::now();
+    let options = &si_core::link::Options { readings: si_core::readings_of(&conditions), ..options.clone() };
     let (g, ls) = si_core::link::link_with(&facts, options);
     let link_ms = ms(t);
 
@@ -643,7 +644,7 @@ fn main() {
     }
     let result = match &cli.cmd {
         Cmd::Index { root, out, stores, stride, include_alias, dump_binds } => {
-            index(root, out, stores, *stride, &si_core::link::Options { include_aliases: aliases(include_alias) }, *dump_binds)
+            index(root, out, stores, *stride, &si_core::link::Options { include_aliases: aliases(include_alias), ..Default::default() }, *dump_binds)
         }
         Cmd::Query { dir, op, name, depth } => query(dir, op, name, *depth),
         Cmd::BenchQuery { dir, n, seed } => bench_query(dir, *n, *seed),
@@ -651,13 +652,13 @@ fn main() {
         Cmd::Sample { dir, n, seed } => sample(dir, *n, *seed),
         Cmd::Serve { dir } => return serve(dir),
         Cmd::Lsp { root, include_alias, keep } => {
-            let options = si_core::link::Options { include_aliases: aliases(include_alias) };
+            let options = si_core::link::Options { include_aliases: aliases(include_alias), ..Default::default() };
             let keep = keep.clone();
             let early = keep.clone();
             return lsp::run(root.as_deref(), move |dir: &Path| early.early(dir), move |dir: &Path, have| keep.open_deferred(dir, &options, have));
         }
         Cmd::Live { root, include_alias, keep } => {
-            return live(root, keep, &si_core::link::Options { include_aliases: aliases(include_alias) })
+            return live(root, keep, &si_core::link::Options { include_aliases: aliases(include_alias), ..Default::default() })
         }
         Cmd::Symbols { dir } => return symbols(dir),
         Cmd::Calls { dir } => return calls(dir),

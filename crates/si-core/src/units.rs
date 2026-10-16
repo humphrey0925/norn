@@ -33,6 +33,59 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::Relaxed};
 /// the directive starts, and whether it holds.
 pub type Verdicts = Vec<Vec<(u32, bool)>>;
 
+/// How each compilation reads the headers that some compilations read
+/// one way and others another (`#if (IS_PLAT_A_EN)` true where the
+/// platform header came first, false where it did not): what a call in a
+/// source file reaches is what its own compilation defines.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Readings {
+    /// Those headers, by path, each with the lines its `#if`s, `#elif`s,
+    /// `#else`s and `#endif`s are on.
+    pub files: Vec<(String, Vec<u32>)>,
+    /// Per header, the ways it is read: per stretch of lines (before the
+    /// first directive, then after each), whether it is compiled, as a
+    /// [`Tri`] (0 no, 1 yes, 2 not known).
+    pub ways: Vec<Vec<Box<[u8]>>>,
+    /// Per compilation (the path of the file it starts from), the way it
+    /// reads each of those headers it reads: (header, way).
+    pub units: Vec<(String, Vec<(u32, u32)>)>,
+}
+
+impl Readings {
+    pub fn is_empty(&self) -> bool {
+        self.units.is_empty()
+    }
+
+    /// Whether the compilation `unit` compiles `line` of `file` (both
+    /// numbered as here); `Unknown` where it does not read the file.
+    pub fn compiled(&self, unit: u32, file: u32, line: u32) -> Tri {
+        let ways = &self.units[unit as usize].1;
+        let Ok(i) = ways.binary_search_by_key(&file, |w| w.0) else { return Tri::Unknown };
+        let way = &self.ways[file as usize][ways[i].1 as usize];
+        // (A definition is on a line after the directive that opens its branch.)
+        let stretch = self.files[file as usize].1.partition_point(|&l| l < line);
+        match way.get(stretch) {
+            Some(0) => Tri::False,
+            Some(1) => Tri::True,
+            _ => Tri::Unknown,
+        }
+    }
+}
+
+/// The ways files are read, numbered per file as they are first seen.
+#[derive(Default)]
+struct Ways {
+    by_file: FxHashMap<u32, FxHashMap<Box<[u8]>, u32>>,
+}
+
+impl Ways {
+    fn number(&mut self, file: u32, way: Vec<u8>) -> u32 {
+        let of = self.by_file.entry(file).or_default();
+        let n = of.len() as u32;
+        *of.entry(way.into()).or_insert(n)
+    }
+}
+
 /// More directive steps than this in all, and the tree is left alone:
 /// the kernel, where an include of `<asm/...>` may mean any of twenty
 /// architectures' and each compilation reads them all, takes three
@@ -100,6 +153,8 @@ struct World<'a> {
     told: Conditions,
     /// Per file and step, how its condition came out: 1 held, 2 failed, 4 open.
     seen: Vec<Vec<AtomicU8>>,
+    /// The files whose reading each compilation keeps (see [`Readings`]).
+    traced: Vec<bool>,
     spent: AtomicU64,
     stop: AtomicBool,
 }
@@ -163,6 +218,9 @@ struct Unit<'a> {
     /// For `SI_COND_PROFILE`: conditions worked out and the ns they took,
     /// definitions kept and their ns, includes followed.
     prof: Option<[u64; 5]>,
+    /// How this compilation reads the files of [`World::traced`]: per
+    /// file, whether each stretch is compiled, as a `Tri`.
+    traces: FxHashMap<u32, Vec<u8>>,
 }
 
 impl Unit<'_> {
@@ -242,7 +300,16 @@ impl Unit<'_> {
         // is compiled, the file being read at all.
         let mut open: Vec<(Tri, Tri, Tri)> = Vec::new();
         let mut live = Tri::True;
+        // How this compilation reads the file, if that is kept: after a
+        // directive, whether what follows is compiled.
+        let whether = if maybe { Tri::Unknown } else { Tri::True };
+        let mut trace = w.traced[file as usize].then(|| vec![whether as u8]);
+        let mut after = false;
         for (i, step) in steps.iter().enumerate() {
+            if let Some(t) = trace.as_mut().filter(|_| std::mem::take(&mut after)) {
+                t.push(live.and(whether) as u8);
+            }
+            after = trace.is_some() && matches!(step, Step::If { .. } | Step::Elif { .. } | Step::Else | Step::Endif);
             match step {
                 Step::If { kind, expr, slot, .. } => {
                     let t = self.prof.map(|_| std::time::Instant::now());
@@ -333,15 +400,40 @@ impl Unit<'_> {
                 }
             }
         }
+        if let Some(mut t) = trace {
+            if after {
+                t.push(live.and(whether) as u8);
+            }
+            // Read twice over: compiled where either reading compiles it.
+            match self.traces.get_mut(&file) {
+                Some(was) if was.len() == t.len() => was.iter_mut().zip(&t).for_each(|(a, &b)| *a = tri(*a).or(tri(b)) as u8),
+                Some(_) => {}
+                None => drop(self.traces.insert(file, t)),
+            }
+        }
         if let Some(times) = self.reading.get_mut(&file) {
             *times -= 1;
         }
     }
 }
 
+fn tri(b: u8) -> Tri {
+    match b {
+        0 => Tri::False,
+        1 => Tri::True,
+        _ => Tri::Unknown,
+    }
+}
+
 /// Read every compilation of the tree: `paths` as the files are indexed,
 /// `scripts` their directives. `None` when the tree is too much to read.
 pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -> Option<Verdicts> {
+    read_tree(paths, scripts, conditions).map(|r| r.0)
+}
+
+/// The same, and how each compilation reads the headers compiled more
+/// than one way.
+pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) -> Option<(Verdicts, Readings)> {
     let n = paths.len();
     // The names a condition can be asked about: those the conditions
     // name, and those the values of such names name (in the sources or
@@ -454,10 +546,14 @@ pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -
         plain: conditions,
         told: conditions.clone(),
         seen: seen(),
+        traced: vec![false; n],
         steps,
         spent: AtomicU64::new(0),
         stop: AtomicBool::new(false),
     };
+    // (Compilation, the ways it reads the traced files it reads.)
+    let ways: std::sync::Mutex<Ways> = Default::default();
+    let read_as: std::sync::Mutex<Vec<(u32, Vec<(u32, u32)>)>> = Default::default();
     // Returns the names defined outright (on the first pass), and the
     // compilations that were too much to read.
     let profile = std::env::var_os("SI_COND_PROFILE").is_some();
@@ -485,6 +581,7 @@ pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -
                     kept: Default::default(),
                     spent: 0,
                     prof: profile.then_some([0; 5]),
+                    traces: FxHashMap::default(),
                 };
                 unit.read.insert(root, true);
                 unit.read(root, false, 0);
@@ -498,6 +595,14 @@ pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -
                     all.1.push(root);
                 } else {
                     all.0.extend(unit.outright.into_iter().flatten());
+                    if !unit.traces.is_empty() {
+                        let mut read: Vec<(u32, Vec<u8>)> = unit.traces.into_iter().collect();
+                        read.sort_unstable_by_key(|r| r.0);
+                        let mut ways = ways.lock().unwrap();
+                        let read = read.into_iter().map(|(f, t)| (f, ways.number(f, t))).collect();
+                        drop(ways);
+                        read_as.lock().unwrap().push((root, read));
+                    }
                 }
                 all
             })
@@ -529,8 +634,17 @@ pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -
     if w.stop.load(Relaxed) {
         return None;
     }
-    if !outright.is_empty() {
-        w.told = conditions.with_undefined(outright);
+    // A file some reading left open or decided otherwise than another is
+    // one each compilation's reading of is kept (knowing the names
+    // defined outright decides more, never otherwise).
+    let undecided = |w: &World, f: usize| {
+        w.steps[f].iter().zip(&w.seen[f]).any(|(step, seen)| matches!(step, Step::If { .. } | Step::Elif { .. }) && !matches!(seen.load(Relaxed), 0 | 1 | 2))
+    };
+    w.traced = (0..n).map(|f| undecided(&w, f)).collect();
+    if !outright.is_empty() || w.traced.iter().any(|t| *t) {
+        if !outright.is_empty() {
+            w.told = conditions.with_undefined(outright);
+        }
         w.seen = seen();
         w.spent = AtomicU64::new(0);
         left = read_all(&w, false).1;
@@ -571,7 +685,46 @@ pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -
             steps.iter().zip(seen).filter_map(one).collect()
         })
         .collect();
-    Some(verdicts)
+    // Of the files kept, those decided one way in some compilations and
+    // another in others (open in all, a compilation's reading says no
+    // more).
+    let split: Vec<bool> = (0..n)
+        .map(|f| {
+            w.traced[f]
+                && !unread[f]
+                && w.steps[f].iter().zip(&w.seen[f]).any(|(step, seen)| {
+                    let s = seen.load(Relaxed);
+                    matches!(step, Step::If { .. } | Step::Elif { .. }) && s & 3 != 0 && !matches!(s, 1 | 2)
+                })
+        })
+        .collect();
+    let mut readings = Readings::default();
+    let mut number = vec![u32::MAX; n];
+    let ways = ways.into_inner().unwrap();
+    for f in (0..n).filter(|&f| split[f]) {
+        number[f] = readings.files.len() as u32;
+        readings.files.push((paths[f].clone(), scripts[f].lines.clone()));
+        let mut of: Vec<(&Box<[u8]>, &u32)> = ways.by_file.get(&(f as u32)).into_iter().flatten().collect();
+        of.sort_unstable_by_key(|w| *w.1);
+        readings.ways.push(of.into_iter().map(|w| w.0.clone()).collect());
+    }
+    let mut read_as = read_as.into_inner().unwrap();
+    read_as.sort_unstable_by_key(|r| r.0);
+    for (root, read) in read_as {
+        let fits = |&&(f, _): &&(u32, u32)| split[f as usize] && ways.by_file[&f].len() > 0;
+        let read: Vec<(u32, u32)> = read.iter().filter(fits).map(|&(f, way)| (number[f as usize], way)).collect();
+        if !read.is_empty() && !unread[root as usize] {
+            readings.units.push((paths[root as usize].clone(), read));
+        }
+    }
+    // (A way that does not fit the lines is no reading: see `Readings::compiled`.)
+    for (f, ways) in readings.ways.iter_mut().enumerate() {
+        let stretches = readings.files[f].1.len() + 1;
+        for way in ways.iter_mut().filter(|w| w.len() != stretches) {
+            *way = vec![Tri::Unknown as u8; stretches].into();
+        }
+    }
+    Some((verdicts, readings))
 }
 
 #[cfg(test)]
@@ -637,6 +790,35 @@ mod tests {
             ("h.h", "#define H\n"),
         ]);
         assert_eq!(got[0], []);
+    }
+
+    #[test]
+    fn each_compilation_is_known_to_read_a_header_its_own_way() {
+        let files = [
+            ("good.c", "#include \"env.h\"
+#include \"ring.h\"
+"),
+            ("spoil.c", "#include \"ring.h\"
+"),
+            ("env.h", "#define PLAT_A_EN 1
+"),
+            ("ring.h", "#if PLAT_A_EN
+int a;
+#else
+int b;
+#endif
+int both;
+"),
+        ];
+        let paths: Vec<String> = files.iter().map(|f| f.0.to_string()).collect();
+        let scripts: Vec<Script> = files.iter().map(|f| crate::mask::script(f.1.as_bytes())).collect();
+        let (verdicts, readings) = read_tree(&paths, &scripts, &Conditions::default()).unwrap();
+        assert_eq!(verdicts[3], []);
+        assert_eq!(readings.files, [("ring.h".to_string(), vec![1, 3, 5])]);
+        let unit = |p: &str| readings.units.iter().position(|u| u.0 == p).unwrap() as u32;
+        let at = |p: &str, line: u32| readings.compiled(unit(p), 0, line);
+        assert_eq!([at("good.c", 2), at("good.c", 4), at("good.c", 6)], [Tri::True, Tri::False, Tri::True]);
+        assert_eq!([at("spoil.c", 2), at("spoil.c", 4), at("spoil.c", 6)], [Tri::False, Tri::True, Tri::True]);
     }
 
     #[test]

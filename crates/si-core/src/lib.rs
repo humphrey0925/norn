@@ -244,7 +244,8 @@ pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions)
         .unzip();
     slowest("scripts", times);
     step("scripts", &mut t);
-    let verdicts = std::sync::Arc::new(units::verdicts(&paths, &scripts, conditions).unwrap_or_default());
+    let (verdicts, readings) = units::read_tree(&paths, &scripts, conditions).unwrap_or_default();
+    let (verdicts, readings) = (std::sync::Arc::new(verdicts), std::sync::Arc::new(readings));
     // The names each file's conditions name: its `#define`s come out
     // otherwise only where what is known of one of these does.
     let tested: Vec<rustc_hash::FxHashSet<&[u8]>> = scripts
@@ -272,6 +273,7 @@ pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions)
     }
     let mut first = cond::Source::new(&paths);
     first.set_verdicts(verdicts.clone());
+    first.set_readings(readings.clone());
     if !first.is_empty() {
         conditions.set_source(Some(std::sync::Arc::new(first)));
     }
@@ -280,6 +282,7 @@ pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions)
     for _ in 0..4 {
         let mut source = mask::source_of(&defines, &paths);
         source.set_verdicts(verdicts.clone());
+        source.set_readings(readings.clone());
         step("source", &mut t);
         if conditions.source().map_or(source.is_empty(), |s| **s == source) {
             break;
@@ -333,6 +336,12 @@ pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions)
     }
     drop(scripts);
     defines
+}
+
+/// How each compilation reads the headers compiled more than one way, as
+/// the sources settle it (see `units`).
+pub fn readings_of(conditions: &cond::Conditions) -> std::sync::Arc<units::Readings> {
+    conditions.source().map(|s| s.readings().clone()).unwrap_or_default()
 }
 
 /// The same, with what the build is known to define: `#define`s in branches
