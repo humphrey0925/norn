@@ -263,8 +263,10 @@ struct Unit<'a> {
     files: Option<FxHashSet<u32>>,
     /// For `SI_COND_WHY`: per name not known, the file that made it so,
     /// and how (1: a definition on a line that may not be compiled; 2:
-    /// a file that may not be read changed it).
-    unknown_why: FxHashMap<u32, (u32, u8)>,
+    /// a file that may not be read changed it), with, for 2, the file
+    /// that includes it and how many files the include may mean (0:
+    /// one, under an `#if` not known).
+    unknown_why: FxHashMap<u32, (u32, u8, u32, u32)>,
 }
 
 impl Unit<'_> {
@@ -364,9 +366,14 @@ impl Unit<'_> {
                 }
                 Some(Some(None)) => 1,
                 Some(None) => {
-                    let how = w.ids.get(&n[..]).and_then(|id| self.unknown_why.get(id)).map_or("?".to_string(), |&(f, how)| {
+                    let how = w.ids.get(&n[..]).and_then(|id| self.unknown_why.get(id)).map_or("?".to_string(), |&(f, how, from, several)| {
                         let path = &w.paths[f as usize];
-                        if how == 1 { format!("a #define in {path} on a line that may not be compiled") } else { format!("changed by {path}, which may not be read there") }
+                        let from = &w.paths[from as usize];
+                        match (how, several) {
+                            (1, _) => format!("a #define in {path} on a line that may not be compiled"),
+                            (_, 0) => format!("changed by {path}, included by {from} under an #if not known"),
+                            _ => format!("changed by {path}, included by {from} with an include that may mean {several} files"),
+                        }
                     });
                     *why.unknown.entry(name.clone()).or_default().entry(how).or_default() += 1;
                     2
@@ -413,13 +420,13 @@ impl Unit<'_> {
         let mut open: Vec<(Tri, Tri, Tri)> = Vec::new();
         let mut live = Tri::True;
         // How this compilation reads the file, if that is kept: after a
-        // directive, whether what follows is compiled.
-        let whether = if maybe { Tri::Unknown } else { Tri::True };
-        let mut trace = w.traced[file as usize].then(|| vec![whether as u8]);
+        // directive, whether what follows is compiled, the file being read.
+        // (A definition a call reaches is in a file that was.)
+        let mut trace = w.traced[file as usize].then(|| vec![Tri::True as u8]);
         let mut after = false;
         for (i, step) in steps.iter().enumerate() {
             if let Some(t) = trace.as_mut().filter(|_| std::mem::take(&mut after)) {
-                t.push(live.and(whether) as u8);
+                t.push(live as u8);
             }
             after = trace.is_some() && matches!(step, Step::If { .. } | Step::Elif { .. } | Step::Else | Step::Endif);
             match step {
@@ -486,7 +493,7 @@ impl Unit<'_> {
                     } else if self.local.get(&name[..]).is_none_or(|v| v.as_ref().and_then(|v| v.as_deref()) != Some(&value[..])) {
                         self.set(*id, name, None, 1);
                         if !w.why.is_empty() {
-                            self.unknown_why.insert(*id, (file, 1));
+                            self.unknown_why.insert(*id, (file, 1, 0, 0));
                         }
                     }
                     if let (Some(p), Some(t)) = (&mut self.prof, t) {
@@ -499,7 +506,7 @@ impl Unit<'_> {
                     } else if self.local.get(&name[..]) != Some(&Some(None)) {
                         self.set(*id, name, None, 1);
                         if !w.why.is_empty() {
-                            self.unknown_why.insert(*id, (file, 1));
+                            self.unknown_why.insert(*id, (file, 1, 0, 0));
                         }
                     }
                 }
@@ -549,7 +556,7 @@ impl Unit<'_> {
                         if self.local.get(&name[..]) != Some(&None) {
                             self.set(id, &name, None, 1);
                             if !w.why.is_empty() {
-                                self.unknown_why.insert(id, (f, 2));
+                                self.unknown_why.insert(id, (f, 2, file, if files.len() > 1 { files.len() as u32 } else { 0 }));
                             }
                         }
                     }
@@ -558,7 +565,7 @@ impl Unit<'_> {
         }
         if let Some(mut t) = trace {
             if after {
-                t.push(live.and(whether) as u8);
+                t.push(live as u8);
             }
             // Read twice over: compiled where either reading compiles it.
             match self.traces.get_mut(&file) {
