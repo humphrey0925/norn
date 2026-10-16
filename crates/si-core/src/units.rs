@@ -240,6 +240,9 @@ struct Unit<'a> {
     /// How this compilation reads the files of [`World::traced`]: per
     /// file, whether each stretch is compiled, as a `Tri`.
     traces: FxHashMap<u32, Vec<u8>>,
+    /// While a file that may not be read is read: each name it changes,
+    /// with how the name was before (see `Step::Include`).
+    journal: Option<Vec<(u32, Box<[u8]>, Option<Option<Option<Vec<u8>>>>, u64)>>,
 }
 
 impl Unit<'_> {
@@ -344,6 +347,9 @@ impl Unit<'_> {
     }
 
     fn set(&mut self, id: u32, name: &[u8], value: Option<Option<Vec<u8>>>, state: u64) {
+        if let Some(j) = &mut self.journal {
+            j.push((id, name.into(), self.local.get(name).cloned(), self.states[id as usize]));
+        }
         self.local.insert(name.to_vec(), value);
         self.states[id as usize] = state;
     }
@@ -433,8 +439,10 @@ impl Unit<'_> {
                     if let Some(p) = &mut self.prof {
                         p[2] += 1;
                     }
-                    if live == Tri::True && !maybe {
-                        if let Some(outright) = &mut self.outright {
+                    // (In a file that may not be read, what follows in it is
+                    // read only if it is: see `Step::Include`.)
+                    if live == Tri::True {
+                        if let Some(outright) = self.outright.as_mut().filter(|_| !maybe) {
                             if !self.local.contains_key(&name[..]) && !w.plain.settles(name) {
                                 outright.insert(name.to_vec());
                             }
@@ -448,7 +456,7 @@ impl Unit<'_> {
                     }
                 }
                 Step::Undef { id, name } => {
-                    if live == Tri::True && !maybe {
+                    if live == Tri::True {
                         self.set(*id, name, Some(None), 2);
                     } else if self.local.get(&name[..]) != Some(&Some(None)) {
                         self.set(*id, name, None, 1);
@@ -460,6 +468,13 @@ impl Unit<'_> {
                         p[4] += files.len() as u64;
                     }
                     let maybe = maybe || live != Tri::True || files.len() > 1;
+                    // A file that may not be read is read as if it were:
+                    // its own conditions come after its own lines. Here,
+                    // where it may not have been, a name it changed is not
+                    // known. (Each of several files an include may mean is
+                    // read from how things are here.)
+                    let unsure = maybe && self.journal.is_none();
+                    let mut changed: Vec<(u32, Box<[u8]>)> = Vec::new();
                     for &f in files.iter() {
                         if w.once[f as usize] {
                             match self.read.get(&f) {
@@ -468,7 +483,31 @@ impl Unit<'_> {
                                 _ => drop(self.read.insert(f, !maybe)),
                             }
                         }
+                        if unsure {
+                            self.journal = Some(Vec::new());
+                        }
                         self.read(f, maybe, depth + 1);
+                        if let Some(journal) = self.journal.take().filter(|_| unsure) {
+                            // (A name's first entry has how it was before.)
+                            let mut named: FxHashSet<&[u8]> = FxHashSet::default();
+                            for (id, name, was, _) in &journal {
+                                if named.insert(&name[..]) && was.as_ref() != self.local.get(&name[..]) {
+                                    changed.push((*id, name.clone()));
+                                }
+                            }
+                            for (id, name, was, state) in journal.into_iter().rev() {
+                                match was {
+                                    Some(v) => drop(self.local.insert(name.to_vec(), v)),
+                                    None => drop(self.local.remove(&name[..])),
+                                }
+                                self.states[id as usize] = state;
+                            }
+                        }
+                    }
+                    for (id, name) in changed {
+                        if self.local.get(&name[..]) != Some(&None) {
+                            self.set(id, &name, None, 1);
+                        }
                     }
                 }
             }
@@ -706,6 +745,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
                     spent: 0,
                     prof: profile.then_some([0; 5]),
                     traces: FxHashMap::default(),
+                    journal: None,
                 };
                 unit.read.insert(root, true);
                 unit.read(root, false, 0);
@@ -955,6 +995,22 @@ int both;
         let at = |p: &str, line: u32| readings.compiled(unit(p), 0, line);
         assert_eq!([at("good.c", 2), at("good.c", 4), at("good.c", 6)], [Tri::True, Tri::False, Tri::True]);
         assert_eq!([at("spoil.c", 2), at("spoil.c", 4), at("spoil.c", 6)], [Tri::False, Tri::True, Tri::True]);
+    }
+
+    #[test]
+    fn a_file_that_may_not_be_read_reads_its_own_lines_as_written() {
+        let got = told(&[
+            ("a.c", "#ifdef BUILD_SAYS\n#include \"h.h\"\n#endif\n#ifdef X\n#endif\n#include \"env.h\"\n#if PLAT == 1\n#endif\n"),
+            ("h.h", "#define X 1\n#if X\n#endif\n"),
+            ("one/env.h", "#define PLAT 1\n#if PLAT == 1\n#endif\n"),
+            ("two/env.h", "#define PLAT 2\n#if PLAT == 2\n#endif\n"),
+        ]);
+        // Read at all, h.h has defined X by its `#if`; a.c may not have read it.
+        assert_eq!(got[1], [one("#if X", true)]);
+        assert_eq!(got[0], []);
+        // Each of the two `env.h`s an include may mean, on its own.
+        assert_eq!(got[2], [one("#if PLAT == 1", true)]);
+        assert_eq!(got[3], [one("#if PLAT == 2", true)]);
     }
 
     #[test]
