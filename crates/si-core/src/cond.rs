@@ -1855,6 +1855,18 @@ C_DEFS = -DUSE_HAL_DRIVER
         assert_eq!((c.defined(b"__GNUC__"), c.defined(b"__CC_ARM")), (Tri::True, Tri::False));
         let c = of("Makefile");
         assert_eq!((c.defined(b"__GNUC__"), c.defined(b"__CC_ARM"), c.defined(b"USE_HAL_DRIVER")), (Tri::True, Tri::False, Tri::True));
+        // Arm Compiler 6, however a description names it: CMSIS takes
+        // cmsis_armclang.h, not the GCC header armclang's __GNUC__ would.
+        for name in ["ARM Compiler 6 (DS-5 built in)", "Arm Compiler 6", "com.arm.toolchain.v6.exe.debug", "com.arm.toolchain.ac6.base", "C:/Keil_v5/ARM/ARMCLANG/bin/armclang.exe"] {
+            assert_eq!(compiler_named(name), Some(Compiler::Armclang), "{name}");
+        }
+        for name in ["ARM Compiler 5 (DS-5 built in)", "com.arm.toolchain.ac5.exe.debug", "C:/Keil_v5/ARM/ARMCC/bin/armcc.exe"] {
+            assert_eq!(compiler_named(name), Some(Compiler::Armcc), "{name}");
+        }
+        std::fs::write(dir.join(".vscode/c_cpp_properties.json"), r#"{ "configurations": [ { "name": "AC6", "compilerPath": "C:/Program Files/Arm/Development Studio/sw/ARMCompiler6.18/bin/armclang.exe" } ] }"#).unwrap();
+        let c = of(".vscode/c_cpp_properties.json#AC6");
+        assert_eq!((c.defined(b"__ARMCC_VERSION"), c.defined(b"__clang__"), c.defined(b"__CC_ARM")), (Tri::True, Tri::True, Tri::False));
+        assert_eq!(c.eval(b"defined (__ARMCC_VERSION) && (__ARMCC_VERSION >= 6100100)"), Tri::True);
         std::fs::remove_dir_all(&dir).ok();
     }
 
