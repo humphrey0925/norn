@@ -140,8 +140,27 @@ enum Step {
     Unseen,
 }
 
+/// For `SI_COND_WHY=<path end>:<line>`: how the compilations read that
+/// one condition, and the names it depends on where they left it open.
+#[derive(Default)]
+struct Why {
+    /// Readings: held, failed, open, in a branch not compiled; and of
+    /// all, those of a file maybe read, and those after an include of
+    /// something not in the tree.
+    counts: [u64; 6],
+    /// Per name, in the readings left open: defined, undefined, not
+    /// known, not mentioned, given by the settings.
+    names: std::collections::BTreeMap<String, [u64; 5]>,
+    /// Per name, the definitions read: (file, value) -> how often.
+    defined: std::collections::BTreeMap<String, std::collections::BTreeMap<(String, String), u64>>,
+}
+
 struct World<'a> {
     steps: Vec<Vec<Step>>,
+    paths: &'a [String],
+    /// The steps `SI_COND_WHY` asks about, per file, and what was found.
+    why: FxHashMap<u32, FxHashSet<usize>>,
+    why_found: std::sync::Mutex<Why>,
     /// The names some step defines or undefines, numbered.
     ids: FxHashMap<Box<[u8]>, u32>,
     /// How many expressions there are (see `Step::If`).
@@ -272,6 +291,58 @@ impl Unit<'_> {
         holds
     }
 
+    /// Note, for `SI_COND_WHY`, how step `i` of `file` came out here.
+    fn note_why(&self, file: u32, i: usize, live: Tri, holds: Tri, maybe: bool, expr: &[u8]) {
+        let w = self.w;
+        if !w.why.get(&file).is_some_and(|steps| steps.contains(&i)) {
+            return;
+        }
+        let mut why = w.why_found.lock().unwrap();
+        why.counts[match (live, holds) {
+            (Tri::False, _) => 3,
+            (_, Tri::True) => 0,
+            (_, Tri::False) => 1,
+            _ => 2,
+        }] += 1;
+        why.counts[4] += maybe as u64;
+        why.counts[5] += self.unseen as u64;
+        if live == Tri::False || holds != Tri::Unknown {
+            return;
+        }
+        // The names it names, and those their values name, as they are here.
+        let mut names: Vec<Vec<u8>> = Vec::new();
+        names_in(expr, |n| names.push(n.to_vec()));
+        let mut k = 0;
+        while k < names.len() && names.len() < 40 {
+            if let Some(Some(Some(v))) = self.local.get(&names[k]) {
+                let mut more = Vec::new();
+                names_in(v, |n| more.push(n.to_vec()));
+                for n in more {
+                    if !names.contains(&n) {
+                        names.push(n);
+                    }
+                }
+            }
+            k += 1;
+        }
+        for n in names {
+            let name = String::from_utf8_lossy(&n).into_owned();
+            let state = match self.local.get(&n) {
+                Some(Some(Some(v))) => {
+                    let at = w.ids.get(&n[..]).map(|&id| self.states[id as usize]).unwrap_or(0);
+                    let from = if at >> 32 > 0 { w.paths[(at >> 32) as usize - 1].clone() } else { "?".to_string() };
+                    *why.defined.entry(name.clone()).or_default().entry((from, String::from_utf8_lossy(v).into_owned())).or_default() += 1;
+                    0
+                }
+                Some(Some(None)) => 1,
+                Some(None) => 2,
+                None if self.conditions().settles(&n) => 4,
+                None => 3,
+            };
+            why.names.entry(name).or_default()[state] += 1;
+        }
+    }
+
     fn set(&mut self, id: u32, name: &[u8], value: Option<Option<Vec<u8>>>, state: u64) {
         self.local.insert(name.to_vec(), value);
         self.states[id as usize] = state;
@@ -314,6 +385,7 @@ impl Unit<'_> {
                 Step::If { kind, expr, slot, .. } => {
                     let t = self.prof.map(|_| std::time::Instant::now());
                     let holds = if live == Tri::False { Tri::False } else { self.holds(*slot, *kind, expr) };
+                    self.note_why(file, i, live, holds, maybe, expr);
                     if let (Some(p), Some(t)) = (&mut self.prof, t) {
                         p[0] += 1;
                         p[1] += t.elapsed().as_nanos() as u64;
@@ -335,6 +407,7 @@ impl Unit<'_> {
                         w.seen[file as usize][i].fetch_or(1 << own as u8, Relaxed);
                         own
                     };
+                    self.note_why(file, i, if outer == Tri::False || group.0 == Tri::True { Tri::False } else { outer }, own, maybe, expr);
                     if let (Some(p), Some(t)) = (&mut self.prof, t) {
                         p[0] += 1;
                         p[1] += t.elapsed().as_nanos() as u64;
@@ -539,7 +612,58 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
             slots += 1;
         }
     }
+    // `SI_COND_WHY=ring_api.h:201`: the `#if`s and `#elif`s on that line of
+    // the files whose path ends so.
+    let mut why: FxHashMap<u32, FxHashSet<usize>> = FxHashMap::default();
+    if let Some((end, line)) = std::env::var("SI_COND_WHY").ok().and_then(|v| v.rsplit_once(':').and_then(|(e, l)| Some((e.replace('\\', "/"), l.parse::<u32>().ok()?)))) {
+        for (f, p) in paths.iter().enumerate().filter(|(_, p)| *p == &end || p.ends_with(&format!("/{end}"))) {
+            let mut d = 0;
+            for (i, step) in steps[f].iter().enumerate() {
+                if matches!(step, Step::If { .. } | Step::Elif { .. } | Step::Else | Step::Endif) {
+                    if matches!(step, Step::If { .. } | Step::Elif { .. }) && scripts[f].lines.get(d) == Some(&line) {
+                        why.entry(f as u32).or_default().insert(i);
+                    }
+                    d += 1;
+                }
+            }
+            eprintln!("why       {p}:{line}: {} directive(s)", why.get(&(f as u32)).map_or(0, |s| s.len()));
+        }
+    }
+    if std::env::var_os("SI_COND_PROFILE").is_some() {
+        // Includes that may mean more than one file, and quoted ones of
+        // nothing here, by the name written.
+        let mut several: FxHashMap<String, (u64, usize)> = FxHashMap::default();
+        let mut missing: FxHashMap<String, u64> = FxHashMap::default();
+        let mut all = 0u64;
+        for (script, path) in scripts.iter().zip(paths) {
+            for op in &script.ops {
+                if let Op::Include { name, quoted } = op {
+                    all += 1;
+                    let files = files_of(path, name);
+                    let name = String::from_utf8_lossy(name).into_owned();
+                    if files.len() > 1 {
+                        let e = several.entry(name).or_default();
+                        e.0 += 1;
+                        e.1 = e.1.max(files.len());
+                    } else if files.is_empty() && *quoted {
+                        *missing.entry(name).or_default() += 1;
+                    }
+                }
+            }
+        }
+        let mut top: Vec<(String, (u64, usize))> = several.into_iter().collect();
+        top.sort_by(|a, b| b.1.0.cmp(&a.1.0).then(a.0.cmp(&b.0)));
+        let ambiguous: u64 = top.iter().map(|t| t.1.0).sum();
+        eprintln!("includes  {ambiguous} of {all} include lines may mean more than one file: {}", top.iter().take(12).map(|t| format!("{} ({} files) {}", t.0, t.1.1, t.1.0)).collect::<Vec<_>>().join(", "));
+        let mut top: Vec<(String, u64)> = missing.into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let unseen: u64 = top.iter().map(|t| t.1).sum();
+        eprintln!("includes  {unseen} quoted include lines name nothing here: {}", top.iter().take(12).map(|t| format!("{} {}", t.0, t.1)).collect::<Vec<_>>().join(", "));
+    }
     let mut w = World {
+        paths,
+        why,
+        why_found: Default::default(),
         ids,
         slots: slots as usize,
         once: scripts.iter().map(|s| s.once).collect(),
@@ -647,6 +771,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         }
         w.seen = seen();
         w.spent = AtomicU64::new(0);
+        w.why_found = Default::default();
         left = read_all(&w, false).1;
         if w.stop.load(Relaxed) {
             return None;
@@ -698,6 +823,17 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
                 })
         })
         .collect();
+    if !w.why.is_empty() {
+        let why = w.why_found.lock().unwrap();
+        let c = why.counts;
+        eprintln!("why       read {} times: held {}, failed {}, open {}, in a branch not compiled {}; of a file maybe read {}, after an include of nothing here {}", c[0] + c[1] + c[2] + c[3], c[0], c[1], c[2], c[3], c[4], c[5]);
+        for (name, n) in &why.names {
+            eprintln!("why       {name}: defined {}, undefined {}, not known {}, not mentioned {}, by the settings {}", n[0], n[1], n[2], n[3], n[4]);
+            for ((from, value), k) in why.defined.get(name).into_iter().flatten().take(4) {
+                eprintln!("why         {k}x {from} = {value}");
+            }
+        }
+    }
     let mut readings = Readings::default();
     let mut number = vec![u32::MAX; n];
     let ways = ways.into_inner().unwrap();
