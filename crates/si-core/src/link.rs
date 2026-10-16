@@ -898,10 +898,21 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         files.iter().map(|f| at.get(f.path.as_str()).copied().unwrap_or(NONE)).collect()
     };
     let edge_why = std::env::var("SI_EDGE_WHY").ok();
-    // What all of them say, if they say one thing; none: nothing.
-    fn agree(mut all: impl Iterator<Item = crate::cond::Tri>) -> Option<crate::cond::Tri> {
-        let first = all.next()?;
-        Some(if all.all(|t| t == first) { first } else { crate::cond::Tri::Unknown })
+    // What they say together: yes where some say yes and none no (one
+    // that does not know may just not read the file), no where all say
+    // no; none: nothing.
+    fn agree(all: impl Iterator<Item = crate::cond::Tri>) -> Option<crate::cond::Tri> {
+        use crate::cond::Tri;
+        let mut n = [0usize; 3];
+        for t in all {
+            n[match t { Tri::True => 0, Tri::False => 1, Tri::Unknown => 2 }] += 1;
+        }
+        Some(match n {
+            [0, 0, 0] => return None,
+            [_, 0, _] if n[0] > 0 => Tri::True,
+            [0, _, 0] => Tri::False,
+            _ => Tri::Unknown,
+        })
     }
     let (unit_of, header_of, path_of) = if readings.is_empty() {
         (Vec::new(), Vec::new(), Vec::new())
