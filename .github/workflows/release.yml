@@ -48,7 +48,7 @@ jobs:
           srv=$(grep -m1 '^version' crates/si-cli/Cargo.toml | cut -d'"' -f2)
           [ "$ext" = "$srv" ] || { echo "extension $ext, server $srv"; exit 1; }
           if [ "${GITHUB_REF_TYPE}" = tag ]; then [ "v$ext" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME}, version $ext"; exit 1; }; fi
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2

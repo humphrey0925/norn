@@ -860,7 +860,12 @@ impl Found {
     /// Add this expansion's names to `known`; was any of them new?
     fn novel(self, known: &mut FxHashSet<String>) -> bool {
         let names = self.single.into_iter().chain(self.decls.into_iter().map(|d| d.0)).chain(self.refs.into_iter().map(|r| r.0));
-        names.fold(false, |new, n| known.insert(n) || new)
+        // (Every one of them inserted: no stopping at the first new one.)
+        let mut new = false;
+        for n in names {
+            new |= known.insert(n);
+        }
+        new
     }
 
     fn is_empty(&self) -> bool {
