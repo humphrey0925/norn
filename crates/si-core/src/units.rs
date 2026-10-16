@@ -297,8 +297,8 @@ struct Unit<'a> {
     /// there (it would do the same again).
     before: FxHashMap<u32, Vec<(u32, Box<[u8]>, Option<Option<Option<Vec<u8>>>>, u64)>>,
     /// While reading what its own file includes under `#if`s not known:
-    /// the lines of those branches; and per file it may not read, those
-    /// it is read under (none: read where it may not be otherwise too).
+    /// the lines of those branches; and per file it may not read, the
+    /// ways it is included so (each one read wherever those hold).
     under_here: Option<Box<[u32]>>,
     under: FxHashMap<u32, Option<Vec<Box<[u32]>>>>,
     /// The directories of the files it certainly reads.
@@ -446,16 +446,12 @@ impl Unit<'_> {
         if self.files.is_none() {
             return;
         }
-        let here = self.under_here.clone();
-        match (self.under.get_mut(&file), here) {
-            (None, here) => drop(self.under.insert(file, here.map(|h| vec![h]))),
-            (Some(Some(ways)), Some(h)) => {
-                if !ways.contains(&h) {
-                    ways.push(h);
-                }
-            }
-            (Some(u), None) => *u = None,
-            (Some(None), _) => {}
+        // (Included here otherwise, as through a header's own `#if` not
+        // known: no way to have it, but the others still are.)
+        let Some(here) = self.under_here.clone() else { return };
+        let ways = self.under.entry(file).or_insert_with(|| Some(Vec::new())).get_or_insert_with(Vec::new);
+        if !ways.contains(&here) {
+            ways.push(here);
         }
     }
 

@@ -1104,7 +1104,9 @@ mod tests {
         d.write("ext.h", "#include \"ring.h\"\n");
         d.write("mod.h", "#include \"ring.h\"\n");
         d.write("c2.c", "#ifdef R\n#define OPT_X 1\n#endif\n");
-        d.write("a.c", "#define FOO 1\n#include \"plat.h\"\n#if FEATURE_EN\n#if OPT_X\n#include \"ext.h\"\n#endif\n#include \"mod.h\"\nint f (void) { return M_GET (1); }\n#endif\nint g (void) { return M_GET (2); }\n");
+        // (And before all that, through a header's own `#if` not known.)
+        d.write("pre.h", "#if OPT_X\n#include \"ring.h\"\n#endif\n");
+        d.write("a.c", "#define FOO 1\n#include \"plat.h\"\n#include \"pre.h\"\n#if FEATURE_EN\n#if OPT_X\n#include \"ext.h\"\n#endif\n#include \"mod.h\"\nint f (void) { return M_GET (1); }\n#endif\nint g (void) { return M_GET (2); }\n");
         d.write("b.c", "#include \"plat.h\"\n");
         d.write("c.c", "#ifdef R\n#define FEATURE_EN 1\n#endif\n");
         let (s, _) = Session::open_cached(&d.0, Options::default(), d.0.join("cache-outside-scan"));
