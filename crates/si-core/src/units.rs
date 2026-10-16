@@ -946,8 +946,9 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
     // Once to learn which names the sources define outright, and then
     // knowing that.
     let (mut outright, mut left) = read_all(&w, true);
-    // So is a file's include guard, though more follow its `#endif`.
-    outright.extend(scripts.iter().filter_map(|s| crate::mask::guard_of(&s.ops)).filter(|g| !conditions.settles(g)));
+    // So is a file's include guard, though more follow its `#endif` or come
+    // before its `#ifndef`.
+    outright.extend(scripts.iter().filter_map(|s| crate::mask::guard_of(&s.ops).or_else(|| crate::mask::guard_after(&s.ops))).filter(|g| !conditions.settles(g)));
     if profile {
         let mut rows = std::mem::take(&mut *profiled.lock().unwrap());
         let mut sum = [0u64; 5];
@@ -1221,6 +1222,16 @@ int both;
             ("b.c", "#ifdef Q\n#define BUILD_SAYS\n#endif\n"),
         ]);
         assert_eq!(got[0], []);
+    }
+
+    #[test]
+    fn an_include_guard_after_an_include_is_one_all_the_same() {
+        let got = told(&[
+            ("a.c", "#include \"g.h\"\n#if SOC == 1\n#endif\n"),
+            ("g.h", "#include \"x.h\"\n#ifndef G_H\n#define G_H\n#define SOC 1\n#endif\n"),
+            ("x.h", ""),
+        ]);
+        assert_eq!(got[0], [one("#if SOC == 1", true)]);
     }
 
     #[test]

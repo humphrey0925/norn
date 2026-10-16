@@ -367,6 +367,23 @@ pub fn guard_of(ops: &[Op]) -> Option<Vec<u8>> {
     (&g == name).then_some(g)
 }
 
+/// The same, where an `#include` or a `#define` comes before the guard:
+/// then all the rest of the file has to be inside it.
+pub fn guard_after(ops: &[Op]) -> Option<Vec<u8>> {
+    let start = ops.iter().position(|op| matches!(op, Op::If { .. } | Op::Elif { .. } | Op::Else | Op::Endif))?;
+    let g = guard_of(&ops[start..])?;
+    let mut depth = 0;
+    let close = ops[start..].iter().position(|op| {
+        match op {
+            Op::If { .. } => depth += 1,
+            Op::Endif => depth -= 1,
+            _ => {}
+        }
+        depth == 0
+    })?;
+    (start + close == ops.len() - 1).then_some(g)
+}
+
 /// The directives of `src`, in order.
 pub fn script(src: &[u8]) -> Script {
     let mut out = Script::default();
