@@ -184,6 +184,8 @@ struct World<'a> {
     slots: usize,
     /// Files read once in a compilation, however often they are included.
     once: Vec<bool>,
+    /// Per file, its directory, numbered.
+    dir: Vec<u32>,
     plain: &'a Conditions,
     /// The same, with the names the sources define outright not defined.
     told: Conditions,
@@ -264,6 +266,8 @@ struct Unit<'a> {
     /// known, with how they were before: read for sure, it is read from
     /// there (it would do the same again).
     before: FxHashMap<u32, Vec<(u32, Box<[u8]>, Option<Option<Option<Vec<u8>>>>, u64)>>,
+    /// The directories of the files it certainly reads.
+    dirs: FxHashSet<u32>,
     /// The file the compilation starts from.
     root: u32,
     /// The files it reads, when that is kept (see [`Readings::reads`]).
@@ -422,6 +426,7 @@ impl Unit<'_> {
         }
         *times += 1;
         if !maybe && self.journal.is_none() {
+            self.dirs.insert(w.dir[file as usize]);
             for (id, name, was, state) in self.before.remove(&file).into_iter().flatten() {
                 if self.local.get(&name[..]) == Some(&None) {
                     match was {
@@ -539,6 +544,16 @@ impl Unit<'_> {
                     if let Some(p) = &mut self.prof {
                         p[4] += files.len() as u64;
                     }
+                    // Of several files an include may mean, those in a
+                    // directory the compilation certainly reads from (as
+                    // its include path would have it), if not all.
+                    let near: Vec<u32>;
+                    let files: &[u32] = if files.len() > 1 {
+                        near = files.iter().copied().filter(|&f| self.dirs.contains(&w.dir[f as usize])).collect();
+                        if !near.is_empty() && near.len() < files.len() { &near } else { files }
+                    } else {
+                        files
+                    };
                     let maybe = maybe || live != Tri::True || files.len() > 1;
                     // A file that may not be read is read as if it were:
                     // its own conditions come after its own lines. Here,
@@ -810,6 +825,10 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         ids,
         slots: slots as usize,
         once: scripts.iter().map(|s| s.once).collect(),
+        dir: {
+            let mut dirs: FxHashMap<&str, u32> = FxHashMap::default();
+            paths.iter().map(|p| { let n = dirs.len() as u32; *dirs.entry(dir_of(p)).or_insert(n) }).collect()
+        },
         plain: conditions,
         told: conditions.clone(),
         seen: seen(),
@@ -851,6 +870,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
                     traces: FxHashMap::default(),
                     journal: None,
                     before: FxHashMap::default(),
+                    dirs: FxHashSet::default(),
                     root,
                     files: w.traced.iter().any(|t| *t).then(FxHashSet::default),
                     unknown_why: FxHashMap::default(),
@@ -1144,6 +1164,17 @@ int both;
             ("b.c", "#ifdef Q\n#define BUILD_SAYS\n#endif\n"),
         ]);
         assert_eq!(got[0], []);
+    }
+
+    #[test]
+    fn of_two_headers_an_include_may_mean_the_one_beside_those_read_is_read() {
+        let got = told(&[
+            ("src/app/a.c", "#include \"symbol.h\"\n#include \"typedef.h\"\n#if SOC == 1\n#endif\n"),
+            ("src/common/symbol.h", ""),
+            ("src/common/typedef.h", "#define SOC 1\n"),
+            ("src/drv/x/typedef.h", "#define SOC 2\n"),
+        ]);
+        assert_eq!(got[0], [one("#if SOC == 1", true)]);
     }
 
     #[test]
