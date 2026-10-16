@@ -1,0 +1,2 @@
+# Shell scripts run in bash on Windows too (CI): LF however checked out.
+*.sh text eol=lf
