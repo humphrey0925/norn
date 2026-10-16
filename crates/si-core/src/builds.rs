@@ -75,7 +75,7 @@ pub(crate) fn find(root: &Path) -> Vec<String> {
 /// is none of the kinds read here.
 pub(crate) fn of(path: &str, text: &str) -> Option<Vec<Build>> {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
-    let one = |b: Build| if b.defines.is_empty() && b.undefines.is_empty() { Vec::new() } else { vec![Build { name: name.to_string(), ..b }] };
+    let one = |b: Build| if b.defines.is_empty() && b.undefines.is_empty() && b.compiler.is_none() { Vec::new() } else { vec![Build { name: name.to_string(), ..b }] };
     Some(match rank(name)? {
         1 => uvision(text),
         2 => iar(text),
@@ -170,6 +170,10 @@ fn makefile(text: &str) -> Build {
             "ifdef" | "ifndef" | "ifeq" | "ifneq" => depth += 1,
             "endif" => depth = depth.saturating_sub(1),
             _ if depth == 0 && line.contains("-D") | line.contains("-U") => words(&line.split_whitespace().collect::<Vec<_>>(), &mut b),
+            // `CC = $(PREFIX)gcc`, `CC := armcc`: the compiler.
+            _ if depth == 0 && b.compiler.is_none() && (first == "CC" || first.starts_with("CC=") || first.starts_with("CC:=")) => {
+                b.compiler = crate::cond::compiler_named(line.split_once('=').map_or("", |s| s.1));
+            }
             _ => {}
         }
     }
@@ -192,6 +196,7 @@ fn cmake(text: &str) -> Build {
             "if" | "foreach" | "while" | "function" | "macro" => depth += 1,
             "endif" | "endforeach" | "endwhile" | "endfunction" | "endmacro" => depth = depth.saturating_sub(1),
             "add_definitions" if depth == 0 => words(&args, &mut b),
+            "set" if args.first() == Some(&"CMAKE_C_COMPILER") => b.compiler = args.get(1).and_then(|c| crate::cond::compiler_named(c)),
             "add_compile_definitions" | "target_compile_definitions" if depth == 0 => {
                 let skip = if command.starts_with("target") { 1 } else { 0 };
                 for arg in args.iter().skip(skip).filter(|a| !matches!(**a, "PRIVATE" | "PUBLIC" | "INTERFACE")) {
@@ -277,7 +282,10 @@ fn uvision(text: &str) -> Vec<Build> {
     let mut out = Vec::new();
     for (_, target) in elements(text, "Target") {
         let Some((_, name)) = elements(target, "TargetName").next() else { continue };
-        let mut b = Build { name: name.trim().to_string(), ..Build::default() };
+        // Arm Compiler 6 where the target says so, else 5.
+        let ac6 = elements(target, "uAC6").next().is_some_and(|u| u.1.trim() == "1");
+        let compiler = Some(if ac6 { crate::cond::Compiler::Armclang } else { crate::cond::Compiler::Armcc });
+        let mut b = Build { name: name.trim().to_string(), compiler, ..Build::default() };
         // The compiler's own settings come first; groups and files may
         // have theirs, further down, which are not the build's.
         if let Some((_, compiler)) = elements(target, "Cads").next() {
@@ -299,7 +307,7 @@ fn iar(text: &str) -> Vec<Build> {
     let mut out = Vec::new();
     for (_, configuration) in elements(text, "configuration") {
         let Some((_, name)) = elements(configuration, "name").next() else { continue };
-        let mut b = Build { name: name.trim().to_string(), ..Build::default() };
+        let mut b = Build { name: name.trim().to_string(), compiler: Some(crate::cond::Compiler::Iar), ..Build::default() };
         for (_, option) in elements(configuration, "option") {
             if elements(option, "name").next().is_some_and(|n| n.1.trim() == "CCDefines") {
                 elements(option, "state").for_each(|s| define_one(&unescaped(s.1), true, &mut b));

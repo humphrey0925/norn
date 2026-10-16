@@ -60,6 +60,14 @@ pub struct Readings {
     /// included only under `#if`s these conditions switch off, by path.
     #[serde(default)]
     pub unread: Vec<String>,
+    /// Per compilation (as `units`), whether it includes a header not in
+    /// the tree (one the build makes), which may bring in any.
+    #[serde(default)]
+    pub generated: Vec<bool>,
+    /// The headers no file here includes (as `paths` numbers them): one
+    /// the build makes may.
+    #[serde(default)]
+    pub orphans: Vec<u32>,
     /// For each of those (in that order), when it is read only under the
     /// compilation's own file's `#if`s not known: for each way it is
     /// included, the lines of the branches it is included in there.
@@ -68,7 +76,7 @@ pub struct Readings {
 
 impl Readings {
     pub fn is_empty(&self) -> bool {
-        self.files.is_empty()
+        self.files.is_empty() && self.units.is_empty()
     }
 
     /// Whether compilation `unit` reads the file `path` (numbered as in `paths`).
@@ -231,6 +239,16 @@ struct World<'a> {
     traced: Vec<bool>,
     spent: AtomicU64,
     stop: AtomicBool,
+}
+
+/// A header of the C standard library, as `#include <...>` names it.
+fn standard_header(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"assert.h" | b"complex.h" | b"ctype.h" | b"errno.h" | b"fenv.h" | b"float.h" | b"inttypes.h" | b"iso646.h" | b"limits.h" | b"locale.h" | b"math.h"
+            | b"setjmp.h" | b"signal.h" | b"stdalign.h" | b"stdarg.h" | b"stdatomic.h" | b"stdbool.h" | b"stddef.h" | b"stdint.h" | b"stdio.h" | b"stdlib.h"
+            | b"stdnoreturn.h" | b"string.h" | b"tgmath.h" | b"threads.h" | b"time.h" | b"uchar.h" | b"wchar.h" | b"wctype.h"
+    )
 }
 
 fn dir_of(path: &str) -> &str {
@@ -611,7 +629,10 @@ impl Unit<'_> {
                         }
                     }
                 }
-                Step::Unseen => self.unseen = true,
+                // (Where it may not be included, what follows is read as if
+                // it were not: what else could it be read as.)
+                Step::Unseen if live == Tri::True => self.unseen = true,
+                Step::Unseen => {}
                 Step::Include { files } => {
                     if let Some(p) = &mut self.prof {
                         p[4] += files.len() as u64;
@@ -813,6 +834,9 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
                         Op::Define { name, value } if asked.contains(&name[..]) && !conditions.settles(name) => Step::Define { id: ids[&name[..]], name: cut(name), value: cut(value) },
                         Op::Undef { name } if asked.contains(&name[..]) && !conditions.settles(name) => Step::Undef { id: ids[&name[..]], name: cut(name) },
                         Op::Define { .. } | Op::Undef { .. } => return None,
+                        // (`<assert.h>` is the C library's, not a header of
+                        // that name somewhere in the tree.)
+                        Op::Include { name, quoted: false } if standard_header(name) => return None,
                         Op::Include { name, quoted } => match files_of(path, name) {
                             files if !files.is_empty() => Step::Include { files: files.into() },
                             _ if *quoted => Step::Unseen,
@@ -955,7 +979,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
     };
     // (Compilation, the ways it reads the traced files it reads.)
     let ways: std::sync::Mutex<Ways> = Default::default();
-    let read_as: std::sync::Mutex<Vec<(u32, Vec<(u32, u32)>, Vec<(u32, bool)>, FxHashMap<u32, Option<Vec<Box<[u32]>>>>)>> = Default::default();
+    let read_as: std::sync::Mutex<Vec<(u32, Vec<(u32, u32)>, Vec<(u32, bool)>, FxHashMap<u32, Option<Vec<Box<[u32]>>>>, bool)>> = Default::default();
     // Returns the names defined outright (on the first pass), and the
     // compilations that were too much to read.
     let profile = std::env::var_os("SI_COND_PROFILE").is_some();
@@ -989,7 +1013,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
                     under_here: None,
                     under: FxHashMap::default(),
                     root,
-                    files: w.traced.iter().any(|t| *t).then(FxHashMap::default),
+                    files: Some(FxHashMap::default()),
                     unknown_why: FxHashMap::default(),
                 };
                 unit.read.insert(root, true);
@@ -1010,7 +1034,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
                         let mut ways = ways.lock().unwrap();
                         let read = read.into_iter().map(|(f, t)| (f, ways.number(f, t))).collect();
                         drop(ways);
-                        read_as.lock().unwrap().push((root, read, files.into_iter().collect(), unit.under));
+                        read_as.lock().unwrap().push((root, read, files.into_iter().collect(), unit.under, unit.unseen && !crate::is_header(&paths[root as usize])));
                     }
                 }
                 all
@@ -1026,15 +1050,64 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
     let (mut outright, mut left) = read_all(&w, true);
     // So is a file's include guard, though more follow its `#endif` or come
     // before its `#ifndef`.
-    let guards: Vec<Vec<u8>> = scripts
+    let mut guards: Vec<Vec<u8>> = scripts
         .iter()
         .zip(paths)
         .filter(|(_, p)| crate::is_header(p))
         .filter_map(|(s, _)| crate::mask::guard_name(&s.ops))
         .filter(|g| !conditions.settles(g))
         .collect();
+    // And a guard within a file (`#ifndef __CORE_CM4_H_DEPENDANT`, a bare
+    // `#define` of it next): a name every definition of which is such, and
+    // no other file tests (`support_p` another tests is a switch).
+    {
+        let mut inner: FxHashMap<Vec<u8>, (bool, FxHashSet<usize>)> = FxHashMap::default();
+        for (f, s) in scripts.iter().enumerate() {
+            for (k, op) in s.ops.iter().enumerate() {
+                if let Op::Define { name, value } = op {
+                    let guarded = k > 0 && matches!(&s.ops[k - 1], Op::If { kind: 2, expr, .. } if expr == name) && value.is_empty();
+                    let e = inner.entry(name.clone()).or_insert((true, FxHashSet::default()));
+                    e.0 &= guarded;
+                    e.1.insert(f);
+                }
+            }
+        }
+        inner.retain(|n, e| e.0 && !conditions.settles(n));
+        for (f, s) in scripts.iter().enumerate() {
+            for op in &s.ops {
+                if let Op::If { expr, .. } | Op::Elif { expr, .. } = op {
+                    names_in(expr, |n| {
+                        if let Some(e) = inner.get_mut(n) {
+                            if !e.1.contains(&f) {
+                                e.0 = false;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        guards.extend(inner.into_iter().filter(|(_, e)| e.0).map(|(n, _)| n));
+    }
     w.unseen = conditions.with_undefined(guards.iter().cloned());
     outright.extend(guards);
+    // So is a name defined only in files no compilation reads (another
+    // chip's header): no source a compilation reads brings it in.
+    {
+        let mut defining: FxHashMap<&[u8], (bool, bool)> = FxHashMap::default();
+        for (f, steps) in w.steps.iter().enumerate() {
+            let read = w.reached[f].load(Relaxed);
+            for step in steps {
+                if let Step::Define { name, .. } = step {
+                    let e = defining.entry(&name[..]).or_insert((false, false));
+                    *e = (e.0 || read, true);
+                }
+            }
+        }
+        let elsewhere: Vec<Vec<u8>> = defining.into_iter().filter(|(n, (read, _))| !read && !conditions.settles(n) && !crate::cond::builtin(n)).map(|(n, _)| n.to_vec()).collect();
+        // (Nor does a header the build makes.)
+        w.unseen = w.unseen.with_undefined(elsewhere.iter().cloned());
+        outright.extend(elsewhere);
+    }
     if profile {
         let mut rows = std::mem::take(&mut *profiled.lock().unwrap());
         let mut sum = [0u64; 5];
@@ -1068,6 +1141,8 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         w.seen = seen();
         w.spent = AtomicU64::new(0);
         w.why_found = Default::default();
+        // (What the first reading kept, this one keeps anew.)
+        read_as.lock().unwrap().clear();
         left = read_all(&w, false).1;
         if w.stop.load(Relaxed) {
             return None;
@@ -1165,12 +1240,13 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
     }
     let mut read_as = read_as.into_inner().unwrap();
     read_as.sort_unstable_by_key(|r| r.0);
-    for (root, read, files, under) in read_as.into_iter().filter(|_| !readings.files.is_empty()) {
+    for (root, read, files, under, generated) in read_as {
         if unread[root as usize] {
             continue;
         }
         let read: Vec<(u32, u32)> = read.iter().filter(|r| split[r.0 as usize]).map(|&(f, way)| (number[f as usize], way)).collect();
         readings.units.push((paths[root as usize].clone(), read));
+        readings.generated.push(generated);
         let mut bits = vec![0u64; n.div_ceil(64)];
         files.iter().for_each(|&(f, _)| bits[f as usize / 64] |= 1 << (f % 64));
         readings.reads.push(bits.into());
@@ -1179,8 +1255,9 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         readings.under.push(maybe.iter().map(|f| under.get(f).cloned().flatten().map(Vec::into_boxed_slice)).collect());
         readings.maybe.push(maybe.into());
     }
-    if !readings.files.is_empty() {
+    if !readings.units.is_empty() {
         readings.paths = paths.to_vec();
+        readings.orphans = (0..n as u32).filter(|&f| crate::is_header(&paths[f as usize]) && !included[f as usize]).collect();
     }
     // (A way that does not fit the lines is no reading: see `Readings::compiled`.)
     for (f, ways) in readings.ways.iter_mut().enumerate() {
@@ -1321,6 +1398,19 @@ int both;
             ("b.c", "#ifdef Q\n#define MORE\n#endif\n"),
         ]);
         assert_eq!(got[0], [one("#if SOC == 1", true)]);
+    }
+
+    #[test]
+    fn a_name_only_another_chip_s_header_defines_is_not_defined() {
+        let got = told(&[
+            ("a.c", "#define SOC 1\n#include \"chip.h\"\n#ifdef BANK1\n#endif\n#include \"core.h\"\n#if V == 1\n#endif\n"),
+            ("chip.h", "#if SOC == 1\n#include \"c1.h\"\n#elif SOC == 2\n#include \"c2.h\"\n#endif\n"),
+            ("c1.h", ""),
+            ("c2.h", "#define BANK1 1\n"),
+            // A guard within the file: defined nowhere else, tested nowhere else.
+            ("core.h", "#include \"c1.h\"\n#ifndef CORE_DEP\n#define CORE_DEP\n#define V 1\n#endif\n#define AFTER 1\n"),
+        ]);
+        assert_eq!(got[0], [one("#ifdef BANK1", false), one("#if V == 1", true)]);
     }
 
     #[test]

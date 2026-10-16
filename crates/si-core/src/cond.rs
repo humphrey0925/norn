@@ -339,7 +339,7 @@ fn compile_commands(text: &str) -> Vec<Build> {
             (None, Some(line)) => words(line),
             _ => continue,
         };
-        let mut one = Build::default();
+        let mut one = Build { compiler: words.first().and_then(|w| compiler_named(w.rsplit(['/', '\\']).next().unwrap_or(w))), ..Build::default() };
         let mut words = words.iter();
         while let Some(word) = words.next() {
             for (flag, define) in [("-D", true), ("-U", false), ("/D", true), ("/U", false)] {
@@ -357,6 +357,9 @@ fn compile_commands(text: &str) -> Vec<Build> {
             Some(mut c) => {
                 c.defines.retain(|d| one.defines.contains(d));
                 c.undefines.retain(|u| one.undefines.contains(u));
+                if c.compiler != one.compiler {
+                    c.compiler = None;
+                }
                 c
             }
         });
@@ -409,6 +412,58 @@ pub(crate) struct Build {
     pub(crate) defines: Vec<String>,
     pub(crate) undefines: Vec<String>,
     pub(crate) includes: Vec<String>,
+    /// The compiler, where the description names it.
+    pub(crate) compiler: Option<Compiler>,
+}
+
+/// A compiler, as far as which of the macros that tell compilers apart
+/// it defines of itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Compiler {
+    /// Arm Compiler 5 (armcc: DS-5, Keil).
+    Armcc,
+    /// Arm Compiler 6 (armclang).
+    Armclang,
+    Gcc,
+    Clang,
+    Iar,
+    Msvc,
+}
+
+/// The compiler a toolchain's name or a compiler's path says.
+pub(crate) fn compiler_named(text: &str) -> Option<Compiler> {
+    let t = text.to_ascii_lowercase();
+    let has = |w: &str| t.contains(w);
+    Some(if has("armclang") || has(".ac6") || has("toolchain.v6") || has("compiler 6") || has("armcompiler6") {
+        Compiler::Armclang
+    } else if has("armcc") || has(".ac5") || has("compiler 5") || has("armcompiler5") || has("rvct") {
+        Compiler::Armcc
+    } else if has("iccarm") || has("iar") {
+        Compiler::Iar
+    } else if has("clang") {
+        Compiler::Clang
+    } else if has("gcc") || has("gnu") {
+        Compiler::Gcc
+    } else if has("cl.exe") || has("msvc") {
+        Compiler::Msvc
+    } else {
+        return None;
+    })
+}
+
+/// The macros that tell compilers apart, as `cmsis_compiler.h` asks.
+const COMPILER_MARKS: [&str; 11] = ["__CC_ARM", "__ARMCC_VERSION", "__GNUC__", "__clang__", "__ICCARM__", "__IAR_SYSTEMS_ICC__", "__TI_ARM__", "__ti__", "__TASKING__", "__CSMC__", "_MSC_VER"];
+
+/// What `compiler` defines of itself, of those.
+fn compiler_defines(compiler: Compiler) -> &'static [(&'static str, &'static str)] {
+    match compiler {
+        Compiler::Armcc => &[("__CC_ARM", "1"), ("__ARMCC_VERSION", "5060960")],
+        Compiler::Armclang => &[("__ARMCC_VERSION", "6190004"), ("__clang__", "1"), ("__GNUC__", "4")],
+        Compiler::Gcc => &[("__GNUC__", "10")],
+        Compiler::Clang => &[("__clang__", "1"), ("__GNUC__", "4")],
+        Compiler::Iar => &[("__ICCARM__", "1"), ("__IAR_SYSTEMS_ICC__", "9")],
+        Compiler::Msvc => &[("_MSC_VER", "1930"), ("_WIN32", "1")],
+    }
 }
 
 /// `-DNAME=value` and `-UNAME` in a line of compiler flags.
@@ -475,6 +530,12 @@ fn cproject(text: &str) -> Vec<Build> {
                 inside = true;
             }
             "fileInfo" => one_file = true,
+            // (Or its compiler, `<tool name="ARM C Compiler 5">`.)
+            "toolChain" | "tool" if inside && !one_file && (name == "toolChain" || attr("name").is_some_and(|n| n.to_ascii_lowercase().contains("compiler"))) => {
+                if let Some(b) = out.last_mut().filter(|b| b.compiler.is_none()) {
+                    b.compiler = attr("superClass").and_then(compiler_named).or_else(|| attr("id").and_then(compiler_named)).or_else(|| attr("name").and_then(compiler_named));
+                }
+            }
             "option" if inside && !one_file => {
                 list = match attr("valueType") {
                     Some("definedSymbols") => 1,
@@ -548,7 +609,7 @@ fn cpp_properties(text: &str) -> Vec<Build> {
     let mut out = Vec::new();
     for c in v["configurations"].as_array().into_iter().flatten() {
         let Some(name) = c["name"].as_str() else { continue };
-        let mut b = Build { name: name.to_string(), defines: strings(&c["defines"]), ..Build::default() };
+        let mut b = Build { name: name.to_string(), defines: strings(&c["defines"]), compiler: c["compilerPath"].as_str().and_then(compiler_named), ..Build::default() };
         // `${default}` and the like stand for settings kept elsewhere.
         b.defines.retain(|d| !d.contains("${"));
         flags(&strings(&c["compilerArgs"]).join(" "), &mut b);
@@ -860,8 +921,19 @@ impl Tri {
 /// A macro the compiler defines of itself, never in a build's `-D`s:
 /// `__CC_ARM`, `__GNUC__`, `_WIN32`, `_MSC_VER`. What a build does not
 /// define is not defined, but these it may, unwritten.
-fn builtin(name: &[u8]) -> bool {
-    name.starts_with(b"__") || name.starts_with(b"_M_") || matches!(name, b"_WIN32" | b"_WIN64" | b"_MSC_VER" | b"_MSC_FULL_VER" | b"_LP64" | b"_ILP32" | b"_CHAR_UNSIGNED")
+pub(crate) fn builtin(name: &[u8]) -> bool {
+    // The kinds compilers define: which compiler, which machine, the sizes
+    // of types, the standard. (A project's own `__CMSIS_GENERIC` is none.)
+    const KINDS: [&[u8]; 58] = [
+        b"__GNUC", b"__clang", b"__llvm", b"__CC_ARM", b"__ARMCC", b"__ARMCOMPILER", b"__ICC", b"__IAR", b"__TI_", b"__ti__", b"__TASKING", b"__CSMC", b"__SDCC", b"__XC",
+        b"__EDG", b"__INTEL", b"__MINGW", b"__CYGWIN", b"__ARM", b"__arm", b"__thumb", b"__aarch64", b"__x86", b"__i386", b"__i486", b"__i586", b"__i686", b"__amd64",
+        b"__riscv", b"__mips", b"__ppc", b"__powerpc", b"__linux", b"__unix", b"__APPLE", b"__WIN", b"__ELF", b"__SIZEOF_", b"__INT", b"__UINT", b"__CHAR", b"__SCHAR",
+        b"__SHRT", b"__LONG", b"__WCHAR", b"__PTRDIFF", b"__FLT", b"__DBL", b"__LDBL", b"__BYTE_ORDER", b"__ORDER_", b"__LITTLE_ENDIAN", b"__BIG_ENDIAN", b"__STDC",
+        b"__cplusplus", b"__OPTIMIZE", b"__VFP", b"__SOFTFP",
+    ];
+    KINDS.iter().any(|k| name.starts_with(k))
+        || name.starts_with(b"_M_")
+        || matches!(name, b"_WIN32" | b"_WIN64" | b"_MSC_VER" | b"_MSC_FULL_VER" | b"_LP64" | b"_ILP32" | b"_CHAR_UNSIGNED" | b"__LP64__" | b"__ILP32__" | b"__FP_FAST_FMA" | b"__FPU_USED")
 }
 
 impl Conditions {
@@ -943,6 +1015,19 @@ impl Conditions {
         }
         for u in &b.undefines {
             self.undefine(u.trim());
+        }
+        if let Some(compiler) = b.compiler {
+            let own = compiler_defines(compiler);
+            for (name, value) in own {
+                if !self.settles(name.as_bytes()) {
+                    self.define(name, value);
+                }
+            }
+            for mark in COMPILER_MARKS.iter().filter(|m| !own.iter().any(|o| o.0 == **m)) {
+                if !self.settles(mark.as_bytes()) {
+                    self.undefine(mark);
+                }
+            }
         }
     }
 
@@ -1747,6 +1832,30 @@ mod tests {
         assert_eq!((c.defined(b"FOO_H"), c.defined(b"HAVE_ZLIB")), (Tri::Unknown, Tri::Unknown));
         assert_eq!(c.eval(b"defined(_WIN32) || defined(HAVE_ZLIB)"), Tri::Unknown);
         assert_eq!(c.eval(b"defined(_WIN32) && defined(HAVE_ZLIB)"), Tri::False);
+    }
+
+    #[test]
+    fn a_build_description_says_which_compiler_and_so_what_it_defines_of_itself() {
+        let dir = std::env::temp_dir().join(format!("si-compiler-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".vscode")).unwrap();
+        let cproject = r#"<cproject><configuration name="Debug"><folderInfo><toolChain id="com.arm.toolchain.ac5.exe.debug.1" name="ARM Compiler 5 (DS-5 built in)" superClass="com.arm.toolchain.ac5.exe.debug"><tool name="ARM C Compiler 5"><option valueType="definedSymbols"><listOptionValue value="CHIP=5037"/></option></tool></toolChain></folderInfo></configuration></cproject>"#;
+        std::fs::write(dir.join(".cproject"), cproject).unwrap();
+        std::fs::write(dir.join(".vscode/c_cpp_properties.json"), r#"{ "configurations": [ { "name": "Arm", "compilerPath": "C:/arm/bin/arm-none-eabi-gcc.exe", "defines": ["X"] } ] }"#).unwrap();
+        std::fs::write(dir.join("Makefile"), "PREFIX = arm-none-eabi-
+CC = $(PREFIX)gcc
+C_DEFS = -DUSE_HAL_DRIVER
+").unwrap();
+        let of = |entry: &str| Conditions::from_settings(&Settings { condition_files: vec![entry.into()], ..Settings::default() }, &dir);
+        let c = of(".cproject#Debug");
+        assert_eq!((c.defined(b"__CC_ARM"), c.defined(b"__GNUC__"), c.defined(b"__ICCARM__"), c.defined(b"CHIP")), (Tri::True, Tri::False, Tri::False, Tri::True));
+        // As CMSIS picks its header.
+        assert_eq!(c.eval(b"defined(__CC_ARM)"), Tri::True);
+        assert_eq!(c.eval(b"defined (__ARMCC_VERSION) && (__ARMCC_VERSION >= 6010050)"), Tri::False);
+        let c = of(".vscode/c_cpp_properties.json#Arm");
+        assert_eq!((c.defined(b"__GNUC__"), c.defined(b"__CC_ARM")), (Tri::True, Tri::False));
+        let c = of("Makefile");
+        assert_eq!((c.defined(b"__GNUC__"), c.defined(b"__CC_ARM"), c.defined(b"USE_HAL_DRIVER")), (Tri::True, Tri::False, Tri::True));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

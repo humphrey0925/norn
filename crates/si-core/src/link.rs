@@ -898,6 +898,13 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         files.iter().map(|f| at.get(f.path.as_str()).copied().unwrap_or(NONE)).collect()
     };
     let edge_why = std::env::var("SI_EDGE_WHY").ok();
+    // The files no compilation reads (a header only `#if`s the conditions
+    // switch off include): what is defined there is no reading of a name
+    // others define, from a file that is read.
+    let unread: Vec<bool> = {
+        let set: FxHashSet<&str> = readings.unread.iter().map(String::as_str).collect();
+        files.iter().map(|f| set.contains(f.path.as_str())).collect()
+    };
     // What they say together: yes where some say yes and none no (one
     // that does not know may just not read the file), no where all say
     // no; none: nothing.
@@ -1256,6 +1263,44 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
                 if tmp.iter().any(is_def) {
                     tmp.retain(is_def);
+                }
+                let built = |c: &u32| !unread.get(syms[*c as usize].file as usize).copied().unwrap_or(false);
+                if !unread.get(fi).copied().unwrap_or(false) && tmp.iter().any(built) {
+                    tmp.retain(built);
+                }
+                // A macro, or a function defined in a header, is there only
+                // where its file is read: in a source file, not one its own
+                // compilation does not read (`core_cm7.h`'s, beside the
+                // `core_cm4.h` it does).
+                let unit_here = unit_of.get(fi).copied().unwrap_or(NONE);
+                if unit_here != NONE {
+                    let local = |c: &u32| {
+                        let s = &syms[*c as usize];
+                        s.kind == kind::MACRO || s.kind == kind::FUNCTION && s.flags & flag::DECL == 0 && s.flags & flag::HEADER != 0
+                    };
+                    let read_here = |c: &u32| {
+                        let s = &syms[*c as usize];
+                        let p = path_of.get(s.file as usize).copied().unwrap_or(NONE);
+                        p == NONE || s.file as usize == fi || readings.reads(unit_here, p)
+                    };
+                    // (But for a header nothing here includes, or no
+                    // compilation reads, where the compilation includes one
+                    // the build makes, which may bring it in.)
+                    let generated = readings.generated.get(unit_here as usize).copied().unwrap_or(true);
+                    let may = |c: &u32| {
+                        let p = path_of.get(syms[*c as usize].file as usize).copied().unwrap_or(NONE);
+                        let elsewhere = readings.orphans.binary_search(&p).is_ok() || unread.get(syms[*c as usize].file as usize).copied().unwrap_or(false);
+                        !local(c) || read_here(c) || generated && elsewhere
+                    };
+                    // Where the compilation reads one of those, or a
+                    // prototype of the name: it means that, not a macro of
+                    // a header it does not read.
+                    let declared = cands.iter().any(|c| syms[*c as usize].flags & flag::DECL != 0 && read_here(c));
+                    if declared || tmp.iter().any(|c| local(c) && read_here(c)) {
+                        if tmp.iter().any(may) && !tmp.iter().all(may) {
+                            tmp.retain(may);
+                        }
+                    }
                 }
                 // In a source file: what its own compilation compiles of a
                 // header read one way here and another elsewhere.
