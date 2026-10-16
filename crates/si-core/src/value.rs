@@ -163,12 +163,14 @@ pub struct Values<'a> {
     pub missing: Vec<(String, String)>,
     /// The definition read for each name, as written (parameters, body).
     written: FxHashMap<String, (Option<Vec<String>>, String)>,
+    /// Why an expansion stopped.
+    expanding: Option<String>,
     enums: FxHashMap<u32, Option<i64>>,
 }
 
 impl<'a> Values<'a> {
     pub fn new(g: &'a Graph, conditions: &'a Conditions, source: &'a mut dyn FnMut(&str) -> Option<std::sync::Arc<Vec<u8>>>) -> Values<'a> {
-        Values { g, conditions, source, local: Local::default(), seen: FxHashSet::default(), types: FxHashMap::default(), unread: Vec::new(), at: None, missing: Vec::new(), written: FxHashMap::default(), enums: FxHashMap::default() }
+        Values { g, conditions, source, local: Local::default(), seen: FxHashSet::default(), types: FxHashMap::default(), unread: Vec::new(), at: None, missing: Vec::new(), written: FxHashMap::default(), expanding: None, enums: FxHashMap::default() }
     }
 
     /// The same, asked on `line` of the file at `path`.
@@ -759,7 +761,7 @@ fn rank_of(node: &Node) -> u8 {
 }
 
 fn show_number(v: i64, u: bool) -> String {
-    if (0..10).contains(&v) {
+    if (0..256).contains(&v) {
         v.to_string()
     } else if v < 0 && !u {
         v.to_string()
@@ -777,8 +779,20 @@ fn show(node: &Node, outer: u8) -> String {
         Node::Unary(op, x) => format!("{op}{}", show(x, 11)),
         Node::Cast(ty, x) => format!("({ty}){}", show(x, 11)),
         Node::Binary(op, a, b) => {
+            // (Shifts and bitwise operators among others: in parentheses,
+            // as one reads them.)
             let r = binary_rank(op).unwrap_or(0);
-            format!("{} {op} {}", show(a, r), show(b, r + 1))
+            let side = |x: &Node, least: u8| {
+                let mut bare = x;
+                while let Node::Paren(inner) = bare {
+                    bare = inner;
+                }
+                match bare {
+                    Node::Binary(o, ..) if *o != *op && (r <= 8 || binary_rank(o).unwrap_or(0) <= 8) => show(bare, 13),
+                    _ => show(x, least),
+                }
+            };
+            format!("{} {op} {}", side(a, r), side(b, r + 1))
         }
         Node::Ternary(c, a, b) => format!("{} ? {} : {}", show(c, 1), show(a, 0), show(b, 0)),
     };
@@ -814,7 +828,10 @@ impl Values<'_> {
             hide.insert(name.clone());
             match params {
                 None => {
-                    let body = tokens_of(&body)?;
+                    let Some(body) = tokens_of(&body) else {
+                        self.expanding = Some(format!("a character that is no part of C in the definition of `{name}`"));
+                        return None;
+                    };
                     out.extend(self.expand(&body, from, &hide, depth + 1)?);
                     i += 1;
                 }
@@ -846,9 +863,13 @@ impl Values<'_> {
                         args.push(arg);
                     }
                     if args.len() != params.len() && !(params.is_empty() && args.is_empty()) {
+                        self.expanding = Some(format!("`{name}` takes {} arguments, here {}", params.len(), args.len()));
                         return None;
                     }
-                    let body = tokens_of(&body)?;
+                    let Some(body) = tokens_of(&body) else {
+                        self.expanding = Some(format!("a character that is no part of C in the definition of `{name}`"));
+                        return None;
+                    };
                     let param = |t: &Tok| match t {
                         Tok::Name(n) => params.iter().position(|p| p == n),
                         _ => None,
@@ -912,13 +933,23 @@ impl Values<'_> {
     /// An expression with its macros expanded and what of it is numbers
     /// worked out, as written: `(void *)(0x400800 + ((U32)(q.cnt[2] & 3) << 4))`.
     pub fn folded(&mut self, expr: &str, from: u32) -> Option<String> {
-        let toks = self.expand(&tokens_of(expr)?, from, &FxHashSet::default(), 0)?;
+        self.fold_or_why(expr, from).ok()
+    }
+
+    /// The same, or why it is not had.
+    pub fn fold_or_why(&mut self, expr: &str, from: u32) -> Result<String, String> {
+        let toks = tokens_of(expr).ok_or_else(|| format!("a character that is no part of C in `{expr}`"))?;
+        self.expanding = None;
+        let toks = match self.expand(&toks, from, &FxHashSet::default(), 0) {
+            Some(t) => t,
+            None => return Err(self.expanding.take().unwrap_or_else(|| "it does not expand".into())),
+        };
         let mut f = Folder { toks: &toks, at: 0, values: self };
-        let node = f.expr()?;
-        if f.at != toks.len() {
-            return None;
+        let node = f.expr();
+        match node {
+            Some(node) if f.at == toks.len() => Ok(show(&fold(node), 0)),
+            _ => Err(format!("not an expression once expanded: `{}`", text_of(&toks))),
         }
-        Some(show(&fold(node), 0))
     }
 }
 

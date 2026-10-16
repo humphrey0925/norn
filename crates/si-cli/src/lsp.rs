@@ -446,50 +446,45 @@ impl Server {
             // The number it comes to; else what of it is numbers worked
             // out, the rest as written (a variable, a member); else why not.
             let squeeze = |t: &str| t.chars().filter(|c| !c.is_whitespace() && *c != '(' && *c != ')').collect::<String>();
+            // (Names defined more than one way, left as written.)
+            let several_ways = |values: &si_core::value::Values| -> String {
+                let names: Vec<String> = values.missing.iter().filter(|m| m.1.contains("definitions")).take(3).map(|(n, w)| format!("`{n}`: {w}")).collect();
+                if names.is_empty() { String::new() } else { format!("\n\nNot expanded: {}", names.join("; ")) }
+            };
             values.missing.clear();
             let mut v = String::new();
             if d.params.is_none() {
                 if let Some(n) = values.of_macro(s) {
-                    v = format!("
-
-`{}`", shown(n.number, n.unsigned));
-                } else if let Some(f) = values.folded(&d.body, sym.file).filter(|f| squeeze(f) != squeeze(&d.body)) {
-                    v = format!("
-
-`= {f}`");
-                } else if !values.missing.is_empty() {
-                    let why: Vec<String> = values.missing.iter().take(3).map(|(n, w)| format!("`{n}`: {w}")).collect();
-                    v = format!("
-
-No value: {}", why.join("; "));
+                    v = format!("\n\n`{}`", shown(n.number, n.unsigned));
+                } else {
+                    match values.fold_or_why(&d.body, sym.file) {
+                        Ok(f) if squeeze(&f) != squeeze(&d.body) => v = format!("\n\n`= {f}`{}", several_ways(&values)),
+                        Ok(_) => {}
+                        Err(why) => v = format!("\n\nNo value: {why}"),
+                    }
+                    if v.is_empty() && !values.missing.is_empty() {
+                        let why: Vec<String> = values.missing.iter().take(3).map(|(n, w)| format!("`{n}`: {w}")).collect();
+                        v = format!("\n\nNo value: {}", why.join("; "));
+                    }
                 }
             }
             if let (Some(_), Some(here)) = (&d.params, &used) {
                 let at = here_file.as_deref().and_then(|f| (0..g.files.len() as u32).find(|&i| g.file_path(i) == f)).unwrap_or(sym.file);
-                if let Some(n) = values.of(here, at) {
-                    v = format!("
-
-`{here}` `{}`", shown(n.number, n.unsigned));
-                } else if let Some(f) = values.folded(here, at) {
-                    v = format!("
-
-`{here}` `= {f}`");
-                }
+                values.missing.clear();
+                v = match values.of(here, at) {
+                    Some(n) => format!("\n\n`{here}` `{}`", shown(n.number, n.unsigned)),
+                    None => match values.fold_or_why(here, at) {
+                        Ok(f) => format!("\n\n`{here}` `= {f}`{}", several_ways(&values)),
+                        Err(why) => format!("\n\n`{here}`: no value: {why}"),
+                    },
+                };
             }
-            parts.push(format!("```c
-{head}
-```{v}
-
-{at}{maybe}"));
+            parts.push(format!("```c\n{head}\n```{v}\n\n{at}{maybe}"));
         }
         if parts.is_empty() {
             return Value::Null;
         }
-        let sep = if several { "
-
----
-
-" } else { "" };
+        let sep = if several { "\n\n---\n\n" } else { "" };
         json!({ "contents": { "kind": "markdown", "value": parts.join(sep) } })
     }
 
