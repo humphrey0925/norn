@@ -1459,7 +1459,7 @@ fn expand_file(
             let (name, classes) = names.member(&mut out, &n);
             // Made where it may not be compiled (`_PCI_NOP_ALL(read, *)` in
             // `#else /* CONFIG_PCI is not enabled */`): as one written there.
-            let undecided = kind == kind::FUNCTION && f.undecided.iter().any(|&(a, b, _)| a <= m.line && m.line <= b);
+            let undecided = kind == kind::FUNCTION && f.undecided.iter().any(|&(a, b, _, _)| a <= m.line && m.line <= b);
             let flags = flags | if undecided { flag::CONDITIONAL } else { 0 };
             let def = Def { name, line: m.line, end_line: m.line, kind, flags };
             if m.first && seen_defs.insert(key(&def)) {

@@ -599,8 +599,8 @@ impl Server {
         let mut deciding = Vec::new();
         for &line in lines {
             // The innermost branch around the line: the last to start.
-            match facts.undecided.iter().rev().find(|&&(a, b, _)| a <= line && line <= b) {
-                Some(&(_, _, directive)) => deciding.push(directive),
+            match facts.undecided.iter().rev().find(|&&(a, b, _, _)| a <= line && line <= b) {
+                Some(&(_, _, directive, _)) => deciding.push(directive),
                 None => return Vec::new(),
             }
         }

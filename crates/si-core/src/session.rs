@@ -1033,7 +1033,8 @@ mod tests {
         assert_eq!((functions(&s, "net_init"), functions(&s, "net_stub")), (1, 1));
         // Each only as sure as the directive that opens it.
         let facts = s.facts_of("a.c").unwrap();
-        assert_eq!((facts.undecided.clone(), facts.inactive.clone()), (vec![(2, 2, 1), (4, 4, 3)], vec![]));
+        let undecided: Vec<(u32, u32, u32)> = facts.undecided.iter().map(|u| (u.0, u.1, u.2)).collect();
+        assert_eq!((undecided, facts.inactive.clone()), (vec![(2, 2, 1), (4, 4, 3)], vec![]));
         // Configured from a file: only the branch that is compiled.
         let settings = Settings { condition_files: vec!["dot-config".into()], ..Settings::default() };
         let up = s.set_conditions(&settings).unwrap();

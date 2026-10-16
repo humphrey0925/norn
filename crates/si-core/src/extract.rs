@@ -549,7 +549,7 @@ impl Extractor {
         // A function defined where it may not be compiled (the stub in the
         // `#else` of a header) is only one reading of its name.
         for d in out.defs.iter_mut().filter(|d| d.kind == kind::FUNCTION) {
-            if out.undecided.iter().any(|&(a, b, _)| a <= d.line && d.line <= b) {
+            if out.undecided.iter().any(|&(a, b, _, _)| a <= d.line && d.line <= b) {
                 d.flags |= flag::CONDITIONAL;
             }
         }
@@ -2519,18 +2519,18 @@ pub(crate) fn inactive_lines(src: &[u8], skipped: &[(u32, u32)]) -> Vec<(u32, u3
 
 /// The same for the branches that may or may not be compiled, each with
 /// the line of the directive that opens it; in order of where they start.
-pub(crate) fn undecided_lines(src: &[u8], undecided: &[(u32, u32, u32)]) -> Vec<(u32, u32, u32)> {
+pub(crate) fn undecided_lines(src: &[u8], undecided: &[(u32, u32, u32, u64)]) -> Vec<(u32, u32, u32, u64)> {
     let breaks: Vec<usize> = src.iter().enumerate().filter(|(_, &b)| b == b'\n').map(|(i, _)| i).collect();
     // From 1: the number of line breaks before `pos`, and one.
     let line_of = |pos: usize| breaks.partition_point(|&b| b < pos) as u32 + 1;
-    let mut out: Vec<(u32, u32, u32)> = undecided
+    let mut out: Vec<(u32, u32, u32, u64)> = undecided
         .iter()
-        .filter_map(|&(from, to, directive)| {
+        .filter_map(|&(from, to, directive, key)| {
             let (from, to) = (from as usize, (to as usize).min(src.len()));
             let starts_line = from == 0 || src[from - 1] == b'\n';
             let first = line_of(from) + u32::from(!starts_line);
             let last = line_of(to) - u32::from(to != src.len());
-            (first <= last).then_some((first, last, line_of(directive as usize)))
+            (first <= last).then_some((first, last, line_of(directive as usize), key))
         })
         .collect();
     out.sort_unstable();

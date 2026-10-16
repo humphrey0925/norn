@@ -1298,10 +1298,14 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 }
                 // A macro that is not there in every configuration is one
                 // reading of the name; so is what a call through it reaches.
+                // (Not where the call is under the same branches as the
+                // macro: compiled, it finds the macro there.)
                 let optional = |c: &u32| {
                     let s = &syms[*c as usize];
+                    let branches = |file: usize, line: u32| files[file].undecided.iter().filter(move |u| u.0 <= line && line <= u.1).map(|u| u.3);
+                    let along = || branches(s.file as usize, s.line).all(|k| branches(fi, r.line).any(|h| h == k));
                     s.kind == kind::MACRO
-                        && (s.flags & flag::CONDITIONAL != 0 || s.file != fi as u32 && !sure.member[s.file as usize])
+                        && (s.flags & flag::CONDITIONAL != 0 && !along() || s.file != fi as u32 && !sure.member[s.file as usize])
                         && compiled(*c) != crate::cond::Tri::True
                 };
                 // (C++: overloads are one function, of one class in one file.)

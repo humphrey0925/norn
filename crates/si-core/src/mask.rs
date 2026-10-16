@@ -109,8 +109,34 @@ pub struct Lexed {
     /// The branches that may or may not be compiled (the conditions in
     /// force cannot tell), as (from, to, directive): from the end of the
     /// directive that opens one to the start of the one that ends it, and
-    /// where that opening directive starts. What is in them is indexed.
-    pub undecided: Vec<(u32, u32, u32)>,
+    /// where that opening directive starts, and which branch it is (see
+    /// [`branch_key`]). What is in them is indexed.
+    pub undecided: Vec<(u32, u32, u32, u64)>,
+}
+
+/// Which branch of which `#if` group: its directives up to the one that
+/// opens it, spaces and comments aside. The same in two files, the one
+/// branch is compiled where the other is.
+pub fn branch_key<'a>(directives: impl Iterator<Item = &'a [u8]>) -> u64 {
+    let mut text = Vec::new();
+    for d in directives {
+        let mut i = 0;
+        while i < d.len() {
+            if d[i..].starts_with(b"//") {
+                break;
+            }
+            if d[i..].starts_with(b"/*") {
+                i += d[i..].windows(2).position(|w| w == b"*/").map_or(d.len(), |p| p + 2);
+                continue;
+            }
+            if !d[i].is_ascii_whitespace() && d[i] != b'\\' {
+                text.push(d[i]);
+            }
+            i += 1;
+        }
+        text.push(b'\n');
+    }
+    xxhash_rust::xxh3::xxh3_64(&text)
 }
 
 /// A `#define` reduced to what decides transparency: `deps` is `Some` when
@@ -1243,8 +1269,9 @@ struct Cond {
     /// that is not is never read.)
     compiled: Tri,
     /// Where the branch being read began (the end of its directive) and its
-    /// directive did, while it is one not known to be compiled.
-    undecided: Option<(usize, usize)>,
+    /// directive did, while it is one not known to be compiled, and which
+    /// branch it is.
+    undecided: Option<(usize, usize, u64)>,
 }
 
 struct Lexer<'a> {
@@ -1783,7 +1810,7 @@ impl<'a> Lexer<'a> {
                     include_guard: false,
                     taken: holds,
                     compiled: holds,
-                    undecided: (holds == Tri::Unknown).then_some((span.1, start)),
+                    undecided: (holds == Tri::Unknown).then(|| (span.1, start, branch_key([&s[span.0..span.1]].into_iter()))),
                 });
                 hide = cuts;
                 skip = holds == Tri::False;
@@ -1792,8 +1819,8 @@ impl<'a> Lexer<'a> {
                 if let Some(c) = self.conds.last_mut() {
                     // The branch read so far ends here. (An include guard
                     // is no condition: what it holds is the file.)
-                    if let Some((from, directive)) = c.undecided.take().filter(|_| !c.include_guard) {
-                        self.out.undecided.push((from as u32, start as u32, directive as u32));
+                    if let Some((from, directive, key)) = c.undecided.take().filter(|_| !c.include_guard) {
+                        self.out.undecided.push((from as u32, start as u32, directive as u32, key));
                     }
                     if cuts && !c.hidden {
                         c.hidden = true;
@@ -1818,7 +1845,7 @@ impl<'a> Lexer<'a> {
                         }
                         c.compiled = c.taken.not().and(own);
                         skip = c.compiled == Tri::False;
-                        c.undecided = (c.compiled == Tri::Unknown).then_some((span.1, start));
+                        c.undecided = (c.compiled == Tri::Unknown).then(|| (span.1, start, branch_key(c.spans.iter().chain([&span]).map(|&(a, e)| &s[a..e]))));
                         c.taken = c.taken.or(own);
                     }
                     // `#else` of a lone `#if` is its negation; after an

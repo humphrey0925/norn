@@ -253,9 +253,10 @@ pub struct FileFacts {
     /// not compiled, so not indexed, and nothing is to be found from them.
     pub inactive: Vec<(u32, u32)>,
     /// The lines that may or may not be compiled, the conditions in force
-    /// cannot tell: (first, last, the line of the `#if` that decides).
-    /// Indexed, and what is found in them is only as sure as that `#if`.
-    pub undecided: Vec<(u32, u32, u32)>,
+    /// cannot tell: (first, last, the line of the `#if` that decides, which
+    /// branch it is: see `mask::branch_key`). Indexed, and what is found
+    /// in them is only as sure as that `#if`.
+    pub undecided: Vec<(u32, u32, u32, u64)>,
     pub macros: Vec<MacroBody>,
     pub sites: Vec<Site>,
     pub binds: Vec<Bind>,
