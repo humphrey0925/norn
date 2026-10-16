@@ -324,6 +324,23 @@ pub struct Script {
     pub lines: Vec<u32>,
 }
 
+/// The name of a file's include guard, when it starts with one: `#ifndef G`
+/// (or `#if !defined(G)`), then `#define G`. (What follows its `#endif`
+/// may be more.)
+pub fn guard_of(ops: &[Op]) -> Option<Vec<u8>> {
+    let [Op::If { kind, expr, .. }, Op::Define { name, .. }, ..] = ops else { return None };
+    let g = match kind {
+        2 => expr.clone(),
+        0 => {
+            let e: Vec<u8> = expr.iter().copied().filter(|c| !c.is_ascii_whitespace()).collect();
+            let e = e.strip_prefix(b"!defined")?;
+            e.strip_prefix(b"(").and_then(|e| e.strip_suffix(b")")).unwrap_or(e).to_vec()
+        }
+        _ => return None,
+    };
+    (&g == name).then_some(g)
+}
+
 /// The directives of `src`, in order.
 pub fn script(src: &[u8]) -> Script {
     let mut out = Script::default();
@@ -414,7 +431,7 @@ pub fn script(src: &[u8]) -> Script {
     }
     // An include guard: all of the file inside `#ifndef G`, which the
     // next directive defines.
-    if let [Op::If { kind: 2, expr, .. }, Op::Define { name, .. }, ..] = &out.ops[..] {
+    if let Some(name) = guard_of(&out.ops) {
         let mut depth = 0;
         let close = out.ops.iter().position(|op| {
             match op {
@@ -424,7 +441,7 @@ pub fn script(src: &[u8]) -> Script {
             }
             depth == 0
         });
-        if expr == name && close == Some(out.ops.len() - 1) {
+        if close == Some(out.ops.len() - 1) {
             out.ops.pop();
             out.ops.drain(..2);
             out.lines.pop();

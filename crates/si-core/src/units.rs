@@ -175,6 +175,9 @@ struct World<'a> {
     /// The steps `SI_COND_WHY` asks about, per file, and what was found.
     why: FxHashMap<u32, FxHashSet<usize>>,
     why_found: std::sync::Mutex<Why>,
+    /// When `SI_COND_WHY` asks: per file, the line of each step that is
+    /// an `#if`, `#elif` or `#else` (0 for the others).
+    why_lines: Vec<Vec<u32>>,
     /// The names some step defines or undefines, numbered.
     ids: FxHashMap<Box<[u8]>, u32>,
     /// How many expressions there are (see `Step::If`).
@@ -257,6 +260,10 @@ struct Unit<'a> {
     /// While a file that may not be read is read: each name it changes,
     /// with how the name was before (see `Step::Include`).
     journal: Option<Vec<(u32, Box<[u8]>, Option<Option<Option<Vec<u8>>>>, u64)>>,
+    /// Per file, the names a reading of it that may not have been made not
+    /// known, with how they were before: read for sure, it is read from
+    /// there (it would do the same again).
+    before: FxHashMap<u32, Vec<(u32, Box<[u8]>, Option<Option<Option<Vec<u8>>>>, u64)>>,
     /// The file the compilation starts from.
     root: u32,
     /// The files it reads, when that is kept (see [`Readings::reads`]).
@@ -266,7 +273,7 @@ struct Unit<'a> {
     /// a file that may not be read changed it), with, for 2, the file
     /// that includes it and how many files the include may mean (0:
     /// one, under an `#if` not known).
-    unknown_why: FxHashMap<u32, (u32, u8, u32, u32)>,
+    unknown_why: FxHashMap<u32, (u32, u8, u32, u32, u32)>,
 }
 
 impl Unit<'_> {
@@ -366,12 +373,12 @@ impl Unit<'_> {
                 }
                 Some(Some(None)) => 1,
                 Some(None) => {
-                    let how = w.ids.get(&n[..]).and_then(|id| self.unknown_why.get(id)).map_or("?".to_string(), |&(f, how, from, several)| {
+                    let how = w.ids.get(&n[..]).and_then(|id| self.unknown_why.get(id)).map_or("?".to_string(), |&(f, how, from, several, at)| {
                         let path = &w.paths[f as usize];
                         let from = &w.paths[from as usize];
                         match (how, several) {
                             (1, _) => format!("a #define in {path} on a line that may not be compiled"),
-                            (_, 0) => format!("changed by {path}, included by {from} under an #if not known"),
+                            (_, 0) => format!("changed by {path}, included by {from} under an #if not known (line {at})"),
                             _ => format!("changed by {path}, included by {from} with an include that may mean {several} files"),
                         }
                     });
@@ -414,10 +421,23 @@ impl Unit<'_> {
             return;
         }
         *times += 1;
+        if !maybe && self.journal.is_none() {
+            for (id, name, was, state) in self.before.remove(&file).into_iter().flatten() {
+                if self.local.get(&name[..]) == Some(&None) {
+                    match was {
+                        Some(v) => drop(self.local.insert(name.to_vec(), v)),
+                        None => drop(self.local.remove(&name[..])),
+                    }
+                    self.states[id as usize] = state;
+                }
+            }
+        }
         // The open groups: whether a branch so far was the one compiled,
         // and whether the one being read is. `live` is whether this line
         // is compiled, the file being read at all.
         let mut open: Vec<(Tri, Tri, Tri)> = Vec::new();
+        // (For `SI_COND_WHY`: the step of each open group's branch.)
+        let mut branch: Vec<usize> = Vec::new();
         let mut live = Tri::True;
         // How this compilation reads the file, if that is kept: after a
         // directive, whether what follows is compiled, the file being read.
@@ -442,6 +462,7 @@ impl Unit<'_> {
                         w.seen[file as usize][i].fetch_or(1 << holds as u8, Relaxed);
                     }
                     open.push((holds, holds, live));
+                    branch.push(i);
                     live = live.and(holds);
                 }
                 Step::Elif { kind, expr, slot, .. } => {
@@ -463,17 +484,20 @@ impl Unit<'_> {
                     group.1 = group.0.not().and(own);
                     group.0 = group.0.or(own);
                     live = outer.and(group.1);
+                    branch.last_mut().map(|b| *b = i);
                 }
                 Step::Else => {
                     let Some(group) = open.last_mut() else { continue };
                     group.1 = group.0.not();
                     group.0 = Tri::True;
                     live = group.2.and(group.1);
+                    branch.last_mut().map(|b| *b = i);
                 }
                 Step::Endif => {
                     if let Some(group) = open.pop() {
                         live = group.2;
                     }
+                    branch.pop();
                 }
                 _ if live == Tri::False => {}
                 Step::Define { id, name, value } => {
@@ -493,7 +517,7 @@ impl Unit<'_> {
                     } else if self.local.get(&name[..]).is_none_or(|v| v.as_ref().and_then(|v| v.as_deref()) != Some(&value[..])) {
                         self.set(*id, name, None, 1);
                         if !w.why.is_empty() {
-                            self.unknown_why.insert(*id, (file, 1, 0, 0));
+                            self.unknown_why.insert(*id, (file, 1, 0, 0, 0));
                         }
                     }
                     if let (Some(p), Some(t)) = (&mut self.prof, t) {
@@ -506,7 +530,7 @@ impl Unit<'_> {
                     } else if self.local.get(&name[..]) != Some(&Some(None)) {
                         self.set(*id, name, None, 1);
                         if !w.why.is_empty() {
-                            self.unknown_why.insert(*id, (file, 1, 0, 0));
+                            self.unknown_why.insert(*id, (file, 1, 0, 0, 0));
                         }
                     }
                 }
@@ -523,6 +547,7 @@ impl Unit<'_> {
                     // read from how things are here.)
                     let unsure = maybe && self.journal.is_none();
                     let mut changed: Vec<(u32, Box<[u8]>, u32)> = Vec::new();
+                    let mut before: Vec<(u32, (u32, Box<[u8]>, Option<Option<Option<Vec<u8>>>>, u64))> = Vec::new();
                     for &f in files.iter() {
                         if w.once[f as usize] {
                             match self.read.get(&f) {
@@ -535,13 +560,21 @@ impl Unit<'_> {
                             self.journal = Some(Vec::new());
                         }
                         self.read(f, maybe, depth + 1);
-                        if let Some(journal) = self.journal.take().filter(|_| unsure) {
+                        // (Within, the journal goes on for the outermost to take.)
+                        if let Some(journal) = unsure.then(|| self.journal.take()).flatten() {
                             // (A name's first entry has how it was before.)
                             let mut named: FxHashSet<&[u8]> = FxHashSet::default();
-                            for (id, name, was, _) in &journal {
+                            for (id, name, was, state) in &journal {
                                 if named.insert(&name[..]) && was.as_ref() != self.local.get(&name[..]) {
                                     changed.push((*id, name.clone(), f));
+                                    // (The file that defined it last.)
+                                    if let Some(by) = (self.states[*id as usize] >> 32).checked_sub(1) {
+                                        before.push((by as u32, (*id, name.clone(), was.clone(), *state)));
+                                    }
                                 }
+                            }
+                            for (by, entry) in before.drain(..) {
+                                self.before.entry(by).or_default().push(entry);
                             }
                             for (id, name, was, state) in journal.into_iter().rev() {
                                 match was {
@@ -556,7 +589,9 @@ impl Unit<'_> {
                         if self.local.get(&name[..]) != Some(&None) {
                             self.set(id, &name, None, 1);
                             if !w.why.is_empty() {
-                                self.unknown_why.insert(id, (f, 2, file, if files.len() > 1 { files.len() as u32 } else { 0 }));
+                                // (The innermost branch not surely compiled.)
+                                let at = open.iter().zip(&branch).rev().find(|(g, _)| g.1 != Tri::True).map_or(0, |(_, &s)| w.why_lines[file as usize].get(s).copied().unwrap_or(0));
+                                self.unknown_why.insert(id, (f, 2, file, if files.len() > 1 { files.len() as u32 } else { 0 }, at));
                             }
                         }
                     }
@@ -752,6 +787,24 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
     }
     let mut w = World {
         paths,
+        why_lines: if why.is_empty() {
+            Vec::new()
+        } else {
+            steps
+                .iter()
+                .zip(scripts)
+                .map(|(steps, script)| {
+                    let mut d = 0;
+                    steps.iter().map(|step| match step {
+                        Step::If { .. } | Step::Elif { .. } | Step::Else | Step::Endif => {
+                            d += 1;
+                            script.lines.get(d - 1).copied().unwrap_or(0)
+                        }
+                        _ => 0,
+                    }).collect()
+                })
+                .collect()
+        },
         why,
         why_found: Default::default(),
         ids,
@@ -797,6 +850,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
                     prof: profile.then_some([0; 5]),
                     traces: FxHashMap::default(),
                     journal: None,
+                    before: FxHashMap::default(),
                     root,
                     files: w.traced.iter().any(|t| *t).then(FxHashSet::default),
                     unknown_why: FxHashMap::default(),
@@ -832,7 +886,9 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
     };
     // Once to learn which names the sources define outright, and then
     // knowing that.
-    let (outright, mut left) = read_all(&w, true);
+    let (mut outright, mut left) = read_all(&w, true);
+    // So is a file's include guard, though more follow its `#endif`.
+    outright.extend(scripts.iter().filter_map(|s| crate::mask::guard_of(&s.ops)).filter(|g| !conditions.settles(g)));
     if profile {
         let mut rows = std::mem::take(&mut *profiled.lock().unwrap());
         let mut sum = [0u64; 5];
@@ -1077,6 +1133,51 @@ int both;
         // Each of the two `env.h`s an include may mean, on its own.
         assert_eq!(got[2], [one("#if PLAT == 1", true)]);
         assert_eq!(got[3], [one("#if PLAT == 2", true)]);
+    }
+
+    #[test]
+    fn what_a_file_that_may_not_be_read_changes_after_an_include_is_not_known() {
+        let got = told(&[
+            ("a.c", "#ifdef BUILD_SAYS\n#include \"h.h\"\n#endif\n#ifdef X\n#endif\n"),
+            ("h.h", "#include \"inner.h\"\n#define X 1\n"),
+            ("inner.h", ""),
+            ("b.c", "#ifdef Q\n#define BUILD_SAYS\n#endif\n"),
+        ]);
+        assert_eq!(got[0], []);
+    }
+
+    #[test]
+    fn a_header_read_for_sure_after_it_may_have_been_is_read_from_before() {
+        // A guard not seen as one: read first where it may not be, its
+        // name is then not known; read for sure, the header is read all the same.
+        for guard in ["#if !defined(SETUP_H)
+#define SETUP_H
+", "#ifndef SETUP_H
+#define SETUP_H
+#include \"env.h\"
+"] {
+            let setup = format!("{guard}#include \"env.h\"
+#endif
+#include \"more.h\"
+");
+            let got = told(&[
+                ("a.c", "#ifdef BUILD_SAYS
+#include \"x.h\"
+#endif
+#include \"setup.h\"
+#if SOC == 1
+#endif
+"),
+                ("x.h", "#include \"setup.h\"
+"),
+                ("setup.h", &setup),
+                ("env.h", "#define SOC 1
+"),
+                ("more.h", ""),
+                ("b.c", "#ifdef Q\n#define BUILD_SAYS\n#endif\n"),
+            ]);
+            assert_eq!(got[0], [one("#if SOC == 1", true)], "{guard}");
+        }
     }
 
     #[test]
