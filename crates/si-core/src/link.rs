@@ -1281,8 +1281,8 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                         // the call under the branches it is included in.)
                         let along = || {
                             u == unit
-                                && readings.read_under(u, p).is_some_and(|lines| {
-                                    lines.iter().all(|&l| files[fi].undecided.iter().any(|b| b.0 <= r.line && r.line <= b.1 && b.2 == l))
+                                && readings.read_under(u, p).is_some_and(|ways| {
+                                    ways.iter().any(|lines| lines.iter().all(|&l| files[fi].undecided.iter().any(|b| b.0 <= r.line && r.line <= b.1 && b.2 == l)))
                                 })
                         };
                         Some(if s.flags & flag::CONDITIONAL == 0 && (readings.reads_surely(u, p) || along()) { Tri::True } else { Tri::Unknown })

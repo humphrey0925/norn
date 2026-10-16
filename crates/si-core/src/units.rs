@@ -57,9 +57,9 @@ pub struct Readings {
     /// Per compilation, of the files it reads, those it may not read.
     pub maybe: Vec<Box<[u32]>>,
     /// For each of those (in that order), when it is read only under the
-    /// compilation's own file's `#if`s not known: the lines of the
-    /// branches it is included in there.
-    pub under: Vec<Box<[Option<Box<[u32]>>]>>,
+    /// compilation's own file's `#if`s not known: for each way it is
+    /// included, the lines of the branches it is included in there.
+    pub under: Vec<Box<[Option<Box<[Box<[u32]>]>>]>>,
 }
 
 impl Readings {
@@ -75,7 +75,7 @@ impl Readings {
     /// Whether it reads it for certain.
     /// Where it may not read it, only for its own file's `#if`s: the lines
     /// of the branches it is included in.
-    pub fn read_under(&self, unit: u32, path: u32) -> Option<&[u32]> {
+    pub fn read_under(&self, unit: u32, path: u32) -> Option<&[Box<[u32]>]> {
         let i = self.maybe.get(unit as usize)?.binary_search(&path).ok()?;
         self.under.get(unit as usize)?.get(i)?.as_deref()
     }
@@ -300,7 +300,7 @@ struct Unit<'a> {
     /// the lines of those branches; and per file it may not read, those
     /// it is read under (none: read where it may not be otherwise too).
     under_here: Option<Box<[u32]>>,
-    under: FxHashMap<u32, Option<Box<[u32]>>>,
+    under: FxHashMap<u32, Option<Vec<Box<[u32]>>>>,
     /// The directories of the files it certainly reads.
     dirs: FxHashSet<u32>,
     /// The file the compilation starts from.
@@ -440,6 +440,25 @@ impl Unit<'_> {
         }
     }
 
+    /// Note that `file`, which may not be read, is included here, under
+    /// [`Unit::under_here`].
+    fn note_under(&mut self, file: u32) {
+        if self.files.is_none() {
+            return;
+        }
+        let here = self.under_here.clone();
+        match (self.under.get_mut(&file), here) {
+            (None, here) => drop(self.under.insert(file, here.map(|h| vec![h]))),
+            (Some(Some(ways)), Some(h)) => {
+                if !ways.contains(&h) {
+                    ways.push(h);
+                }
+            }
+            (Some(u), None) => *u = None,
+            (Some(None), _) => {}
+        }
+    }
+
     fn set(&mut self, id: u32, name: &[u8], value: Option<Option<Vec<u8>>>, state: u64) {
         if let Some(j) = &mut self.journal {
             j.push((id, name.into(), self.local.get(name).cloned(), self.states[id as usize]));
@@ -464,8 +483,7 @@ impl Unit<'_> {
             *files.entry(file).or_default() |= !maybe;
             // (Read where it may not be for another reason too: no lines.)
             if maybe {
-                let under = self.under_here.clone();
-                self.under.entry(file).and_modify(|u| if *u != under { *u = None }).or_insert(under);
+                self.note_under(file);
             }
         }
         // (A file that includes itself without end is read no deeper.)
@@ -606,7 +624,10 @@ impl Unit<'_> {
                     // Included under the compilation's own file's `#if`s
                     // not known, and only so: the branches.
                     let own = file == self.root && !maybe && live != Tri::True && files.len() == 1;
-                    let was_under = self.under_here.take();
+                    let was_under = self.under_here.clone();
+                    if !own && (live != Tri::True || files.len() > 1) {
+                        self.under_here = None;
+                    }
                     if own {
                         let lines = open.iter().zip(&branch).filter(|(g, _)| g.1 != Tri::True).map(|(_, &s)| w.why_lines[file as usize].get(s).copied().unwrap_or(0));
                         self.under_here = Some(lines.collect());
@@ -624,7 +645,11 @@ impl Unit<'_> {
                         if w.once[f as usize] {
                             match self.read.get(&f) {
                                 Some(true) => continue,
-                                Some(false) if maybe => continue,
+                                Some(false) if maybe => {
+                                    // (Included here too, read before.)
+                                    self.note_under(f);
+                                    continue;
+                                }
                                 _ => drop(self.read.insert(f, !maybe)),
                             }
                         }
@@ -924,7 +949,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
     };
     // (Compilation, the ways it reads the traced files it reads.)
     let ways: std::sync::Mutex<Ways> = Default::default();
-    let read_as: std::sync::Mutex<Vec<(u32, Vec<(u32, u32)>, Vec<(u32, bool)>, FxHashMap<u32, Option<Box<[u32]>>>)>> = Default::default();
+    let read_as: std::sync::Mutex<Vec<(u32, Vec<(u32, u32)>, Vec<(u32, bool)>, FxHashMap<u32, Option<Vec<Box<[u32]>>>>)>> = Default::default();
     // Returns the names defined outright (on the first pass), and the
     // compilations that were too much to read.
     let profile = std::env::var_os("SI_COND_PROFILE").is_some();
@@ -1143,7 +1168,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         readings.reads.push(bits.into());
         let mut maybe: Vec<u32> = files.iter().filter(|f| !f.1).map(|f| f.0).collect();
         maybe.sort_unstable();
-        readings.under.push(maybe.iter().map(|f| under.get(f).cloned().flatten()).collect());
+        readings.under.push(maybe.iter().map(|f| under.get(f).cloned().flatten().map(Vec::into_boxed_slice)).collect());
         readings.maybe.push(maybe.into());
     }
     if !readings.files.is_empty() {
