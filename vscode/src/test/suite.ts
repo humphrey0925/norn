@@ -321,6 +321,19 @@ export async function run(): Promise<void> {
   const completions = await vscode.commands.executeCommand<vscode.CompletionList>("vscode.executeCompletionItemProvider", doc.uri, doc.positionAt(typing + "bfd_set_err".length));
   assert.ok(completions.items.some((i) => (typeof i.label === "string" ? i.label : i.label.label) === "bfd_set_error"), completions.items.map((i) => i.label).slice(0, 20).join(" "));
 
+  // A function's hover is how it is declared; a call being written, its
+  // parameters; after `->`, the members of what it points to.
+  const called = find(doc, "bfd_set_error (bfd_error_invalid_operation)");
+  const fnHovers = await vscode.commands.executeCommand<vscode.Hover[]>("vscode.executeHoverProvider", doc.uri, called);
+  const fnText = fnHovers.flatMap((h) => h.contents.map((c) => (typeof c === "string" ? c : c.value))).join("\n");
+  assert.ok(/void bfd_set_error \(bfd_error_type error_tag\)/.test(fnText), fnText);
+  const help = await vscode.commands.executeCommand<vscode.SignatureHelp>("vscode.executeSignatureHelpProvider", doc.uri, doc.positionAt(typing + "bfd_set_error (".length), "(");
+  assert.ok(help?.signatures.some((s) => /bfd_set_error \(bfd_error_type error_tag\)/.test(s.label)) && help.activeParameter === 0, JSON.stringify(help));
+  const arrow = doc.getText().indexOf("abfd->iovec == NULL") + "abfd->".length;
+  const members = await vscode.commands.executeCommand<vscode.CompletionList>("vscode.executeCompletionItemProvider", doc.uri, doc.positionAt(arrow), ">");
+  const memberNames = members.items.map((i) => (typeof i.label === "string" ? i.label : i.label.label));
+  assert.ok(memberNames.includes("iovec") && memberNames.includes("filename") && !memberNames.includes("bfd_set_error"), memberNames.slice(0, 20).join(" "));
+
   // An #include leads to the file it means, and is a link to it.
   const included = doc.positionAt(doc.getText().indexOf('#include "libbfd.h"') + 12);
   const includedFile = await vscode.commands.executeCommand<vscode.Location[]>("vscode.executeDefinitionProvider", doc.uri, included);

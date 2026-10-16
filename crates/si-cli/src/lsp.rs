@@ -63,6 +63,87 @@ fn write_message(out: &mut impl Write, msg: &Value) {
 }
 
 /// A parameter or local variable found under the cursor.
+/// A line with its comments taken out (`//` to the end, `/* */` on it).
+fn uncommented(line: &str) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    loop {
+        let (a, b) = (rest.find("//"), rest.find("/*"));
+        match (a, b) {
+            (Some(i), b) if b.is_none_or(|b| i < b) => {
+                out.push_str(&rest[..i]);
+                return out;
+            }
+            (_, Some(i)) => {
+                out.push_str(&rest[..i]);
+                match rest[i + 2..].find("*/") {
+                    Some(e) => rest = &rest[i + 2 + e + 2..],
+                    None => return out,
+                }
+            }
+            _ => {
+                out.push_str(rest);
+                return out;
+            }
+        }
+    }
+}
+
+/// The words of a comment, its markers taken out.
+fn comment_words(lines: &[String]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for l in lines {
+        let mut t = l.trim();
+        for p in ["/**<", "/*!<", "///<", "//!<", "/**", "/*!", "/*", "///", "//!", "//"] {
+            if let Some(r) = t.strip_prefix(p) {
+                t = r;
+                break;
+            }
+        }
+        let t = t.trim_end().trim_end_matches("*/").trim();
+        let t = t.strip_prefix('*').map_or(t, str::trim);
+        if !t.is_empty() || out.last().is_some_and(|l| !l.is_empty()) {
+            out.push(t.to_string());
+        }
+    }
+    while out.last().is_some_and(String::is_empty) {
+        out.pop();
+    }
+    out.join("  \n")
+}
+
+/// The type a declaration gives `name`: the last word before it that is
+/// no qualifier (`static const struct foo *p` gives `foo`).
+fn type_word(decl: &str, name: &str) -> Option<String> {
+    const NOT: &[&str] = &[
+        "static", "extern", "const", "volatile", "register", "inline", "struct", "union", "enum", "unsigned", "signed", "restrict", "typedef", "__IO",
+        "__I", "__O", "__IM", "__OM", "__IOM", "__restrict", "__inline", "__volatile__", "__const",
+    ];
+    // (What is between braces is the members of a struct written there.)
+    let mut flat = String::new();
+    let mut depth = 0;
+    for c in decl.chars() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            _ if depth == 0 => flat.push(c),
+            _ => {}
+        }
+    }
+    let decl = flat.as_str();
+    let b = decl.as_bytes();
+    let at = decl.match_indices(name).map(|m| m.0).find(|&i| (i == 0 || !is_ident(b[i - 1])) && b.get(i + name.len()).is_none_or(|&c| !is_ident(c)))?;
+    let words: Vec<&str> = decl[..at].split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|w| !w.is_empty() && !w.as_bytes()[0].is_ascii_digit()).collect();
+    words.iter().rev().find(|w| !NOT.contains(w)).map(|w| w.to_string())
+}
+
+const C_KEYWORDS: &[&str] = &[
+    "auto", "break", "case", "char", "const", "continue", "default", "do", "double", "else", "enum", "extern", "float", "for", "goto", "if", "inline",
+    "int", "long", "register", "restrict", "return", "short", "signed", "sizeof", "static", "struct", "switch", "typedef", "union", "unsigned", "void",
+    "volatile", "while", "_Bool", "_Static_assert", "_Alignof", "_Alignas", "_Noreturn", "_Atomic", "_Thread_local", "_Generic", "bool", "true", "false",
+    "NULL",
+];
+
 struct LocalHit {
     file: String,
     name: String,
@@ -381,7 +462,16 @@ impl Server {
             }
             None
         });
+        if !self.alongside {
+            if let Some(h) = self.local_at(params) {
+                return self.local_hover(&h);
+            }
+        }
         let mut found = self.targets(params);
+        let g = &self.session.graph;
+        if !self.alongside && !found.is_empty() && !found.iter().any(|&s| matches!(g.syms[s as usize].kind, kind::MACRO | kind::ENUM_CONST)) {
+            return self.declaration_hover(found);
+        }
         let g = &self.session.graph;
         found.retain(|&s| matches!(g.syms[s as usize].kind, kind::MACRO | kind::ENUM_CONST) && g.syms[s as usize].flags & flag::DECL == 0);
         if found.is_empty() {
@@ -508,6 +598,537 @@ impl Server {
         json!({ "contents": { "kind": "markdown", "value": parts.join(sep) } })
     }
 
+    /// The declaration of a symbol as written (a function's up to its
+    /// body, a struct's whole as far as 20 lines), and its comment: the one
+    /// just above it, else the one after it on its line.
+    fn written(&mut self, sym: u32) -> (String, String) {
+        let (file, line, end, k, name) = {
+            let g = self.g();
+            let s = &g.syms[sym as usize];
+            (g.file_path(s.file).to_string(), s.line, s.end_line.max(s.line), s.kind, g.sym_name(sym).to_string())
+        };
+        let whole = matches!(k, kind::STRUCT | kind::UNION | kind::ENUM | kind::TYPEDEF);
+        let most = if whole { 20 } else { 8 };
+        let mut code: Vec<String> = Vec::new();
+        let (mut depth, mut braces) = (0i32, 0i32);
+        let mut cut = false;
+        for l in line..=end.min(line + most - 1) {
+            let raw = self.line_text(&file, l);
+            let text = if whole { raw.trim_end().to_string() } else { uncommented(&raw).trim_end().to_string() };
+            let mut kept = String::new();
+            for c in text.chars() {
+                // (A function up to its body; a variable or member to its
+                // `;`, braces and all.)
+                if !whole && k != kind::MACRO && depth == 0 && braces == 0 && (c == ';' || c == '{' && k == kind::FUNCTION) {
+                    cut = c == '{';
+                    break;
+                }
+                depth += (c == '(') as i32 - (c == ')') as i32;
+                braces += (c == '{') as i32 - (c == '}') as i32;
+                kept.push(c);
+            }
+            let ended = kept.len() < text.len();
+            if !kept.trim().is_empty() {
+                code.push(kept.trim_end().to_string());
+            }
+            if ended {
+                break;
+            }
+        }
+        if whole && end >= line + most {
+            code.push("    …".into());
+        }
+        // (Indented as written, less what all of it is indented by.)
+        let indent = code.iter().filter(|l| !l.trim().is_empty()).map(|l| l.len() - l.trim_start().len()).min().unwrap_or(0);
+        let mut text = code.iter().map(|l| l.get(indent..).unwrap_or(l.trim_start()).to_string()).collect::<Vec<_>>().join("\n");
+        if text.trim().is_empty() {
+            text = name.clone();
+        }
+        if cut {
+            text.push_str(" { … }");
+        } else if !whole && k != kind::MACRO && k != kind::ENUM_CONST && !text.ends_with(';') {
+            text.push(';');
+        }
+        // The comment above.
+        let mut doc: Vec<String> = Vec::new();
+        let mut l = line;
+        let above = if l > 1 { self.line_text(&file, l - 1) } else { String::new() };
+        if above.trim_end().ends_with("*/") {
+            while l > 1 {
+                l -= 1;
+                let t = self.line_text(&file, l);
+                doc.push(t.clone());
+                if let Some(i) = t.find("/*") {
+                    // (The comment after another declaration is its.)
+                    if !t[..i].trim().is_empty() {
+                        doc.clear();
+                    }
+                    break;
+                }
+                if doc.len() > 40 {
+                    break;
+                }
+            }
+            doc.reverse();
+        } else {
+            while l > 1 && doc.len() < 40 {
+                let t = self.line_text(&file, l - 1);
+                if !t.trim_start().starts_with("//") {
+                    break;
+                }
+                doc.push(t);
+                l -= 1;
+            }
+            doc.reverse();
+        }
+        // Else after it on its line.
+        if doc.is_empty() {
+            let t = self.line_text(&file, line);
+            if let Some(i) = t.find("//").or_else(|| t.find("/*")).filter(|&i| !t[..i].trim().is_empty()) {
+                doc.push(t[i..].to_string());
+            }
+        }
+        (text, comment_words(&doc))
+    }
+
+    /// The comment a prototype of a function has (a header's, where the
+    /// definition has none of its own).
+    fn prototype_doc(&mut self, sym: u32) -> String {
+        let protos: Vec<u32> = {
+            let g = self.g();
+            let k = g.syms[sym as usize].kind;
+            g.find(g.sym_name(sym)).iter().copied().filter(|&s| g.syms[s as usize].kind == k && g.syms[s as usize].flags & flag::DECL != 0).take(8).collect()
+        };
+        for s in protos {
+            let (_, doc) = self.written(s);
+            if !doc.is_empty() {
+                return doc;
+            }
+        }
+        String::new()
+    }
+
+    /// A hover for what is no macro: its declaration and its comment.
+    fn declaration_hover(&mut self, found: Vec<u32>) -> Value {
+        let defs: Vec<u32> = {
+            let g = self.g();
+            let d: Vec<u32> = found.iter().copied().filter(|&s| g.syms[s as usize].flags & flag::DECL == 0).collect();
+            if d.is_empty() { found.clone() } else { d }
+        };
+        let spare = found.first().map_or(String::new(), |&s| self.prototype_doc(s));
+        let mut parts: Vec<String> = Vec::new();
+        let mut doc_seen = String::new();
+        for &s in defs.iter().take(3) {
+            let (code, mut doc) = self.written(s);
+            if doc.is_empty() {
+                doc = spare.clone();
+            }
+            let g = self.g();
+            let sym = &g.syms[s as usize];
+            let maybe = if sym.flags & flag::CONDITIONAL != 0 { " · only where an #if not known holds" } else { "" };
+            let at = format!("{}:{}", g.file_path(sym.file), sym.line);
+            let shown = if doc.is_empty() || doc == doc_seen { String::new() } else { format!("\n\n{doc}") };
+            doc_seen = doc;
+            parts.push(format!("```c\n{code}\n```{shown}\n\n{at}{maybe}"));
+        }
+        if parts.is_empty() {
+            return Value::Null;
+        }
+        json!({ "contents": { "kind": "markdown", "value": parts.join("\n\n---\n\n") } })
+    }
+
+    /// A hover for a parameter or local variable: how it is declared.
+    fn local_hover(&mut self, h: &LocalHit) -> Value {
+        let text = uncommented(&self.line_text(&h.file, h.line));
+        let b = text.as_bytes();
+        let at = text.match_indices(h.name.as_str()).map(|m| m.0).find(|&i| (i == 0 || !is_ident(b[i - 1])) && b.get(i + h.name.len()).is_none_or(|&c| !is_ident(c)));
+        let decl = match at {
+            // A parameter: between the commas round it.
+            Some(i) if h.param => {
+                let from = text[..i].rfind(['(', ',']).map_or(0, |p| p + 1);
+                let to = text[i..].find([',', ')']).map_or(text.len(), |p| i + p);
+                text[from..to].trim().to_string()
+            }
+            _ => {
+                let t = text.trim();
+                t.split_once(';').map_or(t, |x| x.0).trim().to_string() + ";"
+            }
+        };
+        let what = if h.param { "parameter" } else { "local" };
+        json!({ "contents": { "kind": "markdown", "value": format!("```c\n{decl}\n```\n\n{what} of `{}` · {}:{}", h.function, h.file, h.line) } })
+    }
+
+    /// The members of a type by name: a struct's or union's fields; a
+    /// typedef's, of what it names.
+    fn members(&mut self, type_name: &str, depth: u32) -> Vec<u32> {
+        if depth > 4 {
+            return Vec::new();
+        }
+        let hidden = self.hidden();
+        let named: Vec<u32> = {
+            let g = self.g();
+            g.find(type_name)
+                .iter()
+                .copied()
+                .filter(|&s| {
+                    let y = &g.syms[s as usize];
+                    matches!(y.kind, kind::STRUCT | kind::UNION | kind::TYPEDEF | kind::CLASS) && y.flags & flag::DECL == 0 && !hidden[y.file as usize]
+                })
+                .collect()
+        };
+        let mut out = Vec::new();
+        for s in named {
+            let (file, line, end, k) = {
+                let y = &self.g().syms[s as usize];
+                (y.file, y.line, y.end_line.max(y.line), y.kind)
+            };
+            let fields: Vec<u32> = {
+                let g = self.g();
+                g.file_syms(file)
+                    .filter(|&f| {
+                        let y = &g.syms[f as usize];
+                        y.kind == kind::FIELD && y.line >= line && y.line <= end
+                    })
+                    .collect()
+            };
+            let fields = self.direct(file, line, end, fields);
+            if !fields.is_empty() {
+                out.extend(fields);
+            } else if k == kind::TYPEDEF {
+                // `typedef struct tag name;`: the tag's.
+                let (text, _) = self.written(s);
+                let words: Vec<&str> = text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).collect();
+                let name = self.g().sym_name(s).to_string();
+                let tag = words.windows(2).find(|w| matches!(w[0], "struct" | "union")).map(|w| w[1].to_string()).or_else(|| type_word(&text, &name));
+                if let Some(t) = tag.filter(|t| *t != name) {
+                    out.extend(self.members(&t, depth + 1));
+                }
+            }
+            if !out.is_empty() {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Of the fields in lines `line..=end` (a struct written there), its
+    /// own: not those of a struct written inside it with a name of its own
+    /// (`struct pos { int x; } at;` has `at`, not `x`); those of one
+    /// without one (`union { int a; };`), which are its own.
+    fn direct(&mut self, file: u32, line: u32, end: u32, fields: Vec<u32>) -> Vec<u32> {
+        let path = self.g().file_path(file).to_string();
+        let lines: Vec<String> = (line..=end).map(|l| uncommented(&self.line_text(&path, l))).collect();
+        // Per brace pair, whether it is one without a name: `};`.
+        let all: Vec<char> = lines.join("\n").chars().collect();
+        let mut opens = Vec::new();
+        let mut open_of = vec![usize::MAX; all.len()];
+        let mut plain = vec![false; all.len()];
+        for (i, &c) in all.iter().enumerate() {
+            if c == '{' {
+                opens.push(i);
+            } else if c == '}' {
+                if let Some(o) = opens.pop() {
+                    open_of[i] = o;
+                    plain[o] = !opens.is_empty() && all[i + 1..].iter().find(|c| !c.is_whitespace()) == Some(&';');
+                }
+            }
+        }
+        // The depth, of braces that count, of each name on each line.
+        let mut at: Vec<Vec<(String, i32)>> = vec![Vec::new(); lines.len()];
+        let (mut row, mut depth, mut word) = (0usize, 0i32, String::new());
+        let mut stack: Vec<bool> = Vec::new();
+        for (i, &c) in all.iter().enumerate() {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                word.push(c);
+                continue;
+            }
+            if !word.is_empty() {
+                at[row].push((std::mem::take(&mut word), depth));
+            }
+            match c {
+                '\n' => row += 1,
+                '{' => {
+                    let counts = !plain[i];
+                    depth += counts as i32;
+                    stack.push(counts);
+                }
+                '}' => depth -= stack.pop().unwrap_or(false) as i32,
+                _ => {}
+            }
+        }
+        if !word.is_empty() {
+            at[row].push((word, depth));
+        }
+        let g = self.g();
+        fields
+            .into_iter()
+            .filter(|&f| {
+                let y = &g.syms[f as usize];
+                let name = g.sym_name(f);
+                at.get((y.line - line) as usize).is_some_and(|ws| ws.iter().any(|(w, d)| w == name && *d == 1))
+            })
+            .collect()
+    }
+
+    /// The type of a name as the cursor's function sees it: a local's or
+    /// parameter's, else a variable's of the index.
+    fn type_of_name(&mut self, file: &str, line: u32, name: &str) -> Option<String> {
+        let local = self.session.facts_of(file).and_then(|f| {
+            let mut best: Option<&si_core::model::Local> = None;
+            for l in f.locals.iter().filter(|l| f.name(l.name as usize) == name) {
+                let Some(d) = f.defs.get(l.scope as usize) else { continue };
+                if line >= d.line && line <= d.end_line.max(d.line) && l.line <= line && best.is_none_or(|b| l.line >= b.line) {
+                    best = Some(l);
+                }
+            }
+            best.map(|l| (l.line, (l.type_name != si_core::model::NONE).then(|| f.name(l.type_name as usize).to_string())))
+        });
+        if let Some((at, ty)) = local {
+            return ty.or_else(|| type_word(&uncommented(&self.line_text(file, at)), name));
+        }
+        // Declared since the file was indexed: as written above, as far as
+        // the function's first line.
+        for l in (line.saturating_sub(200).max(1)..=line).rev() {
+            let raw = self.line_text(file, l);
+            let text = uncommented(&raw);
+            let b = text.as_bytes();
+            let declared = text.match_indices(name).map(|m| m.0).any(|i| {
+                let after = b.get(i + name.len()).copied();
+                let before = text[..i].trim_end();
+                (i == 0 || !is_ident(b[i - 1]))
+                    && after.is_none_or(|c| !is_ident(c))
+                    && before.ends_with(|c: char| c == '*' || c == '_' || c.is_ascii_alphanumeric())
+                    && text[i + name.len()..].trim_start().starts_with([';', '=', ',', '[', ')'])
+            });
+            if declared {
+                if let Some(t) = type_word(&text, name).filter(|t| !matches!(t.as_str(), "return" | "sizeof" | "case" | "goto" | "else")) {
+                    return Some(t);
+                }
+            }
+            if raw.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                break;
+            }
+        }
+        let syms: Vec<u32> = {
+            let g = self.g();
+            g.find(name).iter().copied().filter(|&s| matches!(g.syms[s as usize].kind, kind::GLOBAL | kind::FIELD)).collect()
+        };
+        for s in syms {
+            let (text, _) = self.written(s);
+            if let Some(t) = type_word(&text, name) {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    /// The members a `.` or `->` before `at` on a line can be followed by:
+    /// of the type of what it follows (`a.b->` as far as the index knows).
+    fn members_after(&mut self, file: &str, line: u32, text: &str, at: usize) -> Option<Vec<u32>> {
+        let b = text.as_bytes();
+        // The chain of names before, as written: `a`, `b`.
+        let mut i = at;
+        let mut chain: Vec<String> = Vec::new();
+        loop {
+            let op = if i >= 1 && b[i - 1] == b'.' {
+                1
+            } else if i >= 2 && &b[i - 2..i] == b"->" {
+                2
+            } else if chain.is_empty() {
+                return None;
+            } else {
+                break;
+            };
+            i -= op;
+            while i > 0 && b[i - 1] == b' ' {
+                i -= 1;
+            }
+            // (`a[i].`, `f(x)->`: what is indexed or called.)
+            if i > 0 && (b[i - 1] == b']' || b[i - 1] == b')') {
+                let (open, close) = if b[i - 1] == b']' { (b'[', b']') } else { (b'(', b')') };
+                let mut depth = 0;
+                while i > 0 {
+                    i -= 1;
+                    depth += (b[i] == close) as i32 - (b[i] == open) as i32;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            let end = i;
+            while i > 0 && is_ident(b[i - 1]) {
+                i -= 1;
+            }
+            if i == end {
+                break;
+            }
+            chain.push(text[i..end].to_string());
+        }
+        chain.reverse();
+        let mut ty = self.type_of_name(file, line, chain.first()?)?;
+        for member in &chain[1..] {
+            let fields = self.members(&ty, 0);
+            let f = fields.into_iter().find(|&f| self.g().sym_name(f) == member)?;
+            let (decl, _) = self.written(f);
+            ty = type_word(&decl, member)?;
+        }
+        Some(self.members(&ty, 0))
+    }
+
+    /// `textDocument/signatureHelp`: in a call being written, how what is
+    /// called is declared, and which argument the cursor is at.
+    fn signature_help(&mut self, params: &Value) -> Value {
+        if self.alongside {
+            return Value::Null;
+        }
+        let Some(path) = params["textDocument"]["uri"].as_str().map(uri_to_path) else { return Value::Null };
+        let Some(file) = self.relative(&path) else { return Value::Null };
+        let (Some(line), Some(character)) = (params["position"]["line"].as_u64(), params["position"]["character"].as_u64()) else { return Value::Null };
+        let line = line as u32 + 1;
+        // The few lines up to the cursor, comments out.
+        let mut text = String::new();
+        for l in line.saturating_sub(5).max(1)..line {
+            text.push_str(&uncommented(&self.line_text(&file, l)));
+            text.push('\n');
+        }
+        let here = self.line_text(&file, line);
+        let cut = (character as usize).min(here.len());
+        text.push_str(&uncommented(here.get(..cut).unwrap_or(&here)));
+        // The `(` not closed, and the commas after it.
+        let b = text.as_bytes();
+        let (mut depth, mut active, mut open) = (0i32, 0u32, None);
+        for i in (0..b.len()).rev() {
+            match b[i] {
+                b')' | b']' | b'}' => depth += 1,
+                b'[' | b'{' if depth > 0 => depth -= 1,
+                b'{' | b';' => break,
+                b'(' if depth == 0 => {
+                    open = Some(i);
+                    break;
+                }
+                b'(' => depth -= 1,
+                b',' if depth == 0 => active += 1,
+                _ => {}
+            }
+        }
+        let Some(open) = open else { return Value::Null };
+        let end = text[..open].trim_end().len();
+        let start = (0..end).rev().take_while(|&i| is_ident(b[i])).last().unwrap_or(end);
+        if start == end {
+            return Value::Null;
+        }
+        let name = text[start..end].to_string();
+        let hidden = self.hidden();
+        let mut found: Vec<u32> = {
+            let g = self.g();
+            let mut f = si_core::definition_at(g, &file, line, &name);
+            f.retain(|&s| matches!(g.syms[s as usize].kind, kind::FUNCTION | kind::MACRO) && !hidden[g.syms[s as usize].file as usize]);
+            f.sort_by_key(|&s| (g.syms[s as usize].flags & flag::DECL != 0, s));
+            f
+        };
+        found.truncate(4);
+        let mut signatures: Vec<Value> = Vec::new();
+        let mut labels: HashMap<String, usize> = HashMap::new();
+        for s in found {
+            let (code, mut doc) = self.written(s);
+            if doc.is_empty() {
+                doc = self.prototype_doc(s);
+            }
+            let one: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+            let one = one.strip_prefix("#define ").map_or(one.clone(), str::to_string);
+            let b = one.as_bytes();
+            let Some(at) = one.match_indices(name.as_str()).map(|m| m.0).find(|&i| (i == 0 || !is_ident(b[i - 1])) && b.get(i + name.len()).is_none_or(|&c| !is_ident(c))) else { continue };
+            let Some(p) = one[at..].find('(').map(|p| at + p) else { continue };
+            // The parameters, between the commas at the top.
+            let (mut depth, mut from, mut parts, mut close) = (0i32, p + 1, Vec::new(), None);
+            for (i, c) in one.bytes().enumerate().skip(p) {
+                match c {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            parts.push((from, i));
+                            close = Some(i);
+                            break;
+                        }
+                    }
+                    b',' if depth == 1 => {
+                        parts.push((from, i));
+                        from = i + 1;
+                    }
+                    _ => {}
+                }
+            }
+            let Some(close) = close else { continue };
+            let label = one[..=close].to_string();
+            if let Some(&i) = labels.get(&label) {
+                if signatures[i].get("documentation").is_none() && !doc.is_empty() {
+                    signatures[i]["documentation"] = json!({ "kind": "markdown", "value": doc });
+                }
+                continue;
+            }
+            labels.insert(label.clone(), signatures.len());
+            let parameters: Vec<Value> = parts
+                .iter()
+                .map(|&(a, e)| {
+                    let t = &one[a..e];
+                    let a = a + (t.len() - t.trim_start().len());
+                    json!({ "label": [label[..a].encode_utf16().count(), label[..a].encode_utf16().count() + one[a..e].trim().encode_utf16().count()] })
+                })
+                .filter(|p| p["label"][0] != p["label"][1])
+                .collect();
+            let mut sig = json!({ "label": label, "parameters": parameters });
+            if !doc.is_empty() {
+                sig["documentation"] = json!({ "kind": "markdown", "value": doc });
+            }
+            signatures.push(sig);
+        }
+        if signatures.is_empty() {
+            return Value::Null;
+        }
+        json!({ "signatures": signatures, "activeSignature": 0, "activeParameter": active })
+    }
+
+    /// Completion in an `#include`'s operand: the headers the index has,
+    /// each by the shortest end of its path that what is typed begins.
+    fn include_completion(&mut self, text: &str, at: usize, line: u64) -> Option<Value> {
+        let t = text.trim_start();
+        let rest = t.strip_prefix('#')?.trim_start().strip_prefix("include")?;
+        let rest = rest.strip_prefix("_next").unwrap_or(rest);
+        let open = text.len() - rest.len() + (rest.len() - rest.trim_start().len());
+        if !matches!(text.as_bytes().get(open), Some(b'"' | b'<')) || at <= open {
+            return None;
+        }
+        let typed = text[open + 1..at].replace('\\', "/").to_ascii_lowercase();
+        let headers = ["h", "hpp", "hh", "hxx", "inl", "inc"];
+        let g = self.g();
+        let mut found: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for f in 0..g.files.len() as u32 {
+            let p = g.file_path(f);
+            if !p.rsplit_once('.').is_some_and(|(_, x)| headers.contains(&x.to_ascii_lowercase().as_str())) {
+                continue;
+            }
+            let lower = p.to_ascii_lowercase();
+            let starts = std::iter::once(0).chain(lower.match_indices('/').map(|m| m.0 + 1));
+            if let Some(k) = starts.filter(|&k| lower[k..].starts_with(&typed)).last() {
+                if seen.insert(p[k..].to_string()) {
+                    found.push(p[k..].to_string());
+                }
+            }
+        }
+        found.sort_by(|a, b| (a.matches('/').count(), a.len(), a).cmp(&(b.matches('/').count(), b.len(), b)));
+        let complete = found.len() <= 200;
+        found.truncate(200);
+        let range = json!({ "start": { "line": line, "character": text[..open + 1].encode_utf16().count() }, "end": { "line": line, "character": text[..at].encode_utf16().count() } });
+        let items: Vec<Value> = found
+            .iter()
+            .enumerate()
+            .map(|(i, p)| json!({ "label": p, "kind": 17, "sortText": format!("{i:04}"), "filterText": p, "textEdit": { "range": range, "newText": p } }))
+            .collect();
+        Some(json!({ "isIncomplete": !complete, "items": items }))
+    }
+
     /// `textDocument/completion`: the names the index has that the word
     /// being typed matches, best first.
     fn completion(&mut self, params: &Value) -> Value {
@@ -519,9 +1140,52 @@ impl Server {
         let b = text.as_bytes();
         let at = (character as usize).min(b.len());
         let start = (0..at).rev().take_while(|&i| is_ident(b[i])).last().unwrap_or(at);
-        let word = &text[start..at];
+        let word = text[start..at].to_string();
+        let word = word.as_str();
+        if let Some(found) = self.include_completion(&text, at, line) {
+            return found;
+        }
+        // After `.` or `->`: the members of what it follows (where the
+        // C/C++ extension does not give them), else nothing.
+        let before = text[..start].trim_end();
+        if before.ends_with('.') || before.ends_with("->") {
+            if self.alongside || before.ends_with("..") {
+                return empty;
+            }
+            let Some(fields) = self.members_after(&file, line as u32 + 1, before, before.len()) else { return empty };
+            let lower = word.to_ascii_lowercase();
+            let g = self.g();
+            let mut seen = std::collections::HashSet::new();
+            let items: Vec<Value> = fields
+                .into_iter()
+                .filter(|&f| g.sym_name(f).to_ascii_lowercase().starts_with(&lower) && seen.insert(g.sym_name(f)))
+                .map(|f| json!({ "label": g.sym_name(f), "kind": 5, "detail": format!("{}:{}", g.file_path(g.syms[f as usize].file), g.syms[f as usize].line) }))
+                .collect();
+            return json!({ "isIncomplete": false, "items": items });
+        }
         if word.is_empty() || word.as_bytes()[0].is_ascii_digit() {
             return empty;
+        }
+        // The parameters and locals of the function the cursor is in, and
+        // C's keywords (where the C/C++ extension does not give them).
+        let mut extra: Vec<Value> = Vec::new();
+        if !self.alongside {
+            let lower = word.to_ascii_lowercase();
+            let here = line as u32 + 1;
+            if let Some(f) = self.session.facts_of(&file) {
+                let mut seen = std::collections::HashSet::new();
+                for l in &f.locals {
+                    let Some(d) = f.defs.get(l.scope as usize) else { continue };
+                    let name = f.name(l.name as usize);
+                    if here >= d.line && here <= d.end_line.max(d.line) && (l.param || l.line <= here) && name.to_ascii_lowercase().starts_with(&lower) && name != word && seen.insert(name) {
+                        let ty = (l.type_name != si_core::model::NONE).then(|| f.name(l.type_name as usize));
+                        extra.push(json!({ "label": name, "kind": 6, "detail": format!("{}{}", if l.param { "parameter" } else { "local" }, ty.map_or(String::new(), |t| format!(" · {t}"))) }));
+                    }
+                }
+            }
+            for k in C_KEYWORDS.iter().filter(|k| k.starts_with(word) && **k != word) {
+                extra.push(json!({ "label": k, "kind": 14 }));
+            }
         }
         // The names that start with it, from the listing in name order
         // (made once): where they begin is found by halving. Few of them:
@@ -562,7 +1226,13 @@ impl Server {
             complete = false;
         }
         let mut items = Vec::new();
+        let ahead = extra.len();
+        for (rank, mut item) in extra.into_iter().enumerate() {
+            item["sortText"] = json!(format!("{rank:04}"));
+            items.push(item);
+        }
         for (rank, &s) in picked.iter().enumerate() {
+            let rank = rank + ahead;
             let sym = &g.syms[s as usize];
             let name = g.sym_name(s);
             // (LSP's CompletionItemKind.)
@@ -1298,6 +1968,7 @@ impl Server {
         Some(match method {
             "textDocument/definition" => self.definition(params),
             "textDocument/hover" => self.hover(params),
+            "textDocument/signatureHelp" => self.signature_help(params),
             "textDocument/completion" => self.completion(params),
             "textDocument/declaration" => self.declaration(params),
             "textDocument/typeDefinition" => self.type_definition(params),
@@ -1470,7 +2141,8 @@ pub fn run(
                 "textDocumentSync": { "openClose": true, "change": 1, "save": true },
                 "definitionProvider": true, "declarationProvider": true, "typeDefinitionProvider": true, "implementationProvider": true, "referencesProvider": true,
                 "documentSymbolProvider": true, "workspaceSymbolProvider": true, "callHierarchyProvider": true,
-                "hoverProvider": true, "completionProvider": { "resolveProvider": false },
+                "hoverProvider": true, "completionProvider": { "resolveProvider": false, "triggerCharacters": [".", ">", "\"", "<", "/"] },
+                "signatureHelpProvider": { "triggerCharacters": ["(", ","], "retriggerCharacters": [")"] },
                 "documentLinkProvider": { "resolveProvider": false }, "documentHighlightProvider": true,
             });
             let result = json!({ "capabilities": capabilities, "serverInfo": { "name": "norn", "version": env!("CARGO_PKG_VERSION") } });
