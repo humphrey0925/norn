@@ -414,7 +414,7 @@ impl Server {
         let readings = si_core::readings_of(conditions);
         let mut values = si_core::value::Values::new(g, conditions, &mut read).without(&readings.unread);
         if let Some((file, line, _)) = &asked {
-            values = values.asked_at(file, *line);
+            values = values.asked_at(file, *line).read_with(&readings, file);
         }
         let shown = |n: i64, unsigned: bool| {
             let dec = if unsigned { (n as u64).to_string() } else { n.to_string() };

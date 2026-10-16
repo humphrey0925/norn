@@ -1132,6 +1132,25 @@ mod tests {
     }
 
     #[test]
+    fn of_one_chip_s_definitions_the_one_read_with_the_file_is_the_value() {
+        let d = Dir::new("chip-values");
+        d.write("plat.h", "#if FOO\nint p1;\n#else\nint p2;\n#endif\n");
+        d.write("reg_5037.h", "#define NOBLK_SQ (2)\n");
+        d.write("reg_2321.h", "#define NOBLK_SQ (4)\n");
+        d.write("api.h", "#include \"reg_5037.h\"\n#define Q3 (3 * NOBLK_SQ)\n");
+        d.write("a.c", "#define FOO 1\n#include \"plat.h\"\n#include \"api.h\"\n");
+        d.write("lpm.c", "#include \"plat.h\"\n#include \"reg_2321.h\"\n");
+        let (s, _) = Session::open_cached(&d.0, Options::default(), d.0.join("cache-outside-scan"));
+        let g = &s.graph;
+        let root = d.0.clone();
+        let mut read = |p: &str| std::fs::read(root.join(p)).ok().map(std::sync::Arc::new);
+        let readings = crate::readings_of(&s.conditions);
+        let q3 = g.find("Q3")[0];
+        let mut values = crate::value::Values::new(g, &s.conditions, &mut read).asked_at("api.h", 2).read_with(&readings, "api.h");
+        assert_eq!(values.of_macro(q3).map(|v| v.number), Some(6));
+    }
+
+    #[test]
     fn a_macro_s_value_is_worked_out_as_an_enumerator_s_is() {
         let d = Dir::new("macro-values");
         d.write("reg.h", "typedef unsigned int U32;\n#define BUF_X_BASE (((0x00400000)) + ((32) << (0x05)) + ((32) << (0x05)))\n#define BUF_X_MASK ((4) - 1)\n#define BUF_X_DATA_SIZE_LOG ((0x04))\n#define M_BUF_PTR(BUFID, OFFSET) (void *)((BUFID ## _BASE) + ((U32)(OFFSET & (BUFID ## _MASK)) << (BUFID ## _DATA_SIZE_LOG)))\n#define BUF_BASE (0x1000u)\n#define BUF_STRIDE ((U32)4)\n#define BUF_Q(n) (BUF_BASE + (n) * BUF_STRIDE)\n#define BUF_Q3 BUF_Q(3)\nenum q { Q_A, Q_B = 5, Q_C,\n  Q_D = Q_C * 2 };\n#define WITH_ENUM (Q_D + 1)\n#ifdef BIG\n#define WIDTH 64\n#else\n#define WIDTH 32\n#endif\n#define NAMED_ELSEWHERE (UNKNOWN_THING + 1)\n#define TWICE_W (WIDTH * 2)\n");

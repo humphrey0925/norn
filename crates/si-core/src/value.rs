@@ -165,17 +165,35 @@ pub struct Values<'a> {
     written: FxHashMap<String, (Option<Vec<String>>, String)>,
     /// Why an expansion stopped.
     expanding: Option<String>,
+    /// Per file, how many of the compilations that read the file asked in
+    /// read it too (see [`Values::read_with`]).
+    read_with: Vec<u32>,
     enums: FxHashMap<u32, Option<i64>>,
 }
 
 impl<'a> Values<'a> {
     pub fn new(g: &'a Graph, conditions: &'a Conditions, source: &'a mut dyn FnMut(&str) -> Option<std::sync::Arc<Vec<u8>>>) -> Values<'a> {
-        Values { g, conditions, source, local: Local::default(), seen: FxHashSet::default(), types: FxHashMap::default(), unread: Vec::new(), at: None, missing: Vec::new(), written: FxHashMap::default(), expanding: None, enums: FxHashMap::default() }
+        Values { g, conditions, source, local: Local::default(), seen: FxHashSet::default(), types: FxHashMap::default(), unread: Vec::new(), at: None, missing: Vec::new(), written: FxHashMap::default(), expanding: None, read_with: Vec::new(), enums: FxHashMap::default() }
     }
 
     /// The same, asked on `line` of the file at `path`.
     pub fn asked_at(mut self, path: &str, line: u32) -> Values<'a> {
         self.at = self.conditions.source().and_then(|s| s.file(path)).map(|f| (f, line));
+        self
+    }
+
+    /// The same, of several definitions those the compilations that read
+    /// the file at `path` read (one chip's header and not another's).
+    pub fn read_with(mut self, readings: &crate::units::Readings, path: &str) -> Values<'a> {
+        let Some(at) = readings.paths.iter().position(|p| p == path) else { return self };
+        let readers: Vec<u32> = (0..readings.units.len() as u32).filter(|&u| readings.reads(u, at as u32)).collect();
+        if readers.is_empty() {
+            return self;
+        }
+        let index: FxHashMap<&str, u32> = readings.paths.iter().enumerate().map(|(i, p)| (p.as_str(), i as u32)).collect();
+        self.read_with = (0..self.g.files.len() as u32)
+            .map(|f| index.get(self.g.file_path(f)).map_or(0, |&p| readers.iter().filter(|&&u| readings.reads(u, p)).count() as u32))
+            .collect();
         self
     }
 
@@ -280,6 +298,14 @@ impl<'a> Values<'a> {
         let mut defs: Vec<(u32, Define)> = pick.iter().filter_map(|&s| Some((g.syms[s as usize].file, self.define(s)?))).collect();
         defs.sort_by(|a, b| a.1.body.cmp(&b.1.body));
         defs.dedup_by(|a, b| a.1 == b.1);
+        if defs.len() > 1 && !self.read_with.is_empty() {
+            // Those most read along with where it is asked.
+            let read = |f: u32| self.read_with.get(f as usize).copied().unwrap_or(0);
+            let most = defs.iter().map(|d| read(d.0)).max().unwrap_or(0);
+            if most > 0 {
+                defs.retain(|d| read(d.0) == most);
+            }
+        }
         if defs.len() > 1 {
             // The nearest: in the same file, else the same directory, else
             // the one whose directory shares most with this one's.
