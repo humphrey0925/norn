@@ -164,6 +164,9 @@ struct Server {
     /// conditions (a header only `#if`s they switch off include): what is
     /// in it is not listed, searched or related; made when first asked for.
     hidden: Option<std::rc::Rc<Vec<bool>>>,
+    /// The editor has the C/C++ extension too (`initializationOptions`):
+    /// a hover says only what its does not.
+    alongside: bool,
     /// The index is still being read or made: the session answers with
     /// what was saved (or nothing), and what would change it waits.
     loading: bool,
@@ -418,8 +421,11 @@ impl Server {
         }
         let shown = |n: i64, unsigned: bool| {
             let dec = if unsigned { (n as u64).to_string() } else { n.to_string() };
-            if (0..10).contains(&n) { format!("= {dec}") } else { format!("= {dec} (0x{:X})", n as u64) }
+            if (0..10).contains(&n) { dec } else { format!("{dec} /* 0x{:X} */", n as u64) }
         };
+        // Beside the C/C++ extension, whose hover has the definition and
+        // its expansion: only what it does not, the value.
+        let alongside = self.alongside;
         let several = found.len() > 1;
         let mut parts = Vec::new();
         for s in found {
@@ -428,14 +434,11 @@ impl Server {
             let name = g.sym_name(s).to_string();
             let maybe = if sym.flags & flag::CONDITIONAL != 0 { " · only where an #if not known holds" } else { "" };
             if sym.kind == kind::ENUM_CONST {
-                let v = values.enumerator(s).map_or(String::new(), |n| format!("
-
-`{}`", shown(n, false)));
-                parts.push(format!("```c
-{name}
-```{v}
-
-{at}{maybe}"));
+                if alongside {
+                    continue;
+                }
+                let v = values.enumerator(s).map_or(String::new(), |n| format!(" = {}", shown(n, false)));
+                parts.push(format!("```c\n{name}{v}\n```\n\n{at}{maybe}"));
                 continue;
             }
             let Some(d) = values.define(s) else { continue };
@@ -449,42 +452,59 @@ impl Server {
             // (Names defined more than one way, left as written.)
             let several_ways = |values: &si_core::value::Values| -> String {
                 let names: Vec<String> = values.missing.iter().filter(|m| m.1.contains("definitions")).take(3).map(|(n, w)| format!("`{n}`: {w}")).collect();
-                if names.is_empty() { String::new() } else { format!("\n\nNot expanded: {}", names.join("; ")) }
+                if names.is_empty() { String::new() } else { format!("Not expanded: {}", names.join("; ")) }
             };
             values.missing.clear();
-            let mut v = String::new();
+            // (What it is written as, what it comes to; a note.)
+            let mut value: Option<(String, String)> = None;
+            let mut note = String::new();
             if d.params.is_none() {
                 if let Some(n) = values.of_macro(s) {
-                    v = format!("\n\n`{}`", shown(n.number, n.unsigned));
+                    value = Some((name.clone(), shown(n.number, n.unsigned)));
                 } else {
                     match values.fold_or_why(&d.body, sym.file) {
-                        Ok(f) if squeeze(&f) != squeeze(&d.body) => v = format!("\n\n`= {f}`{}", several_ways(&values)),
+                        Ok(f) if squeeze(&f) != squeeze(&d.body) => {
+                            value = Some((name.clone(), f));
+                            note = several_ways(&values);
+                        }
                         Ok(_) => {}
-                        Err(why) => v = format!("\n\nNo value: {why}"),
+                        Err(why) => note = format!("No value: {why}"),
                     }
-                    if v.is_empty() && !values.missing.is_empty() {
+                    if value.is_none() && note.is_empty() && !values.missing.is_empty() {
                         let why: Vec<String> = values.missing.iter().take(3).map(|(n, w)| format!("`{n}`: {w}")).collect();
-                        v = format!("\n\nNo value: {}", why.join("; "));
+                        note = format!("No value: {}", why.join("; "));
                     }
                 }
             }
             if let (Some(_), Some(here)) = (&d.params, &used) {
                 let at = here_file.as_deref().and_then(|f| (0..g.files.len() as u32).find(|&i| g.file_path(i) == f)).unwrap_or(sym.file);
                 values.missing.clear();
-                v = match values.of(here, at) {
-                    Some(n) => format!("\n\n`{here}` `{}`", shown(n.number, n.unsigned)),
+                match values.of(here, at) {
+                    Some(n) => value = Some((here.clone(), shown(n.number, n.unsigned))),
                     None => match values.fold_or_why(here, at) {
-                        Ok(f) => format!("\n\n`{here}` `= {f}`{}", several_ways(&values)),
-                        Err(why) => format!("\n\n`{here}`: no value: {why}"),
+                        Ok(f) => {
+                            value = Some((here.clone(), f));
+                            note = several_ways(&values);
+                        }
+                        Err(why) => note = format!("`{here}`: no value: {why}"),
                     },
-                };
+                }
             }
-            parts.push(format!("```c\n{head}\n```{v}\n\n{at}{maybe}"));
+            let code = value.map(|(what, v)| format!("```c\n{what} = {v}{}\n```", if several && alongside { format!(" // {at}") } else { String::new() }));
+            let note = if note.is_empty() { String::new() } else { format!("\n\n{note}") };
+            if alongside {
+                if code.is_some() || !note.is_empty() {
+                    parts.push(format!("{}{note}", code.unwrap_or_default()));
+                }
+            } else {
+                let code = code.map_or(String::new(), |c| format!("\n{c}"));
+                parts.push(format!("```c\n{head}\n```{code}{note}\n\n{at}{maybe}"));
+            }
         }
         if parts.is_empty() {
             return Value::Null;
         }
-        let sep = if several { "\n\n---\n\n" } else { "" };
+        let sep = if several && !alongside { "\n\n---\n\n" } else { "\n" };
         json!({ "contents": { "kind": "markdown", "value": parts.join(sep) } })
     }
 
@@ -1311,7 +1331,7 @@ pub fn run(
             std::thread::spawn(move || {
                 let _ = events.send(Event::Opened(Box::new(open(&at, have))));
             });
-            *server = Some(Server { session, opened: (0, 0), root: dir, open: HashMap::new(), lines: HashMap::new(), listing: [None, None], hidden: None, loading: true, waiting: Vec::new() });
+            *server = Some(Server { session, opened: (0, 0), root: dir, open: HashMap::new(), lines: HashMap::new(), listing: [None, None], hidden: None, alongside: params["initializationOptions"]["alongside"].as_bool().unwrap_or(false), loading: true, waiting: Vec::new() });
             let capabilities = json!({
                 "textDocumentSync": { "openClose": true, "change": 1, "save": true },
                 "definitionProvider": true, "declarationProvider": true, "typeDefinitionProvider": true, "implementationProvider": true, "referencesProvider": true,

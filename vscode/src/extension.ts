@@ -1750,6 +1750,9 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
     const clientOptions: LanguageClientOptions = {
       documentSelector: selector as LanguageClientOptions["documentSelector"],
       synchronize: { fileEvents: vscode.workspace.createFileSystemWatcher(SOURCE_GLOB) },
+      // Beside the C/C++ extension, the server's hover says only what that
+      // one's does not (a macro's value).
+      initializationOptions: { alongside: !!vscode.extensions.getExtension("ms-vscode.cpptools") },
     };
     client = new LanguageClient("norn", "Norn", serverOptions, clientOptions);
     client.onNotification("si/progress", progress);
