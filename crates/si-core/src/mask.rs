@@ -431,7 +431,7 @@ pub fn script(src: &[u8]) -> Script {
     }
     // An include guard: all of the file inside `#ifndef G`, which the
     // next directive defines.
-    if let Some(name) = guard_of(&out.ops) {
+    if guard_of(&out.ops).is_some() {
         let mut depth = 0;
         let close = out.ops.iter().position(|op| {
             match op {

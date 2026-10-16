@@ -897,6 +897,12 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         let at: FxHashMap<&str, u32> = list.into_iter().enumerate().map(|(i, p)| (p, i as u32)).collect();
         files.iter().map(|f| at.get(f.path.as_str()).copied().unwrap_or(NONE)).collect()
     };
+    let edge_why = std::env::var("SI_EDGE_WHY").ok();
+    // What all of them say, if they say one thing; none: nothing.
+    fn agree(mut all: impl Iterator<Item = crate::cond::Tri>) -> Option<crate::cond::Tri> {
+        let first = all.next()?;
+        Some(if all.all(|t| t == first) { first } else { crate::cond::Tri::Unknown })
+    }
     let (unit_of, header_of, path_of) = if readings.is_empty() {
         (Vec::new(), Vec::new(), Vec::new())
     } else {
@@ -941,6 +947,9 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
             let (mut pick, mut lineage, mut overrides, mut descendants) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             // In a header: the compilations that read it (worked out when first needed).
             let readers: std::cell::OnceCell<Vec<u32>> = std::cell::OnceCell::new();
+            // (And, where none of them reads the callee's file, what every
+            // compilation that does compiles: per (file, line).)
+            let anywhere: std::cell::RefCell<FxHashMap<(u32, u32), crate::cond::Tri>> = Default::default();
             let constructs: FxHashSet<u32> = f.cxx().constructs.iter().copied().collect();
             let operands: FxHashMap<u32, (u32, u32, bool)> = f.cxx().operators.iter().map(|&(r, l, rr, binary)| (r, (l, rr, binary))).collect();
             for (ri, r) in f.refs.iter().enumerate() {
@@ -1245,17 +1254,34 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     use crate::cond::Tri;
                     let s = &syms[c as usize];
                     let h = header_of.get(s.file as usize).copied().unwrap_or(NONE);
-                    if h == NONE {
+                    let p = path_of.get(s.file as usize).copied().unwrap_or(NONE);
+                    // In a file every compilation reads one way: compiled
+                    // where it is read for certain, unless under an `#if`
+                    // not known. (None: a compilation that does not read
+                    // it has no say.)
+                    let in_unit = |u: u32| -> Option<Tri> {
+                        if h != NONE {
+                            return readings.units[u as usize].1.binary_search_by_key(&h, |w| w.0).is_ok().then(|| readings.compiled(u, h, s.line));
+                        }
+                        if p == NONE || !readings.reads(u, p) {
+                            return None;
+                        }
+                        Some(if s.flags & flag::CONDITIONAL == 0 && readings.reads_surely(u, p) { Tri::True } else { Tri::Unknown })
+                    };
+                    if h == NONE && p == NONE {
                         return Tri::Unknown;
                     }
                     if unit != NONE {
-                        return readings.compiled(unit, h, s.line);
+                        return in_unit(unit).unwrap_or(Tri::Unknown);
                     }
                     let at = path_of.get(fi).copied().unwrap_or(NONE);
                     let readers = readers.get_or_init(|| if at == NONE { Vec::new() } else { (0..readings.units.len() as u32).filter(|&u| readings.reads(u, at)).collect() });
-                    let mut all = readers.iter().map(|&u| readings.compiled(u, h, s.line));
-                    let first = all.next().unwrap_or(Tri::Unknown);
-                    if all.all(|t| t == first) { first } else { Tri::Unknown }
+                    // (A compilation that does not read the callee's file
+                    // has no say: what it calls is not that.)
+                    if let Some(t) = agree(readers.iter().filter_map(|&u| in_unit(u))) {
+                        return t;
+                    }
+                    *anywhere.borrow_mut().entry((s.file, s.line)).or_insert_with(|| agree((0..readings.units.len() as u32).filter_map(in_unit)).unwrap_or(Tri::Unknown))
                 };
                 if !header_of.is_empty() && tmp.iter().any(|&c| compiled(c) == crate::cond::Tri::False) && tmp.iter().any(|&c| compiled(c) != crate::cond::Tri::False) {
                     tmp.retain(|&c| compiled(c) != crate::cond::Tri::False);
@@ -1287,6 +1313,22 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 };
                 let ambiguous = several || maybe || guessed || tmp.iter().any(optional);
                 counts[ambiguous as usize] += 1;
+                // `SI_EDGE_WHY=<name>`: why each call of that name that is
+                // not certain is not.
+                if ambiguous && edge_why.as_deref().is_some_and(|w| g.name(remap[fi][r.name as usize]) == w) {
+                    let at = path_of.get(fi).and_then(|&p| readings.paths.get(p as usize)).map_or("?", |p| p.as_str());
+                    let c = tmp[0];
+                    let readers = readers.get().map_or(0, |r| r.len());
+                    eprintln!(
+                        "edgewhy   {at}:{}: {} target(s), maybe {maybe}, guessed {guessed}, optional {}, conditional {}, compiled {:?}, in its unit {}, readers {readers}",
+                        r.line,
+                        tmp.len(),
+                        tmp.iter().any(optional),
+                        syms[c as usize].flags & flag::CONDITIONAL != 0,
+                        compiled(c),
+                        unit != NONE,
+                    );
+                }
                 if in_cpp && through {
                     // A method reached through an object is called, not a
                     // function stored in a member.

@@ -54,6 +54,8 @@ pub struct Readings {
     /// what the compilations that read the header compile.
     pub paths: Vec<String>,
     pub reads: Vec<Box<[u64]>>,
+    /// Per compilation, of the files it reads, those it may not read.
+    pub maybe: Vec<Box<[u32]>>,
 }
 
 impl Readings {
@@ -64,6 +66,11 @@ impl Readings {
     /// Whether compilation `unit` reads the file `path` (numbered as in `paths`).
     pub fn reads(&self, unit: u32, path: u32) -> bool {
         self.reads.get(unit as usize).and_then(|b| b.get(path as usize / 64)).is_some_and(|w| w & (1 << (path % 64)) != 0)
+    }
+
+    /// Whether it reads it for certain.
+    pub fn reads_surely(&self, unit: u32, path: u32) -> bool {
+        self.reads(unit, path) && self.maybe.get(unit as usize).is_none_or(|m| m.binary_search(&path).is_err())
     }
 
     /// Whether the compilation `unit` compiles `line` of `file` (both
@@ -271,7 +278,7 @@ struct Unit<'a> {
     /// The file the compilation starts from.
     root: u32,
     /// The files it reads, when that is kept (see [`Readings::reads`]).
-    files: Option<FxHashSet<u32>>,
+    files: Option<FxHashMap<u32, bool>>,
     /// For `SI_COND_WHY`: per name not known, the file that made it so,
     /// and how (1: a definition on a line that may not be compiled; 2:
     /// a file that may not be read changed it), with, for 2, the file
@@ -417,7 +424,7 @@ impl Unit<'_> {
             return;
         }
         if let Some(files) = &mut self.files {
-            files.insert(file);
+            *files.entry(file).or_default() |= !maybe;
         }
         // (A file that includes itself without end is read no deeper.)
         let times = self.reading.entry(file).or_default();
@@ -865,7 +872,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
     };
     // (Compilation, the ways it reads the traced files it reads.)
     let ways: std::sync::Mutex<Ways> = Default::default();
-    let read_as: std::sync::Mutex<Vec<(u32, Vec<(u32, u32)>, Vec<u32>)>> = Default::default();
+    let read_as: std::sync::Mutex<Vec<(u32, Vec<(u32, u32)>, Vec<(u32, bool)>)>> = Default::default();
     // Returns the names defined outright (on the first pass), and the
     // compilations that were too much to read.
     let profile = std::env::var_os("SI_COND_PROFILE").is_some();
@@ -898,7 +905,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
                     before: FxHashMap::default(),
                     dirs: FxHashSet::default(),
                     root,
-                    files: w.traced.iter().any(|t| *t).then(FxHashSet::default),
+                    files: w.traced.iter().any(|t| *t).then(FxHashMap::default),
                     unknown_why: FxHashMap::default(),
                 };
                 unit.read.insert(root, true);
@@ -1070,8 +1077,11 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         let read: Vec<(u32, u32)> = read.iter().filter(|r| split[r.0 as usize]).map(|&(f, way)| (number[f as usize], way)).collect();
         readings.units.push((paths[root as usize].clone(), read));
         let mut bits = vec![0u64; n.div_ceil(64)];
-        files.iter().for_each(|&f| bits[f as usize / 64] |= 1 << (f % 64));
+        files.iter().for_each(|&(f, _)| bits[f as usize / 64] |= 1 << (f % 64));
         readings.reads.push(bits.into());
+        let mut maybe: Vec<u32> = files.iter().filter(|f| !f.1).map(|f| f.0).collect();
+        maybe.sort_unstable();
+        readings.maybe.push(maybe.into());
     }
     if !readings.files.is_empty() {
         readings.paths = paths.to_vec();
