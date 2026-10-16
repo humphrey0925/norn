@@ -1093,6 +1093,24 @@ mod tests {
     }
 
     #[test]
+    fn a_call_under_the_if_a_header_is_included_under_reaches_it_for_sure() {
+        // A whole file inside `#if FEATURE_EN`, its includes too: where the
+        // call is compiled, the macro's header was read.
+        let d = Dir::new("include-under-if");
+        d.write("plat.h", "#if FOO\nint p1;\n#else\nint p2;\n#endif\n");
+        d.write("ring.h", "#define M_GET(x) ((x) + 2)\n");
+        d.write("a.c", "#define FOO 1\n#include \"plat.h\"\n#if FEATURE_EN\n#include \"ring.h\"\nint f (void) { return M_GET (1); }\n#endif\nint g (void) { return M_GET (2); }\n");
+        d.write("b.c", "#include \"plat.h\"\n");
+        d.write("c.c", "#ifdef R\n#define FEATURE_EN 1\n#endif\n");
+        let (s, _) = Session::open_cached(&d.0, Options::default(), d.0.join("cache-outside-scan"));
+        let g = &s.graph;
+        let m = g.find("M_GET")[0];
+        let mut callers: Vec<(&str, bool)> = crate::callers_through_macros(g, m).iter().map(|c| (g.sym_name(c.caller), !c.ambiguous)).collect();
+        callers.sort();
+        assert_eq!(callers, [("f", true), ("g", false)]);
+    }
+
+    #[test]
     fn parameters_and_local_variables_are_kept_with_their_uses() {
         let d = Dir::new("locals");
         d.write("a.c", "int total;\nint sum (int *values, int count)\n{\n  int i, acc = 0;\n  for (i = 0; i < count; i++)\n    acc += values[i];\n  total = acc;\n  return acc;\n}\nint other (int count) { return count; }\n");

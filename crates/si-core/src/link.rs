@@ -1277,7 +1277,15 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                         if p == NONE || !readings.reads(u, p) {
                             return None;
                         }
-                        Some(if s.flags & flag::CONDITIONAL == 0 && readings.reads_surely(u, p) { Tri::True } else { Tri::Unknown })
+                        // (Its own compilation: read wherever the call is,
+                        // the call under the branches it is included in.)
+                        let along = || {
+                            u == unit
+                                && readings.read_under(u, p).is_some_and(|lines| {
+                                    lines.iter().all(|&l| files[fi].undecided.iter().any(|b| b.0 <= r.line && r.line <= b.1 && b.2 == l))
+                                })
+                        };
+                        Some(if s.flags & flag::CONDITIONAL == 0 && (readings.reads_surely(u, p) || along()) { Tri::True } else { Tri::Unknown })
                     };
                     if h == NONE && p == NONE {
                         return Tri::Unknown;
