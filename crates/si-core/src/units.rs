@@ -740,6 +740,35 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
             files.iter().for_each(|&f| included[f as usize] = true);
         }
     }
+    // The directories of the files, numbered.
+    let dir: Vec<u32> = {
+        let mut dirs: FxHashMap<&str, u32> = FxHashMap::default();
+        paths.iter().map(|p| { let n = dirs.len() as u32; *dirs.entry(dir_of(p)).or_insert(n) }).collect()
+    };
+    // Of several files an include may mean, those in the directory the
+    // sources most include from elsewhere (as an include path would have
+    // it), when that is not all of them.
+    let mut from_elsewhere = vec![0u32; n];
+    for (f, step) in steps.iter().enumerate().flat_map(|(f, s)| s.iter().map(move |s| (f, s))) {
+        if let Step::Include { files } = step {
+            if let [one] = files[..] {
+                if dir[one as usize] != dir[f] {
+                    from_elsewhere[dir[one as usize] as usize] += 1;
+                }
+            }
+        }
+    }
+    for step in steps.iter_mut().flatten() {
+        if let Step::Include { files } = step {
+            if files.len() > 1 {
+                let most = files.iter().map(|&f| from_elsewhere[dir[f as usize] as usize]).max().unwrap_or(0);
+                let near: Box<[u32]> = files.iter().copied().filter(|&f| from_elsewhere[dir[f as usize] as usize] == most).collect();
+                if most > 0 && near.len() < files.len() {
+                    *files = near;
+                }
+            }
+        }
+    }
     // What a compilation starts from: a file that is not a header, or a
     // header nothing here includes (it is somebody's, out of sight).
     let roots: Vec<u32> = (0..n as u32).filter(|&i| !crate::is_header(&paths[i as usize]) || !included[i as usize]).collect();
@@ -825,10 +854,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         ids,
         slots: slots as usize,
         once: scripts.iter().map(|s| s.once).collect(),
-        dir: {
-            let mut dirs: FxHashMap<&str, u32> = FxHashMap::default();
-            paths.iter().map(|p| { let n = dirs.len() as u32; *dirs.entry(dir_of(p)).or_insert(n) }).collect()
-        },
+        dir,
         plain: conditions,
         told: conditions.clone(),
         seen: seen(),
@@ -1009,6 +1035,21 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         if !why.open_in.is_empty() {
             eprintln!("why       left open in: {}", why.open_in.join(", "));
         }
+        // What each of those includes that may still mean several files.
+        let mut said = FxHashSet::default();
+        for root in &why.open_in {
+            let Some(f) = paths.iter().position(|p| p == root) else { continue };
+            for step in &w.steps[f] {
+                if let Step::Include { files } = step {
+                    if files.len() > 1 && said.insert((f, files.clone())) {
+                        eprintln!("why       {root} includes one of {}:", files.len());
+                        for &c in files.iter() {
+                            eprintln!("why         {}", paths[c as usize]);
+                        }
+                    }
+                }
+            }
+        }
     }
     let mut readings = Readings::default();
     let mut number = vec![u32::MAX; n];
@@ -1170,6 +1211,18 @@ int both;
     fn of_two_headers_an_include_may_mean_the_one_beside_those_read_is_read() {
         let got = told(&[
             ("src/app/a.c", "#include \"symbol.h\"\n#include \"typedef.h\"\n#if SOC == 1\n#endif\n"),
+            ("src/common/symbol.h", ""),
+            ("src/common/typedef.h", "#define SOC 1\n"),
+            ("src/drv/x/typedef.h", "#define SOC 2\n"),
+        ]);
+        assert_eq!(got[0], [one("#if SOC == 1", true)]);
+    }
+
+    #[test]
+    fn of_two_headers_an_include_may_mean_the_one_where_the_sources_include_from_is_read() {
+        let got = told(&[
+            ("src/app/a.c", "#include \"typedef.h\"\n#if SOC == 1\n#endif\n"),
+            ("src/hal/b.c", "#include \"symbol.h\"\n"),
             ("src/common/symbol.h", ""),
             ("src/common/typedef.h", "#define SOC 1\n"),
             ("src/drv/x/typedef.h", "#define SOC 2\n"),
