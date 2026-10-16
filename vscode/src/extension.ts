@@ -1786,7 +1786,8 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
       synchronize: { fileEvents: vscode.workspace.createFileSystemWatcher(SOURCE_GLOB) },
       // Beside the C/C++ extension, the server's hover says only what that
       // one's does not (a macro's value).
-      initializationOptions: { alongside: !!vscode.extensions.getExtension("ms-vscode.cpptools") },
+      // (Its IntelliSense off, Norn gives what it would: hovers, completion.)
+      initializationOptions: { alongside: !!vscode.extensions.getExtension("ms-vscode.cpptools") && vscode.workspace.getConfiguration("C_Cpp").get<string>("intelliSenseEngine", "default") !== "disabled" },
     };
     // (Alt+O switches header and source with Norn where the C/C++ extension does not.)
     void vscode.commands.executeCommand("setContext", "norn.cppTools", !!vscode.extensions.getExtension("ms-vscode.cpptools"));
