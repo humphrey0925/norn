@@ -161,12 +161,14 @@ pub struct Values<'a> {
     at: Option<(u32, u32)>,
     /// The names whose value was not had, and why.
     pub missing: Vec<(String, String)>,
+    /// The definition read for each name, as written (parameters, body).
+    written: FxHashMap<String, (Option<Vec<String>>, String)>,
     enums: FxHashMap<u32, Option<i64>>,
 }
 
 impl<'a> Values<'a> {
     pub fn new(g: &'a Graph, conditions: &'a Conditions, source: &'a mut dyn FnMut(&str) -> Option<std::sync::Arc<Vec<u8>>>) -> Values<'a> {
-        Values { g, conditions, source, local: Local::default(), seen: FxHashSet::default(), types: FxHashMap::default(), unread: Vec::new(), at: None, missing: Vec::new(), enums: FxHashMap::default() }
+        Values { g, conditions, source, local: Local::default(), seen: FxHashSet::default(), types: FxHashMap::default(), unread: Vec::new(), at: None, missing: Vec::new(), written: FxHashMap::default(), enums: FxHashMap::default() }
     }
 
     /// The same, asked on `line` of the file at `path`.
@@ -242,6 +244,7 @@ impl<'a> Values<'a> {
         if let (Some((f, line)), Some(source)) = (self.at, self.conditions.source()) {
             if let Some(v) = source.get(f, line, name.as_bytes()) {
                 let v = String::from_utf8_lossy(v).into_owned();
+                self.written.insert(name.to_string(), (None, v.clone()));
                 for n in names(&v).into_iter().map(str::to_string).collect::<Vec<_>>() {
                     self.learn(&n, from);
                 }
@@ -255,7 +258,10 @@ impl<'a> Values<'a> {
             // An enumerator: its number, as a value.
             match syms.iter().find(|&&s| g.syms[s as usize].kind == kind::ENUM_CONST) {
                 Some(&e) => match self.enumerator(e) {
-                    Some(n) => drop(self.local.insert(name.as_bytes().to_vec(), Some(Some(n.to_string().into_bytes())))),
+                    Some(n) => {
+                        self.local.insert(name.as_bytes().to_vec(), Some(Some(n.to_string().into_bytes())));
+                        self.written.insert(name.to_string(), (None, n.to_string()));
+                    }
                     None => self.missing.push((name.to_string(), "an enumerator whose number is not worked out".into())),
                 },
                 None if syms.is_empty() => self.missing.push((name.to_string(), "no definition in the index".into())),
@@ -297,6 +303,7 @@ impl<'a> Values<'a> {
             return;
         };
         let (at, d) = (*at, d.clone());
+        self.written.insert(name.to_string(), (d.params.clone(), d.body.clone()));
         let body = self.plain(&d.body);
         let params: Vec<String> = d.params.clone().unwrap_or_default();
         let value = match &d.params {
@@ -400,6 +407,519 @@ fn strip_comments(text: &str) -> String {
         }
     }
     out
+}
+
+/// A token of an expression as written: a name, a number, a literal or
+/// a punctuator.
+#[derive(Clone, Debug, PartialEq)]
+enum Tok {
+    Name(String),
+    Num(String),
+    Lit(String),
+    Punct(&'static str),
+}
+
+const PUNCTS: &[&str] = &[
+    "<<=", ">>=", "...", "->", "++", "--", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "##", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "+", "-", "*", "/",
+    "%", "&", "|", "^", "~", "!", "<", ">", "=", "?", ":", ",", ".", "(", ")", "[", "]", "{", "}", "#", ";",
+];
+
+fn tokens_of(text: &str) -> Option<Vec<Tok>> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if c.is_ascii_alphabetic() || c == b'_' {
+            let s = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            out.push(Tok::Name(text[s..i].to_string()));
+        } else if c.is_ascii_digit() || c == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit) {
+            let s = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'.' || (matches!(b[i], b'+' | b'-') && matches!(b[i - 1], b'e' | b'E' | b'p' | b'P'))) {
+                i += 1;
+            }
+            out.push(Tok::Num(text[s..i].to_string()));
+        } else if c == b'"' || c == b'\'' {
+            let s = i;
+            i += 1;
+            while i < b.len() && b[i] != c {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            i = (i + 1).min(b.len());
+            out.push(Tok::Lit(text[s..i].to_string()));
+        } else {
+            let p = PUNCTS.iter().find(|p| text[i..].starts_with(**p))?;
+            out.push(Tok::Punct(p));
+            i += p.len();
+        }
+    }
+    Some(out)
+}
+
+fn text_of(toks: &[Tok]) -> String {
+    let mut out = String::new();
+    for t in toks {
+        let s = match t {
+            Tok::Name(s) | Tok::Num(s) | Tok::Lit(s) => s.as_str(),
+            Tok::Punct(p) => p,
+        };
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(s);
+    }
+    out
+}
+
+/// An integer literal: its value, and whether it is unsigned.
+fn number(s: &str) -> Option<(i64, bool)> {
+    let lower = s.to_ascii_lowercase();
+    let digits = lower.trim_end_matches(['u', 'l']);
+    let unsigned = lower[digits.len()..].contains('u');
+    let v = if let Some(h) = digits.strip_prefix("0x") {
+        u64::from_str_radix(h, 16).ok()?
+    } else if let Some(bits) = digits.strip_prefix("0b") {
+        u64::from_str_radix(bits, 2).ok()?
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        u64::from_str_radix(&digits[1..], 8).ok()?
+    } else {
+        digits.parse::<u64>().ok()?
+    };
+    Some((v as i64, unsigned || v > i64::MAX as u64))
+}
+
+/// An expression, what of it is known worked out.
+#[derive(Clone, Debug)]
+enum Node {
+    Num(i64, bool),
+    /// What is not a number: a name, a literal (and what follows it, as
+    /// `a.b[2]`, `f(x)`), kept as written.
+    Text(String),
+    Unary(&'static str, Box<Node>),
+    Binary(&'static str, Box<Node>, Box<Node>),
+    Ternary(Box<Node>, Box<Node>, Box<Node>),
+    /// `(type) operand`, the type as written.
+    Cast(String, Box<Node>),
+    Paren(Box<Node>),
+}
+
+fn binary_rank(op: &str) -> Option<u8> {
+    Some(match op {
+        "*" | "/" | "%" => 10,
+        "+" | "-" => 9,
+        "<<" | ">>" => 8,
+        "<" | ">" | "<=" | ">=" => 7,
+        "==" | "!=" => 6,
+        "&" => 5,
+        "^" => 4,
+        "|" => 3,
+        "&&" => 2,
+        "||" => 1,
+        _ => return None,
+    })
+}
+
+struct Folder<'t, 'v, 'a> {
+    toks: &'t [Tok],
+    at: usize,
+    values: &'v mut Values<'a>,
+}
+
+impl Folder<'_, '_, '_> {
+    fn peek(&self) -> Option<&Tok> {
+        self.toks.get(self.at)
+    }
+
+    fn punct(&self, p: &str) -> bool {
+        matches!(self.peek(), Some(Tok::Punct(q)) if *q == p)
+    }
+
+    fn expr(&mut self) -> Option<Node> {
+        let c = self.binary(1)?;
+        if self.punct("?") {
+            self.at += 1;
+            let a = self.expr()?;
+            if !self.punct(":") {
+                return None;
+            }
+            self.at += 1;
+            let b = self.expr()?;
+            return Some(Node::Ternary(Box::new(c), Box::new(a), Box::new(b)));
+        }
+        Some(c)
+    }
+
+    fn binary(&mut self, min: u8) -> Option<Node> {
+        let mut left = self.unary()?;
+        loop {
+            let Some(Tok::Punct(op)) = self.peek() else { break };
+            let op: &'static str = op;
+            let Some(rank) = binary_rank(op).filter(|&r| r >= min) else { break };
+            self.at += 1;
+            let right = self.binary(rank + 1)?;
+            left = Node::Binary(op, Box::new(left), Box::new(right));
+        }
+        Some(left)
+    }
+
+    /// Whether the tokens from `at` are a type in parentheses: `(U32)`,
+    /// `(void *)`, `(volatile unsigned long *)`.
+    fn cast_at(&mut self, at: usize) -> Option<usize> {
+        let mut i = at + 1;
+        let mut words = 0;
+        while let Some(t) = self.toks.get(i) {
+            match t {
+                Tok::Name(n) if n == "void" || self.values.is_type(n) => words += 1,
+                Tok::Punct("*") => {}
+                Tok::Punct(")") if words > 0 => return Some(i),
+                _ => return None,
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn unary(&mut self) -> Option<Node> {
+        match self.peek()?.clone() {
+            Tok::Punct(op @ ("-" | "+" | "~" | "!")) => {
+                self.at += 1;
+                Some(Node::Unary(op, Box::new(self.unary()?)))
+            }
+            Tok::Punct("(") => {
+                if let Some(close) = self.cast_at(self.at) {
+                    let ty = text_of(&self.toks[self.at + 1..close]).replace(" *", "*").replace("* ", "*").replace('*', " *");
+                    self.at = close + 1;
+                    return Some(Node::Cast(ty.trim().to_string(), Box::new(self.unary()?)));
+                }
+                self.at += 1;
+                let inner = self.expr()?;
+                if !self.punct(")") {
+                    return None;
+                }
+                self.at += 1;
+                self.postfix(Node::Paren(Box::new(inner)))
+            }
+            Tok::Num(n) => {
+                self.at += 1;
+                let node = match number(&n) {
+                    Some((v, u)) => Node::Num(v, u),
+                    None => Node::Text(n),
+                };
+                self.postfix(node)
+            }
+            Tok::Name(_) | Tok::Lit(_) => {
+                let t = self.peek()?.clone();
+                self.at += 1;
+                self.postfix(Node::Text(text_of(&[t])))
+            }
+            _ => None,
+        }
+    }
+
+    /// What follows a name: `.f`, `->f`, `[i]`, `(args)`, kept as written
+    /// (what is in brackets and arguments worked out).
+    fn postfix(&mut self, mut node: Node) -> Option<Node> {
+        loop {
+            match self.peek() {
+                Some(Tok::Punct(p @ ("." | "->"))) => {
+                    let p: &str = p;
+                    let Some(Tok::Name(f)) = self.toks.get(self.at + 1).cloned() else { return None };
+                    node = Node::Text(format!("{}{p}{f}", show(&node, 11)));
+                    self.at += 2;
+                }
+                Some(Tok::Punct(p @ ("[" | "("))) => {
+                    let close = if *p == "[" { "]" } else { ")" };
+                    let open: &str = p;
+                    self.at += 1;
+                    let mut args = Vec::new();
+                    while !self.punct(close) {
+                        args.push(show(&fold(self.expr()?), 0));
+                        if self.punct(",") {
+                            self.at += 1;
+                        } else if !self.punct(close) {
+                            return None;
+                        }
+                    }
+                    self.at += 1;
+                    node = Node::Text(format!("{}{open}{}{close}", show(&node, 11), args.join(", ")));
+                }
+                _ => return Some(node),
+            }
+        }
+    }
+}
+
+/// `n` cut to what a cast to `ty` keeps: an unsigned type of a known width.
+fn cast_number(ty: &str, n: i64) -> Option<(i64, bool)> {
+    if ty.contains('*') {
+        return None;
+    }
+    let lower = ty.to_ascii_lowercase();
+    let bits = ["8", "16", "32", "64"].iter().find(|w| lower.ends_with(**w) || lower.contains(&format!("{w}_t"))).map(|w| w.parse::<u32>().unwrap());
+    let bits = bits.or(if lower.contains("char") { Some(8) } else if lower.contains("short") { Some(16) } else { None });
+    let unsigned = lower.contains("unsigned") || lower.starts_with('u');
+    match (bits, unsigned) {
+        (Some(64), u) => Some((n, u)),
+        (Some(b), true) => Some((n & ((1i64 << b) - 1), true)),
+        (Some(b), false) => Some(((n << (64 - b)) >> (64 - b), false)),
+        (None, u) => Some((n, u)),
+    }
+}
+
+fn arith(op: &str, (a, au): (i64, bool), (b, bu): (i64, bool)) -> Option<(i64, bool)> {
+    let u = au || bu;
+    let v = match op {
+        "*" => a.wrapping_mul(b),
+        "/" if b == 0 => return None,
+        "/" => if u { ((a as u64) / (b as u64)) as i64 } else { a.checked_div(b)? },
+        "%" if b == 0 => return None,
+        "%" => if u { ((a as u64) % (b as u64)) as i64 } else { a.checked_rem(b)? },
+        "+" => a.wrapping_add(b),
+        "-" => a.wrapping_sub(b),
+        "<<" if !(0..64).contains(&b) => return None,
+        "<<" => a.wrapping_shl(b as u32),
+        ">>" if !(0..64).contains(&b) => return None,
+        ">>" => if au { ((a as u64) >> b) as i64 } else { a >> b },
+        "<" => return Some((if u { ((a as u64) < (b as u64)) as i64 } else { (a < b) as i64 }, false)),
+        ">" => return Some((if u { ((a as u64) > (b as u64)) as i64 } else { (a > b) as i64 }, false)),
+        "<=" => return Some((if u { ((a as u64) <= (b as u64)) as i64 } else { (a <= b) as i64 }, false)),
+        ">=" => return Some((if u { ((a as u64) >= (b as u64)) as i64 } else { (a >= b) as i64 }, false)),
+        "==" => return Some(((a == b) as i64, false)),
+        "!=" => return Some(((a != b) as i64, false)),
+        "&" => a & b,
+        "^" => a ^ b,
+        "|" => a | b,
+        "&&" => return Some(((a != 0 && b != 0) as i64, false)),
+        "||" => return Some(((a != 0 || b != 0) as i64, false)),
+        _ => return None,
+    };
+    Some((v, if matches!(op, "<<" | ">>") { au } else { u }))
+}
+
+/// `node` with what of it is numbers worked out.
+fn fold(node: Node) -> Node {
+    match node {
+        Node::Paren(inner) => match fold(*inner) {
+            n @ Node::Num(..) => n,
+            n => Node::Paren(Box::new(n)),
+        },
+        Node::Unary(op, x) => match (op, fold(*x)) {
+            ("-", Node::Num(v, u)) => Node::Num(v.wrapping_neg(), u),
+            ("+", n @ Node::Num(..)) => n,
+            ("~", Node::Num(v, u)) => Node::Num(!v, u),
+            ("!", Node::Num(v, _)) => Node::Num((v == 0) as i64, false),
+            (op, x) => Node::Unary(op, Box::new(x)),
+        },
+        Node::Cast(ty, x) => match fold(*x) {
+            Node::Num(v, _) if cast_number(&ty, v).is_some() => {
+                let (v, u) = cast_number(&ty, v).unwrap();
+                Node::Num(v, u)
+            }
+            x => Node::Cast(ty, Box::new(x)),
+        },
+        Node::Binary(op, a, b) => {
+            let (a, b) = (fold(*a), fold(*b));
+            // (`C + x + D`: the numbers of a sum gathered, `C + D + x`.)
+            if let (Node::Binary(inner, x, y), Node::Num(..)) = (&a, &b) {
+                if *inner == "+" && op == "+" {
+                    if let (Node::Num(..), _) | (_, Node::Num(..)) = (x.as_ref(), y.as_ref()) {
+                        let (num, other) = if let Node::Num(..) = x.as_ref() { (x.as_ref().clone(), y.as_ref().clone()) } else { (y.as_ref().clone(), x.as_ref().clone()) };
+                        return fold(Node::Binary("+", Box::new(Node::Binary("+", Box::new(num), Box::new(b))), Box::new(other)));
+                    }
+                }
+            }
+            match (&a, &b) {
+                (Node::Num(x, xu), Node::Num(y, yu)) => match arith(op, (*x, *xu), (*y, *yu)) {
+                    Some((v, u)) => Node::Num(v, u),
+                    None => Node::Binary(op, Box::new(a), Box::new(b)),
+                },
+                _ => Node::Binary(op, Box::new(a), Box::new(b)),
+            }
+        }
+        Node::Ternary(c, a, b) => match fold(*c) {
+            Node::Num(v, _) => fold(if v != 0 { *a } else { *b }),
+            c => Node::Ternary(Box::new(c), Box::new(fold(*a)), Box::new(fold(*b))),
+        },
+        n => n,
+    }
+}
+
+fn rank_of(node: &Node) -> u8 {
+    match node {
+        Node::Binary(op, ..) => binary_rank(op).unwrap_or(0),
+        Node::Ternary(..) => 0,
+        Node::Unary(..) | Node::Cast(..) => 11,
+        _ => 12,
+    }
+}
+
+fn show_number(v: i64, u: bool) -> String {
+    if (0..10).contains(&v) {
+        v.to_string()
+    } else if v < 0 && !u {
+        v.to_string()
+    } else {
+        format!("0x{:X}", v as u64)
+    }
+}
+
+/// `node` written out, in parentheses where it binds less than `outer`.
+fn show(node: &Node, outer: u8) -> String {
+    let s = match node {
+        Node::Num(v, u) => show_number(*v, *u),
+        Node::Text(t) => t.clone(),
+        Node::Paren(inner) => return show(inner, outer),
+        Node::Unary(op, x) => format!("{op}{}", show(x, 11)),
+        Node::Cast(ty, x) => format!("({ty}){}", show(x, 11)),
+        Node::Binary(op, a, b) => {
+            let r = binary_rank(op).unwrap_or(0);
+            format!("{} {op} {}", show(a, r), show(b, r + 1))
+        }
+        Node::Ternary(c, a, b) => format!("{} ? {} : {}", show(c, 1), show(a, 0), show(b, 0)),
+    };
+    if rank_of(node) < outer { format!("({s})") } else { s }
+}
+
+impl Values<'_> {
+    /// `toks` with the macros the index has expanded, as the preprocessor
+    /// would (`##` and `#` too); names it cannot expand stay as written.
+    fn expand(&mut self, toks: &[Tok], from: u32, hide: &FxHashSet<String>, depth: u32) -> Option<Vec<Tok>> {
+        if depth > 32 {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < toks.len() {
+            let Tok::Name(name) = &toks[i] else {
+                out.push(toks[i].clone());
+                i += 1;
+                continue;
+            };
+            if hide.contains(name) {
+                out.push(toks[i].clone());
+                i += 1;
+                continue;
+            }
+            let Some((params, body)) = self.definition(name, from) else {
+                out.push(toks[i].clone());
+                i += 1;
+                continue;
+            };
+            let mut hide = hide.clone();
+            hide.insert(name.clone());
+            match params {
+                None => {
+                    let body = tokens_of(&body)?;
+                    out.extend(self.expand(&body, from, &hide, depth + 1)?);
+                    i += 1;
+                }
+                Some(params) => {
+                    if toks.get(i + 1) != Some(&Tok::Punct("(")) {
+                        out.push(toks[i].clone());
+                        i += 1;
+                        continue;
+                    }
+                    // The arguments, split at the commas outside brackets.
+                    let (mut args, mut arg, mut level, mut j) = (Vec::new(), Vec::new(), 0, i + 2);
+                    loop {
+                        let t = toks.get(j)?;
+                        match t {
+                            Tok::Punct("(" | "[" | "{") => level += 1,
+                            Tok::Punct(")") if level == 0 => break,
+                            Tok::Punct(")" | "]" | "}") => level -= 1,
+                            Tok::Punct(",") if level == 0 => {
+                                args.push(std::mem::take(&mut arg));
+                                j += 1;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                        arg.push(t.clone());
+                        j += 1;
+                    }
+                    if !arg.is_empty() || !args.is_empty() {
+                        args.push(arg);
+                    }
+                    if args.len() != params.len() && !(params.is_empty() && args.is_empty()) {
+                        return None;
+                    }
+                    let body = tokens_of(&body)?;
+                    let param = |t: &Tok| match t {
+                        Tok::Name(n) => params.iter().position(|p| p == n),
+                        _ => None,
+                    };
+                    // Each parameter by its argument: as written beside `##`
+                    // or after `#`, else expanded first.
+                    let mut made: Vec<Tok> = Vec::new();
+                    let mut k = 0;
+                    while k < body.len() {
+                        let pasted = body.get(k + 1) == Some(&Tok::Punct("##")) || k > 0 && body[k - 1] == Tok::Punct("##");
+                        if body[k] == Tok::Punct("#") {
+                            if let Some(p) = body.get(k + 1).and_then(param) {
+                                made.push(Tok::Lit(format!("\"{}\"", text_of(&args[p]))));
+                                k += 2;
+                                continue;
+                            }
+                        }
+                        match param(&body[k]) {
+                            Some(p) if pasted => made.extend(args[p].iter().cloned()),
+                            Some(p) => made.extend(self.expand(&args[p], from, &FxHashSet::default(), depth + 1)?),
+                            None => made.push(body[k].clone()),
+                        }
+                        k += 1;
+                    }
+                    // `a ## b`: one token of the two.
+                    let mut joined: Vec<Tok> = Vec::new();
+                    let mut k = 0;
+                    while k < made.len() {
+                        if made[k] == Tok::Punct("##") {
+                            let left = joined.pop()?;
+                            let right = made.get(k + 1)?;
+                            let text = format!("{}{}", text_of(&[left]), text_of(std::slice::from_ref(right)));
+                            joined.extend(tokens_of(&text)?);
+                            k += 2;
+                            continue;
+                        }
+                        joined.push(made[k].clone());
+                        k += 1;
+                    }
+                    out.extend(self.expand(&joined, from, &hide, depth + 1)?);
+                    i = j + 1;
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// What `name` is defined as, as [`Values::learn`] picks it: the
+    /// parameters (none: object-like) and the body as written.
+    fn definition(&mut self, name: &str, from: u32) -> Option<(Option<Vec<String>>, String)> {
+        if let Some(v) = self.conditions.setting(name.as_bytes()) {
+            return Some((None, String::from_utf8_lossy(v).into_owned()));
+        }
+        if self.is_type(name) {
+            return None;
+        }
+        self.learn(name, from);
+        self.written.get(name).cloned()
+    }
+
+    /// An expression with its macros expanded and what of it is numbers
+    /// worked out, as written: `(void *)(0x400800 + ((U32)(q.cnt[2] & 3) << 4))`.
+    pub fn folded(&mut self, expr: &str, from: u32) -> Option<String> {
+        let toks = self.expand(&tokens_of(expr)?, from, &FxHashSet::default(), 0)?;
+        let mut f = Folder { toks: &toks, at: 0, values: self };
+        let node = f.expr()?;
+        if f.at != toks.len() {
+            return None;
+        }
+        Some(show(&fold(node), 0))
+    }
 }
 
 #[cfg(test)]

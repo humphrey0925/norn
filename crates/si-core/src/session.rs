@@ -1134,7 +1134,7 @@ mod tests {
     #[test]
     fn a_macro_s_value_is_worked_out_as_an_enumerator_s_is() {
         let d = Dir::new("macro-values");
-        d.write("reg.h", "typedef unsigned int U32;\n#define BUF_BASE (0x1000u)\n#define BUF_STRIDE ((U32)4)\n#define BUF_Q(n) (BUF_BASE + (n) * BUF_STRIDE)\n#define BUF_Q3 BUF_Q(3)\nenum q { Q_A, Q_B = 5, Q_C,\n  Q_D = Q_C * 2 };\n#define WITH_ENUM (Q_D + 1)\n#ifdef BIG\n#define WIDTH 64\n#else\n#define WIDTH 32\n#endif\n#define NAMED_ELSEWHERE (UNKNOWN_THING + 1)\n#define TWICE_W (WIDTH * 2)\n");
+        d.write("reg.h", "typedef unsigned int U32;\n#define BUF_X_BASE (((0x00400000)) + ((32) << (0x05)) + ((32) << (0x05)))\n#define BUF_X_MASK ((4) - 1)\n#define BUF_X_DATA_SIZE_LOG ((0x04))\n#define M_BUF_PTR(BUFID, OFFSET) (void *)((BUFID ## _BASE) + ((U32)(OFFSET & (BUFID ## _MASK)) << (BUFID ## _DATA_SIZE_LOG)))\n#define BUF_BASE (0x1000u)\n#define BUF_STRIDE ((U32)4)\n#define BUF_Q(n) (BUF_BASE + (n) * BUF_STRIDE)\n#define BUF_Q3 BUF_Q(3)\nenum q { Q_A, Q_B = 5, Q_C,\n  Q_D = Q_C * 2 };\n#define WITH_ENUM (Q_D + 1)\n#ifdef BIG\n#define WIDTH 64\n#else\n#define WIDTH 32\n#endif\n#define NAMED_ELSEWHERE (UNKNOWN_THING + 1)\n#define TWICE_W (WIDTH * 2)\n");
         d.write("a.c", "#include \"reg.h\"\n");
         // One per chip, each header its own: the one beside what names it.
         d.write("chip_a/regs.h", "#define REG_BASE 0x100\n#define REG_X (REG_BASE + 4)\n");
@@ -1160,6 +1160,10 @@ mod tests {
         assert_eq!(of("TWICE_W"), None);
         assert_eq!(of("REG_X"), Some(0x104));
         assert_eq!((of("Q_SIZE"), of("Q_END")), (Some(64), Some(80)));
+        // What of it is numbers, worked out; the rest as written.
+        let at = g.syms[g.find("BUF_Q")[0] as usize].file;
+        assert_eq!(values.folded("M_BUF_PTR(BUF_X, gRing.Used[(2)])", at).as_deref(), Some("(void *)(0x400800 + ((U32)(gRing.Used[2] & 3) << 4))"));
+        assert_eq!(values.folded("BUF_X_BASE", at).as_deref(), Some("0x400800"));
         // Defined two ways, the build deciding: each its own.
         let mut widths: Vec<Option<i64>> = g.find("WIDTH").iter().map(|&w| values.of_macro(w).map(|v| v.number)).collect();
         widths.sort();

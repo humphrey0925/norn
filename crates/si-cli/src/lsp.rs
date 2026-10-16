@@ -443,15 +443,26 @@ impl Server {
                 Some(p) => format!("#define {}({}) {}", d.name, p.join(", "), d.body),
                 None => format!("#define {} {}", d.name, d.body),
             };
+            // The number it comes to; else what of it is numbers worked
+            // out, the rest as written (a variable, a member); else why not.
+            let squeeze = |t: &str| t.chars().filter(|c| !c.is_whitespace() && *c != '(' && *c != ')').collect::<String>();
             values.missing.clear();
-            let mut v = values.of_macro(s).map_or(String::new(), |v| format!("
+            let mut v = String::new();
+            if d.params.is_none() {
+                if let Some(n) = values.of_macro(s) {
+                    v = format!("
 
-`{}`", shown(v.number, v.unsigned)));
-            if v.is_empty() && d.params.is_none() && !values.missing.is_empty() {
-                let why: Vec<String> = values.missing.iter().take(3).map(|(n, w)| format!("`{n}`: {w}")).collect();
-                v = format!("
+`{}`", shown(n.number, n.unsigned));
+                } else if let Some(f) = values.folded(&d.body, sym.file).filter(|f| squeeze(f) != squeeze(&d.body)) {
+                    v = format!("
+
+`= {f}`");
+                } else if !values.missing.is_empty() {
+                    let why: Vec<String> = values.missing.iter().take(3).map(|(n, w)| format!("`{n}`: {w}")).collect();
+                    v = format!("
 
 No value: {}", why.join("; "));
+                }
             }
             if let (Some(_), Some(here)) = (&d.params, &used) {
                 let at = here_file.as_deref().and_then(|f| (0..g.files.len() as u32).find(|&i| g.file_path(i) == f)).unwrap_or(sym.file);
@@ -459,6 +470,10 @@ No value: {}", why.join("; "));
                     v = format!("
 
 `{here}` `{}`", shown(n.number, n.unsigned));
+                } else if let Some(f) = values.folded(here, at) {
+                    v = format!("
+
+`{here}` `= {f}`");
                 }
             }
             parts.push(format!("```c
