@@ -32,6 +32,17 @@ const version = JSON.parse(fs.readFileSync(path.join(ext, "package.json"), "utf8
 const run = (cmd, args, cwd = root, env = {}) =>
   execFileSync(cmd, args, { cwd, stdio: "inherit", shell: process.platform === "win32", env: { ...process.env, ...env } });
 
+// No path of the machine it was built on in it (release/build.js leaves
+// them out): the builder's home folder, as either kind of slash.
+const bytes = fs.readFileSync(path.resolve(server));
+const home = require("os").homedir();
+for (const p of new Set([home, home.replaceAll("\\", "/"), home.replaceAll("/", "\\")])) {
+  if (p.length > 3 && bytes.includes(Buffer.from(p))) {
+    console.error(`${server} names ${p}: build it with \`node release/build.js\``);
+    process.exit(1);
+  }
+}
+
 // The server, under the name of the platform it runs on.
 const exe = target.startsWith("win32") ? "norn.exe" : "norn";
 fs.rmSync(path.join(ext, "bin"), { recursive: true, force: true });

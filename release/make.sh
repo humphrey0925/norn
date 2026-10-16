@@ -8,7 +8,7 @@ version=$(node -p "require('./vscode/package.json').version")
 seven="${SEVENZIP:-/c/Program Files/7-Zip/7z.exe}"
 # (CARGO_TARGET_DIR: build elsewhere, when target/ is in use, by a benchmark say.)
 target="${CARGO_TARGET_DIR:-target}"
-cargo build --release
+node release/build.js
 # The server goes inside the extension, under the name of what it runs on.
 rm -rf vscode/bin && mkdir -p vscode/bin/win32-x64
 cp "$target/release/norn.exe" vscode/bin/win32-x64/norn.exe

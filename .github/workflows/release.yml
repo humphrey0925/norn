@@ -62,12 +62,14 @@ jobs:
         run: |
           pip install ziglang==0.13.0
           cargo install cargo-zigbuild@0.19.8 --locked
-      - name: Build (zig)
-        if: matrix.zig
-        run: cargo zigbuild --release --locked --target ${{ matrix.rust }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: vscode/package-lock.json
+      # (No path of the build machine left in the binary: release/build.js.)
       - name: Build
-        if: ${{ !matrix.zig }}
-        run: cargo build --release --locked --target ${{ matrix.rust }}
+        run: node release/build.js ${{ matrix.rust }} ${{ matrix.zig && '--zig' || '' }}
 
       - name: Server as released
         shell: bash
@@ -89,11 +91,6 @@ jobs:
           ${{ matrix.run }} "$SERVER" index smoke --out smoke-out --stores none | tee smoke.json
           grep -q '"files": 2' smoke.json
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: vscode/package-lock.json
       - name: Package
         shell: bash
         env:
