@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build the server and the extension and pack them as
-# release/norn-<version>-windows-x64.7z, the one file a release is.
+# out/norn-<version>-windows-x64.7z (not committed: releases are on GitHub).
 # The version is the extension's (vscode/package.json).
 set -e
 cd "$(dirname "$0")/.."
@@ -34,7 +34,7 @@ cp release/README.md "$stage/README.md"
 cp CHANGELOG.md "$stage/CHANGELOG.md"
 cp vscode/THIRD_PARTY_NOTICES.txt "$stage/THIRD_PARTY_NOTICES.txt"
 cp LICENSE NOTICE "$stage/"
-out="release/norn-$version-windows-x64.7z"
-rm -f release/si-*-windows-x64.7z release/norn-*-windows-x64.7z
+out="out/norn-$version-windows-x64.7z"
+rm -f out/norn-*-windows-x64.7z
 (cd "$stage" && "$seven" a -t7z -mx=9 "../../$out" . > /dev/null)
 "$seven" l "$out" | tail -6

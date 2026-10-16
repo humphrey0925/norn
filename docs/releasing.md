@@ -69,7 +69,7 @@ Settings → Branches → `master`：要求 PR、要求 CI（`ubuntu-24.04`、
 
 - 單一平台：`node release/package.js <平台> <伺服器執行檔> [輸出目錄]`，例如
   `node release/package.js linux-x64 target/x86_64-unknown-linux-musl/release/norn dist`。
-- 舊的 Windows 打包腳本：`release/make.sh`，產生 `release/norn-<版本>-windows-x64.7z`。
+- 舊的 Windows 打包腳本：`release/make.sh`，產生 `out/norn-<版本>-windows-x64.7z`（不提交進 repo，發佈檔一律放在 GitHub Release）。
 
 ## CI 用量
 

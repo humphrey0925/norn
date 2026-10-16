@@ -3,3 +3,5 @@
 /tools
 /out
 __pycache__/
+# Release archives are attached to GitHub releases, not committed.
+/release/*.7z
