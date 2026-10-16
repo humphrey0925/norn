@@ -131,8 +131,12 @@ thread_local! {
     /// defined: their conditions come out the same, and working each out
     /// (its macros expanded, their values read, again and again) was most
     /// of the time.
-    static KEPT: std::cell::RefCell<Vec<Vec<Kept>>> = Default::default();
+    /// (With the reading it was for: see [`World::pass`].)
+    static KEPT: std::cell::RefCell<(u64, Vec<Vec<Kept>>)> = Default::default();
 }
+
+/// Readings numbered as they start, all of them in this process.
+static PASSES: AtomicU64 = AtomicU64::new(1);
 
 /// How a name is in a compilation, as one number: not mentioned (0), not
 /// known (1), undefined (2), or defined by the `#define` at this file and
@@ -193,6 +197,9 @@ struct World<'a> {
     slots: usize,
     /// Files read once in a compilation, however often they are included.
     once: Vec<bool>,
+    /// Which reading this is, of all in this process: what a thread kept
+    /// of another is not this one's.
+    pass: AtomicU64,
     /// Per file, its directory, numbered.
     dir: Vec<u32>,
     plain: &'a Conditions,
@@ -307,6 +314,12 @@ impl Unit<'_> {
     fn worked_out(&self, slot: u32, expr: &[u8]) -> Tri {
         let found = KEPT.with(|k| {
             let mut k = k.borrow_mut();
+            // (A thread may have worked for another reading before.)
+            let pass = self.w.pass.load(Relaxed);
+            if k.0 != pass {
+                *k = (pass, Vec::new());
+            }
+            let k = &mut k.1;
             if k.len() < self.w.slots {
                 k.resize_with(self.w.slots, Vec::new);
             }
@@ -327,7 +340,7 @@ impl Unit<'_> {
         let names = names.into_iter().map(|n| (n, self.states[n as usize])).collect();
         KEPT.with(|k| {
             let mut k = k.borrow_mut();
-            let ways = &mut k[slot as usize];
+            let ways = &mut k.1[slot as usize];
             if ways.len() < KEPT_WAYS {
                 ways.push(Kept { names, unseen: self.unseen, holds });
             } else {
@@ -867,6 +880,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         ids,
         slots: slots as usize,
         once: scripts.iter().map(|s| s.once).collect(),
+        pass: AtomicU64::new(0),
         dir,
         plain: conditions,
         told: conditions.clone(),
@@ -887,8 +901,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
     let kept_counts: std::sync::Mutex<[u64; 3]> = Default::default();
     let read_all = |w: &World, first: bool| -> (FxHashSet<Vec<u8>>, Vec<u32>) {
         // (What was worked out under other conditions does not hold now.)
-        rayon::broadcast(|_| KEPT.with(|k| k.borrow_mut().clear()));
-        KEPT.with(|k| k.borrow_mut().clear());
+        w.pass.store(PASSES.fetch_add(1, Relaxed), Relaxed);
         roots
             .par_iter()
             .fold(Default::default, |mut all: (FxHashSet<Vec<u8>>, Vec<u32>), &root| {
