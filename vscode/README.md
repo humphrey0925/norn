@@ -83,6 +83,8 @@ between them. Macros can also be set by hand.
 Hovering a macro shows the value it works out to under those conditions,
 even through several levels of macros, casts and token pasting.
 
+![Hovering a macro: BSF_EXPORT = 2, through BSF_GLOBAL](media/screenshots/hover-macro.png)
+
 ### A complete C editor, with or without the C/C++ extension
 
 Norn is a full language server. Go to Definition, Find References, workspace
@@ -108,6 +110,14 @@ itself:
 | Folding | Blocks, `#if` branches, comments, runs of `#include` |
 | Formatting | With clang-format, when it is installed |
 | Quick fix | Adds the `#include` that declares a name |
+
+![A function's hover: its declaration and documentation comment](media/screenshots/hover-function.png)
+
+![Signature help while typing a call, the current parameter in bold](media/screenshots/signature-help.png)
+
+![Completion after -> lists the members of the struct](media/screenshots/member-completion.png)
+
+![Semantic highlighting, and parameter names shown at call sites](media/screenshots/highlighting-and-hints.png)
 
 ![The light theme](media/screenshots/light-theme.png)
 
