@@ -16,6 +16,8 @@
   "categories": [
     "Programming Languages"
   ],
+  "keywords": ["c", "c++", "embedded", "firmware", "source insight", "call hierarchy", "macro", "function pointer", "code navigation", "language server"],
+  "pricing": "Free",
   "main": "./out/extension.js",
   "activationEvents": [
     "onLanguage:c",
