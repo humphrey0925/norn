@@ -195,6 +195,11 @@ impl Session {
         self.files.binary_search(&path).ok().and_then(|i| self.facts.get(i))
     }
 
+    /// What the settings and the build say is defined.
+    pub fn conditions(&self) -> &Conditions {
+        &self.conditions
+    }
+
     /// How many macros the conditions settle, one way or the other.
     pub fn conditions_known(&self) -> usize {
         self.conditions.len()
@@ -804,7 +809,9 @@ mod tests {
         }
 
         fn write(&self, name: &str, text: &str) -> PathBuf {
-            std::fs::write(self.0.join(name), text).unwrap();
+            let path = self.0.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
             PathBuf::from(name)
         }
     }
@@ -1093,15 +1100,37 @@ mod tests {
     }
 
     #[test]
+    fn a_header_of_one_branch_does_not_see_the_macros_of_another_s() {
+        // CMSIS: one header per compiler, chosen by an `#if` not known;
+        // IAR's `#define __QSUB8 __iar_builtin_QSUB8` is not GCC's.
+        let d = Dir::new("rival-headers");
+        d.write("compiler.h", "#ifndef COMPILER_H\n#define COMPILER_H\n#if defined(__CC_ARM)\n#include \"armcc.h\"\n#elif defined(__GNUC__)\n#include \"gcc.h\"\n#elif defined(__ICCARM__)\n#include \"iccarm.h\"\n#endif\n#endif\n");
+        d.write("armcc.h", "#define __QSUB8 __qsub8\n#define __INLINE __inline\n");
+        d.write("iccarm.h", "#define __QSUB8 __iar_builtin_QSUB8\n#define __INLINE inline\n");
+        d.write("gcc.h", "static inline unsigned __QSUB8(unsigned a, unsigned b) { return a - b; }\n");
+        for c in ["a.c", "b.c", "c.c", "d.c", "e.c", "f.c", "g.c", "h.c", "i.c", "j.c", "k.c", "l.c", "m.c", "n.c", "o.c", "p.c", "q.c", "r.c", "s.c", "t.c"] {
+            d.write(c, "#include \"compiler.h\"\nunsigned use (void) { return __QSUB8 (2, 1); }\n");
+        }
+        let (s, _) = Session::open_cached(&d.0, Options::default(), d.0.join("cache-outside-scan"));
+        assert_eq!((functions(&s, "__QSUB8"), functions(&s, "__iar_builtin_QSUB8"), functions(&s, "__qsub8")), (1, 0, 0));
+    }
+
+    #[test]
     fn a_macro_s_value_is_worked_out_as_an_enumerator_s_is() {
         let d = Dir::new("macro-values");
         d.write("reg.h", "typedef unsigned int U32;\n#define BUF_BASE (0x1000u)\n#define BUF_STRIDE ((U32)4)\n#define BUF_Q(n) (BUF_BASE + (n) * BUF_STRIDE)\n#define BUF_Q3 BUF_Q(3)\nenum q { Q_A, Q_B = 5, Q_C,\n  Q_D = Q_C * 2 };\n#define WITH_ENUM (Q_D + 1)\n#ifdef BIG\n#define WIDTH 64\n#else\n#define WIDTH 32\n#endif\n#define NAMED_ELSEWHERE (UNKNOWN_THING + 1)\n#define TWICE_W (WIDTH * 2)\n");
         d.write("a.c", "#include \"reg.h\"\n");
+        // One per chip, each header its own: the one beside what names it.
+        d.write("chip_a/regs.h", "#define REG_BASE 0x100\n#define REG_X (REG_BASE + 4)\n");
+        d.write("chip_b/regs.h", "#define REG_BASE 0x200\n");
+        // A type that is a macro, cast to.
+        d.write("types.h", "#define U32 unsigned long\n#define u32 U32\n#define Q_SIZE ((u32)0x10 << 2)\n#define Q_END ((U32)Q_SIZE + (U32)(REG_SIZE * 2))\n#define REG_SIZE (8)\n");
         let (s, _) = Session::open_cached(&d.0, Options::default(), d.0.join("cache-outside-scan"));
         let g = &s.graph;
         let root = d.0.clone();
         let mut read = |p: &str| std::fs::read(root.join(p)).ok().map(std::sync::Arc::new);
-        let mut values = crate::value::Values::new(g, &mut read);
+        let conditions = Conditions::default();
+        let mut values = crate::value::Values::new(g, &conditions, &mut read);
         let mut of = |name: &str| {
             let sym = g.find(name).iter().copied().find(|&x| matches!(g.syms[x as usize].kind, kind::MACRO | kind::ENUM_CONST))?;
             if g.syms[sym as usize].kind == kind::ENUM_CONST { values.enumerator(sym) } else { values.of_macro(sym).map(|v| v.number) }
@@ -1113,6 +1142,8 @@ mod tests {
         assert_eq!(of("NAMED_ELSEWHERE"), None);
         // Naming a macro defined two ways: no one value.
         assert_eq!(of("TWICE_W"), None);
+        assert_eq!(of("REG_X"), Some(0x104));
+        assert_eq!((of("Q_SIZE"), of("Q_END")), (Some(64), Some(80)));
         // Defined two ways, the build deciding: each its own.
         let mut widths: Vec<Option<i64>> = g.find("WIDTH").iter().map(|&w| values.of_macro(w).map(|v| v.number)).collect();
         widths.sort();

@@ -1,8 +1,10 @@
 //! What a macro or an enumerator stands for, worked out from the sources
 //! the way an `#if` is: `#define BUF_BASE (0x1000)`, `#define BUF_Q (BUF_BASE
 //! + 4 * 2)` is 0x1008. The macros a body names are read where the index
-//! has them, one definition each; one that may be defined more than one
-//! way leaves the value unknown. Casts to a type (`(U32)0x10`) are passed
+//! has them: what the settings and the build define first, then, of
+//! several definitions, the one nearest the macro that names it (in its
+//! file, else its directory, else the nearest directory); several no one
+//! of which is nearer leave the value unknown. Casts to a type (`(U32)0x10`) are passed
 //! over, as an `#if` would not take them. An enumerator is what it is set
 //! to, or one more than the one before it.
 
@@ -145,15 +147,18 @@ pub struct Value {
 /// (a path as the index has it).
 pub struct Values<'a> {
     g: &'a Graph,
+    conditions: &'a Conditions,
     source: &'a mut dyn FnMut(&str) -> Option<std::sync::Arc<Vec<u8>>>,
     local: Local,
     seen: FxHashSet<String>,
+    /// Names known to name a type, or not.
+    types: FxHashMap<String, bool>,
     enums: FxHashMap<u32, Option<i64>>,
 }
 
 impl<'a> Values<'a> {
-    pub fn new(g: &'a Graph, source: &'a mut dyn FnMut(&str) -> Option<std::sync::Arc<Vec<u8>>>) -> Values<'a> {
-        Values { g, source, local: Local::default(), seen: FxHashSet::default(), enums: FxHashMap::default() }
+    pub fn new(g: &'a Graph, conditions: &'a Conditions, source: &'a mut dyn FnMut(&str) -> Option<std::sync::Arc<Vec<u8>>>) -> Values<'a> {
+        Values { g, conditions, source, local: Local::default(), seen: FxHashSet::default(), types: FxHashMap::default(), enums: FxHashMap::default() }
     }
 
     /// The `#define` of macro `sym`.
@@ -163,23 +168,53 @@ impl<'a> Values<'a> {
         define_at(&src, s.line).filter(|d| d.name == self.g.sym_name(sym))
     }
 
-    fn is_type(&self, w: &str) -> bool {
-        let syms = self.g.find(w);
-        !syms.is_empty() && syms.iter().all(|&s| matches!(self.g.syms[s as usize].kind, kind::TYPEDEF | kind::STRUCT | kind::UNION | kind::ENUM | kind::CLASS))
+    /// Whether `w` names a type: a typedef, a struct, a union or an enum,
+    /// or a macro that stands for one (`#define U32 unsigned long`).
+    fn is_type(&mut self, w: &str) -> bool {
+        self.type_name(w, 0)
     }
 
-    fn plain(&self, text: &str) -> String {
+    fn type_name(&mut self, w: &str, depth: u32) -> bool {
+        if type_word(w) {
+            return true;
+        }
+        if let Some(&t) = self.types.get(w) {
+            return t;
+        }
         let g = self.g;
-        let mut is_type = |w: &str| {
-            let syms = g.find(w);
-            !syms.is_empty() && syms.iter().all(|&s| matches!(g.syms[s as usize].kind, kind::TYPEDEF | kind::STRUCT | kind::UNION | kind::ENUM | kind::CLASS))
-        };
-        without_casts(text, &mut is_type)
+        let syms: Vec<u32> = g.find(w).to_vec();
+        let mut t = !syms.is_empty() && syms.iter().all(|&s| matches!(g.syms[s as usize].kind, kind::TYPEDEF | kind::STRUCT | kind::UNION | kind::ENUM | kind::CLASS));
+        if !t && depth < 8 {
+            // A macro every definition of which is words that name types.
+            self.types.insert(w.to_string(), false);
+            let macros: Vec<u32> = syms.iter().copied().filter(|&s| g.syms[s as usize].kind == kind::MACRO && g.syms[s as usize].flags & flag::DECL == 0).collect();
+            let bodies: Vec<Define> = macros.iter().filter_map(|&s| self.define(s)).collect();
+            let plain = |d: &Define| d.params.is_none() && !d.body.is_empty() && d.body.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '*' || c.is_whitespace());
+            t = !bodies.is_empty() && bodies.iter().all(plain);
+            if t {
+                let words: Vec<String> = bodies.iter().flat_map(|d| d.body.split(|c: char| c.is_whitespace() || c == '*').filter(|w| !w.is_empty()).map(str::to_string).collect::<Vec<_>>()).collect();
+                t = !words.is_empty() && words.iter().all(|w| !w.as_bytes()[0].is_ascii_digit() && self.type_name(w, depth + 1));
+            }
+        }
+        self.types.insert(w.to_string(), t);
+        t
     }
 
-    /// Gives `name` its value among the names, and those its value names.
-    fn learn(&mut self, name: &str) {
-        if self.seen.len() >= MOST_NAMES || !self.seen.insert(name.to_string()) || self.is_type(name) {
+    fn plain(&mut self, text: &str) -> String {
+        // (Which of its words name types first, then the text without
+        // the casts to them.)
+        let mut known = FxHashMap::default();
+        for w in names(text) {
+            let t = self.is_type(w);
+            known.insert(w.to_string(), t);
+        }
+        without_casts(text, &mut |w| known.get(w).copied().unwrap_or(false))
+    }
+
+    /// Gives `name` its value among the names, and those its value names;
+    /// `from` is the file of what names it.
+    fn learn(&mut self, name: &str, from: u32) {
+        if self.seen.len() >= MOST_NAMES || self.conditions.settles(name.as_bytes()) || !self.seen.insert(name.to_string()) || self.is_type(name) {
             return;
         }
         let g = self.g;
@@ -198,9 +233,30 @@ impl<'a> Values<'a> {
         // compiled first.
         let sure: Vec<u32> = macros.iter().copied().filter(|&s| g.syms[s as usize].flags & flag::CONDITIONAL == 0).collect();
         let pick = if sure.is_empty() { macros } else { sure };
-        let mut defs: Vec<Define> = pick.iter().filter_map(|&s| self.define(s)).collect();
-        defs.dedup();
-        let [d] = &defs[..] else { return };
+        let mut defs: Vec<(u32, Define)> = pick.iter().filter_map(|&s| Some((g.syms[s as usize].file, self.define(s)?))).collect();
+        defs.sort_by(|a, b| a.1.body.cmp(&b.1.body));
+        defs.dedup_by(|a, b| a.1 == b.1);
+        if defs.len() > 1 {
+            // The nearest: in the same file, else the same directory, else
+            // the one whose directory shares most with this one's.
+            let dir_of = |f: u32| -> Vec<&str> {
+                let p = g.file_path(f);
+                p.rsplit_once('/').map_or(Vec::new(), |(d, _)| d.split('/').collect())
+            };
+            let here = dir_of(from);
+            let near = |f: u32| -> usize {
+                if f == from {
+                    return usize::MAX;
+                }
+                let d = dir_of(f);
+                let common = d.iter().zip(&here).take_while(|(a, b)| a == b).count();
+                if common == d.len() && common == here.len() { usize::MAX - 1 } else { common }
+            };
+            let best = defs.iter().map(|d| near(d.0)).max().unwrap_or(0);
+            defs.retain(|d| near(d.0) == best);
+        }
+        let [(at, d)] = &defs[..] else { return };
+        let (at, d) = (*at, d.clone());
         let body = self.plain(&d.body);
         let params: Vec<String> = d.params.clone().unwrap_or_default();
         let value = match &d.params {
@@ -210,17 +266,18 @@ impl<'a> Values<'a> {
         let Some(value) = value else { return };
         self.local.insert(name.as_bytes().to_vec(), Some(Some(value)));
         for n in names(&body).into_iter().filter(|n| !params.iter().any(|p| p == n)).map(str::to_string).collect::<Vec<_>>() {
-            self.learn(&n);
+            self.learn(&n, at);
         }
     }
 
-    /// The value of an expression, its names as the index has them.
-    pub fn of(&mut self, expr: &str) -> Option<Value> {
+    /// The value of an expression written in file `at`, its names as the
+    /// index has them.
+    pub fn of(&mut self, expr: &str, at: u32) -> Option<Value> {
         let expr = self.plain(expr);
         for n in names(&expr).into_iter().map(str::to_string).collect::<Vec<_>>() {
-            self.learn(&n);
+            self.learn(&n, at);
         }
-        let (number, unsigned) = Conditions::default().number_in(&self.local, expr.as_bytes())?;
+        let (number, unsigned) = self.conditions.number_in(&self.local, expr.as_bytes())?;
         Some(Value { number, unsigned })
     }
 
@@ -230,7 +287,8 @@ impl<'a> Values<'a> {
         if d.params.is_some() || d.body.is_empty() {
             return None;
         }
-        self.of(&d.body)
+        let at = self.g.syms[sym as usize].file;
+        self.of(&d.body, at)
     }
 
     /// The number of enumerator `sym`.
@@ -264,7 +322,7 @@ impl<'a> Values<'a> {
                 continue;
             }
             let value = match v {
-                Some(v) => self.of(v)?.number,
+                Some(v) => self.of(v, s.file)?.number,
                 None => next,
             };
             if n == name {

@@ -325,6 +325,7 @@ impl Server {
     /// the definitions the index has).
     fn hover(&mut self, params: &Value) -> Value {
         // A macro with arguments, written with them here: `BUF_Q(3)`.
+        let here_file = self.at(params).map(|a| a.0);
         let used = self.at(params).and_then(|(file, line, name)| {
             let text = self.line_text(&file, line);
             let b = text.as_bytes();
@@ -354,6 +355,15 @@ impl Server {
         if found.is_empty() {
             return Value::Null;
         }
+        // On a definition: that one.
+        if let Some((file, line, _)) = self.at(params) {
+            let g = &self.session.graph;
+            let here: Vec<u32> = found.iter().copied().filter(|&s| g.syms[s as usize].line == line && g.file_path(g.syms[s as usize].file) == file).collect();
+            if !here.is_empty() {
+                found = here;
+            }
+        }
+        let g = &self.session.graph;
         // Certainly compiled first.
         found.sort_by_key(|&s| (g.syms[s as usize].flags & flag::CONDITIONAL != 0, s));
         found.truncate(6);
@@ -371,7 +381,8 @@ impl Server {
             read_files.insert(p.to_string(), bytes.clone());
             Some(bytes)
         };
-        let mut values = si_core::value::Values::new(g, &mut read);
+        let conditions = self.session.conditions();
+        let mut values = si_core::value::Values::new(g, conditions, &mut read);
         let shown = |n: i64, unsigned: bool| {
             let dec = if unsigned { (n as u64).to_string() } else { n.to_string() };
             if (0..10).contains(&n) { format!("= {dec}") } else { format!("= {dec} (0x{:X})", n as u64) }
@@ -403,7 +414,8 @@ impl Server {
 
 `{}`", shown(v.number, v.unsigned)));
             if let (Some(_), Some(here)) = (&d.params, &used) {
-                if let Some(n) = values.of(here) {
+                let at = here_file.as_deref().and_then(|f| (0..g.files.len() as u32).find(|&i| g.file_path(i) == f)).unwrap_or(sym.file);
+                if let Some(n) = values.of(here, at) {
                     v = format!("
 
 `{here}` `{}`", shown(n.number, n.unsigned));
@@ -441,15 +453,46 @@ impl Server {
         if word.is_empty() || word.as_bytes()[0].is_ascii_digit() {
             return empty;
         }
-        let g = self.g();
+        // The names that start with it, from the listing in name order
+        // (made once): where they begin is found by halving. Few of them:
+        // those that hold it otherwise too, as a search finds them.
+        const MOST: usize = 150;
+        self.make_listing(false);
+        let g = &self.session.graph;
+        let all = self.listing[0].as_deref().unwrap_or(&[]);
+        let lower = word.to_ascii_lowercase();
+        let first = all.partition_point(|&s| g.sym_name(s).to_ascii_lowercase().as_str() < lower.as_str());
+        let mut picked: Vec<u32> = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        let mut complete = true;
+        for &s in &all[first..] {
+            let name = g.sym_name(s);
+            if !name.as_bytes().get(..lower.len()).is_some_and(|b| b.eq_ignore_ascii_case(lower.as_bytes())) {
+                break;
+            }
+            if seen.insert(name) {
+                if picked.len() == MOST {
+                    complete = false;
+                    break;
+                }
+                picked.push(s);
+            }
+        }
+        if complete && picked.len() < MOST / 3 {
+            for (_, s) in si_core::search::search(g, word, MOST) {
+                if picked.len() >= MOST {
+                    break;
+                }
+                if seen.insert(g.sym_name(s)) {
+                    picked.push(s);
+                }
+            }
+            complete = false;
+        }
         let mut items = Vec::new();
-        for (rank, (_, s)) in si_core::search::search(g, word, 300).into_iter().enumerate() {
+        for (rank, &s) in picked.iter().enumerate() {
             let sym = &g.syms[s as usize];
             let name = g.sym_name(s);
-            if !seen.insert(name) {
-                continue;
-            }
             // (LSP's CompletionItemKind.)
             let kind = match sym.kind {
                 kind::FUNCTION => 3,
@@ -463,11 +506,9 @@ impl Server {
                 _ => 6,
             };
             items.push(json!({ "label": name, "kind": kind, "detail": format!("{}:{}", g.file_path(sym.file), sym.line), "sortText": format!("{rank:04}") }));
-            if items.len() >= 100 {
-                break;
-            }
         }
-        json!({ "isIncomplete": true, "items": items })
+        // (All of them: the editor narrows the list itself as more is typed.)
+        json!({ "isIncomplete": !complete, "items": items })
     }
 
     fn definition(&mut self, params: &Value) -> Value {
@@ -952,6 +993,25 @@ impl Server {
         // `order`: "name", or "kind" (functions together, then their
         // prototypes, macros, and so on, each kind by name).
         let by_kind = params["order"].as_str() == Some("kind");
+        self.make_listing(by_kind);
+        let all = self.listing[by_kind as usize].as_ref().unwrap();
+        let offset = (params["offset"].as_u64().unwrap_or(0) as usize).min(all.len());
+        let limit = params["limit"].as_u64().unwrap_or(200).min(2000) as usize;
+        let g = self.g();
+        let q = si_core::graph::Qualifier::new(g);
+        let items: Vec<Value> = all[offset..(offset + limit).min(all.len())]
+            .iter()
+            .map(|&s| {
+                let sym = &g.syms[s as usize];
+                json!({ "name": q.name(g, s), "kind": kind::name(sym.kind), "declaration": sym.flags & flag::DECL != 0, "file": g.file_path(sym.file), "line": sym.line })
+            })
+            .collect();
+        json!({ "total": all.len(), "offset": offset, "items": items })
+    }
+
+    /// Every symbol in name order, without regard to case (`by_kind`: each
+    /// kind by name); made when first asked for.
+    fn make_listing(&mut self, by_kind: bool) {
         if self.listing[by_kind as usize].is_none() {
             let g = self.g();
             let mut all: Vec<u32> = (0..g.syms.len() as u32)
@@ -978,19 +1038,6 @@ impl Server {
             });
             self.listing[by_kind as usize] = Some(all);
         }
-        let all = self.listing[by_kind as usize].as_ref().unwrap();
-        let offset = (params["offset"].as_u64().unwrap_or(0) as usize).min(all.len());
-        let limit = params["limit"].as_u64().unwrap_or(200).min(2000) as usize;
-        let g = self.g();
-        let q = si_core::graph::Qualifier::new(g);
-        let items: Vec<Value> = all[offset..(offset + limit).min(all.len())]
-            .iter()
-            .map(|&s| {
-                let sym = &g.syms[s as usize];
-                json!({ "name": q.name(g, s), "kind": kind::name(sym.kind), "declaration": sym.flags & flag::DECL != 0, "file": g.file_path(sym.file), "line": sym.line })
-            })
-            .collect();
-        json!({ "total": all.len(), "offset": offset, "items": items })
     }
 
     /// `si/place`: where exactly the name of the symbol defined on `line`
