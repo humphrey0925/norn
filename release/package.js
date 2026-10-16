@@ -59,6 +59,9 @@ run("node", [path.join(root, "release", "notices.js"), path.join(ext, "THIRD_PAR
 
 const out = path.resolve(root, outDir, `norn-${version}-${target}.vsix`);
 fs.mkdirSync(path.dirname(out), { recursive: true });
-run("npx", ["vsce", "package", "--target", target, "-o", out], ext);
+// (The README's images and links, as the Marketplace shows it: from the
+// repository, the extension being in its vscode/ folder.)
+const base = "https://github.com/humphrey0925/norn";
+run("npx", ["vsce", "package", "--target", target, "-o", out, "--baseImagesUrl", `${base}/raw/HEAD/vscode`, "--baseContentUrl", `${base}/blob/HEAD/vscode`], ext);
 run("node", [path.join(ext, "out", "test", "package.js"), out]);
 console.log(out);

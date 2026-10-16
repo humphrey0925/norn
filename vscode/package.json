@@ -8,7 +8,8 @@
   "icon": "media/icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/humphrey0925/norn.git"
+    "url": "https://github.com/humphrey0925/norn.git",
+    "directory": "vscode"
   },
   "engines": {
     "vscode": "^1.85.0"
@@ -639,7 +640,7 @@
     "bundle": "esbuild src/extension.ts --bundle --platform=node --target=node18 --format=cjs --external:vscode --main-fields=module,main --minify-whitespace --minify-syntax --outfile=out/extension.js --log-level=warning",
     "vscode:prepublish": "npm run compile",
     "watch": "tsc -watch -p ./",
-    "package": "vsce package -o ../out/norn.vsix",
+    "package": "vsce package -o ../out/norn.vsix --baseImagesUrl https://github.com/humphrey0925/norn/raw/HEAD/vscode --baseContentUrl https://github.com/humphrey0925/norn/blob/HEAD/vscode",
     "test": "npm run compile && node ./out/test/runTest.js",
     "test:package": "npm run compile && npm run package && node ./out/test/package.js && node ./out/test/runTest.js packaged"
   },
