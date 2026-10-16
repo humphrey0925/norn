@@ -1384,6 +1384,9 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     let file = p.ne(&NONE).then(|| readings.paths[p as usize].as_str()).unwrap_or("?");
                     if h == NONE {
                         eprintln!("edgewhy     {file}:{}: read one way by all; read {}, for sure {}", s.line, unit != NONE && p != NONE && readings.reads(unit, p), unit != NONE && p != NONE && readings.reads_surely(unit, p));
+                        let call: Vec<u32> = files[fi].undecided.iter().filter(|b| b.0 <= r.line && r.line <= b.1).map(|b| b.2).collect();
+                        let under = (unit != NONE && p != NONE).then(|| readings.read_under(unit, p)).flatten();
+                        eprintln!("edgewhy     included under branches (lines): {under:?}; the call is under {call:?}");
                     } else {
                         let lines = &readings.files[h as usize].1;
                         let stretch = lines.partition_point(|&l| l < s.line);
