@@ -182,6 +182,8 @@ struct World<'a> {
     /// The steps `SI_COND_WHY` asks about, per file, and what was found.
     why: FxHashMap<u32, FxHashSet<usize>>,
     why_found: std::sync::Mutex<Why>,
+    /// `SI_COND_WHY_UNIT=<path end>`: only the compilations of that file.
+    why_unit: Option<String>,
     /// When `SI_COND_WHY` asks: per file, the line of each step that is
     /// an `#if`, `#elif` or `#else` (0 for the others).
     why_lines: Vec<Vec<u32>>,
@@ -340,6 +342,9 @@ impl Unit<'_> {
     fn note_why(&self, file: u32, i: usize, live: Tri, holds: Tri, maybe: bool, expr: &[u8]) {
         let w = self.w;
         if !w.why.get(&file).is_some_and(|steps| steps.contains(&i)) {
+            return;
+        }
+        if w.why_unit.as_ref().is_some_and(|u| !w.paths[self.root as usize].ends_with(u.as_str())) {
             return;
         }
         let mut why = w.why_found.lock().unwrap();
@@ -858,6 +863,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         },
         why,
         why_found: Default::default(),
+        why_unit: std::env::var("SI_COND_WHY_UNIT").ok().map(|u| u.replace('\\', "/")),
         ids,
         slots: slots as usize,
         once: scripts.iter().map(|s| s.once).collect(),
