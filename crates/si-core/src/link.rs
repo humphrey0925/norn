@@ -1332,6 +1332,27 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                         compiled(c),
                         unit != NONE,
                     );
+                    // How its own compilation reads the macro's file.
+                    let s = &syms[c as usize];
+                    let h = header_of.get(s.file as usize).copied().unwrap_or(NONE);
+                    let p = path_of.get(s.file as usize).copied().unwrap_or(NONE);
+                    let file = p.ne(&NONE).then(|| readings.paths[p as usize].as_str()).unwrap_or("?");
+                    if h == NONE {
+                        eprintln!("edgewhy     {file}:{}: read one way by all; read {}, for sure {}", s.line, unit != NONE && p != NONE && readings.reads(unit, p), unit != NONE && p != NONE && readings.reads_surely(unit, p));
+                    } else {
+                        let lines = &readings.files[h as usize].1;
+                        let stretch = lines.partition_point(|&l| l < s.line);
+                        let way = (unit != NONE).then(|| readings.units[unit as usize].1.binary_search_by_key(&h, |w| w.0).ok()).flatten();
+                        let way = way.map(|i| &readings.ways[h as usize][readings.units[unit as usize].1[i].1 as usize]);
+                        eprintln!(
+                            "edgewhy     {file}:{}: read {} ways, {} directives (around: {:?}), stretch {stretch}, its way {:?}",
+                            s.line,
+                            readings.ways[h as usize].len(),
+                            lines.len(),
+                            &lines[stretch.saturating_sub(2)..(stretch + 2).min(lines.len())],
+                            way.map(|w| (w.len(), w.get(stretch.saturating_sub(2)..(stretch + 2).min(w.len())).map(|x| x.to_vec()))),
+                        );
+                    }
                 }
                 if in_cpp && through {
                     // A method reached through an object is called, not a
