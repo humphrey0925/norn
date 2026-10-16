@@ -183,6 +183,11 @@ pub struct Define {
     /// `start << 16 | branch` (else 0).
     #[serde(default)]
     pub branch: u64,
+    /// Of a macro with parameters, those its body does not use, as bits
+    /// (`#define NRFX_ASSERT(expression)`): what is written there is not
+    /// compiled.
+    #[serde(default)]
+    pub unused: u64,
 }
 
 impl Define {
@@ -204,6 +209,7 @@ impl Define {
             line: 0,
             local: false,
             branch: 0,
+            unused: 0,
             system: false,
             head: Vec::new(),
         }
@@ -539,6 +545,10 @@ pub struct MacroSets {
     /// The files, by path, as `scoped` and `reach` number them; only when
     /// anything is scoped.
     ids: FxHashMap<String, u32>,
+    /// Macros with parameters no definition of which uses: name -> those
+    /// parameters, as bits.
+    #[serde(default)]
+    discards: FxHashMap<Vec<u8>, u64>,
     /// Per file, its rivals: the headers included in another branch of an
     /// `#if` not known that it is included in, and nowhere else (one per
     /// compiler, say: `cmsis_gcc.h`, `cmsis_iccarm.h`). No compilation
@@ -602,6 +612,7 @@ impl MacroSets {
         let mut bodies: FxHashMap<&[u8], (bool, bool, Vec<&[u8]>)> = FxHashMap::default();
         // (name, first word of the body) of each macro with arguments.
         let mut loop_heads: Vec<(&[u8], &[u8])> = Vec::new();
+        let mut discards: FxHashMap<&[u8], u64> = FxHashMap::default();
         for d in defines {
             // `#define inline` and the like: the keyword still matters to us.
             if is_keyword(&d.name) || d.undef || d.include || d.test {
@@ -619,6 +630,8 @@ impl MacroSets {
             if d.local {
                 continue;
             }
+            let unused = if d.function_like { d.unused } else { 0 };
+            *discards.entry(&d.name).or_insert(u64::MAX) &= unused;
             let e = by_name.entry(&d.name).or_default();
             e.0 |= d.function_like;
             e.1.push(d.deps.as_deref());
@@ -697,7 +710,8 @@ impl MacroSets {
                 break;
             }
         }
-        MacroSets { transparent: set, expanding, kept, loops, ..MacroSets::default() }
+        let discards = discards.into_iter().filter(|(_, bits)| *bits != 0).map(|(n, bits)| (n.to_vec(), bits)).collect();
+        MacroSets { transparent: set, expanding, kept, loops, discards, ..MacroSets::default() }
     }
 
     /// The sets of every file's `#define`s (`per_file`, the files being
@@ -906,6 +920,11 @@ impl MacroSets {
 
     pub fn is_empty(&self) -> bool {
         self.transparent.is_empty()
+    }
+
+    /// The parameters of macro `name` no definition of it uses, as bits.
+    pub fn discards(&self, name: &[u8]) -> u64 {
+        self.discards.get(name).copied().unwrap_or(0)
     }
 
     /// Is `name` a transparent macro?
@@ -1157,6 +1176,46 @@ impl<'a> Cur<'a> {
 /// Identifier references in `s[start..end]`, as a macro body or macro
 /// arguments would contain them. Skips pasted and stringified tokens,
 /// keywords and `params`.
+/// Where the commas between arguments are in `args` (not those inside
+/// brackets or literals).
+pub fn top_commas(args: &[u8]) -> Vec<usize> {
+    let (mut out, mut depth, mut i) = (Vec::new(), 0i32, 0);
+    while i < args.len() {
+        match args[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => out.push(i),
+            q @ (b'"' | b'\'') => {
+                i += 1;
+                while i < args.len() && args[i] != q {
+                    i += if args[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The parameters (of the first 64) `body` does not name, as bits.
+fn unused_params(params: &[&[u8]], body: &[u8]) -> u64 {
+    let mut named: FxHashSet<&[u8]> = FxHashSet::default();
+    let mut i = 0;
+    while i < body.len() {
+        if is_ident_start(body[i]) {
+            let s = i;
+            while i < body.len() && is_ident(body[i]) {
+                i += 1;
+            }
+            named.insert(&body[s..i]);
+        } else {
+            i += 1;
+        }
+    }
+    params.iter().take(64).enumerate().filter(|(_, p)| !named.contains(**p)).fold(0, |bits, (k, _)| bits | 1 << k)
+}
+
 fn scan_refs(s: &[u8], start: usize, end: usize, line: u32, params: &[&[u8]], out: &mut Vec<Tok>) {
     let mut c = Cur { s: &s[..end], i: start, line };
     // The previous significant bytes decide whether an identifier is a member
@@ -1663,6 +1722,18 @@ impl<'a> Lexer<'a> {
                 self.out.events.push(Event::Ref(tok));
                 let mut args = Vec::new();
                 scan_refs(s, open + 1, end - 1, line, &[], &mut args);
+                // What is written where no definition uses it is not
+                // compiled: a name there is mentioned, not called.
+                let discards = sets.discards(&s[a..e]);
+                if discards != 0 {
+                    let commas = top_commas(&s[open + 1..end - 1]);
+                    for t in &mut args {
+                        let k = commas.iter().filter(|&&c| open + 1 + c < t.start as usize).count();
+                        if k < 64 && discards & 1 << k != 0 {
+                            t.call = false;
+                        }
+                    }
+                }
                 self.out.events.extend(args.into_iter().map(Event::Ref));
                 blank(&mut self.out.masked, a, end);
                 return;
@@ -2091,6 +2162,7 @@ impl<'a> Lexer<'a> {
                 system: false,
                 head: first_word(&s[body..end]),
                 branch: 0,
+                unused: unused_params(&params, &s[body..end]),
             });
         }
         // A `.c` file's own macros stand in it alone, so they are not in

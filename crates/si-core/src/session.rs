@@ -1100,6 +1100,24 @@ mod tests {
     }
 
     #[test]
+    fn what_is_written_where_a_macro_does_not_use_it_is_not_called() {
+        // nrfx's glue: an assertion compiled out; another kept where some
+        // definition uses its argument.
+        let d = Dir::new("discarded-arguments");
+        d.write("glue.h", "#define NRFX_ASSERT(expression)\n#define IRQ_SET(irq, prio)\n#ifdef DEBUG\n#define CHECK(e) do { if (!(e)) halt(); } while (0)\n#else\n#define CHECK(e) ((void)0)\n#endif\n");
+        d.write("a.c", "#include \"glue.h\"\nint valid (int a) { return a > 0; }\nint irq (void) { return 3; }\nvoid halt (void) {}\nvoid f (int a)\n{\n    NRFX_ASSERT(valid (a));\n    IRQ_SET(irq (), 1);\n    CHECK(valid (a));\n}\n");
+        let (s, _) = Session::open_cached(&d.0, Options::default(), d.0.join("cache-outside-scan"));
+        let g = &s.graph;
+        let called = |name: &str| -> Vec<u32> {
+            let f = g.find(name).iter().copied().find(|&x| g.syms[x as usize].kind == kind::FUNCTION).unwrap();
+            let mut lines: Vec<u32> = crate::callers_through_macros(g, f).iter().filter(|c| g.sym_name(c.caller) == "f").map(|c| c.line).collect();
+            lines.sort();
+            lines
+        };
+        assert_eq!((called("valid"), called("irq")), (vec![9], vec![]));
+    }
+
+    #[test]
     fn a_header_only_a_branch_switched_off_includes_is_read_by_no_compilation() {
         let d = Dir::new("unread-headers");
         d.write("chip.h", "#if SOC == 1\n#include \"a1.h\"\n#elif SOC == 2\n#include \"a2.h\"\n#endif\n");

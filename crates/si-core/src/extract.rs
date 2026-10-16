@@ -344,6 +344,11 @@ struct Walk<'a> {
     next_event: Option<&'a Event>,
     blocks: &'a [(u32, u32, u32)],
     ids: &'a Ids,
+    /// The macro sets, for the parameters macros leave unused.
+    sets: &'a MacroSets,
+    /// The arguments of macros that do not use them (byte ranges): what is
+    /// called there is not.
+    quiet: Vec<(usize, usize)>,
     out: FileFacts,
     names: FxHashMap<&'a [u8], u32>,
     /// Start bytes of identifier nodes already consumed as a def name or call target.
@@ -473,6 +478,8 @@ impl Extractor {
             events,
             blocks: &lexed.blocks,
             ids,
+            sets: transparent,
+            quiet: Vec::new(),
             out,
             names: FxHashMap::default(),
             skip: FxHashSet::default(),
@@ -1468,6 +1475,8 @@ impl<'a> Walk<'a> {
     }
 
     fn push_ref(&mut self, n: Node, kind: u8) {
+        let at = n.start_byte();
+        let kind = if matches!(kind, refkind::CALL | refkind::PCALL | refkind::ICALL) && self.quiet.iter().any(|&(a, e)| a <= at && at < e) { refkind::USE } else { kind };
         let name = self.intern(self.text(n));
         let scope = self.scope.map_or(0, |s| s.def);
         self.out.refs.push(Ref { name, line: n.start_position().row as u32 + 1, scope, kind });
@@ -1884,6 +1893,17 @@ impl<'a> Walk<'a> {
                         self.local_calls.push((self.text(f), f.start_position().row as u32 + 1));
                     } else {
                         self.push_ref(f, refkind::CALL);
+                        // A macro's arguments it does not use: not compiled.
+                        let discards = self.sets.discards(self.text(f));
+                        if discards != 0 {
+                            if let Some(args) = node.child_by_field_id(ids.f_arguments) {
+                                let mut c = args.walk();
+                                let list: Vec<Node<'a>> = args.named_children(&mut c).filter(|a| !a.is_extra()).collect();
+                                for (_, a) in list.into_iter().enumerate().filter(|(i, _)| *i < 64 && discards & 1 << i != 0) {
+                                    self.quiet.push((a.start_byte(), a.end_byte()));
+                                }
+                            }
+                        }
                         // Names handed over: callbacks, if the callee calls them.
                         let callee = self.intern(self.text(f));
                         if let Some(args) = node.child_by_field_id(ids.f_arguments) {
