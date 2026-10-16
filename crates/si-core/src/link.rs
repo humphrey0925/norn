@@ -897,10 +897,14 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         let at: FxHashMap<&str, u32> = list.into_iter().enumerate().map(|(i, p)| (p, i as u32)).collect();
         files.iter().map(|f| at.get(f.path.as_str()).copied().unwrap_or(NONE)).collect()
     };
-    let (unit_of, header_of) = if readings.is_empty() {
-        (Vec::new(), Vec::new())
+    let (unit_of, header_of, path_of) = if readings.is_empty() {
+        (Vec::new(), Vec::new(), Vec::new())
     } else {
-        (numbered(readings.units.iter().map(|u| u.0.as_str()).collect()), numbered(readings.files.iter().map(|f| f.0.as_str()).collect()))
+        (
+            numbered(readings.units.iter().map(|u| u.0.as_str()).collect()),
+            numbered(readings.files.iter().map(|f| f.0.as_str()).collect()),
+            numbered(readings.paths.iter().map(|p| p.as_str()).collect()),
+        )
     };
 
     // 3. Resolve references. Each file is independent given the symbol table.
@@ -935,6 +939,8 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 }
             }
             let (mut pick, mut lineage, mut overrides, mut descendants) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            // In a header: the compilations that read it (worked out when first needed).
+            let readers: std::cell::OnceCell<Vec<u32>> = std::cell::OnceCell::new();
             let constructs: FxHashSet<u32> = f.cxx().constructs.iter().copied().collect();
             let operands: FxHashMap<u32, (u32, u32, bool)> = f.cxx().operators.iter().map(|&(r, l, rr, binary)| (r, (l, rr, binary))).collect();
             for (ri, r) in f.refs.iter().enumerate() {
@@ -1233,15 +1239,25 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 }
                 // In a source file: what its own compilation compiles of a
                 // header read one way here and another elsewhere.
+                // In a header: what every compilation that reads it compiles.
                 let unit = unit_of.get(fi).copied().unwrap_or(NONE);
                 let compiled = |c: u32| {
+                    use crate::cond::Tri;
                     let s = &syms[c as usize];
-                    match header_of.get(s.file as usize) {
-                        Some(&h) if unit != NONE && h != NONE => readings.compiled(unit, h, s.line),
-                        _ => crate::cond::Tri::Unknown,
+                    let h = header_of.get(s.file as usize).copied().unwrap_or(NONE);
+                    if h == NONE {
+                        return Tri::Unknown;
                     }
+                    if unit != NONE {
+                        return readings.compiled(unit, h, s.line);
+                    }
+                    let at = path_of.get(fi).copied().unwrap_or(NONE);
+                    let readers = readers.get_or_init(|| if at == NONE { Vec::new() } else { (0..readings.units.len() as u32).filter(|&u| readings.reads(u, at)).collect() });
+                    let mut all = readers.iter().map(|&u| readings.compiled(u, h, s.line));
+                    let first = all.next().unwrap_or(Tri::Unknown);
+                    if all.all(|t| t == first) { first } else { Tri::Unknown }
                 };
-                if unit != NONE && tmp.iter().any(|&c| compiled(c) == crate::cond::Tri::False) && tmp.iter().any(|&c| compiled(c) != crate::cond::Tri::False) {
+                if !header_of.is_empty() && tmp.iter().any(|&c| compiled(c) == crate::cond::Tri::False) && tmp.iter().any(|&c| compiled(c) != crate::cond::Tri::False) {
                     tmp.retain(|&c| compiled(c) != crate::cond::Tri::False);
                 }
                 // Without types, a member name shared by many structs says

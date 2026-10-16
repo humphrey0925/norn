@@ -49,11 +49,21 @@ pub struct Readings {
     /// Per compilation (the path of the file it starts from), the way it
     /// reads each of those headers it reads: (header, way).
     pub units: Vec<(String, Vec<(u32, u32)>)>,
+    /// Every file, by path, and per compilation (as `units`) the files it
+    /// reads, as bits in that order: what a call in a header reaches is
+    /// what the compilations that read the header compile.
+    pub paths: Vec<String>,
+    pub reads: Vec<Box<[u64]>>,
 }
 
 impl Readings {
     pub fn is_empty(&self) -> bool {
-        self.units.is_empty()
+        self.files.is_empty()
+    }
+
+    /// Whether compilation `unit` reads the file `path` (numbered as in `paths`).
+    pub fn reads(&self, unit: u32, path: u32) -> bool {
+        self.reads.get(unit as usize).and_then(|b| b.get(path as usize / 64)).is_some_and(|w| w & (1 << (path % 64)) != 0)
     }
 
     /// Whether the compilation `unit` compiles `line` of `file` (both
@@ -153,6 +163,10 @@ struct Why {
     names: std::collections::BTreeMap<String, [u64; 5]>,
     /// Per name, the definitions read: (file, value) -> how often.
     defined: std::collections::BTreeMap<String, std::collections::BTreeMap<(String, String), u64>>,
+    /// Per name, why it was not known: what made it so -> how often.
+    unknown: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
+    /// The compilations (their first file) that left it open.
+    open_in: Vec<String>,
 }
 
 struct World<'a> {
@@ -243,6 +257,14 @@ struct Unit<'a> {
     /// While a file that may not be read is read: each name it changes,
     /// with how the name was before (see `Step::Include`).
     journal: Option<Vec<(u32, Box<[u8]>, Option<Option<Option<Vec<u8>>>>, u64)>>,
+    /// The file the compilation starts from.
+    root: u32,
+    /// The files it reads, when that is kept (see [`Readings::reads`]).
+    files: Option<FxHashSet<u32>>,
+    /// For `SI_COND_WHY`: per name not known, the file that made it so,
+    /// and how (1: a definition on a line that may not be compiled; 2:
+    /// a file that may not be read changed it).
+    unknown_why: FxHashMap<u32, (u32, u8)>,
 }
 
 impl Unit<'_> {
@@ -312,6 +334,9 @@ impl Unit<'_> {
         if live == Tri::False || holds != Tri::Unknown {
             return;
         }
+        if why.open_in.len() < 8 {
+            why.open_in.push(w.paths[self.root as usize].clone());
+        }
         // The names it names, and those their values name, as they are here.
         let mut names: Vec<Vec<u8>> = Vec::new();
         names_in(expr, |n| names.push(n.to_vec()));
@@ -338,7 +363,14 @@ impl Unit<'_> {
                     0
                 }
                 Some(Some(None)) => 1,
-                Some(None) => 2,
+                Some(None) => {
+                    let how = w.ids.get(&n[..]).and_then(|id| self.unknown_why.get(id)).map_or("?".to_string(), |&(f, how)| {
+                        let path = &w.paths[f as usize];
+                        if how == 1 { format!("a #define in {path} on a line that may not be compiled") } else { format!("changed by {path}, which may not be read there") }
+                    });
+                    *why.unknown.entry(name.clone()).or_default().entry(how).or_default() += 1;
+                    2
+                }
                 None if self.conditions().settles(&n) => 4,
                 None => 3,
             };
@@ -365,6 +397,9 @@ impl Unit<'_> {
         if depth > DEEPEST || self.spent > MOST_IN_ONE || w.stop.load(Relaxed) {
             self.spent = u64::MAX / 2;
             return;
+        }
+        if let Some(files) = &mut self.files {
+            files.insert(file);
         }
         // (A file that includes itself without end is read no deeper.)
         let times = self.reading.entry(file).or_default();
@@ -450,6 +485,9 @@ impl Unit<'_> {
                         self.set(*id, name, Some(Some(value.to_vec())), defined_at(file, i));
                     } else if self.local.get(&name[..]).is_none_or(|v| v.as_ref().and_then(|v| v.as_deref()) != Some(&value[..])) {
                         self.set(*id, name, None, 1);
+                        if !w.why.is_empty() {
+                            self.unknown_why.insert(*id, (file, 1));
+                        }
                     }
                     if let (Some(p), Some(t)) = (&mut self.prof, t) {
                         p[3] += t.elapsed().as_nanos() as u64;
@@ -460,6 +498,9 @@ impl Unit<'_> {
                         self.set(*id, name, Some(None), 2);
                     } else if self.local.get(&name[..]) != Some(&Some(None)) {
                         self.set(*id, name, None, 1);
+                        if !w.why.is_empty() {
+                            self.unknown_why.insert(*id, (file, 1));
+                        }
                     }
                 }
                 Step::Unseen => self.unseen = true,
@@ -474,7 +515,7 @@ impl Unit<'_> {
                     // known. (Each of several files an include may mean is
                     // read from how things are here.)
                     let unsure = maybe && self.journal.is_none();
-                    let mut changed: Vec<(u32, Box<[u8]>)> = Vec::new();
+                    let mut changed: Vec<(u32, Box<[u8]>, u32)> = Vec::new();
                     for &f in files.iter() {
                         if w.once[f as usize] {
                             match self.read.get(&f) {
@@ -492,7 +533,7 @@ impl Unit<'_> {
                             let mut named: FxHashSet<&[u8]> = FxHashSet::default();
                             for (id, name, was, _) in &journal {
                                 if named.insert(&name[..]) && was.as_ref() != self.local.get(&name[..]) {
-                                    changed.push((*id, name.clone()));
+                                    changed.push((*id, name.clone(), f));
                                 }
                             }
                             for (id, name, was, state) in journal.into_iter().rev() {
@@ -504,9 +545,12 @@ impl Unit<'_> {
                             }
                         }
                     }
-                    for (id, name) in changed {
+                    for (id, name, f) in changed {
                         if self.local.get(&name[..]) != Some(&None) {
                             self.set(id, &name, None, 1);
+                            if !w.why.is_empty() {
+                                self.unknown_why.insert(id, (f, 2));
+                            }
                         }
                     }
                 }
@@ -716,7 +760,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
     };
     // (Compilation, the ways it reads the traced files it reads.)
     let ways: std::sync::Mutex<Ways> = Default::default();
-    let read_as: std::sync::Mutex<Vec<(u32, Vec<(u32, u32)>)>> = Default::default();
+    let read_as: std::sync::Mutex<Vec<(u32, Vec<(u32, u32)>, Vec<u32>)>> = Default::default();
     // Returns the names defined outright (on the first pass), and the
     // compilations that were too much to read.
     let profile = std::env::var_os("SI_COND_PROFILE").is_some();
@@ -746,6 +790,9 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
                     prof: profile.then_some([0; 5]),
                     traces: FxHashMap::default(),
                     journal: None,
+                    root,
+                    files: w.traced.iter().any(|t| *t).then(FxHashSet::default),
+                    unknown_why: FxHashMap::default(),
                 };
                 unit.read.insert(root, true);
                 unit.read(root, false, 0);
@@ -759,13 +806,13 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
                     all.1.push(root);
                 } else {
                     all.0.extend(unit.outright.into_iter().flatten());
-                    if !unit.traces.is_empty() {
+                    if let Some(files) = unit.files {
                         let mut read: Vec<(u32, Vec<u8>)> = unit.traces.into_iter().collect();
                         read.sort_unstable_by_key(|r| r.0);
                         let mut ways = ways.lock().unwrap();
                         let read = read.into_iter().map(|(f, t)| (f, ways.number(f, t))).collect();
                         drop(ways);
-                        read_as.lock().unwrap().push((root, read));
+                        read_as.lock().unwrap().push((root, read, files.into_iter().collect()));
                     }
                 }
                 all
@@ -872,6 +919,12 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
             for ((from, value), k) in why.defined.get(name).into_iter().flatten().take(4) {
                 eprintln!("why         {k}x {from} = {value}");
             }
+            for (how, k) in why.unknown.get(name).into_iter().flatten().take(4) {
+                eprintln!("why         {k}x not known: {how}");
+            }
+        }
+        if !why.open_in.is_empty() {
+            eprintln!("why       left open in: {}", why.open_in.join(", "));
         }
     }
     let mut readings = Readings::default();
@@ -886,12 +939,18 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
     }
     let mut read_as = read_as.into_inner().unwrap();
     read_as.sort_unstable_by_key(|r| r.0);
-    for (root, read) in read_as {
-        let fits = |&&(f, _): &&(u32, u32)| split[f as usize] && ways.by_file[&f].len() > 0;
-        let read: Vec<(u32, u32)> = read.iter().filter(fits).map(|&(f, way)| (number[f as usize], way)).collect();
-        if !read.is_empty() && !unread[root as usize] {
-            readings.units.push((paths[root as usize].clone(), read));
+    for (root, read, files) in read_as.into_iter().filter(|_| !readings.files.is_empty()) {
+        if unread[root as usize] {
+            continue;
         }
+        let read: Vec<(u32, u32)> = read.iter().filter(|r| split[r.0 as usize]).map(|&(f, way)| (number[f as usize], way)).collect();
+        readings.units.push((paths[root as usize].clone(), read));
+        let mut bits = vec![0u64; n.div_ceil(64)];
+        files.iter().for_each(|&f| bits[f as usize / 64] |= 1 << (f % 64));
+        readings.reads.push(bits.into());
+    }
+    if !readings.files.is_empty() {
+        readings.paths = paths.to_vec();
     }
     // (A way that does not fit the lines is no reading: see `Readings::compiled`.)
     for (f, ways) in readings.ways.iter_mut().enumerate() {
