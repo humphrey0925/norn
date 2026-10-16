@@ -1100,6 +1100,22 @@ mod tests {
     }
 
     #[test]
+    fn a_header_only_a_branch_switched_off_includes_is_read_by_no_compilation() {
+        let d = Dir::new("unread-headers");
+        d.write("chip.h", "#if SOC == 1\n#include \"a1.h\"\n#elif SOC == 2\n#include \"a2.h\"\n#endif\n");
+        d.write("a1.h", "int f1 (void);\n");
+        d.write("a2.h", "int f2 (void);\n#include \"a2_more.h\"\n");
+        d.write("a2_more.h", "int f2_more (void);\n");
+        // Nothing includes it: somebody's, out of sight; read.
+        d.write("lone.h", "int lone (void);\n");
+        d.write("a.c", "#define SOC 1\n#include \"chip.h\"\n");
+        let (s, _) = Session::open_cached(&d.0, Options::default(), d.0.join("cache-outside-scan"));
+        let mut unread = crate::readings_of(&s.conditions).unread.clone();
+        unread.sort();
+        assert_eq!(unread, ["a2.h", "a2_more.h"]);
+    }
+
+    #[test]
     fn a_header_of_one_branch_does_not_see_the_macros_of_another_s() {
         // CMSIS: one header per compiler, chosen by an `#if` not known;
         // IAR's `#define __QSUB8 __iar_builtin_QSUB8` is not GCC's.

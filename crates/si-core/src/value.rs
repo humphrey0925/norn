@@ -153,12 +153,22 @@ pub struct Values<'a> {
     seen: FxHashSet<String>,
     /// Names known to name a type, or not.
     types: FxHashMap<String, bool>,
+    /// Per file, whether no compilation reads it: its definitions only
+    /// where there are no others.
+    unread: Vec<bool>,
     enums: FxHashMap<u32, Option<i64>>,
 }
 
 impl<'a> Values<'a> {
     pub fn new(g: &'a Graph, conditions: &'a Conditions, source: &'a mut dyn FnMut(&str) -> Option<std::sync::Arc<Vec<u8>>>) -> Values<'a> {
-        Values { g, conditions, source, local: Local::default(), seen: FxHashSet::default(), types: FxHashMap::default(), enums: FxHashMap::default() }
+        Values { g, conditions, source, local: Local::default(), seen: FxHashSet::default(), types: FxHashMap::default(), unread: Vec::new(), enums: FxHashMap::default() }
+    }
+
+    /// The same, the files no compilation reads (by path) read last.
+    pub fn without(mut self, unread: &[String]) -> Values<'a> {
+        let set: FxHashSet<&str> = unread.iter().map(String::as_str).collect();
+        self.unread = (0..self.g.files.len() as u32).map(|f| set.contains(self.g.file_path(f))).collect();
+        self
     }
 
     /// The `#define` of macro `sym`.
@@ -231,6 +241,8 @@ impl<'a> Values<'a> {
         }
         // One definition, or several written alike; those certainly
         // compiled first.
+        let read = |s: &u32| !self.unread.get(g.syms[*s as usize].file as usize).copied().unwrap_or(false);
+        let macros: Vec<u32> = if macros.iter().any(read) { macros.into_iter().filter(read).collect() } else { macros };
         let sure: Vec<u32> = macros.iter().copied().filter(|&s| g.syms[s as usize].flags & flag::CONDITIONAL == 0).collect();
         let pick = if sure.is_empty() { macros } else { sure };
         let mut defs: Vec<(u32, Define)> = pick.iter().filter_map(|&s| Some((g.syms[s as usize].file, self.define(s)?))).collect();

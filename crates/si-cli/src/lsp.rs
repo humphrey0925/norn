@@ -160,6 +160,10 @@ struct Server {
     /// Every symbol worth listing, by name without regard to case; made
     /// when first asked for and dropped when the index changes.
     listing: [Option<Vec<u32>>; 2],
+    /// Per file of the index, whether no compilation reads it under these
+    /// conditions (a header only `#if`s they switch off include): what is
+    /// in it is not listed, searched or related; made when first asked for.
+    hidden: Option<std::rc::Rc<Vec<bool>>>,
     /// The index is still being read or made: the session answers with
     /// what was saved (or nothing), and what would change it waits.
     loading: bool,
@@ -241,12 +245,36 @@ impl Server {
         self.location(&file, line, &name)
     }
 
-    /// What the name under the cursor refers to; definitions first.
+    /// Per file of the index, whether no compilation reads it.
+    fn hidden(&mut self) -> std::rc::Rc<Vec<bool>> {
+        if let Some(h) = &self.hidden {
+            return h.clone();
+        }
+        let readings = si_core::readings_of(self.session.conditions());
+        let unread: std::collections::HashSet<&str> = readings.unread.iter().map(String::as_str).collect();
+        let g = &self.session.graph;
+        let h = std::rc::Rc::new((0..g.files.len() as u32).map(|f| unread.contains(g.file_path(f))).collect::<Vec<bool>>());
+        self.hidden = Some(h.clone());
+        h
+    }
+
+    /// Whether symbol `sym` is in a file some compilation reads.
+    fn shown(&mut self, sym: u32) -> bool {
+        let file = self.session.graph.syms[sym as usize].file as usize;
+        !self.hidden().get(file).copied().unwrap_or(false)
+    }
+
+    /// What the name under the cursor refers to; definitions first, and
+    /// those in a file no compilation reads only if there is nothing else.
     fn targets(&mut self, params: &Value) -> Vec<u32> {
         let Some((file, line, name)) = self.at(params) else { return Vec::new() };
+        let hidden = self.hidden();
         let g = self.g();
         let mut found = si_core::definition_at(g, &file, line, &name);
         found.sort_by_key(|&s| (g.syms[s as usize].flags & flag::DECL != 0, s));
+        if found.iter().any(|&s| !hidden[g.syms[s as usize].file as usize]) {
+            found.retain(|&s| !hidden[g.syms[s as usize].file as usize]);
+        }
         found
     }
 
@@ -382,7 +410,8 @@ impl Server {
             Some(bytes)
         };
         let conditions = self.session.conditions();
-        let mut values = si_core::value::Values::new(g, conditions, &mut read);
+        let readings = si_core::readings_of(conditions);
+        let mut values = si_core::value::Values::new(g, conditions, &mut read).without(&readings.unread);
         let shown = |n: i64, unsigned: bool| {
             let dec = if unsigned { (n as u64).to_string() } else { n.to_string() };
             if (0..10).contains(&n) { format!("= {dec}") } else { format!("= {dec} (0x{:X})", n as u64) }
@@ -479,7 +508,9 @@ impl Server {
             }
         }
         if complete && picked.len() < MOST / 3 {
-            for (_, s) in si_core::search::search(g, word, MOST) {
+            let hidden = self.hidden.clone().unwrap_or_default();
+            let g = &self.session.graph;
+            for (_, s) in si_core::search::search(g, word, MOST).into_iter().filter(|h| !hidden.get(g.syms[h.1 as usize].file as usize).copied().unwrap_or(false)) {
                 if picked.len() >= MOST {
                     break;
                 }
@@ -676,7 +707,7 @@ impl Server {
     fn workspace_symbols(&mut self, params: &Value) -> Value {
         let query = params["query"].as_str().unwrap_or("");
         // Fragments in any order, initials, letters in order.
-        let syms: Vec<u32> = si_core::search::search(self.g(), query, 200).into_iter().map(|h| h.1).collect();
+        let syms: Vec<u32> = si_core::search::search(self.g(), query, 400).into_iter().map(|h| h.1).filter(|&s| self.shown(s)).take(200).collect();
         json!(syms.into_iter().map(|s| self.symbol_info(s)).collect::<Vec<_>>())
     }
 
@@ -713,8 +744,11 @@ impl Server {
     /// calls are on in the calling function's file.
     fn calls(&mut self, params: &Value, incoming: bool) -> Value {
         let Some(sym) = self.item_symbol(&params["item"]) else { return json!([]) };
+        let hidden = self.hidden();
         let g = self.g();
         let edges = if incoming { si_core::callers_through_macros(g, sym) } else { si_core::callees_through_slots(g, sym) };
+        let away = |s: u32| hidden[g.syms[s as usize].file as usize];
+        let edges: Vec<_> = edges.into_iter().filter(|c| !away(c.caller) && !c.via.is_some_and(away)).collect();
         // other end -> lines of the calls
         let mut by_other: Vec<(u32, Vec<u32>)> = Vec::new();
         for c in edges {
@@ -745,7 +779,8 @@ impl Server {
     /// (an editor filters `workspace/symbol` results again by its own rules).
     fn search(&mut self, params: &Value) -> Value {
         let limit = params["limit"].as_u64().unwrap_or(100) as usize;
-        let hits = si_core::search::search(self.g(), params["query"].as_str().unwrap_or(""), limit);
+        let hits = si_core::search::search(self.g(), params["query"].as_str().unwrap_or(""), limit * 2);
+        let hits: Vec<(i32, u32)> = hits.into_iter().filter(|h| self.shown(h.1)).take(limit).collect();
         json!(hits.into_iter().map(|(score, s)| { let mut v = self.entry(s); v["score"] = json!(score); v }).collect::<Vec<_>>())
     }
 
@@ -864,6 +899,11 @@ impl Server {
             (false, _) => si_core::stored_in(g, root),
         };
         let callable_root = matches!(root_kind, kind::FUNCTION | kind::MACRO);
+        // (Nor what is in a file no compilation reads, or comes through one.)
+        let hidden = self.hidden();
+        let g = self.g();
+        let away = |s: u32| hidden[g.syms[s as usize].file as usize];
+        let edges: Vec<_> = edges.into_iter().filter(|c| !away(c.caller) && !c.via.is_some_and(away) && !c.slot.is_some_and(away)).collect();
         // (other end, macro, member or variable, pointer) -> (lines, certain)
         let mut groups: Vec<((u32, Option<u32>, Option<u32>, bool), Vec<u32>, bool)> = Vec::new();
         for c in edges {
@@ -966,6 +1006,7 @@ impl Server {
         trace(|| format!("  synced: {} added, {} removed, {} changed, {} parsed, {:.0} ms", up.added, up.removed, up.changed, up.extracted, up.extract_ms + up.link_ms));
         self.lines.clear();
         self.listing = [None, None];
+        self.hidden = None;
         let mut v = self.scope();
         v["files"] = json!(self.session.files());
         v["symbols"] = json!(self.g().syms.len());
@@ -983,6 +1024,7 @@ impl Server {
             trace(|| format!("  updated {} files: {} parsed, {:.0} ms", paths.len(), up.extracted, up.extract_ms + up.link_ms));
             self.lines.clear();
             self.listing = [None, None];
+        self.hidden = None;
         }
     }
 
@@ -1013,9 +1055,10 @@ impl Server {
     /// kind by name); made when first asked for.
     fn make_listing(&mut self, by_kind: bool) {
         if self.listing[by_kind as usize].is_none() {
+            let hidden = self.hidden();
             let g = self.g();
             let mut all: Vec<u32> = (0..g.syms.len() as u32)
-                .filter(|&s| g.syms[s as usize].kind != kind::FILE)
+                .filter(|&s| g.syms[s as usize].kind != kind::FILE && !hidden[g.syms[s as usize].file as usize])
                 .collect();
             let rank = |k: u8, flags: u8| match (k, flags & flag::DECL != 0) {
                 (kind::FUNCTION, false) => 0,
@@ -1247,7 +1290,7 @@ pub fn run(
             std::thread::spawn(move || {
                 let _ = events.send(Event::Opened(Box::new(open(&at, have))));
             });
-            *server = Some(Server { session, opened: (0, 0), root: dir, open: HashMap::new(), lines: HashMap::new(), listing: [None, None], loading: true, waiting: Vec::new() });
+            *server = Some(Server { session, opened: (0, 0), root: dir, open: HashMap::new(), lines: HashMap::new(), listing: [None, None], hidden: None, loading: true, waiting: Vec::new() });
             let capabilities = json!({
                 "textDocumentSync": { "openClose": true, "change": 1, "save": true },
                 "definitionProvider": true, "declarationProvider": true, "typeDefinitionProvider": true, "implementationProvider": true, "referencesProvider": true,

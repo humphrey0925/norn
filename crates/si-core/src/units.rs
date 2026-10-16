@@ -56,6 +56,10 @@ pub struct Readings {
     pub reads: Vec<Box<[u64]>>,
     /// Per compilation, of the files it reads, those it may not read.
     pub maybe: Vec<Box<[u32]>>,
+    /// The files no compilation reads (where it may not, either): headers
+    /// included only under `#if`s these conditions switch off, by path.
+    #[serde(default)]
+    pub unread: Vec<String>,
     /// For each of those (in that order), when it is read only under the
     /// compilation's own file's `#if`s not known: for each way it is
     /// included, the lines of the branches it is included in there.
@@ -221,6 +225,8 @@ struct World<'a> {
     unseen: Conditions,
     /// Per file and step, how its condition came out: 1 held, 2 failed, 4 open.
     seen: Vec<Vec<AtomicU8>>,
+    /// Per file, whether some compilation reads it (where it may not, too).
+    reached: Vec<AtomicBool>,
     /// The files whose reading each compilation keeps (see [`Readings`]).
     traced: Vec<bool>,
     spent: AtomicU64,
@@ -474,6 +480,9 @@ impl Unit<'_> {
         if depth > DEEPEST || self.spent > MOST_IN_ONE || w.stop.load(Relaxed) {
             self.spent = u64::MAX / 2;
             return;
+        }
+        if !w.reached[file as usize].load(Relaxed) {
+            w.reached[file as usize].store(true, Relaxed);
         }
         if let Some(files) = &mut self.files {
             *files.entry(file).or_default() |= !maybe;
@@ -938,6 +947,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         told: conditions.clone(),
         unseen: conditions.clone(),
         seen: seen(),
+        reached: (0..n).map(|_| AtomicBool::new(false)).collect(),
         traced: vec![false; n],
         steps,
         spent: AtomicU64::new(0),
@@ -1142,6 +1152,8 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         }
     }
     let mut readings = Readings::default();
+    // (What a compilation left unread reaches may be read.)
+    readings.unread = (0..n).filter(|&f| !w.reached[f].load(Relaxed) && !unread[f]).map(|f| paths[f].clone()).collect();
     let mut number = vec![u32::MAX; n];
     let ways = ways.into_inner().unwrap();
     for f in (0..n).filter(|&f| split[f]) {
