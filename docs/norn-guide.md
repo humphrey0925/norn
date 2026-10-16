@@ -341,6 +341,26 @@ include 路徑包含建置設定裡寫的路徑，以及所有含有標頭檔的
   - 和 C/C++ 擴充套件一起使用時，定義和展開由 IntelliSense 顯示，Norn 只補上一行值。
 - **自動完成**：輸入名稱時，Norn 會從索引裡找出符合的函式、巨集、型別、變數，和 C/C++ 擴充套件的建議一起列出。不需要先編譯，也不需要設定 include 路徑。
 
+### 不用 IntelliSense 時
+
+沒有安裝 C/C++ 擴充套件，或在它的設定把 IntelliSense 關掉（`C_Cpp.intelliSenseEngine` 設為 `disabled`，改完重新載入視窗）時，平常由 IntelliSense 提供的編輯功能改由 Norn 提供，同樣不需要先編譯：
+
+| 功能 | 說明 |
+|---|---|
+| 懸停 | 函式、變數、型別顯示宣告原文和上方的文件註解（定義沒有註解時用標頭檔原型的）；參數和區域變數顯示宣告 |
+| 參數提示 | 打 `(`、`,` 時顯示函式宣告，標出目前的參數 |
+| 自動完成 | `.`、`->` 之後列出成員；目前函式的參數和區域變數；C 關鍵字；`#include` 的路徑 |
+| 上色 | 依名稱的種類：巨集、函式、型別、全域變數、參數、區域變數、成員、列舉值 |
+| 摺疊 | 大括號區塊、`#if` 各分支、多行註解、連續的 `#include` |
+| 重新命名（`F2`） | 改掉同一個東西的所有寫法；static 函式和變數只改自己的檔案；巨集和全域名稱連目前設定關掉的 `#if` 分支裡的寫法也一起改 |
+| 參數名稱 | 呼叫時在引數前顯示參數名稱；不想看可關掉 `editor.inlayHints.enabled` |
+| 未編譯的行變暗 | 見 `norn.dimInactive` |
+| 格式化 | 有安裝 clang-format（例如 LLVM）時使用；專案有 `.clang-format` 照它，沒有則用 Visual Studio 樣式 |
+
+另外不論有沒有 IntelliSense 都有：`#include` 可以點開、F12 開啟對應的檔案；游標所在名稱在檔案裡的其他用處會反白；用到的名字沒有任何讀到的標頭檔宣告時，燈泡會提供「Add #include」。
+
+Norn 不提供編譯錯誤的紅色波浪線：那要由編譯器產生。
+
 ## 12. 保持索引最新
 
 | 情況 | Norn 的處理 |
@@ -365,6 +385,7 @@ include 路徑包含建置設定裡寫的路徑，以及所有含有標頭檔的
 | `norn.codeLens.enabled` | 開 | 在每個函式上方顯示呼叫者與被呼叫者數量 |
 | `norn.fileSymbols.showLocals` | 開 | 在 File Symbols 的函式底下列出參數與區域變數 |
 | `norn.conditions.updateCppProperties` | 關 | 在 `c_cpp_properties.json` 維護一組「Norn」設定（見第 11 節的說明） |
+| `norn.dimInactive` | auto | 目前設定不編譯的行變暗。auto：C/C++ 擴充套件不做時才做；always；never |
 | `norn.includeAliases` | 空白 | 建置時由範本產生的標頭檔對應，格式 `產生的檔名=範本檔名`，例如 `bfd.h=bfd-in2.h` |
 
 ## 14. 指令一覽
@@ -384,8 +405,9 @@ include 路徑包含建置設定裡寫的路徑，以及所有含有標頭檔的
 | Norn: Switch Compile Configuration… | 切換編譯條件的設定組 |
 | Norn: Open the Scope File | 開啟 `.norn/config.json` |
 | Norn: Reset View Layout | 把所有 Norn 檢視放回預設位置 |
+| Norn: Switch Header/Source | 切換同名的標頭檔與原始檔；沒有 C/C++ 擴充套件時快速鍵為 `Alt+O` |
 
-Norn 沒有預設快速鍵。需要的話在「鍵盤快速鍵」（`Ctrl+K Ctrl+S`）搜尋 `Norn` 自行指定。
+其他指令沒有預設快速鍵。需要的話在「鍵盤快速鍵」（`Ctrl+K Ctrl+S`）搜尋 `Norn` 自行指定。
 
 Norn 同時也是標準的語言伺服器，所以 VS Code 內建的操作一樣有效：`F12` 移至定義、`Shift+F12` 尋找所有參考、`Ctrl+T` 依名稱找符號、`Ctrl+Shift+O` 檔案內符號、呼叫階層。
 
