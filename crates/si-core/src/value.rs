@@ -1,6 +1,6 @@
 //! What a macro or an enumerator stands for, worked out from the sources
-//! the way an `#if` is: `#define BUF_BASE (0x1000)`, `#define BUF_Q (BUF_BASE
-//! + 4 * 2)` is 0x1008. The macros a body names are read where the index
+//! the way an `#if` is: `#define BUF_BASE (0x1000)`,
+//! `#define BUF_Q (BUF_BASE + 4 * 2)` is 0x1008. The macros a body names are read where the index
 //! has them: what the settings and the build define first, then, of
 //! several definitions, the one nearest the macro that names it (in its
 //! file, else its directory, else the nearest directory); several no one
@@ -584,8 +584,7 @@ impl Folder<'_, '_, '_> {
 
     fn binary(&mut self, min: u8) -> Option<Node> {
         let mut left = self.unary()?;
-        loop {
-            let Some(Tok::Punct(op)) = self.peek() else { break };
+        while let Some(Tok::Punct(op)) = self.peek() {
             let op: &'static str = op;
             let Some(rank) = binary_rank(op).filter(|&r| r >= min) else { break };
             self.at += 1;
@@ -787,9 +786,7 @@ fn rank_of(node: &Node) -> u8 {
 }
 
 fn show_number(v: i64, u: bool) -> String {
-    if (0..256).contains(&v) {
-        v.to_string()
-    } else if v < 0 && !u {
+    if (0..256).contains(&v) || v < 0 && !u {
         v.to_string()
     } else {
         format!("0x{:X}", v as u64)

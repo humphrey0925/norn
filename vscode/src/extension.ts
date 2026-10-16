@@ -1437,10 +1437,14 @@ function bundledServer(): string | undefined {
   return fs.existsSync(exe) ? exe : undefined;
 }
 
-/** Where that server is, or would be. (Windows on Arm runs the x64 one.) */
+/** Where that server is, or would be: the one for this kind of machine
+ *  (`bin/linux-arm64/norn`, as VS Code names platforms). Windows on Arm and
+ *  a Mac on Arm run the x64 one where theirs is not in the package. */
 function bundledPath(): string {
-  const machine = process.platform === "win32" ? "win32-x64" : `${process.platform}-${process.arch}`;
-  return path.join(home.fsPath, "bin", machine, process.platform === "win32" ? "norn.exe" : "norn");
+  const exe = process.platform === "win32" ? "norn.exe" : "norn";
+  const own = path.join(home.fsPath, "bin", `${process.platform}-${process.arch}`, exe);
+  const x64 = path.join(home.fsPath, "bin", `${process.platform}-x64`, exe);
+  return process.arch === "arm64" && (process.platform === "win32" || process.platform === "darwin") && !fs.existsSync(own) && fs.existsSync(x64) ? x64 : own;
 }
 
 /** This extension's version, for messages that may be read back to us. */

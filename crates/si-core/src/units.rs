@@ -25,6 +25,7 @@
 
 use crate::cond::{Conditions, Local, Tri};
 use crate::mask::{Op, Script};
+use std::ops::Not;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::Relaxed};
@@ -579,14 +580,18 @@ impl Unit<'_> {
                     group.1 = group.0.not().and(own);
                     group.0 = group.0.or(own);
                     live = outer.and(group.1);
-                    branch.last_mut().map(|b| *b = i);
+                    if let Some(b) = branch.last_mut() {
+                        *b = i;
+                    }
                 }
                 Step::Else => {
                     let Some(group) = open.last_mut() else { continue };
                     group.1 = group.0.not();
                     group.0 = Tri::True;
                     live = group.2.and(group.1);
-                    branch.last_mut().map(|b| *b = i);
+                    if let Some(b) = branch.last_mut() {
+                        *b = i;
+                    }
                 }
                 Step::Endif => {
                     if let Some(group) = open.pop() {
@@ -1131,7 +1136,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
     // one each compilation's reading of is kept (knowing the names
     // defined outright decides more, never otherwise).
     let undecided = |w: &World, f: usize| {
-        w.steps[f].iter().zip(&w.seen[f]).any(|(step, seen)| matches!(step, Step::If { .. } | Step::Elif { .. }) && !matches!(seen.load(Relaxed), 0 | 1 | 2))
+        w.steps[f].iter().zip(&w.seen[f]).any(|(step, seen)| matches!(step, Step::If { .. } | Step::Elif { .. }) && !matches!(seen.load(Relaxed), 0..=2))
     };
     w.traced = (0..n).map(|f| undecided(&w, f)).collect();
     if !outright.is_empty() || w.traced.iter().any(|t| *t) {
@@ -1226,9 +1231,11 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
             }
         }
     }
-    let mut readings = Readings::default();
     // (What a compilation left unread reaches may be read.)
-    readings.unread = (0..n).filter(|&f| !w.reached[f].load(Relaxed) && !unread[f]).map(|f| paths[f].clone()).collect();
+    let mut readings = Readings {
+        unread: (0..n).filter(|&f| !w.reached[f].load(Relaxed) && !unread[f]).map(|f| paths[f].clone()).collect(),
+        ..Default::default()
+    };
     let mut number = vec![u32::MAX; n];
     let ways = ways.into_inner().unwrap();
     for f in (0..n).filter(|&f| split[f]) {

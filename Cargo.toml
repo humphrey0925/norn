@@ -6,3 +6,8 @@ members = ["crates/si-core", "crates/si-cli"]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+# (Tuples of plain values are the style here; a type alias for each would
+# say less.)
+[workspace.lints.clippy]
+type_complexity = "allow"

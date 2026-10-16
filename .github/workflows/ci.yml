@@ -1,0 +1,65 @@
+# On each push to master and each pull request: the server built and tested,
+# the extension tested in VS Code against it, on Linux and Windows. macOS
+# (ten times the cost of Linux on a private repository's Actions minutes)
+# runs weekly and by hand, and always in a release (release.yml).
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-24.04","windows-2025","macos-14"]' || '["ubuntu-24.04","windows-2025"]') }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Rust tests
+        run: cargo test --locked
+      - name: Build the server
+        run: cargo build --release --locked
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: vscode/package-lock.json
+      - name: Extension dependencies
+        working-directory: vscode
+        run: npm ci
+      - name: Test corpus
+        shell: bash
+        run: release/fetch-test-corpus.sh
+      - name: Extension tests (Linux)
+        if: runner.os == 'Linux'
+        working-directory: vscode
+        run: xvfb-run -a npm test
+      - name: Extension tests
+        if: runner.os != 'Linux'
+        working-directory: vscode
+        run: npm test

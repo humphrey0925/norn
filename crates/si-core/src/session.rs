@@ -1263,7 +1263,7 @@ mod tests {
         let mut s = Session::open(&d.0, Options::default());
         assert_eq!((s.files(), functions(&s, "b")), (1, 0));
         let b = d.write("b.c", "int b (void) { return 0; }\n");
-        assert_eq!(s.update(&[b.clone()]).added, 1);
+        assert_eq!(s.update(std::slice::from_ref(&b)).added, 1);
         assert_eq!((s.files(), functions(&s, "b")), (2, 1));
         let calls: Vec<&str> = s.graph.find("a").iter().flat_map(|&x| s.graph.refs_from(x)).map(|e| s.graph.sym_name(e.other)).collect();
         assert_eq!(calls, ["b"]);

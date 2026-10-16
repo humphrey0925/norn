@@ -1,0 +1,202 @@
+# A tag v<version> makes a release: the server built for each platform, the
+# extension packaged for each with its server inside, the packages tested
+# as installed on Windows, Linux and macOS, a GitHub release with all of
+# it, then (after approval in the `marketplace` environment) the packages
+# published to the Visual Studio Marketplace and Open VSX.
+#
+# Secrets: VSCE_PAT (Azure DevOps token, Marketplace: Manage) and, if
+# publishing there too, OVSX_PAT (open-vsx.org token). Without one, that
+# step is skipped.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to the marketplaces (else build and test only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.vsc }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { vsc: win32-x64, rust: x86_64-pc-windows-msvc, os: windows-2025, run: "" }
+          - { vsc: win32-arm64, rust: aarch64-pc-windows-msvc, os: windows-2025, run: none }
+          - { vsc: linux-x64, rust: x86_64-unknown-linux-musl, os: ubuntu-24.04, zig: true, run: "" }
+          - { vsc: linux-arm64, rust: aarch64-unknown-linux-musl, os: ubuntu-24.04, zig: true, run: qemu-aarch64-static }
+          - { vsc: darwin-arm64, rust: aarch64-apple-darwin, os: macos-14, run: "" }
+          - { vsc: darwin-x64, rust: x86_64-apple-darwin, os: macos-14, run: "arch -x86_64" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Versions agree
+        shell: bash
+        run: |
+          ext=$(node -p "require('./vscode/package.json').version")
+          srv=$(grep -m1 '^version' crates/si-cli/Cargo.toml | cut -d'"' -f2)
+          [ "$ext" = "$srv" ] || { echo "extension $ext, server $srv"; exit 1; }
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then [ "v$ext" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME}, version $ext"; exit 1; }; fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.rust }}
+
+      # Linux: static (musl), so one binary runs on every distribution;
+      # built with zig as the C compiler and linker for both machines.
+      - name: zig
+        if: matrix.zig
+        run: |
+          pip install ziglang==0.13.0
+          cargo install cargo-zigbuild@0.19.8 --locked
+      - name: Build (zig)
+        if: matrix.zig
+        run: cargo zigbuild --release --locked --target ${{ matrix.rust }}
+      - name: Build
+        if: ${{ !matrix.zig }}
+        run: cargo build --release --locked --target ${{ matrix.rust }}
+
+      - name: Server as released
+        shell: bash
+        run: |
+          exe=norn; [[ "${{ matrix.vsc }}" == win32-* ]] && exe=norn.exe
+          mkdir -p dist
+          cp "target/${{ matrix.rust }}/release/$exe" "dist/norn-${{ matrix.vsc }}${exe#norn}"
+          echo "SERVER=target/${{ matrix.rust }}/release/$exe" >> "$GITHUB_ENV"
+      - name: qemu
+        if: matrix.run == 'qemu-aarch64-static'
+        run: sudo apt-get update -q && sudo apt-get install -yq qemu-user-static
+      # It runs: indexes a little C.
+      - name: Smoke test
+        if: matrix.run != 'none'
+        shell: bash
+        run: |
+          mkdir -p smoke && printf '#include "a.h"\nint g(void) { return f(1); }\n' > smoke/main.c && printf 'int f(int x);\n#define K 3\n' > smoke/a.h
+          ${{ matrix.run }} "$SERVER" --version
+          ${{ matrix.run }} "$SERVER" index smoke --out smoke-out --stores none | tee smoke.json
+          grep -q '"files": 2' smoke.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: vscode/package-lock.json
+      - name: Package
+        shell: bash
+        env:
+          NORN_TARGET: ${{ matrix.rust }}
+        run: |
+          (cd vscode && npm ci && npm run compile)
+          node release/package.js ${{ matrix.vsc }} "$SERVER" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.vsc }}
+          path: dist/*
+          if-no-files-found: error
+
+  # The packages as installed, in VS Code, on each system.
+  test:
+    name: test ${{ matrix.vsc }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { vsc: win32-x64, os: windows-2025 }
+          - { vsc: linux-x64, os: ubuntu-24.04 }
+          - { vsc: darwin-arm64, os: macos-14 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ matrix.vsc }}
+          path: dist
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: vscode/package-lock.json
+      - name: Prepare
+        shell: bash
+        run: |
+          release/fetch-test-corpus.sh
+          (cd vscode && npm ci && npm run compile)
+      - name: Installed package (Linux)
+        if: runner.os == 'Linux'
+        working-directory: vscode
+        run: xvfb-run -a node out/test/runTest.js packaged ../dist/norn-*-${{ matrix.vsc }}.vsix
+      - name: Installed package
+        if: runner.os != 'Linux'
+        shell: bash
+        working-directory: vscode
+        run: node out/test/runTest.js packaged ../dist/norn-*-${{ matrix.vsc }}.vsix
+
+  release:
+    needs: test
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums and notes
+        run: |
+          cp LICENSE NOTICE dist/
+          (cd dist && sha256sum * > SHA256SUMS)
+          # This version's section of the change log.
+          v="${GITHUB_REF_NAME#v}"
+          awk -v v="## $v" '$0==v{on=1;next} /^## /{if(on)exit} on' CHANGELOG.md > notes.md
+          test -s notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          files: dist/*
+
+  publish:
+    needs: [test, release]
+    if: always() && needs.test.result == 'success' && (github.ref_type == 'tag' || inputs.publish) && needs.release.result != 'failure'
+    runs-on: ubuntu-24.04
+    environment: marketplace
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - working-directory: vscode
+        run: npm ci
+      - name: Visual Studio Marketplace
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          if [ -z "$VSCE_PAT" ]; then echo "::warning::VSCE_PAT not set: not published to the Marketplace"; exit 0; fi
+          cd vscode && npx vsce publish --packagePath ../dist/*.vsix
+      - name: Open VSX
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: |
+          if [ -z "$OVSX_PAT" ]; then echo "::notice::OVSX_PAT not set: not published to Open VSX"; exit 0; fi
+          cd vscode && for f in ../dist/*.vsix; do npx ovsx publish "$f"; done

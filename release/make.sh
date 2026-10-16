@@ -15,6 +15,7 @@ cp "$target/release/norn.exe" vscode/bin/win32-x64/norn.exe
 # The change log goes in too (VS Code shows it on the extension's page),
 # and the notices of what others made that the release includes.
 cp CHANGELOG.md vscode/CHANGELOG.md
+cp LICENSE NOTICE vscode/
 node release/notices.js vscode/THIRD_PARTY_NOTICES.txt
 (cd vscode && npm run package)
 unzip -l out/norn.vsix | grep -q "extension/bin/win32-x64/norn.exe" || { echo "the package has no server in it"; exit 1; }
@@ -32,6 +33,7 @@ cp "$target/release/norn.exe" "$stage/norn-windows-x64.exe"
 cp release/README.md "$stage/README.md"
 cp CHANGELOG.md "$stage/CHANGELOG.md"
 cp vscode/THIRD_PARTY_NOTICES.txt "$stage/THIRD_PARTY_NOTICES.txt"
+cp LICENSE NOTICE "$stage/"
 out="release/norn-$version-windows-x64.7z"
 rm -f release/si-*-windows-x64.7z release/norn-*-windows-x64.7z
 (cd "$stage" && "$seven" a -t7z -mx=9 "../../$out" . > /dev/null)

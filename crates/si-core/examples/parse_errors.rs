@@ -68,7 +68,7 @@ fn main() {
                     let parent = parents.last().copied().unwrap_or("");
                     let e = tally.entry((first, parent)).or_insert_with(|| {
                         let line = n.start_position().row + 1;
-                        let snip: String = text.chars().take(70).collect::<String>().replace('\n', "\n");
+                        let snip: String = text.chars().take(70).collect::<String>().replace('\n', "\\n");
                         (0, 0, format!("{}:{line}: {snip}", si_core::rel_path(root, p)))
                     });
                     e.0 += 1;

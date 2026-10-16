@@ -395,7 +395,7 @@ fn parse(text: &str, function_like: bool, guard: &str) -> Parsed {
         let close = toks.iter().position(|t| t.is(")")).unwrap_or(toks.len());
         for t in &toks[..close] {
             if t.k == K::Ident {
-                params.push(t.text.clone());
+                params.push(t.text);
             } else if t.is("...") {
                 variadic = true;
             }
@@ -698,7 +698,7 @@ impl<'a> Engine<'a> {
             let rest = args.split_off(np);
             let comma = T { text: ",".into(), k: K::Punct, origin: Origin::Site, noexpand: false };
             for a in rest {
-                args[np - 1].push(comma.clone());
+                args[np - 1].push(comma);
                 args[np - 1].extend(a);
             }
         }
@@ -716,7 +716,7 @@ impl<'a> Engine<'a> {
                 continue;
             }
             if p == NONE {
-                res.push(t.clone());
+                res.push(*t);
             } else {
                 let p = p as usize;
                 let pasted = i > 0 && m.body[i - 1].is("##") || m.body.get(i + 1).is_some_and(|n| n.is("##"));
@@ -744,7 +744,7 @@ impl<'a> Engine<'a> {
         let mut i = 0;
         while i < res.len() {
             if res[i].is("##") && res[i].origin == Origin::Body && !out.is_empty() && i + 1 < res.len() {
-                let right = res[i + 1].clone();
+                let right = res[i + 1];
                 let left = out.pop().unwrap();
                 if left.is(",") {
                     // GNU `, ## args`: the comma goes when there are none.
@@ -760,7 +760,7 @@ impl<'a> Engine<'a> {
                 i += 2;
                 continue;
             }
-            out.push(res[i].clone());
+            out.push(res[i]);
             i += 1;
         }
         out.retain(|t| !t.text.is_empty());

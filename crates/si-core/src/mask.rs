@@ -19,6 +19,7 @@
 //! offset and line number in the masked text matches the original.
 
 use crate::cond::{Conditions, Tri};
+use std::ops::Not;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// An identifier occurrence found lexically.
@@ -2214,7 +2215,7 @@ fn transparent_deps(s: &[u8], start: usize, end: usize, refs: &[Tok]) -> Option<
         }
         if c.peek(0) == b'[' && c.peek(1) == b'[' {
             // `[[nodiscard]]`: a standard attribute.
-            let Some(close) = s[c.i..end].windows(2).position(|w| w == b"]]") else { return None };
+            let close = s[c.i..end].windows(2).position(|w| w == b"]]")?;
             c.i += close + 2;
             continue;
         }

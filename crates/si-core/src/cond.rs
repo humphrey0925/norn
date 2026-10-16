@@ -57,6 +57,7 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
+use std::ops::Not;
 use std::path::Path;
 
 /// The settings as written.
@@ -730,7 +731,7 @@ impl Source {
     /// The line of `file` after which the entry's name is known there: the
     /// first of its own includes that brings a definition in, or 0 when it
     /// brings none in itself (the files that include it do).
-    fn from_line(&self, file: u32, brings: &[u64]) -> u32 {
+    fn line_bringing(&self, file: u32, brings: &[u64]) -> u32 {
         self.includes[file as usize].iter().filter(|(_, t)| has(brings, *t)).map(|(l, _)| *l).min().unwrap_or(0)
     }
 
@@ -738,7 +739,7 @@ impl Source {
     /// compilations that read the file have it there.
     pub fn get(&self, file: u32, line: u32, name: &[u8]) -> Option<&[u8]> {
         let (value, _, brings) = self.names.get(name)?.iter().find(|(_, known, _)| has(known, file))?;
-        (line > self.from_line(file, brings)).then_some(&value[..])
+        (line > self.line_bringing(file, brings)).then_some(&value[..])
     }
 
     pub fn is_empty(&self) -> bool {
@@ -773,7 +774,7 @@ impl Source {
         for (k, values) in &self.names {
             for (v, known, brings) in values {
                 if has(known, file) {
-                    d ^= h(v, h(k, 16 + self.from_line(file, brings) as u64));
+                    d ^= h(v, h(k, 16 + self.line_bringing(file, brings) as u64));
                 }
             }
         }
@@ -892,17 +893,21 @@ pub enum Tri {
     Unknown,
 }
 
-impl Tri {
-    fn of(b: bool) -> Tri {
-        if b { Tri::True } else { Tri::False }
-    }
+impl Not for Tri {
+    type Output = Tri;
 
-    pub fn not(self) -> Tri {
+    fn not(self) -> Tri {
         match self {
             Tri::True => Tri::False,
             Tri::False => Tri::True,
             Tri::Unknown => Tri::Unknown,
         }
+    }
+}
+
+impl Tri {
+    fn of(b: bool) -> Tri {
+        if b { Tri::True } else { Tri::False }
     }
 
     pub fn or(self, other: Tri) -> Tri {
@@ -1150,9 +1155,8 @@ impl Conditions {
     pub fn defined(&self, name: &[u8]) -> Tri {
         if self.defined.contains_key(name) {
             Tri::True
-        } else if self.undefined.contains(name) {
-            Tri::False
-        } else if self.undecided_off
+        } else if self.undefined.contains(name)
+            || self.undecided_off
             || !self.in_source.contains(name) && (self.assume_all || self.assume_built && !builtin(name) || self.assume_undefined.iter().any(|p| name.starts_with(p)))
         {
             Tri::False

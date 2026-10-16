@@ -4,6 +4,7 @@
   "description": "Norn: Source-Insight-style symbol search, context and relation views for C, from an index that follows macros and function pointers.",
   "version": "0.22.0",
   "publisher": "humphrey0925",
+  "license": "Apache-2.0",
   "icon": "media/icon.png",
   "repository": {
     "type": "git",
@@ -554,7 +555,11 @@
       "properties": {
         "norn.dimInactive": {
           "type": "string",
-          "enum": ["auto", "always", "never"],
+          "enum": [
+            "auto",
+            "always",
+            "never"
+          ],
           "enumDescriptions": [
             "Dim them where the C/C++ extension does not (it is not installed, or its IntelliSense is off).",
             "Always dim them.",
@@ -632,7 +637,7 @@
     "bundle": "esbuild src/extension.ts --bundle --platform=node --target=node18 --format=cjs --external:vscode --main-fields=module,main --minify-whitespace --minify-syntax --outfile=out/extension.js --log-level=warning",
     "vscode:prepublish": "npm run compile",
     "watch": "tsc -watch -p ./",
-    "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license -o ../out/norn.vsix",
+    "package": "vsce package -o ../out/norn.vsix",
     "test": "npm run compile && node ./out/test/runTest.js",
     "test:package": "npm run compile && npm run package && node ./out/test/package.js && node ./out/test/runTest.js packaged"
   },
@@ -645,7 +650,9 @@
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
     "@vscode/test-electron": "^2.4.0",
+    "@vscode/vsce": "4.0.0",
     "esbuild": "^0.25.0",
+    "ovsx": "1.2.0",
     "typescript": "^5.4.0"
   }
 }

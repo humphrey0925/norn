@@ -23,7 +23,7 @@ fn main() {
     println!("root {} error={} children={} bytes={}", root.kind(), root.is_error(), root.child_count(), src.len());
     let mut c = root.walk();
     for ch in root.children(&mut c).filter(|n| n.is_error() || n.byte_range().len() > src.len() / 20) {
-        let text = String::from_utf8_lossy(&src[ch.start_byte()..(ch.start_byte() + 60).min(src.len())]).replace('\n', "\n");
+        let text = String::from_utf8_lossy(&src[ch.start_byte()..(ch.start_byte() + 60).min(src.len())]).replace('\n', "\\n");
         println!("  {:22} lines {}-{} error={} has_error={}  {text}", ch.kind(), ch.start_position().row + 1, ch.end_position().row + 1, ch.is_error(), ch.has_error());
     }
 }

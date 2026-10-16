@@ -94,10 +94,12 @@ following.
 
 ## Setup
 
-The packaged extension for Windows x64 has the `norn` server inside it:
-install the `.vsix` and open a folder. Elsewhere, build `norn`
-(`cargo build --release` at the repository root) and point `norn.serverPath`
-at the executable, or put it on `PATH`; a path set there is always used in
+The extension has the `norn` server inside it, built for the system it is
+installed on: Windows (x64, Arm64), Linux (x64, Arm64; static, any
+distribution) and macOS (Intel, Apple silicon). Install it and open a
+folder. To use a server of your own instead, build `norn`
+(`cargo build --release` at the repository root) and point
+`norn.serverPath` at the executable; a path set there is always used in
 place of the built-in server. The index is built when a folder with C
 files is opened, kept in `.norn/cache`, and updated when files are saved.
 
@@ -109,3 +111,8 @@ from, for example `bfd.h=bfd-in2.h`.
     npm install
     npm run compile
     npm test        # runs the extension in a real VS Code on a scratch copy
+
+## License
+
+Apache License 2.0; see `LICENSE` and `NOTICE`. What Norn includes of
+others' work is listed with its licenses in `THIRD_PARTY_NOTICES.txt`.

@@ -45,8 +45,11 @@ export function check(vsix: string): string[] {
   };
   icons(manifest.contributes, "contributes");
 
-  // The server it starts.
-  need("bin/win32-x64/norn.exe", "the built-in server");
+  // The server it starts: one, for the platform the package is for.
+  const servers = all.map((e) => e.name).filter((n) => /^extension\/bin\/(win32|linux|alpine|darwin)-(x64|arm64)\/norn(\.exe)?$/.test(n));
+  if (servers.length !== 1) {
+    missing.push(`bin/<platform>/norn (the built-in server: ${servers.length} found)`);
+  }
   // What others made that it includes, with their licenses.
   need("THIRD_PARTY_NOTICES.txt", "the third-party notices");
 

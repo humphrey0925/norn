@@ -1,0 +1,33 @@
+# The Contributor License Agreement (CLA.md): a pull request waits until its
+# author has signed it, by a comment on a pull request. Signatures are kept
+# in signatures/version1/cla.json on the branch `cla-signatures`.
+name: CLA
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, closed, synchronize]
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla:
+    runs-on: ubuntu-24.04
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      github.event.comment.body == 'recheck' ||
+      github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA'
+    steps:
+      - uses: contributor-assistant/github-action@v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          path-to-signatures: signatures/version1/cla.json
+          path-to-document: https://github.com/${{ github.repository }}/blob/master/CLA.md
+          branch: cla-signatures
+          allowlist: humphrey0925,dependabot[bot],github-actions[bot]

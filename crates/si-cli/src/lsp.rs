@@ -1112,8 +1112,8 @@ impl Server {
                 continue;
             }
             let lower = p.to_ascii_lowercase();
-            let starts = std::iter::once(0).chain(lower.match_indices('/').map(|m| m.0 + 1));
-            if let Some(k) = starts.filter(|&k| lower[k..].starts_with(&typed)).last() {
+            let mut starts = std::iter::once(0).chain(lower.match_indices('/').map(|m| m.0 + 1));
+            if let Some(k) = starts.rfind(|&k| lower[k..].starts_with(&typed)) {
                 if seen.insert(p[k..].to_string()) {
                     found.push(p[k..].to_string());
                 }

@@ -1296,11 +1296,10 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     // prototype of the name: it means that, not a macro of
                     // a header it does not read.
                     let declared = cands.iter().any(|c| syms[*c as usize].flags & flag::DECL != 0 && read_here(c));
-                    if declared || tmp.iter().any(|c| local(c) && read_here(c)) {
-                        if tmp.iter().any(may) && !tmp.iter().all(may) {
+                    if (declared || tmp.iter().any(|c| local(c) && read_here(c)))
+                        && tmp.iter().any(may) && !tmp.iter().all(may) {
                             tmp.retain(may);
                         }
-                    }
                 }
                 // In a source file: what its own compilation compiles of a
                 // header read one way here and another elsewhere.
@@ -1426,7 +1425,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     }
                     let h = header_of.get(s.file as usize).copied().unwrap_or(NONE);
                     let p = path_of.get(s.file as usize).copied().unwrap_or(NONE);
-                    let file = p.ne(&NONE).then(|| readings.paths[p as usize].as_str()).unwrap_or("?");
+                    let file = if p.ne(&NONE) { readings.paths[p as usize].as_str() } else { "?" };
                     if h == NONE {
                         eprintln!("edgewhy     {file}:{}: read one way by all; read {}, for sure {}", s.line, unit != NONE && p != NONE && readings.reads(unit, p), unit != NONE && p != NONE && readings.reads_surely(unit, p));
                         let call: Vec<u32> = files[fi].undecided.iter().filter(|b| b.0 <= r.line && r.line <= b.1).map(|b| b.2).collect();
