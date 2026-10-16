@@ -584,6 +584,21 @@ pub fn callees_through_slots(g: &graph::Graph, sym: u32) -> Vec<Caller> {
 /// The symbol the name `name` on `line` of `file` (a path as indexed) refers
 /// to: what "go to definition" wants. Falls back on every symbol of that
 /// name when the line has no such reference (a declaration, say).
+/// What `#include`s of `includer` (a path as indexed) mean, as the index
+/// finds them: per operand as written, the files (paths).
+pub fn includes_meant(g: &graph::Graph, includer: &str, operands: &[&str]) -> Vec<Vec<String>> {
+    let paths: Vec<&str> = (0..g.files.len() as u32).map(|f| g.file_path(f)).collect();
+    let found = link::Includes::new(paths.iter().copied());
+    operands
+        .iter()
+        .map(|o| {
+            let mut out = Vec::new();
+            found.resolve(includer, o, &mut out);
+            out.into_iter().map(|f| paths[f as usize].to_string()).collect()
+        })
+        .collect()
+}
+
 pub fn definition_at(g: &graph::Graph, file: &str, line: u32, name: &str) -> Vec<u32> {
     let here = (0..g.files.len() as u32).find(|&f| g.file_path(f) == file);
     let mut out: Vec<u32> = here

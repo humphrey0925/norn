@@ -321,6 +321,24 @@ export async function run(): Promise<void> {
   const completions = await vscode.commands.executeCommand<vscode.CompletionList>("vscode.executeCompletionItemProvider", doc.uri, doc.positionAt(typing + "bfd_set_err".length));
   assert.ok(completions.items.some((i) => (typeof i.label === "string" ? i.label : i.label.label) === "bfd_set_error"), completions.items.map((i) => i.label).slice(0, 20).join(" "));
 
+  // An #include leads to the file it means, and is a link to it.
+  const included = doc.positionAt(doc.getText().indexOf('#include "libbfd.h"') + 12);
+  const includedFile = await vscode.commands.executeCommand<vscode.Location[]>("vscode.executeDefinitionProvider", doc.uri, included);
+  assert.ok(includedFile.length >= 1 && includedFile[0].uri.fsPath.endsWith("libbfd.h"), JSON.stringify(includedFile));
+  const links = await vscode.commands.executeCommand<vscode.DocumentLink[]>("vscode.executeLinkProvider", doc.uri);
+  assert.ok(links.some((l) => l.target?.fsPath.endsWith("libbfd.h")), JSON.stringify(links.map((l) => l.target?.fsPath)));
+
+  // The name under the cursor, where else in the file it means the same.
+  const marks = await vscode.commands.executeCommand<vscode.DocumentHighlight[]>("vscode.executeDocumentHighlights", doc.uri, find(doc, "bfd_set_error (bfd_error_invalid_operation)"));
+  assert.ok(marks.length >= 2 && marks.every((m) => doc.getText(m.range) === "bfd_set_error"), JSON.stringify(marks.map((m) => m.range.start.line)));
+
+  // A source file's header, and back.
+  const libbfd = await vscode.workspace.openTextDocument(path.join(folder, "bfd", "libbfd.c"));
+  await vscode.window.showTextDocument(libbfd);
+  await vscode.commands.executeCommand("norn.switchHeaderSource");
+  await until("the header of libbfd.c", async () => vscode.window.activeTextEditor?.document.uri.fsPath.endsWith("libbfd.h"));
+  editor = await vscode.window.showTextDocument(doc);
+
   // Saving an edit re-indexes it.
   const edit = new vscode.WorkspaceEdit();
   edit.insert(doc.uri, new vscode.Position(doc.lineCount, 0), "\nint si_probe (void) { return 0; }\n");

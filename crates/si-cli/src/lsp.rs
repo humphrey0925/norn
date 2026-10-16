@@ -583,7 +583,61 @@ impl Server {
         json!({ "isIncomplete": !complete, "items": items })
     }
 
+    /// The operand of an `#include` on a line, and where it is in it.
+    fn include_operand(text: &str) -> Option<(&str, usize, usize)> {
+        let t = text.trim_start();
+        let rest = t.strip_prefix('#')?.trim_start().strip_prefix("include")?;
+        let rest = rest.strip_prefix("_next").unwrap_or(rest);
+        let at = text.len() - rest.len() + (rest.len() - rest.trim_start().len());
+        let close = match text[at..].chars().next()? {
+            '"' => '"',
+            '<' => '>',
+            _ => return None,
+        };
+        let end = text[at + 1..].find(close)? + at + 1;
+        Some((&text[at + 1..end], at + 1, end))
+    }
+
+    /// `textDocument/documentLink`: each `#include` to the file it means,
+    /// where the index has one.
+    fn document_links(&mut self, params: &Value) -> Value {
+        let path = uri_to_path(params["textDocument"]["uri"].as_str().unwrap_or(""));
+        let Some(file) = self.relative(&path) else { return json!([]) };
+        let text = match self.open.get(&path) {
+            Some(t) => t.clone(),
+            None => String::from_utf8_lossy(&std::fs::read(&path).unwrap_or_default()).into_owned(),
+        };
+        let mut found: Vec<(usize, &str, usize, usize)> = Vec::new();
+        for (i, line) in text.lines().enumerate() {
+            if let Some((operand, a, e)) = Self::include_operand(line) {
+                found.push((i, operand, a, e));
+            }
+        }
+        let operands: Vec<&str> = found.iter().map(|f| f.1).collect();
+        let targets = si_core::includes_meant(self.g(), &file, &operands);
+        let mut links = Vec::new();
+        for ((line, _, a, e), files) in found.iter().zip(targets) {
+            // (One of several: the nearest, as the index takes it.)
+            if let Some(target) = files.first() {
+                links.push(json!({ "range": { "start": { "line": line, "character": a }, "end": { "line": line, "character": e } },
+                                   "target": path_to_uri(&self.root.join(target)) }));
+            }
+        }
+        json!(links)
+    }
+
     fn definition(&mut self, params: &Value) -> Value {
+        // On an `#include`: the file it means.
+        if let (Some(path), Some(line)) = (params["textDocument"]["uri"].as_str().map(uri_to_path), params["position"]["line"].as_u64()) {
+            if let Some(file) = self.relative(&path) {
+                let text = self.line_text(&file, line as u32 + 1);
+                if let Some((operand, _, _)) = Self::include_operand(&text) {
+                    let files = si_core::includes_meant(self.g(), &file, &[operand]).pop().unwrap_or_default();
+                    let start = json!({ "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } });
+                    return json!(files.iter().map(|f| json!({ "uri": path_to_uri(&self.root.join(f)), "range": start })).collect::<Vec<_>>());
+                }
+            }
+        }
         if let Some(h) = self.local_at(params) {
             return json!([self.location(&h.file, h.line, &h.name)]);
         }
@@ -702,6 +756,73 @@ impl Server {
         places.sort();
         places.dedup();
         json!(places.into_iter().take(LIMIT).map(|(f, l, n)| self.location(&f, l, &n)).collect::<Vec<_>>())
+    }
+
+    /// `si/counterpart`: the header of a source file, or the source of a
+    /// header: the files of the same name with the other kind of suffix,
+    /// those in the same folder first, then the nearest.
+    fn counterpart(&mut self, params: &Value) -> Value {
+        let path = uri_to_path(params["textDocument"]["uri"].as_str().unwrap_or(""));
+        let Some(file) = self.relative(&path) else { return json!([]) };
+        let (dir, base) = file.rsplit_once('/').unwrap_or(("", &file));
+        let Some((stem, suffix)) = base.rsplit_once('.') else { return json!([]) };
+        let headers = ["h", "hpp", "hh", "hxx", "inl"];
+        let sources = ["c", "cpp", "cc", "cxx", "c++"];
+        let want: &[&str] = if headers.contains(&suffix.to_ascii_lowercase().as_str()) { &sources } else { &headers };
+        let g = self.g();
+        let mut found: Vec<(usize, String)> = (0..g.files.len() as u32)
+            .map(|f| g.file_path(f))
+            .filter(|p| {
+                let b = p.rsplit('/').next().unwrap_or(p);
+                b.rsplit_once('.').is_some_and(|(s, x)| s.eq_ignore_ascii_case(stem) && want.contains(&x.to_ascii_lowercase().as_str()))
+            })
+            .map(|p| {
+                let d = p.rsplit_once('/').map_or("", |x| x.0);
+                let shared = d.split('/').zip(dir.split('/')).take_while(|(a, b)| a == b).count();
+                (usize::MAX - if d == dir { usize::MAX } else { shared }, p.to_string())
+            })
+            .collect();
+        found.sort();
+        json!(found.into_iter().map(|(_, p)| path_to_uri(&self.root.join(p))).collect::<Vec<_>>())
+    }
+
+    /// `textDocument/documentHighlight`: in this file, where the name under
+    /// the cursor means what it means there: each of its spellings on the
+    /// lines the index has it on (the definition, the uses).
+    fn document_highlight(&mut self, params: &Value) -> Value {
+        let Some((file, line, name)) = self.at(params) else { return Value::Null };
+        let mut lines: Vec<u32> = vec![line];
+        if let Some(h) = self.local_at(params) {
+            lines.push(h.line);
+            lines.extend(h.uses.iter().copied());
+        } else {
+            let g = self.g();
+            for t in si_core::definition_at(g, &file, line, &name) {
+                let s = &g.syms[t as usize];
+                if g.file_path(s.file) == file {
+                    lines.push(s.line);
+                }
+                for e in g.refs_to(t).iter().filter(|e| e.kind() != refkind::BIND) {
+                    if g.file_path(g.syms[e.other as usize].file) == file {
+                        lines.push(e.line());
+                    }
+                }
+            }
+        }
+        lines.sort_unstable();
+        lines.dedup();
+        let mut out = Vec::new();
+        for l in lines {
+            let text = self.line_text(&file, l);
+            let b = text.as_bytes();
+            for (i, _) in text.match_indices(&name) {
+                let end = i + name.len();
+                if (i == 0 || !is_ident(b[i - 1])) && b.get(end).is_none_or(|&c| !is_ident(c)) {
+                    out.push(json!({ "range": { "start": { "line": l - 1, "character": i }, "end": { "line": l - 1, "character": end } }, "kind": 1 }));
+                }
+            }
+        }
+        json!(out)
     }
 
     /// `si/references`: the references of the name under the cursor, by
@@ -1135,6 +1256,14 @@ impl Server {
     /// The lines switched off by the conditions in force that a
     /// `textDocument` position is on, if it is on such a line: nothing
     /// there is compiled, so nothing is to be found from it.
+    /// `si/inactive`: the lines of a file these conditions do not compile,
+    /// as (first, last) from 1.
+    fn inactive(&mut self, params: &Value) -> Value {
+        let path = uri_to_path(params["textDocument"]["uri"].as_str().unwrap_or(""));
+        let Some(file) = self.relative(&path) else { return json!([]) };
+        json!(self.session.facts_of(&file).map_or(Vec::new(), |f| f.inactive.clone()))
+    }
+
     fn inactive_at(&mut self, params: &Value) -> Option<(u32, u32)> {
         let file = self.relative(&uri_to_path(params["textDocument"]["uri"].as_str()?))?;
         let line = params["position"]["line"].as_u64()? as u32 + 1;
@@ -1148,6 +1277,7 @@ impl Server {
             method,
             "textDocument/definition"
                 | "textDocument/hover"
+                | "textDocument/documentHighlight"
                 | "textDocument/declaration"
                 | "textDocument/typeDefinition"
                 | "textDocument/implementation"
@@ -1186,6 +1316,10 @@ impl Server {
             "si/symbols" => self.symbols(params),
             "si/place" => self.place(params),
             "si/locals" => self.locals(params),
+            "si/inactive" => self.inactive(params),
+            "si/counterpart" => self.counterpart(params),
+            "textDocument/documentLink" => self.document_links(params),
+            "textDocument/documentHighlight" => self.document_highlight(params),
             "si/conditions" => self.conditions(),
             "si/setConditions" => {
                 let project: si_core::cond::Project = serde_json::from_value(params.clone()).unwrap_or_default();
@@ -1337,6 +1471,7 @@ pub fn run(
                 "definitionProvider": true, "declarationProvider": true, "typeDefinitionProvider": true, "implementationProvider": true, "referencesProvider": true,
                 "documentSymbolProvider": true, "workspaceSymbolProvider": true, "callHierarchyProvider": true,
                 "hoverProvider": true, "completionProvider": { "resolveProvider": false },
+                "documentLinkProvider": { "resolveProvider": false }, "documentHighlightProvider": true,
             });
             let result = json!({ "capabilities": capabilities, "serverInfo": { "name": "norn", "version": env!("CARGO_PKG_VERSION") } });
             write_message(out, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));

@@ -1478,6 +1478,40 @@ function serverCommand(): { command: string; args: string[] } {
   return { command: serverPath(), args };
 }
 
+/** Whether the C/C++ extension dims the lines the conditions do not
+ *  compile (it does with the conditions Norn gives it): then Norn does not. */
+function cppDims(): boolean {
+  if (!vscode.extensions.getExtension("ms-vscode.cpptools")) {
+    return false;
+  }
+  const cpp = vscode.workspace.getConfiguration("C_Cpp");
+  return cpp.get<string>("intelliSenseEngine", "default") !== "disabled" && cpp.get<boolean>("dimInactiveRegions", true);
+}
+
+/** Lines the conditions in force do not compile, dimmed as the C/C++
+ *  extension dims them, where it does not (`norn.dimInactive`). */
+const dimmed = vscode.window.createTextEditorDecorationType({ opacity: "0.55", rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed });
+
+async function dim(editor: vscode.TextEditor | undefined): Promise<void> {
+  if (!editor || !isSource(editor.document)) {
+    return;
+  }
+  const mode = vscode.workspace.getConfiguration("norn").get<string>("dimInactive", "auto");
+  if (mode === "never" || (mode === "auto" && cppDims())) {
+    editor.setDecorations(dimmed, []);
+    return;
+  }
+  const lines = await ask<[number, number][]>("si/inactive", { textDocument: { uri: editor.document.uri.toString() } });
+  if (!lines) {
+    return;
+  }
+  const last = editor.document.lineCount - 1;
+  editor.setDecorations(
+    dimmed,
+    lines.map(([a, b]) => new vscode.Range(Math.min(a - 1, last), 0, Math.min(b - 1, last), Number.MAX_SAFE_INTEGER)),
+  );
+}
+
 export async function activate(context: vscode.ExtensionContext) {
   home = context.extensionUri;
   const relation = new Relation(vscode.Uri.joinPath(context.extensionUri, "media"));
@@ -1754,6 +1788,8 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
       // one's does not (a macro's value).
       initializationOptions: { alongside: !!vscode.extensions.getExtension("ms-vscode.cpptools") },
     };
+    // (Alt+O switches header and source with Norn where the C/C++ extension does not.)
+    void vscode.commands.executeCommand("setContext", "norn.cppTools", !!vscode.extensions.getExtension("ms-vscode.cpptools"));
     client = new LanguageClient("norn", "Norn", serverOptions, clientOptions);
     client.onNotification("si/progress", progress);
     // The index is there (the server answers before it is, from what the
@@ -1766,6 +1802,7 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
       search.refresh();
       lenses.refresh();
       follow(vscode.window.activeTextEditor ?? current, true);
+      vscode.window.visibleTextEditors.forEach((e) => void dim(e));
     });
     try {
       await client.start();
@@ -1814,6 +1851,12 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
     vscode.window.registerWebviewViewProvider("norn.context", contextView),
     vscode.languages.registerCodeLensProvider(selector, lenses),
     vscode.window.onDidChangeActiveTextEditor((e) => follow(e, true)),
+    vscode.window.onDidChangeVisibleTextEditors((editors) => editors.forEach((e) => void dim(e))),
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("norn.dimInactive") || e.affectsConfiguration("C_Cpp.intelliSenseEngine") || e.affectsConfiguration("C_Cpp.dimInactiveRegions")) {
+        vscode.window.visibleTextEditors.forEach((v) => void dim(v));
+      }
+    }),
     vscode.window.onDidChangeTextEditorSelection((e) => {
       // The same file may be open in two groups; only the focused one counts.
       if (e.textEditor === vscode.window.activeTextEditor) {
@@ -1821,6 +1864,8 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
       }
     }),
     vscode.workspace.onDidSaveTextDocument(async (doc) => {
+      // What the save changed is indexed by now: what is compiled too.
+      vscode.window.visibleTextEditors.filter((e) => e.document === doc).forEach((e) => void dim(e));
       // The scope edited by hand takes effect when its file is saved.
       if (scopeTree.scope.config && doc.uri.fsPath.toLowerCase() === scopeTree.scope.config.toLowerCase()) {
         await sync();
@@ -1841,6 +1886,18 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
     vscode.commands.registerCommand("norn.goToDefinition", () => goTo("textDocument/definition", "editor.action.revealDefinition", "No definition found")),
     vscode.commands.registerCommand("norn.goToImplementations", () => goTo("textDocument/implementation", "editor.action.goToImplementation", "No implementation found")),
     vscode.commands.registerCommand("norn.goToReferences", () => goTo("textDocument/references", "editor.action.goToReferences", "No references found")),
+    vscode.commands.registerCommand("norn.switchHeaderSource", async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) {
+        return;
+      }
+      const found = await ask<string[]>("si/counterpart", { textDocument: { uri: editor.document.uri.toString() } });
+      if (!found?.length) {
+        void vscode.window.setStatusBarMessage("Norn: no matching header or source file", 3000);
+        return;
+      }
+      await vscode.window.showTextDocument(vscode.Uri.parse(found[0]));
+    }),
     vscode.commands.registerCommand("norn.relation.callers", () => relation.setMode("callers")),
     vscode.commands.registerCommand("norn.relation.callees", () => relation.setMode("callees")),
     vscode.commands.registerCommand("norn.relation.references", () => relation.setMode("references")),

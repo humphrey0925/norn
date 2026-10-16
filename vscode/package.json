@@ -292,6 +292,10 @@
       {
         "command": "norn.goToReferences",
         "title": "Norn: Go to References"
+      },
+      {
+        "command": "norn.switchHeaderSource",
+        "title": "Norn: Switch Header/Source"
       }
     ],
     "menus": {
@@ -548,6 +552,17 @@
     "configuration": {
       "title": "Norn",
       "properties": {
+        "norn.dimInactive": {
+          "type": "string",
+          "enum": ["auto", "always", "never"],
+          "enumDescriptions": [
+            "Dim them where the C/C++ extension does not (it is not installed, or its IntelliSense is off).",
+            "Always dim them.",
+            "Never dim them."
+          ],
+          "default": "auto",
+          "description": "Dim the lines the compile conditions in force switch off (#if branches not compiled)."
+        },
         "norn.serverPath": {
           "type": "string",
           "default": "",
@@ -604,6 +619,11 @@
         "command": "norn.goToReferences",
         "key": "shift+f12",
         "when": "editorTextFocus && editorLangId =~ /^(c|cpp)$/"
+      },
+      {
+        "command": "norn.switchHeaderSource",
+        "key": "alt+o",
+        "when": "editorTextFocus && editorLangId =~ /^(c|cpp)$/ && !norn.cppTools"
       }
     ]
   },
