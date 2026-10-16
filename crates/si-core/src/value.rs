@@ -156,12 +156,23 @@ pub struct Values<'a> {
     /// Per file, whether no compilation reads it: its definitions only
     /// where there are no others.
     unread: Vec<bool>,
+    /// Where the value is asked for (as the conditions' sources number
+    /// files): a name the compilations settle there has that value.
+    at: Option<(u32, u32)>,
+    /// The names whose value was not had, and why.
+    pub missing: Vec<(String, String)>,
     enums: FxHashMap<u32, Option<i64>>,
 }
 
 impl<'a> Values<'a> {
     pub fn new(g: &'a Graph, conditions: &'a Conditions, source: &'a mut dyn FnMut(&str) -> Option<std::sync::Arc<Vec<u8>>>) -> Values<'a> {
-        Values { g, conditions, source, local: Local::default(), seen: FxHashSet::default(), types: FxHashMap::default(), unread: Vec::new(), enums: FxHashMap::default() }
+        Values { g, conditions, source, local: Local::default(), seen: FxHashSet::default(), types: FxHashMap::default(), unread: Vec::new(), at: None, missing: Vec::new(), enums: FxHashMap::default() }
+    }
+
+    /// The same, asked on `line` of the file at `path`.
+    pub fn asked_at(mut self, path: &str, line: u32) -> Values<'a> {
+        self.at = self.conditions.source().and_then(|s| s.file(path)).map(|f| (f, line));
+        self
     }
 
     /// The same, the files no compilation reads (by path) read last.
@@ -227,15 +238,28 @@ impl<'a> Values<'a> {
         if self.seen.len() >= MOST_NAMES || self.conditions.settles(name.as_bytes()) || !self.seen.insert(name.to_string()) || self.is_type(name) {
             return;
         }
+        // Known where it is asked for: as the compilations have it there.
+        if let (Some((f, line)), Some(source)) = (self.at, self.conditions.source()) {
+            if let Some(v) = source.get(f, line, name.as_bytes()) {
+                let v = String::from_utf8_lossy(v).into_owned();
+                for n in names(&v).into_iter().map(str::to_string).collect::<Vec<_>>() {
+                    self.learn(&n, from);
+                }
+                return;
+            }
+        }
         let g = self.g;
         let syms: Vec<u32> = g.find(name).to_vec();
         let macros: Vec<u32> = syms.iter().copied().filter(|&s| g.syms[s as usize].kind == kind::MACRO && g.syms[s as usize].flags & flag::DECL == 0).collect();
         if macros.is_empty() {
             // An enumerator: its number, as a value.
-            if let Some(&e) = syms.iter().find(|&&s| g.syms[s as usize].kind == kind::ENUM_CONST) {
-                if let Some(n) = self.enumerator(e) {
-                    self.local.insert(name.as_bytes().to_vec(), Some(Some(n.to_string().into_bytes())));
-                }
+            match syms.iter().find(|&&s| g.syms[s as usize].kind == kind::ENUM_CONST) {
+                Some(&e) => match self.enumerator(e) {
+                    Some(n) => drop(self.local.insert(name.as_bytes().to_vec(), Some(Some(n.to_string().into_bytes())))),
+                    None => self.missing.push((name.to_string(), "an enumerator whose number is not worked out".into())),
+                },
+                None if syms.is_empty() => self.missing.push((name.to_string(), "no definition in the index".into())),
+                None => self.missing.push((name.to_string(), "not a macro or an enumerator".into())),
             }
             return;
         }
@@ -267,7 +291,11 @@ impl<'a> Values<'a> {
             let best = defs.iter().map(|d| near(d.0)).max().unwrap_or(0);
             defs.retain(|d| near(d.0) == best);
         }
-        let [(at, d)] = &defs[..] else { return };
+        let [(at, d)] = &defs[..] else {
+            let places: Vec<String> = defs.iter().take(3).map(|d| format!("{} = {}", g.file_path(d.0), d.1.body)).collect();
+            self.missing.push((name.to_string(), format!("{} definitions, none nearer than the others: {}", defs.len(), places.join("; "))));
+            return;
+        };
         let (at, d) = (*at, d.clone());
         let body = self.plain(&d.body);
         let params: Vec<String> = d.params.clone().unwrap_or_default();
@@ -275,7 +303,10 @@ impl<'a> Values<'a> {
             None => crate::cond::value_of(body.as_bytes()),
             Some(p) => crate::cond::function_value(&p.iter().map(|p| p.as_bytes()).collect::<Vec<_>>(), body.as_bytes()),
         };
-        let Some(value) = value else { return };
+        let Some(value) = value else {
+            self.missing.push((name.to_string(), "its body is not a value".into()));
+            return;
+        };
         self.local.insert(name.as_bytes().to_vec(), Some(Some(value)));
         for n in names(&body).into_iter().filter(|n| !params.iter().any(|p| p == n)).map(str::to_string).collect::<Vec<_>>() {
             self.learn(&n, at);
@@ -289,7 +320,7 @@ impl<'a> Values<'a> {
         for n in names(&expr).into_iter().map(str::to_string).collect::<Vec<_>>() {
             self.learn(&n, at);
         }
-        let (number, unsigned) = self.conditions.number_in(&self.local, expr.as_bytes())?;
+        let (number, unsigned) = self.conditions.number_in(&self.local, self.at, expr.as_bytes())?;
         Some(Value { number, unsigned })
     }
 

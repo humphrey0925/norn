@@ -353,7 +353,8 @@ impl Server {
     /// the definitions the index has).
     fn hover(&mut self, params: &Value) -> Value {
         // A macro with arguments, written with them here: `BUF_Q(3)`.
-        let here_file = self.at(params).map(|a| a.0);
+        let asked = self.at(params);
+        let here_file = asked.as_ref().map(|a| a.0.clone());
         let used = self.at(params).and_then(|(file, line, name)| {
             let text = self.line_text(&file, line);
             let b = text.as_bytes();
@@ -412,6 +413,9 @@ impl Server {
         let conditions = self.session.conditions();
         let readings = si_core::readings_of(conditions);
         let mut values = si_core::value::Values::new(g, conditions, &mut read).without(&readings.unread);
+        if let Some((file, line, _)) = &asked {
+            values = values.asked_at(file, *line);
+        }
         let shown = |n: i64, unsigned: bool| {
             let dec = if unsigned { (n as u64).to_string() } else { n.to_string() };
             if (0..10).contains(&n) { format!("= {dec}") } else { format!("= {dec} (0x{:X})", n as u64) }
@@ -439,9 +443,16 @@ impl Server {
                 Some(p) => format!("#define {}({}) {}", d.name, p.join(", "), d.body),
                 None => format!("#define {} {}", d.name, d.body),
             };
+            values.missing.clear();
             let mut v = values.of_macro(s).map_or(String::new(), |v| format!("
 
 `{}`", shown(v.number, v.unsigned)));
+            if v.is_empty() && d.params.is_none() && !values.missing.is_empty() {
+                let why: Vec<String> = values.missing.iter().take(3).map(|(n, w)| format!("`{n}`: {w}")).collect();
+                v = format!("
+
+No value: {}", why.join("; "));
+            }
             if let (Some(_), Some(here)) = (&d.params, &used) {
                 let at = here_file.as_deref().and_then(|f| (0..g.files.len() as u32).find(|&i| g.file_path(i) == f)).unwrap_or(sym.file);
                 if let Some(n) = values.of(here, at) {

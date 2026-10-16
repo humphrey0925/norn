@@ -565,6 +565,9 @@ pub struct Conditions {
     assume_undefined: Vec<Vec<u8>>,
     /// `*`: every name not defined here is assumed undefined.
     assume_all: bool,
+    /// The same, the build's own description saying what it defines: but
+    /// for what the compiler defines of itself (see `builtin`).
+    assume_built: bool,
     /// Names the sources `#define` somewhere: not for assuming about.
     in_source: FxHashSet<Vec<u8>>,
     /// What the sources define, file by file (see [`Source`]). What the
@@ -670,7 +673,9 @@ impl Source {
         self.includes[file as usize].iter().filter(|(_, t)| has(brings, *t)).map(|(l, _)| *l).min().unwrap_or(0)
     }
 
-    fn get(&self, file: u32, line: u32, name: &[u8]) -> Option<&[u8]> {
+    /// The value `name` is known to have on `line` of `file`, as the
+    /// compilations that read the file have it there.
+    pub fn get(&self, file: u32, line: u32, name: &[u8]) -> Option<&[u8]> {
         let (value, _, brings) = self.names.get(name)?.iter().find(|(_, known, _)| has(known, file))?;
         (line > self.from_line(file, brings)).then_some(&value[..])
     }
@@ -852,6 +857,13 @@ impl Tri {
     }
 }
 
+/// A macro the compiler defines of itself, never in a build's `-D`s:
+/// `__CC_ARM`, `__GNUC__`, `_WIN32`, `_MSC_VER`. What a build does not
+/// define is not defined, but these it may, unwritten.
+fn builtin(name: &[u8]) -> bool {
+    name.starts_with(b"__") || name.starts_with(b"_M_") || matches!(name, b"_WIN32" | b"_WIN64" | b"_MSC_VER" | b"_MSC_FULL_VER" | b"_LP64" | b"_ILP32" | b"_CHAR_UNSIGNED")
+}
+
 impl Conditions {
     /// The settings and everything the files they name add.
     pub fn load(root: &Path) -> Conditions {
@@ -863,6 +875,15 @@ impl Conditions {
         for file in &settings.condition_files {
             c.read_source(root, file);
         }
+        // A configuration of the build's own description (an IDE's project,
+        // the C/C++ extension's) lists all the build defines: what it does
+        // not, the build does not (see `builtin`). (A compilation database
+        // has what every command defines; one may define more.)
+        let whole = |file: &String| {
+            let (path, config) = split_entry(file);
+            config.is_some() && matches!(path.rsplit(['/', '\\']).next(), Some(".cproject" | "c_cpp_properties.json"))
+        };
+        c.assume_built = settings.condition_files.iter().any(whole);
         // What is written in the settings themselves has the last word.
         for (name, value) in &settings.defines {
             c.define(name, value);
@@ -970,13 +991,13 @@ impl Conditions {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.defined.is_empty() && self.undefined.is_empty() && self.assume_undefined.is_empty() && !self.assume_all && !self.undecided_off
+        self.defined.is_empty() && self.undefined.is_empty() && self.assume_undefined.is_empty() && !self.assume_all && !self.assume_built && !self.undecided_off
     }
 
     /// Do these conditions assume anything about names they do not list?
     /// Then they need to be told which names the sources define.
     pub fn assumes(&self) -> bool {
-        self.assume_all || !self.assume_undefined.is_empty()
+        self.assume_all || self.assume_built || !self.assume_undefined.is_empty()
     }
 
     pub fn set_in_source(&mut self, names: FxHashSet<Vec<u8>>) {
@@ -1035,7 +1056,7 @@ impl Conditions {
         use xxhash_rust::xxh3::xxh3_64_with_seed as h;
         let d = self.defined.iter().fold(0, |acc, (k, v)| acc ^ h(v, h(k, 11)));
         let u = self.undefined.iter().fold(0, |acc, k| acc ^ h(k, 12));
-        let a = self.assume_undefined.iter().fold(self.assume_all as u64, |acc, k| acc ^ h(k, 13));
+        let a = self.assume_undefined.iter().fold(self.assume_all as u64 | (self.assume_built as u64) << 1, |acc, k| acc ^ h(k, 13));
         let s = self.in_source.iter().fold(0, |acc, k| acc ^ h(k, 14));
         let c = self.source.as_ref().map_or(0, |s| s.digest()) ^ self.no_source as u64 ^ (self.undecided_off as u64) << 1;
         d ^ u ^ a ^ s ^ c
@@ -1046,7 +1067,9 @@ impl Conditions {
             Tri::True
         } else if self.undefined.contains(name) {
             Tri::False
-        } else if self.undecided_off || !self.in_source.contains(name) && (self.assume_all || self.assume_undefined.iter().any(|p| name.starts_with(p))) {
+        } else if self.undecided_off
+            || !self.in_source.contains(name) && (self.assume_all || self.assume_built && !builtin(name) || self.assume_undefined.iter().any(|p| name.starts_with(p)))
+        {
             Tri::False
         } else {
             Tri::Unknown
@@ -1080,10 +1103,12 @@ impl Conditions {
 
     /// The value of an expression as an `#if` works it out, names taking
     /// their values from `local`: the number, and whether it is unsigned.
-    pub fn number_in(&self, local: &Local, expr: &[u8]) -> Option<(i64, bool)> {
+    /// `at`: the file (as the [`Source`] numbers it) and line it is
+    /// written on, for what the sources settle there.
+    pub fn number_in(&self, local: &Local, at: Option<(u32, u32)>, expr: &[u8]) -> Option<(i64, bool)> {
         let toks = tokens(expr);
         let memo = Default::default();
-        let mut p = Parser { c: View { c: self, local, at: None, depth: 0, memo: &memo, noted: None }, toks: &toks, at: 0 };
+        let mut p = Parser { c: View { c: self, local, at, depth: 0, memo: &memo, noted: None }, toks: &toks, at: 0 };
         let v = p.ternary()?;
         (p.at == toks.len()).then_some((v.v, v.unsigned))
     }
@@ -1761,11 +1786,14 @@ mod tests {
         assert_eq!(discover(&dir).iter().map(|d| d.1.as_str()).collect::<Vec<_>>(), [".cproject#Debug", ".cproject#Release", ".vscode/c_cpp_properties.json#Win32", ".vscode/c_cpp_properties.json#Linux"]);
         let mut settings = Settings { condition_files: vec![".cproject#Release".into()], ..Settings::default() };
         let c = Conditions::from_settings(&settings, &dir);
-        assert_eq!((c.defined(b"NDEBUG"), c.defined(b"DEBUG")), (Tri::True, Tri::Unknown));
+        // A configuration lists what the build defines: what only another
+        // defines is not defined here; what the compiler does of itself may be.
+        assert_eq!((c.defined(b"NDEBUG"), c.defined(b"DEBUG")), (Tri::True, Tri::False));
+        assert_eq!((c.defined(b"__CC_ARM"), c.defined(b"_WIN32")), (Tri::Unknown, Tri::Unknown));
         settings.condition_files = vec![".cproject#Debug".into(), ".vscode/c_cpp_properties.json#Win32".into()];
         settings.defines.insert("LEVEL".into(), "9".into());
         let c = Conditions::from_settings(&settings, &dir);
-        assert_eq!((c.eval(b"LEVEL == 9 && N == 2 && DEBUG"), c.defined(b"NDEBUG"), c.defined(b"ONLY_A")), (Tri::True, Tri::False, Tri::Unknown));
+        assert_eq!((c.eval(b"LEVEL == 9 && N == 2 && DEBUG"), c.defined(b"NDEBUG"), c.defined(b"ONLY_A")), (Tri::True, Tri::False, Tri::False));
         assert_eq!(include_paths(&settings, &dir), ["inc", "drivers/include", "bsp", "C:/Arm/include"]);
         // What it all comes to, and who says so.
         let e = effective(&settings, &dir);
