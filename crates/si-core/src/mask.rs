@@ -178,6 +178,11 @@ pub struct Define {
     /// The first word of the body (`for`, or the macro it begins with).
     #[serde(default)]
     pub head: Vec<u8>,
+    /// For an `#include` in a branch of an `#if` not known: which group
+    /// (where it starts in the file) and which branch of it, as
+    /// `start << 16 | branch` (else 0).
+    #[serde(default)]
+    pub branch: u64,
 }
 
 impl Define {
@@ -198,6 +203,7 @@ impl Define {
             test: false,
             line: 0,
             local: false,
+            branch: 0,
             system: false,
             head: Vec::new(),
         }
@@ -533,6 +539,15 @@ pub struct MacroSets {
     /// The files, by path, as `scoped` and `reach` number them; only when
     /// anything is scoped.
     ids: FxHashMap<String, u32>,
+    /// Per file, its rivals: the headers included in another branch of an
+    /// `#if` not known that it is included in, and nowhere else (one per
+    /// compiler, say: `cmsis_gcc.h`, `cmsis_iccarm.h`). No compilation
+    /// reads both, so what only rivals define a file does not see.
+    #[serde(default)]
+    rivals: FxHashMap<u32, Vec<u32>>,
+    /// The macros some rival does not see: name -> the files defining it.
+    #[serde(default)]
+    rival_defined: FxHashMap<Vec<u8>, Vec<u32>>,
     /// What the build is known to define: branches it never compiles are
     /// skipped (see `cond`). (Not saved: made anew from the settings.)
     #[serde(skip)]
@@ -718,6 +733,7 @@ impl MacroSets {
             })
             .collect();
         let open: Vec<u32> = read.iter().enumerate().filter(|(_, r)| r.1).map(|(f, _)| f as u32).collect();
+        let branches: Vec<Vec<u64>> = per_file.iter().map(|defines| defines.iter().filter(|d| d.include).map(|d| d.branch).collect()).collect();
         let includes: Vec<Vec<Included>> = read.into_iter().map(|r| r.0).collect();
         // Who includes each file, and at which of its `#include`s first.
         let mut up: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n];
@@ -806,6 +822,37 @@ impl MacroSets {
             )
             .collect();
         let reach: FxHashMap<(u32, u32), Option<Vec<u32>>> = reach.into_iter().collect();
+        // Rivals: two headers each included only by one file, in two
+        // branches of one `#if` there.
+        let mut rivals: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        for (f, list) in includes.iter().enumerate() {
+            let only_here = |t: u32| up[t as usize].len() == 1 && up[t as usize][0].0 == f as u32 && list.iter().filter(|(ts, _)| ts.contains(&t)).count() == 1;
+            let at: Vec<(u64, u32)> = list
+                .iter()
+                .zip(&branches[f])
+                .filter(|(_, &b)| b != 0)
+                .filter_map(|((ts, _), &b)| match ts[..] {
+                    [t] if only_here(t) => Some((b, t)),
+                    _ => None,
+                })
+                .collect();
+            for &(b, t) in &at {
+                for &(c, u) in &at {
+                    if b >> 16 == c >> 16 && b != c && t != u {
+                        rivals.entry(t).or_default().push(u);
+                    }
+                }
+            }
+        }
+        if !rivals.is_empty() {
+            for (name, at) in &defined_in {
+                let files: Vec<u32> = at.iter().map(|d| d.0).collect();
+                if files.iter().all(|f| rivals.contains_key(f)) {
+                    self.rival_defined.insert(name.to_vec(), files);
+                }
+            }
+            self.rivals = rivals;
+        }
         for (name, at) in defined_in {
             // Seen everywhere if one of its definitions is.
             if at.iter().all(|d| reach[d].is_some()) {
@@ -817,7 +864,7 @@ impl MacroSets {
         if std::env::var_os("SI_SCOPE_PROFILE").is_some() {
             eprintln!("scope     {} macros seen by few files, {} definitions, {} entries", self.scoped.len(), self.reach.len(), self.reach.values().map(Vec::len).sum::<usize>());
         }
-        if !self.scoped.is_empty() {
+        if !self.scoped.is_empty() || !self.rival_defined.is_empty() {
             // Those who may read anything are not numbered: they see all.
             let open: FxHashSet<u32> = open.into_iter().collect();
             self.ids = paths.iter().enumerate().filter(|(i, _)| !open.contains(&(*i as u32))).map(|(i, p)| (p.clone(), i as u32)).collect();
@@ -831,6 +878,12 @@ impl MacroSets {
 
     /// Can the file numbered `file` see a definition of `name`?
     pub fn visible(&self, name: &[u8], file: u32) -> bool {
+        // Defined only in its rivals.
+        if let (Some(at), Some(rivals)) = (self.rival_defined.get(name), self.rivals.get(&file)) {
+            if at.iter().all(|f| rivals.contains(f)) {
+                return false;
+            }
+        }
         match self.scoped.get(name) {
             None => true,
             Some(defining) => defining.iter().any(|d| self.reach.get(d).is_some_and(|r| r.binary_search(&file).is_ok())),
@@ -1782,8 +1835,10 @@ impl<'a> Lexer<'a> {
                 if let Some(len) = text.iter().skip(1).position(|&b| b == close) {
                     let conditional = self.conds.iter().any(|c| !c.include_guard && c.compiled != Tri::True);
                     self.out.includes.push((open as u32 + 1, (open + 1 + len) as u32, conditional));
+                    // (The group it is in, when its branch is not known.)
+                    let branch = self.conds.iter().rev().find(|c| !c.include_guard).filter(|c| c.compiled == Tri::Unknown).map_or(0, |c| (c.spans[0].0 as u64 + 1) << 16 | c.spans.len() as u64 & 0xffff);
                     if let Some(defines) = &mut self.defines {
-                        defines.push(Define { include: true, system: close == b'>', line: if conditional { 0 } else { line }, ..Define::note(&s[open + 1..open + 1 + len], !conditional) });
+                        defines.push(Define { include: true, system: close == b'>', line: if conditional { 0 } else { line }, branch, ..Define::note(&s[open + 1..open + 1 + len], !conditional) });
                     }
                 }
             }
@@ -2035,6 +2090,7 @@ impl<'a> Lexer<'a> {
                 local: self.c_file,
                 system: false,
                 head: first_word(&s[body..end]),
+                branch: 0,
             });
         }
         // A `.c` file's own macros stand in it alone, so they are not in
