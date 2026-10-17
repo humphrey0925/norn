@@ -4,6 +4,9 @@
 # it, then (after approval in the `marketplace` environment) the packages
 # published to the Visual Studio Marketplace and Open VSX.
 #
+# By hand (Actions → Release → Run workflow), without `publish`, it builds
+# and tests all of it and publishes nothing: a rehearsal before a tag.
+#
 # Secrets: VSCE_PAT (Azure DevOps token, Marketplace: Manage) and, if
 # publishing there too, OVSX_PAT (open-vsx.org token). Without one, that
 # step is skipped.
