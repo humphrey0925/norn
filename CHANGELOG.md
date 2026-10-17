@@ -1,6 +1,8 @@
 # Norn 變更紀錄
 
-## 未發佈
+## 0.23.0
+
+**Kconfig 專案免設定、索引跨資料夾沿用、命令列手冊**
 
 - 命令列 `norn` 有了手冊（[docs/cli.md](docs/cli.md)、[繁體中文](docs/cli.zh-TW.md)），`--help` 也說明每個參數；給的資料夾沒有索引、或原始碼樹裡沒有 C 原始檔時，改成說明原因並以 2 結束，不再當掉。
 - 不用設定也會採用 Kconfig build（Linux、U-Boot、Buildroot）留下的設定：樹裡或 build 資料夾（`make O=build`）的 `include/generated/autoconf.h` 或 `.config`；它沒設的 `CONFIG_` 一律當作未定義。
