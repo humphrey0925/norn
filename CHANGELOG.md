@@ -2,7 +2,16 @@
 
 ## Unreleased
 
-**The Linux kernel with its configuration: 78% of calls certain, up from 70%**
+**C++ and the Linux kernel more accurate**
+
+### C++
+
+- Implicit conversions of arguments (a `std::string` where a `Slice` is taken, format strings through `LogInfo` or `strprintf`), `T x(a);` and `T{...}` making a `T`, `return s;` calling the copy or move constructor, and overloads in several files narrowed by the number of arguments.
+- gtest and Boost.Test: `ASSERT_*`/`EXPECT_*`, `TEST_F` fixtures and their bases, `ASSERT_THAT`'s `operator()`, `name_invoker`.
+- Parsing: a macro alone in a class or function body, `extern "C" {` split across `#ifdef __cplusplus`, a header whose C++ part defines a class.
+- Against clang: fmt calls found 75.0% → 89.7% (certain 62.6% → 79.6%), leveldb 86.8% → 95.9% (68.2% → 87.8%), bitcoin 86.1% → 93.9% (78.5% → 89.6%); certain precision up a little on each. The first opening after the upgrade builds the index again.
+
+### C, and the Linux kernel
 
 - A Kconfig configuration of Linux says which architecture it is for. The other architectures' folders, and `tools/` and `scripts/` (programs the host runs), are taken as not built: still indexed and searched, but where a name or an `#include` could mean what is there or what the build compiles, it means what the build compiles. The setting is `"notBuilt": [...]`, for any project to use.
 - With it, what Kbuild and the compiler it names define for C: `__KERNEL__`, the compiler's own macros (`__clang__` and its version, or `__GNUC__`), the architecture's (`__x86_64__`); `__ASSEMBLY__` and `__CHECKER__` not defined.
