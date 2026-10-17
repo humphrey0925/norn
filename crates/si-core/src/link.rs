@@ -2958,6 +2958,24 @@ mod test_framework_tests {
     }
 
     #[test]
+    fn a_class_a_macro_defines_derives_from_what_it_says() {
+        // gtest's TEST_F, of a corpus that has gtest: the test's class
+        // derives from the fixture, whose methods the body calls.
+        let files = [
+            ("t.h", "#define TEST_F(f, n) class f##_##n##_Test : public ::testing::f { void TestBody(); }; void f##_##n##_Test::TestBody()\n"),
+            ("t.cc", "#include \"t.h\"\nnamespace testing { class LogTest { public: void Write(int x) {} }; }\nclass Other { public: void Write(int x) {} };\nTEST_F(LogTest, BadLength) {\n  Write(1);\n}\n"),
+        ];
+        let sets = MacroSets::from_defines(files.iter().flat_map(|(_, src)| crate::mask::defines(src.as_bytes(), &crate::cond::Conditions::default())));
+        let mut ex = Extractor::new();
+        let facts: Vec<FileFacts> = files.iter().map(|(path, src)| ex.extract(path, src.as_bytes(), &sets)).collect();
+        let g = link(&facts).0;
+        let q = crate::graph::Qualifier::new(&g);
+        let body = g.find("TestBody").iter().copied().find(|&s| g.syms[s as usize].flags & flag::DECL == 0).expect("TestBody");
+        let calls: Vec<String> = g.refs_from(body).iter().filter(|e| e.kind() == refkind::CALL && !e.ambiguous()).map(|e| q.name(&g, e.other).into_owned()).collect();
+        assert_eq!(calls, ["LogTest::Write"]);
+    }
+
+    #[test]
     fn a_test_macro_the_corpus_defines_is_expanded_not_guessed() {
         // A macro of that name of the corpus's own: what it makes is read
         // from its expansion, and nothing is made of the name.

@@ -859,12 +859,15 @@ struct Found {
     /// Names the expansion uses that are not written at the use: name,
     /// kind, and the function the expansion defines around it, if any.
     refs: Vec<(String, u8, Option<String>)>,
+    /// C++: classes the expansion defines, with a class they derive from
+    /// (gtest's `TEST_F (Fixture, Name)`, a class of the fixture's).
+    bases: Vec<(String, String)>,
 }
 
 impl Found {
     /// Add this expansion's names to `known`; was any of them new?
     fn novel(self, known: &mut FxHashSet<String>) -> bool {
-        let names = self.single.into_iter().chain(self.decls.into_iter().map(|d| d.0)).chain(self.refs.into_iter().map(|r| r.0));
+        let names = self.single.into_iter().chain(self.decls.into_iter().map(|d| d.0)).chain(self.refs.into_iter().map(|r| r.0)).chain(self.bases.into_iter().map(|b| b.0 + ":" + &b.1));
         // (Every one of them inserted: no stopping at the first new one.)
         let mut new = false;
         for n in names {
@@ -874,7 +877,7 @@ impl Found {
     }
 
     fn is_empty(&self) -> bool {
-        self.single.is_none() && self.decls.is_empty() && self.refs.is_empty()
+        self.single.is_none() && self.decls.is_empty() && self.refs.is_empty() && self.bases.is_empty()
     }
 
     /// What a definition whose name is this use is really called.
@@ -949,6 +952,42 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
             "static" => storage |= flag::STATIC,
             "extern" => storage |= flag::DECL,
             _ => {}
+        }
+        // C++: `class Name : public Base {`, what it derives from.
+        if cpp && matches!(&*t.text, "class" | "struct") && toks.get(i + 1).is_some_and(|x| x.k == K::Ident) && toks.get(i + 2).is_some_and(|x| x.is(":")) {
+            let class = toks[i + 1].text.to_string();
+            let mut j = i + 3;
+            loop {
+                while toks.get(j).is_some_and(|x| x.k == K::Ident && matches!(&*x.text, "public" | "protected" | "private" | "virtual")) {
+                    j += 1;
+                }
+                let mut base = None;
+                while let Some(x) = toks.get(j) {
+                    if x.k == K::Ident {
+                        base = Some(x.text.to_string());
+                    } else if !x.is("::") {
+                        break;
+                    }
+                    j += 1;
+                }
+                // (`Base<T>`: its arguments are no part of the name.)
+                if toks.get(j).is_some_and(|x| x.is("<")) {
+                    let mut depth = 0;
+                    while let Some(x) = toks.get(j) {
+                        depth += x.is("<") as i32 - x.is(">") as i32;
+                        j += 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+                let Some(base) = base else { break };
+                found.bases.push((class.clone(), base));
+                if !toks.get(j).is_some_and(|x| x.is(",")) {
+                    break;
+                }
+                j += 1;
+            }
         }
         if is_keyword(t.text.as_bytes()) {
             continue;
@@ -1489,6 +1528,12 @@ fn expand_file(
                     out.cxx_mut().owners.push((at, chain, class));
                 }
                 out.defs.push(def);
+            }
+        }
+        for (class, base) in m.found.bases.iter().filter(|_| m.first) {
+            let (class, base) = (names.id(&mut out, class), names.id(&mut out, base));
+            if !out.cxx().bases.contains(&(class, base)) {
+                out.cxx_mut().bases.push((class, base));
             }
         }
         for (n, kind, owner) in m.found.refs {
