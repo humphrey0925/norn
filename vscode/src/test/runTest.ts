@@ -3,8 +3,16 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { runTests } from "@vscode/test-electron";
+import { downloadAndUnzipVSCode, runTests } from "@vscode/test-electron";
 import { extract } from "./zip";
+
+/** The VS Code to test in. On macOS its program was `Electron` and is
+ *  `Code` from 1.142, which @vscode/test-electron 2 does not know of. */
+async function vscode(): Promise<string> {
+  const exe = await downloadAndUnzipVSCode();
+  const code = path.join(path.dirname(exe), "Code");
+  return process.platform === "darwin" && !fs.existsSync(exe) && fs.existsSync(code) ? code : exe;
+}
 
 /** `startup <folder>`: VS Code opening a folder of one's own, as it is
  *  (its `.norn` included), Norn's server from this build set in a user
@@ -19,6 +27,7 @@ async function startup(folder: string) {
   console.log(`launched at ${t} ms since 1970`);
   try {
     await runTests({
+      vscodeExecutablePath: await vscode(),
       extensionDevelopmentPath: path.resolve(__dirname, "../.."),
       extensionTestsPath: path.resolve(__dirname, "./startup"),
       // NORN_STARTUP_CPP: with the C/C++ extension too (see `cpp` below).
@@ -79,6 +88,7 @@ async function main() {
   fs.writeFileSync(path.join(work, ".vscode", "settings.json"), JSON.stringify({ ...withCpp, ...(process.env.SI_TEST_BUNDLED || packaged ? {} : { "norn.serverPath": `"${server}"` }), ...(process.env.SI_DEMO_THEME ? { "workbench.colorTheme": process.env.SI_DEMO_THEME } : {}) }));
   try {
     await runTests({
+      vscodeExecutablePath: await vscode(),
       extensionDevelopmentPath: extension,
       extensionTestsPath: path.resolve(__dirname, process.argv[2] === "demo" ? "./demo" : cpp ? "./cpp" : packaged ? "./packaged" : "./suite"),
       launchArgs: cpp ? [work, "--extensions-dir", path.resolve(__dirname, "../../.vscode-test/extensions-cpp")] : [work, "--disable-extensions"],
