@@ -566,6 +566,11 @@ struct Cpp {
     arity: FxHashMap<u32, (u8, u8)>,
     /// (Function, position) -> the class of the parameter there.
     params: FxHashMap<(u32, u32), u32>,
+    /// The constructors that convert nothing.
+    explicit: FxHashSet<u32>,
+    /// A macro -> what it passes its arguments on to: (the function or
+    /// macro called, its qualifier, the parameter, the argument, `...`).
+    forwards: FxHashMap<u32, Vec<(u32, u32, u32, u32, bool)>>,
 }
 
 impl Cpp {
@@ -621,6 +626,11 @@ impl Cpp {
             }
             c.arity.extend(f.cxx().arity.iter().map(|&(def, least, most)| ((base + def as usize) as u32, (least, most))));
             c.params.extend(f.cxx().params.iter().map(|&(def, at, t)| (((base + def as usize) as u32, at), remap[fi][t as usize])));
+            c.explicit.extend(f.cxx().explicit.iter().map(|&def| (base + def as usize) as u32));
+            for w in &f.cxx().forwards {
+                let qual = if w.qual == NONE { NONE } else { remap[fi][w.qual as usize] };
+                c.forwards.entry((base + w.def as usize) as u32).or_default().push((remap[fi][w.callee as usize], qual, w.param, w.arg, w.rest));
+            }
             for &(class, b) in &f.cxx().bases {
                 let (class, b) = (remap[fi][class as usize], remap[fi][b as usize]);
                 if class != b {
@@ -661,7 +671,148 @@ impl Cpp {
                 }
             }
         }
+        // So is `explicit`: a constructor defined apart is so where one of
+        // its class declared with as many parameters, the first of the same
+        // class, is.
+        let key = |c: &Cpp, sym: u32| (c.class(sym), g.syms[sym as usize].name, c.arity.get(&sym).map_or(u8::MAX, |a| a.1), c.params.get(&(sym, 0)).copied().unwrap_or(NONE));
+        let declared: FxHashSet<_> = c.explicit.iter().filter(|&&s| g.syms[s as usize].flags & flag::DECL != 0).map(|&s| key(&c, s)).collect();
+        if !declared.is_empty() {
+            let defs: Vec<u32> = c.arity.keys().copied().filter(|&s| g.syms[s as usize].flags & flag::DECL == 0 && declared.contains(&key(&c, s))).collect();
+            c.explicit.extend(defs);
+        }
         c
+    }
+
+    /// The constructors that make a call's arguments into the classes of
+    /// the parameters they are passed as (`Put ("k")` of a `Put (const
+    /// Slice& key)`: Slice's from a string), as (constructor, class).
+    /// `given`: (position, what is known of the argument's type: a class,
+    /// or `literals`, a string's or a number's); `targets`: what the call
+    /// reaches, functions or the one macro it uses, which passes them on.
+    #[allow(clippy::too_many_arguments)]
+    fn conversions(
+        &self,
+        g: &Graph,
+        aliases: &FxHashMap<u32, Vec<u32>>,
+        given: &[(u32, u32)],
+        targets: &[u32],
+        literals: (u32, u32),
+        lineage: &mut Vec<u32>,
+        out: &mut Vec<(u32, u32)>,
+    ) {
+        let syms = &g.syms;
+        let is = |c: u32, k: u8| syms[c as usize].kind == k;
+        // (what may be called, (position in the call, position there))
+        let mut work: Vec<(Vec<u32>, Vec<(u32, u32)>)> = Vec::new();
+        let start: Vec<(u32, u32)> = given.iter().map(|&(j, _)| (j, j)).collect();
+        if !targets.is_empty() && targets.iter().all(|&t| is(t, kind::FUNCTION)) {
+            work.push((targets.to_vec(), start));
+        } else if let [m] = *targets {
+            // Through the macros that pass the arguments on.
+            let mut macros = vec![(m, start, 0)];
+            while let Some((m, map, depth)) = macros.pop() {
+                let Some(rows) = self.forwards.get(&m).filter(|_| is(m, kind::MACRO)) else { continue };
+                let mut callees: Vec<(u32, u32)> = rows.iter().map(|r| (r.0, r.1)).collect();
+                callees.sort_unstable();
+                callees.dedup();
+                for (callee, qual) in callees {
+                    let mapped: Vec<(u32, u32)> = map
+                        .iter()
+                        .filter_map(|&(j, p)| {
+                            rows.iter().filter(|r| r.0 == callee && r.1 == qual).find_map(|r| if r.4 { (p >= r.2).then(|| r.3 + (p - r.2)) } else { (p == r.2).then_some(r.3) }).map(|k| (j, k))
+                        })
+                        .collect();
+                    if mapped.is_empty() {
+                        continue;
+                    }
+                    let named = g.syms_named(callee);
+                    let mut fns: Vec<u32> = named.iter().copied().filter(|&c| is(c, kind::FUNCTION)).collect();
+                    if fns.is_empty() {
+                        if let [next] = *named.iter().copied().filter(|&c| is(c, kind::MACRO)).collect::<Vec<_>>() {
+                            if depth < 4 {
+                                macros.push((next, mapped, depth + 1));
+                            }
+                        }
+                        continue;
+                    }
+                    // `tfm::format`: of that namespace, or class; a name
+                    // not qualified, a function of no class.
+                    let qual = self.namespace_aliases.get(&qual).copied().unwrap_or(qual);
+                    let keep = |c: &u32| {
+                        if qual == NONE {
+                            self.class(*c) == NONE
+                        } else if self.namespaces.contains(&qual) {
+                            self.ns(*c) == qual
+                        } else {
+                            self.class(*c) == qual
+                        }
+                    };
+                    if fns.iter().any(keep) {
+                        fns.retain(keep);
+                    }
+                    work.push((fns, mapped));
+                }
+            }
+        }
+        let literal = |t: u32| t == literals.0 || t == literals.1;
+        let mut ctors: Vec<(u32, u32)> = Vec::new();
+        for (fns, map) in work {
+            for (j, k) in map {
+                let Some(&(_, a)) = given.iter().find(|x| x.0 == j) else { continue };
+                // A candidate taking it as it is is the one called.
+                if fns.iter().any(|&c| self.params.get(&(c, k)) == Some(&a)) {
+                    continue;
+                }
+                lineage.clear();
+                if !literal(a) {
+                    self.lineage(a, lineage);
+                }
+                // The classes the candidates take there, and of each the
+                // constructors that would make one of the argument: taking
+                // one argument, not `explicit`; of a string or a number one
+                // whose parameter is no class of the corpus, of an object
+                // one taking its class (or a base).
+                let ctor_of = |c: u32, class: u32| is(c, kind::FUNCTION) && self.class(c) == class;
+                let has_ctor = |class: u32| g.syms_named(class).iter().any(|&c| ctor_of(c, class));
+                let from = |c: u32| match self.params.get(&(c, 0)) {
+                    None => true,
+                    Some(&p) if literal(p) => p == a,
+                    Some(p) => !literal(a) && lineage.contains(p),
+                };
+                ctors.clear();
+                let mut classes: Vec<u32> = fns.iter().filter_map(|&c| self.params.get(&(c, k)).copied()).filter(|&t| !literal(t)).collect();
+                classes.sort_unstable();
+                classes.dedup();
+                for t in classes {
+                    // (An object of a class derived from it is passed as is.)
+                    if lineage.contains(&t) {
+                        ctors.clear();
+                        break;
+                    }
+                    let mut class = t;
+                    if !has_ctor(class) {
+                        match aliases.get(&class).into_iter().flatten().copied().find(|&x| has_ctor(x)) {
+                            Some(tag) => class = tag,
+                            None => continue,
+                        }
+                    }
+                    for &c in g.syms_named(class) {
+                        if ctor_of(c, class) && !self.explicit.contains(&c) && self.arity.get(&c).is_none_or(|&(least, most)| least <= 1 && 1 <= most) && from(c) {
+                            ctors.push((c, class));
+                        }
+                    }
+                }
+                // Only where one class can take it.
+                if ctors.iter().any(|x| x.1 != ctors[0].1) {
+                    continue;
+                }
+                let is_def = |c: &(u32, u32)| syms[c.0 as usize].flags & flag::DECL == 0;
+                if ctors.iter().any(is_def) {
+                    ctors.retain(is_def);
+                }
+                out.extend_from_slice(&ctors);
+            }
+        }
     }
 
     /// Of overloads, keep those that take `n` arguments, if any does and
@@ -977,6 +1128,8 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     //    includes; anything with external visibility.
     let t = Instant::now();
     let syms = &g.syms;
+    // (What the facts call a string and a number passed.)
+    let literals = (g.name_id("\"\"").unwrap_or(NONE), g.name_id("0").unwrap_or(NONE));
     let per_file: Vec<(Vec<[u32; 3]>, [u64; 4], Vec<[u32; 4]>, Vec<[u32; 3]>)> = files
         .par_iter()
         .enumerate()
@@ -1013,6 +1166,21 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
             let operands: FxHashMap<u32, (u32, u32, bool)> = f.cxx().operators.iter().map(|&(r, l, rr, binary)| (r, (l, rr, binary))).collect();
             let args_of: FxHashMap<u32, u8> = f.cxx().args.iter().copied().collect();
             let copies: FxHashSet<u32> = f.cxx().copies.iter().copied().collect();
+            let mut arg_types: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+            for &(r, at, t) in &f.cxx().arg_types {
+                arg_types.entry(r).or_default().push((at, remap[fi][t as usize]));
+            }
+            let mut made: Vec<(u32, u32)> = Vec::new();
+            // The objects a call's arguments are made into (see `Cpp::conversions`).
+            let mut convert = |ri: usize, r: &crate::model::Ref, targets: &[u32], ambiguous: bool, lineage: &mut Vec<u32>, edges: &mut Vec<[u32; 3]>| {
+                let Some(given) = arg_types.get(&(ri as u32)) else { return };
+                made.clear();
+                cpp.conversions(&g, &aliases, given, targets, literals, lineage, &mut made);
+                for &(c, class) in &made {
+                    let several = made.iter().any(|&(o, k)| k == class && syms[o as usize].file != syms[c as usize].file);
+                    edges.push([base + r.scope, c, pack_meta(r.line, ambiguous || several, refkind::CALL)]);
+                }
+            };
             for (ri, r) in f.refs.iter().enumerate() {
                 if let Some(&(lh, rh, binary)) = operands.get(&(ri as u32)).filter(|_| in_cpp) {
                     // An operator used on objects: the left operand's
@@ -1164,6 +1332,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     counts[ambiguous as usize] += 1;
                     let meta = pack_meta(r.line, ambiguous, refkind::CALL);
                     edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta]));
+                    convert(ri, r, &tmp, ambiguous, &mut lineage, &mut edges);
                     continue;
                 }
                 let (kind, maybe) = (r.kind & !refkind::MAYBE, r.kind & refkind::MAYBE != 0);
@@ -1519,6 +1688,15 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 } else {
                     let meta = pack_meta(r.line, ambiguous, edge_kind);
                     edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta]));
+                }
+                // (Not of a function no header read here declares: gtest's
+                // `printf ("...")` is the C library's, not fmt's.)
+                let hidden = tmp.iter().any(|&c| {
+                    let seen = |d: &u32| syms[*d as usize].file == fi as u32 || closure.member[syms[*d as usize].file as usize];
+                    syms[c as usize].kind == kind::FUNCTION && !g.syms_named(syms[c as usize].name).iter().any(|d| seen(d) && cpp.class(*d) == cpp.class(c))
+                });
+                if in_cpp && edge_kind != refkind::USE && !hidden {
+                    convert(ri, r, &tmp, ambiguous, &mut lineage, &mut edges);
                 }
                 // A virtual method called on an object may run an override:
                 // those of the classes derived from its class.
@@ -2430,6 +2608,73 @@ Status* h(Status* p) { return p; }
         // pointer is no object.
         assert!(made("g").is_empty(), "{:?}", made("g"));
         assert!(made("h").is_empty(), "{:?}", made("h"));
+    }
+
+    #[test]
+    fn an_argument_passed_as_another_class_is_made_into_one() {
+        let g = graph(&[
+            ("s.h", "class Slice {
+ public:
+  Slice(const char* s) {}
+};
+class Key {
+ public:
+  explicit Key(const char* s) {}
+};
+class Status {
+ public:
+  Status(const Slice& msg) {}
+};
+void Put(const Slice& key, int n) {}
+void Name(const char* s) {}
+void Name(const Slice& s) {}
+void Lookup(const Key& k) {}
+namespace tinyformat {
+template <unsigned n>
+struct FormatStringCheck {
+  FormatStringCheck(const char* str) {}
+};
+template <typename... Args>
+void format(FormatStringCheck<sizeof...(Args)> fmt, const Args&... args) {}
+}
+namespace tfm = tinyformat;
+#define strprintf tfm::format
+inline void LogPrint(int level, tinyformat::FormatStringCheck<1> fmt, int x) {}
+#define LogLevel_(level, ...) LogPrint(level, __VA_ARGS__)
+#define LogInfo(...) LogLevel_(1, __VA_ARGS__)
+"),
+            ("o.h", "class Other {
+ public:
+  Other(const char* s) {}
+};
+void Elsewhere(const Other& o) {}
+"),
+            ("s.cc", "#include \"s.h\"
+void a() { Put(\"k\", 1); Slice s(\"x\"); Status t(s); }
+void b() { Name(\"n\"); Lookup(Key(\"k\")); }
+void c(int x) { strprintf(\"%d\", x); LogInfo(\"%d\", x); }
+void d() { Elsewhere(\"e\"); }
+"),
+        ]);
+        let q = crate::graph::Qualifier::new(&g);
+        let made = |caller: &str| -> Vec<String> {
+            let mut v: Vec<String> = g.find(caller).iter().flat_map(|&s| g.refs_from(s))
+                .filter(|e| e.kind() == refkind::CALL && !e.ambiguous() && g.syms[e.other as usize].line < 25 && q.name(&g, e.other).contains("::"))
+                .map(|e| q.name(&g, e.other).into_owned()).collect();
+            v.sort();
+            v
+        };
+        // `Put ("k", 1)` makes a Slice of the string; `Status t (s)` takes
+        // the Slice it is given, made by the constructor of Status.
+        assert_eq!(made("a"), ["Slice::Slice", "Slice::Slice", "Status::Status"]);
+        // A string is what `Name (const char*)` takes; an explicit
+        // constructor converts nothing (`Key ("k")` is made, not converted).
+        assert_eq!(made("b"), ["Key::Key"]);
+        // Through a name for a function, and through macros passing on
+        // what they are given.
+        assert_eq!(made("c"), ["FormatStringCheck::FormatStringCheck", "FormatStringCheck::FormatStringCheck"]);
+        // Of a function no header read here declares, nothing.
+        assert!(made("d").is_empty(), "{:?}", made("d"));
     }
 
     #[test]

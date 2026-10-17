@@ -2,7 +2,7 @@
 
 use crate::mask::{self, Event, Tok, MacroSets};
 use crate::model::{
-    flag, kind, refkind, root, site, ArgPass, Bind, Def, FileFacts, InitSite, MacroBody, MemberHint, ParamCall, Record,
+    flag, kind, refkind, root, site, ArgPass, Bind, Def, FileFacts, Forward, InitSite, MacroBody, MemberHint, ParamCall, Record,
     Ref, Site, NONE,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -879,10 +879,17 @@ impl<'a> Walk<'a> {
                             }
                         }
                         // Of a parameter that is an object or a reference to
-                        // one, its class (`const Status& s`: `Status`).
+                        // one, its class (`const Status& s`: `Status`); one
+                        // that takes a string or a number as it is, `""` or `0`.
                         let pointer = q.child_by_field_id(ids.f_declarator.get()).is_some_and(|d| matches!(d.kind(), "pointer_declarator" | "abstract_pointer_declarator"));
-                        if most != at && most != u8::MAX && !pointer {
-                            let t = self.type_name_of(q);
+                        let builtin = q.child_by_field_id(ids.f_type).filter(|t| matches!(t.kind(), "primitive_type" | "sized_type_specifier"));
+                        if most != at && most != u8::MAX {
+                            let t = match builtin {
+                                Some(b) if pointer && self.text(b).ends_with(b"char") => self.intern_str("\"\""),
+                                Some(_) if !pointer => self.intern_str("0"),
+                                _ if !pointer => self.type_name_of(q),
+                                _ => NONE,
+                            };
                             if t != NONE {
                                 self.out.cxx_mut().params.push((def, at as u32, t));
                             }
@@ -892,6 +899,12 @@ impl<'a> Walk<'a> {
                         most = u8::MAX;
                     }
                     self.out.cxx_mut().arity.push((def, least, most));
+                    if let Some(d) = p.parent() {
+                        let mut c = d.walk();
+                        if d.children(&mut c).any(|x| x.kind() == "explicit_function_specifier") {
+                            self.out.cxx_mut().explicit.push(def);
+                        }
+                    }
                     return;
                 }
                 Some(p) => n = p,
@@ -906,6 +919,31 @@ impl<'a> Walk<'a> {
         if let Some(n) = self.count_args(list) {
             let r = self.out.refs.len() as u32 - 1;
             self.out.cxx_mut().args.push((r, n));
+        }
+        self.note_arg_types(list);
+    }
+
+    /// C++: of the arguments of the reference just pushed, what is known of
+    /// their types: a string or a number written (`""`, `0`), or a local
+    /// object's class. An argument of another type than its parameter's
+    /// class is made into one by a constructor of that class.
+    fn note_arg_types(&mut self, list: Option<Node<'a>>) {
+        let Some(list) = list.filter(|l| l.kind() == "argument_list") else { return };
+        let r = self.out.refs.len() as u32 - 1;
+        let mut c = list.walk();
+        let args: Vec<Node<'a>> = list.named_children(&mut c).filter(|a| !a.is_extra()).collect();
+        for (i, a) in args.into_iter().enumerate() {
+            let a = self.strip(a);
+            let t = match a.kind() {
+                "string_literal" | "concatenated_string" | "raw_string_literal" => self.intern_str("\"\""),
+                "number_literal" | "char_literal" => self.intern_str("0"),
+                "identifier" if self.in_fn() => match self.local_types.get(self.text(a)) {
+                    Some(&t) => t,
+                    None => continue,
+                },
+                _ => continue,
+            };
+            self.out.cxx_mut().arg_types.push((r, i as u32, t));
         }
     }
 
@@ -1413,6 +1451,9 @@ impl<'a> Walk<'a> {
                             }
                         }
                     }
+                    if self.cpp {
+                        self.note_forwards(scope, m.name.end as usize, m.end as usize, m.name.call);
+                    }
                     if m.keep {
                         let text = String::from_utf8_lossy(&self.orig[m.name.end as usize..m.end as usize]);
                         let text = self.out.push_text(&text);
@@ -1584,6 +1625,167 @@ impl<'a> Walk<'a> {
             i -= 1;
         }
         matches!(&s[i..end], b"struct" | b"class" | b"union" | b"enum" | b"namespace" | b"typename")
+    }
+
+    /// C++: which of its parameters the macro `def`, whose text after its
+    /// name is `orig[from..end]`, passes on as arguments of the calls its
+    /// body makes; or, of a name standing for a function (`#define
+    /// strprintf tfm::format`), that its use's arguments are the function's.
+    fn note_forwards(&mut self, def: u32, from: usize, end: usize, function_like: bool) {
+        let s = self.orig;
+        let skip = |mut i: usize| {
+            while i < end && (s[i].is_ascii_whitespace() || s[i] == b'\\') {
+                i += 1;
+            }
+            i
+        };
+        let word = |i: usize| {
+            let mut e = i;
+            while e < end && (s[e].is_ascii_alphanumeric() || s[e] == b'_') {
+                e += 1;
+            }
+            e
+        };
+        // The parameters, `...` (or GNU's `args...`) last.
+        let mut params: Vec<&'a [u8]> = Vec::new();
+        let mut rest: Option<(u32, &'a [u8])> = None;
+        let mut i = from;
+        if function_like {
+            i = skip(i);
+            if s.get(i) != Some(&b'(') {
+                return;
+            }
+            i += 1;
+            loop {
+                i = skip(i);
+                if i >= end {
+                    return;
+                }
+                if s[i] == b')' {
+                    i += 1;
+                    break;
+                }
+                if s[i..].starts_with(b"...") {
+                    rest = Some((params.len() as u32, b"__VA_ARGS__"));
+                    i += 3;
+                } else {
+                    let e = word(i);
+                    if e == i {
+                        return;
+                    }
+                    let name = &s[i..e];
+                    i = skip(e);
+                    if s[i..].starts_with(b"...") {
+                        rest = Some((params.len() as u32, name));
+                        i += 3;
+                    } else {
+                        params.push(name);
+                    }
+                }
+                i = skip(i);
+                if s.get(i) == Some(&b',') {
+                    i += 1;
+                }
+            }
+        }
+        // A name through scopes at `i`: (qualifier or `NONE`, name, end).
+        let qualified = |mut i: usize| -> Option<(Option<&'a [u8]>, &'a [u8], usize)> {
+            let (mut qual, mut name) = (None, None);
+            loop {
+                if s.get(i..i + 2) == Some(b"::") {
+                    i = skip(i + 2);
+                }
+                let e = word(i);
+                if e == i || s[i].is_ascii_digit() {
+                    return name.map(|n| (qual, n, i));
+                }
+                qual = name.or(qual);
+                name = Some(&s[i..e]);
+                let j = skip(e);
+                if s.get(j..j + 2) != Some(b"::") {
+                    return Some((qual, &s[i..e], j));
+                }
+                i = j;
+            }
+        };
+        let body = skip(i);
+        if !function_like {
+            // `#define strprintf tfm::format`.
+            if let Some((qual, name, _)) = qualified(body).filter(|q| skip(q.2) >= end) {
+                let (callee, qual) = (self.intern(name), qual.map_or(NONE, |q| self.intern(q)));
+                self.out.cxx_mut().forwards.push(Forward { def, callee, qual, param: 0, arg: 0, rest: true });
+            }
+            return;
+        }
+        let mut i = body;
+        while i < end {
+            let b = s[i];
+            if b == b'"' || b == b'\'' {
+                i += 1;
+                while i < end && s[i] != b {
+                    i += 1 + (s[i] == b'\\') as usize;
+                }
+                i += 1;
+                continue;
+            }
+            let starts = (b.is_ascii_alphabetic() || b == b'_' || (b == b':' && s.get(i + 1) == Some(&b':')))
+                && (i == 0 || !(s[i - 1].is_ascii_alphanumeric() || s[i - 1] == b'_' || s[i - 1] == b'.' || (s[i - 1] == b'>' && i >= 2 && s[i - 2] == b'-')));
+            let Some((qual, name, open)) = starts.then(|| qualified(i)).flatten() else {
+                i += 1;
+                continue;
+            };
+            if s.get(open) != Some(&b'(') || crate::mask::is_keyword(name) || name == b"defined" {
+                i = open.max(i + 1);
+                continue;
+            }
+            // The arguments, at the top level of the parentheses.
+            let (mut depth, mut k, mut a) = (0i32, 0u32, open + 1);
+            let mut j = open;
+            let mut found: Vec<(u32, u32, bool)> = Vec::new();
+            while j < end {
+                match s[j] {
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' | b',' if depth == 1 => {
+                        let mut text = &s[a..j];
+                        while let [b' ' | b'\t' | b'\\' | b'\r' | b'\n', more @ ..] = text {
+                            text = more;
+                        }
+                        while let [more @ .., b' ' | b'\t' | b'\\' | b'\r' | b'\n'] = text {
+                            text = more;
+                        }
+                        let text = text.strip_prefix(b"##").map_or(text, |t| t.trim_ascii_start());
+                        if let Some(p) = params.iter().position(|&p| p == text) {
+                            found.push((p as u32, k, false));
+                        } else if let Some((p, _)) = rest.filter(|r| r.1 == text) {
+                            found.push((p, k, true));
+                        }
+                        if s[j] == b',' {
+                            k += 1;
+                            a = j + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    b')' | b']' | b'}' => depth -= 1,
+                    b'"' | b'\'' => {
+                        let q = s[j];
+                        j += 1;
+                        while j < end && s[j] != q {
+                            j += 1 + (s[j] == b'\\') as usize;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            if !found.is_empty() {
+                let (callee, qual) = (self.intern(name), qual.map_or(NONE, |q| self.intern(q)));
+                for (param, arg, rest) in found {
+                    self.out.cxx_mut().forwards.push(Forward { def, callee, qual, param, arg, rest });
+                }
+            }
+            i = open + 1;
+        }
     }
 
     /// How many arguments the parentheses at `pos` in the text (a macro
@@ -2460,6 +2662,7 @@ impl<'a> Walk<'a> {
                                 // (`T x;`: none; `T x {a}` may take a list.)
                                 let args = if value.is_none() && plain { Some(0) } else { self.count_args(value) };
                                 self.push_construction(class, d, NONE, args);
+                                self.note_arg_types(value);
                             }
                         }
                         if let Some(value) = d.child_by_field_id(ids.f_value).filter(|_| d.kind_id() == ids.init_declarator) {
@@ -2610,9 +2813,10 @@ impl<'a> Walk<'a> {
             if let Some(t) = node.child_by_field_id(ids.f_type) {
                 let class = self.constructed_class(t);
                 if class != NONE {
-                    let args = node.child_by_field_id(ids.f_arguments);
-                    let args = if args.is_none() && node.kind() == "new_expression" { Some(0) } else { self.count_args(args) };
+                    let list = node.child_by_field_id(ids.f_arguments);
+                    let args = if list.is_none() && node.kind() == "new_expression" { Some(0) } else { self.count_args(list) };
                     self.push_construction(class, node, NONE, args);
+                    self.note_arg_types(list);
                 }
             }
             return true;
@@ -2628,6 +2832,7 @@ impl<'a> Walk<'a> {
                     let mut c = node.walk();
                     let args = node.named_children(&mut c).find(|n| n.kind() == "argument_list");
                     self.push_construction(class, node, hint, self.count_args(args));
+                    self.note_arg_types(args);
                 }
             }
             return true;

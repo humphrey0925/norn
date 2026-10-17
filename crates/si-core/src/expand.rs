@@ -1611,6 +1611,12 @@ fn expand_file(
         for p in &mut c.params {
             p.0 = new_index[p.0 as usize];
         }
+        for d in &mut c.explicit {
+            *d = new_index[*d as usize];
+        }
+        for f in &mut c.forwards {
+            f.def = new_index[f.def as usize];
+        }
     }
     for d in out.records.iter_mut().flat_map(|r| r.defs.iter_mut()).filter(|d| **d != NONE) {
         *d = new_index[*d as usize];
