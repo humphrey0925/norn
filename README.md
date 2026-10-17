@@ -1,77 +1,172 @@
-# Norn
+<p align="center">
+  <img src="vscode/media/icon.png" width="112" alt="Norn">
+</p>
 
-**English** | [繁體中文](README.zh-TW.md)
+<h1 align="center">Norn</h1>
 
-**Source Insight-style code navigation for large C codebases, in VS Code.**
-Norn indexes a source tree without building it: no compilation database and
-no configuration. It follows calls through macros and function pointers, and it
-works out which `#if` branches the project's build compiles.
+<p align="center">
+  <b>Source Insight-style code navigation for large C codebases, in VS Code.</b><br>
+  No build. No <code>compile_commands.json</code>. Calls through macros and function pointers, and only the code your build compiles.
+</p>
 
-![Norn in VS Code](vscode/media/screenshots/overview.png)
+<p align="center">
+  <a href="https://github.com/humphrey0925/norn/actions/workflows/ci.yml"><img src="https://github.com/humphrey0925/norn/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS-informational.svg" alt="Windows | Linux | macOS">
+  <img src="https://img.shields.io/badge/written%20in-Rust-orange.svg" alt="Written in Rust">
+</p>
+
+<p align="center">
+  <a href="#why-norn">Why Norn</a> ·
+  <a href="#benchmarks">Benchmarks</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#getting-started">Getting started</a> ·
+  <a href="docs/norn-guide.md">User guide</a> ·
+  <a href="README.zh-TW.md">繁體中文</a>
+</p>
+
+<p align="center">
+  <img src="vscode/media/screenshots/overview.png" alt="Norn in VS Code: Project Symbols, File Symbols, Relation and Context around the editor" width="900">
+</p>
 
 ## Why Norn
 
-Language servers built on a compiler (clangd, IntelliSense) need to know exactly
-how each file is compiled. For a lot of real C that is hard to give them:
-firmware built with a proprietary toolchain, SDKs with a header per chip,
-code that only builds on one machine. Norn reads the sources the way a person
-would, and the build's own description where there is one.
+Language servers built on a compiler, such as clangd, need to know exactly how
+every file is compiled. A great deal of real C cannot tell them: firmware built
+with a proprietary toolchain, SDKs with a header per chip, vendor trees that only
+build on one machine, code too large or too old to have a working compilation
+database. Text indexers such as ctags and cscope work anywhere, but they find
+names, not calls, and they cannot tell which `#if` branch is compiled.
 
-- **Fast**: the whole Linux kernel indexes in under a minute on a desktop PC;
-  saving a file updates the index in tens of milliseconds; a workspace reopens
-  instantly from its cache.
-- **Accurate**: measured call by call against clang on public projects
-  (Redis: 99.3% of calls found, 99.8% precision; STM32F4 HAL: 96.5% found,
-  100% precision).
-- **Local**: no network connections, no data collected.
+Norn reads the sources the way a person would, and the build's own description
+where there is one:
 
-## What it does
+- **No setup.** Open a folder. Norn finds the build's configuration in Arm DS-5,
+  Keil, IAR, Visual Studio, CMake, Makefile, PlatformIO or `compile_commands.json`
+  files and works out which `#if` branches are compiled.
+- **Calls, not just names.** It follows calls through macros and through function
+  pointers stored in structs, and says how each call comes about.
+- **Fast enough to forget about.** The whole Linux kernel indexes in under a
+  minute on a desktop PC; saving a file updates the index in milliseconds.
+- **Checked against the compiler.** Measured call by call against clang's own
+  view of real builds of public projects (see [Benchmarks](#benchmarks)).
+- **Private.** Everything runs on your machine. No network, no telemetry.
 
-- **Project Symbols**: fuzzy search over every symbol in the workspace.
-- **Relation**: callers, callees, references and function-pointer
-  assignments, as a tree or a graph, each call marked as direct, through a
-  macro, through a function pointer, or under an undecided `#if`.
-- **Context**: the definition of the name under the cursor, beside your code.
-- **File Symbols**: the current file's symbols, with each function's
-  parameters and locals.
-- **Compile conditions**: read from Arm DS-5 `.cproject`, Keil, IAR, Visual
-  Studio, `compile_commands.json`, PlatformIO, CMake and Makefiles; code the
-  build does not compile is left out and dimmed.
-- **A full C language server**: definitions, references, call hierarchy,
-  hover with macro values, completion, signature help, semantic highlighting,
-  rename, inlay hints, folding and formatting. Alongside Microsoft's C/C++
-  extension it acts as its configuration provider instead of duplicating it.
+| | Norn | clangd | ctags / cscope / GNU Global |
+|---|:-:|:-:|:-:|
+| Works without a compilation database | ✅ | ⚠️ less accurate | ✅ |
+| Knows which `#if` branches the build compiles | ✅ | ✅ with a database | ❌ |
+| Call graph (callers and callees) | ✅ | ✅ | ⚠️ cscope, by name |
+| Calls through function pointers | ✅ | ❌ | ❌ |
+| Calls generated by macros | ✅ | ✅ with a database | ❌ |
+| Index updated as you save | ✅ | ✅ | ❌ re-run |
+| Source Insight-style views (Relation, Context) | ✅ | ❌ | ❌ |
 
-See the extension's page, [vscode/README.md](vscode/README.md), for the
-details and screenshots, and the user guide, [docs/norn-guide.md](docs/norn-guide.md)
-(in Traditional Chinese).
+## Benchmarks
 
-## Install
+Measured on public projects against clang's own view of a real build of each.
+Each tool's cold index of the whole project is timed, and every call it reports
+is checked against the call clang compiles. clangd is given what a project
+without a working compilation database can give it. ctags, cscope and GNU Global
+index fastest because they record names and places, not a call graph.
 
-Install **Norn — Code Navigation & Symbol Index** from the Visual Studio
-Marketplace or Open VSX, or a `.vsix` from the
-[releases](https://github.com/humphrey0925/norn/releases). The server is
-included for Windows, Linux and macOS (x64 and Arm64). Open a folder with C
-sources; nothing else to set up.
+<!-- BENCHMARKS:BEGIN -->
+<p align="center"><img src="docs/benchmarks/calls-found.svg" alt="Calls found" width="760"></p>
+
+<p align="center"><img src="docs/benchmarks/index-time.svg" alt="Time to index" width="760"></p>
+
+| Project | Files | Norn | clangd | cscope | GNU Global | Universal Ctags |
+|---|--:|:-:|:-:|:-:|:-:|:-:|
+| Redis | 801 | **100.0%<br><sub>0.69 s</sub>** | 95.8%<br><sub>24 s</sub> | 96.9%<br><sub>0.31 s</sub> | n/a<br><sub>0.21 s</sub> | n/a<br><sub>0.30 s</sub> |
+| git | 919 | **99.9%<br><sub>0.25 s</sub>** | 64.2%<br><sub>34 s</sub> | 87.9%<br><sub>0.37 s</sub> | n/a<br><sub>0.22 s</sub> | n/a<br><sub>0.31 s</sub> |
+| binutils | 1,622 | **99.6%<br><sub>2.71 s</sub>** | 32.2%<br><sub>23 s</sub> | 70.6%<br><sub>1.54 s</sub> | n/a<br><sub>0.87 s</sub> | n/a<br><sub>1.38 s</sub> |
+| STM32F4 HAL | 253 | **96.5%<br><sub>0.88 s</sub>** | 0.0%<br><sub>2.19 s</sub> | 75.7%<br><sub>0.53 s</sub> | n/a<br><sub>0.70 s</sub> | n/a<br><sub>0.73 s</sub> |
+| nrfx | 535 | **98.0%<br><sub>0.79 s</sub>** | 14.1%<br><sub>1.66 s</sub> | 12.0%<br><sub>0.31 s</sub> | n/a<br><sub>0.38 s</sub> | n/a<br><sub>0.35 s</sub> |
+
+<sub>Each cell: the share of calls found (checked against clang), and below it the time to index.</sub>
+
+<sub>clangd on binutils, STM32F4 HAL, nrfx: given no include paths and no <code>-D</code>, as a project without a compilation database would, most of the code that needs the build's include paths or definitions does not parse for it. With a real build's database it does far better; that is not what is measured here.</sub>
+<!-- BENCHMARKS:END -->
+
+How the numbers are made, every figure for every project, and the versions of
+the tools: [docs/benchmarks](docs/benchmarks/README.md). Every number there is
+produced by [`bench/compare.py`](bench/compare.py); none is typed in.
+
+## Features
+
+<table>
+  <tr>
+    <td width="50%"><b>Project Symbols</b><br>Fuzzy search over every symbol: fragments in any order, initials, letters in order.<br><img src="vscode/media/screenshots/search.png" alt="Project Symbols"></td>
+    <td width="50%"><b>Relation</b><br>Callers, callees, references and function-pointer assignments, as a tree or a graph.<br><img src="vscode/media/screenshots/relation-graph.png" alt="Relation as a graph"></td>
+  </tr>
+  <tr>
+    <td><b>Hover with documentation</b><br>A declaration and its doc comment; a macro's value worked out through other macros.<br><img src="vscode/media/screenshots/hover-function.png" alt="Hover"></td>
+    <td><b>Context</b><br>The definition of whatever the cursor is on, beside your code, without leaving your place.<br><img src="vscode/media/screenshots/called-by.png" alt="Relation and Context"></td>
+  </tr>
+  <tr>
+    <td><b>Completion</b><br>Members after <code>.</code> and <code>-></code>, locals, keywords, <code>#include</code> paths, every indexed name.<br><img src="vscode/media/screenshots/member-completion.png" alt="Member completion"></td>
+    <td><b>Highlighting and hints</b><br>Names coloured by what they are; parameter names at call sites.<br><img src="vscode/media/screenshots/highlighting-and-hints.png" alt="Semantic highlighting and inlay hints"></td>
+  </tr>
+  <tr>
+    <td><b>File Symbols with locals</b><br>A function's parameters and local variables, and every line that uses one.<br><img src="vscode/media/screenshots/locals.png" alt="File Symbols with locals"></td>
+    <td><b>Compile conditions</b><br>Configurations read from the build; switch between Debug, Release or one per board.<br><img src="vscode/media/screenshots/conditions-switch.png" alt="Switching configuration"></td>
+  </tr>
+</table>
+
+Norn is a complete language server: Go to Definition, Find References, Call
+Hierarchy, signature help, rename, folding, formatting and quick fixes too.
+Alongside Microsoft's C/C++ extension it becomes IntelliSense's configuration
+provider instead of competing with it. The full list is on the
+[extension's page](vscode/README.md).
+
+## Getting started
+
+1. Install **Norn — Code Navigation & Symbol Index** from the Visual Studio
+   Marketplace or Open VSX, or a `.vsix` from the
+   [releases](https://github.com/humphrey0925/norn/releases).
+2. Open a folder with C sources.
+
+That is all. The server is included for Windows, Linux and macOS, on x64 and
+Arm64. The [user guide](docs/norn-guide.md) (Traditional Chinese) covers every
+view and setting.
+
+## How it works
+
+```
+sources ─► tree-sitter parse ─► facts per file ─► link ─► call graph (CSR) ─► language server
+              ▲                                     ▲
+   #if worked out from the build's              calls through macros and
+   own configuration and the sources            function pointers resolved
+```
+
+Norn is written in Rust. Each file is parsed once with tree-sitter after its
+preprocessor conditions are worked out, from the build's configuration and from
+what the sources themselves define. The facts of each file are cached by content
+hash; linking them into a call graph takes milliseconds, so saving a file
+updates the index almost at once. The graph is kept in compressed sparse rows,
+which answer a callers query in well under a microsecond.
 
 ## Building from source
 
 Requires Rust (stable) and Node.js 20.
 
-    cargo build --release                  # the server: target/release/norn
-    cd vscode && npm ci && npm run compile  # the extension
+```bash
+cargo build --release
+```
 
-`node release/package.js <platform> <server>` packages the extension for one
-platform, for example `node release/package.js linux-x64 target/release/norn`.
-Releases are built and tested on Windows, Linux and macOS by GitHub Actions;
-see [docs/releasing.md](docs/releasing.md).
+```bash
+cd vscode && npm ci && npm run compile
+```
 
 | Path | |
 |---|---|
-| `crates/si-core` | The index: parsing (tree-sitter), preprocessor conditions, linking, the stored graph |
-| `crates/si-cli` | The `norn` executable: `norn lsp` (the language server), `norn index`, `norn query` |
-| `vscode/` | The VS Code extension |
-| `bench/` | Accuracy and speed measurements against clang and other indexers |
+| [`crates/si-core`](crates/si-core) | The index: parsing, preprocessor conditions, linking, the stored graph |
+| [`crates/si-cli`](crates/si-cli) | The `norn` executable: `norn lsp` (the language server), `norn index`, `norn query` |
+| [`vscode`](vscode) | The VS Code extension |
+| [`bench`](bench) | Accuracy and speed measurements against clang and other indexers |
+
+Releases are built and tested on Windows, Linux and macOS by GitHub Actions; see
+[docs/releasing.md](docs/releasing.md).
 
 ## Contributing
 
