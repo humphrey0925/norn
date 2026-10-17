@@ -362,16 +362,38 @@ pub fn prescan_under(root: &Path, files: &[PathBuf], conditions: &mut cond::Cond
 }
 
 pub fn extract_file(ex: &mut extract::Extractor, root: &Path, path: &Path, transparent: &MacroSets) -> FileFacts {
+    extract_file_reusing(ex, root, path, transparent, None)
+}
+
+/// The same, the facts taken from another root's index where it has them
+/// of this very text read under these very conditions (`store::Reuse`).
+pub fn extract_file_reusing(ex: &mut extract::Extractor, root: &Path, path: &Path, transparent: &MacroSets, reuse: Option<&store::Reuse>) -> FileFacts {
     let src = std::fs::read(path).unwrap_or_default();
-    let facts = ex.extract(&rel_path(root, path), &src, transparent);
+    let rel = rel_path(root, path);
+    let facts = match reuse {
+        Some(r) => {
+            let (facts, reused) = ex.extract_reusing(&rel, &src, transparent, &|key| r.get(&rel, key));
+            if reused {
+                r.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            facts
+        }
+        None => ex.extract(&rel, &src, transparent),
+    };
     progress::tick();
     facts
 }
 
 /// Extract all files on the current rayon pool; output order matches `files`.
 pub fn extract_all(root: &Path, files: &[PathBuf], transparent: &MacroSets) -> Vec<FileFacts> {
+    extract_all_reusing(root, files, transparent, None)
+}
+
+/// The same, taking what other roots' indexes have (`store::Reuse`).
+pub fn extract_all_reusing(root: &Path, files: &[PathBuf], transparent: &MacroSets, reuse: Option<&store::Reuse>) -> Vec<FileFacts> {
     progress::parsing(files.len());
-    let mut facts: Vec<FileFacts> = files.par_iter().map_init(extract::Extractor::new, |ex, p| extract_file(ex, root, p, transparent)).collect();
+    let mut facts: Vec<FileFacts> =
+        files.par_iter().map_init(extract::Extractor::new, |ex, p| extract_file_reusing(ex, root, p, transparent, reuse)).collect();
     mem_mark("extracted");
     gather(&mut facts);
     trim_memory();

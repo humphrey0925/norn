@@ -550,7 +550,7 @@ fn live(root: &Path, keep: &Keep, options: &si_core::link::Options) {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let ready = json!({ "ready": true, "files": session.files(), "symbols": session.graph.syms.len(), "ms": ms(t),
-                        "loaded": opened.loaded, "extracted": opened.extracted, "link_ms": opened.link_ms,
+                        "loaded": opened.loaded, "extracted": opened.extracted, "reused": opened.reused, "link_ms": opened.link_ms,
                         "cache": session.cache_dir().map(|d| d.to_string_lossy().into_owned()) });
     writeln!(out, "{ready}").and_then(|_| out.flush()).expect("write response");
     for line in std::io::stdin().lock().lines() {

@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped whenever what extraction records, or how it is laid out, changes:
 /// facts written by another version are not read.
-const FORMAT: u32 = 25;
+const FORMAT: u32 = 26;
 
 /// Size and modification time of a source file when its facts were made.
 pub type Stamp = (u64, u64);
@@ -63,6 +63,10 @@ pub struct Manifest {
     /// How each compilation reads the headers compiled more than one way.
     #[serde(default)]
     pub readings: crate::units::Readings,
+    /// Each file's `FileFacts::lex_key`, in the order of `files`: what
+    /// another root looks up before it reads any file's facts.
+    #[serde(default)]
+    pub keys: Vec<u64>,
 }
 
 pub struct Store {
@@ -108,9 +112,9 @@ impl Store {
         (m.format == FORMAT).then_some(m)
     }
 
-    pub fn save_manifest(&self, sets: u64, files: Vec<String>, verdicts: crate::units::Verdicts, readings: crate::units::Readings) {
+    pub fn save_manifest(&self, sets: u64, files: Vec<String>, verdicts: crate::units::Verdicts, readings: crate::units::Readings, keys: Vec<u64>) {
         self.prepare();
-        if let Ok(bytes) = bincode::serialize(&Manifest { format: FORMAT, sets, files, verdicts, readings }) {
+        if let Ok(bytes) = bincode::serialize(&Manifest { format: FORMAT, sets, files, verdicts, readings, keys }) {
             // Written aside and moved into place: a start never reads half of it.
             let tmp = self.dir.join("manifest.tmp");
             if std::fs::write(&tmp, bytes).is_ok() {
@@ -262,5 +266,94 @@ impl Store {
     /// Before expansions are written over: the list no longer vouches for them.
     pub fn invalidate_expansions(&self) {
         let _ = std::fs::remove_file(self.dir.join("expansions"));
+    }
+}
+
+/// The indexes of other roots this one's facts may be taken from: an inner
+/// folder's (opened on its own before) and an outer one's (a tree this one
+/// is in). A file's facts are taken only where its `lex_key` is the one
+/// made of it now (see `Extractor::extract_reusing`): the same text, read
+/// under the same conditions.
+pub struct Reuse {
+    /// Each other index, how its paths are written, and the key it has of
+    /// each file (from its manifest: no file's facts are read to find out).
+    stores: Vec<(Store, Mapping, rustc_hash::FxHashMap<String, u64>)>,
+    pub hits: std::sync::atomic::AtomicUsize,
+}
+
+/// How a path under this root is written under the other.
+enum Mapping {
+    /// The other root is the folder `prefix` (with a trailing `/`) in this one.
+    Inner(String),
+    /// This root is the folder `prefix` (with a trailing `/`) in the other.
+    Outer(String),
+}
+
+impl Reuse {
+    /// Folders this deep in the root are looked in for an index of their own.
+    const DEPTH: usize = 6;
+
+    /// The other indexes there are, if any (`own`: this root's, left out).
+    pub fn find(root: &Path, own: &Path) -> Option<Reuse> {
+        // (Read where they are, without moving a `.si` to `.norn` as
+        // opening a root does: these roots are not being opened.)
+        let caches = |d: &Path| [d.join(".norn").join("cache"), d.join(".si").join("cache")];
+        let usable = |dir: PathBuf| -> Option<(Store, rustc_hash::FxHashMap<String, u64>)> {
+            let s = Store::new(dir);
+            if s.dir == own {
+                return None;
+            }
+            let m = s.manifest().filter(|m| m.keys.len() == m.files.len())?;
+            Some((s, m.files.into_iter().zip(m.keys).collect()))
+        };
+        let mut stores = Vec::new();
+        let mut stack = vec![(root.to_path_buf(), 0)];
+        while let Some((dir, depth)) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for e in entries.flatten() {
+                if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.') || matches!(&*name, "node_modules" | "target") {
+                    continue;
+                }
+                let path = e.path();
+                if let Some((s, keys)) = caches(&path).into_iter().find_map(usable) {
+                    stores.push((s, Mapping::Inner(format!("{}/", crate::rel_path(root, &path))), keys));
+                }
+                if depth + 1 < Self::DEPTH {
+                    stack.push((path, depth + 1));
+                }
+            }
+        }
+        for outer in root.ancestors().skip(1).take(8) {
+            if let Some((s, keys)) = caches(outer).into_iter().find_map(usable) {
+                stores.push((s, Mapping::Outer(format!("{}/", crate::rel_path(outer, root))), keys));
+            }
+        }
+        (!stores.is_empty()).then(|| Reuse { stores, hits: Default::default() })
+    }
+
+    /// The facts another index has of the file at `rel` (relative to this
+    /// root) made with `key`, if one has.
+    pub fn get(&self, rel: &str, key: u64) -> Option<FileFacts> {
+        for (store, mapping, keys) in &self.stores {
+            let there = match mapping {
+                Mapping::Inner(prefix) => match rel.strip_prefix(prefix.as_str()) {
+                    Some(r) => r.to_string(),
+                    None => continue,
+                },
+                Mapping::Outer(prefix) => format!("{prefix}{rel}"),
+            };
+            if keys.get(&there) != Some(&key) {
+                continue;
+            }
+            if let Some(saved) = store.load(&there).filter(|s| s.facts.lex_key == key) {
+                return Some(saved.facts);
+            }
+        }
+        None
     }
 }

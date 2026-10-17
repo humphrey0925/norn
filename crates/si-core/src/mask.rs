@@ -23,7 +23,7 @@ use std::ops::Not;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// An identifier occurrence found lexically.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Hash)]
 pub struct Tok {
     pub start: u32,
     pub end: u32,
@@ -34,7 +34,7 @@ pub struct Tok {
     pub member: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct Macro {
     pub name: Tok,
     pub end_line: u32,
@@ -56,7 +56,7 @@ pub struct Macro {
 
 /// A use of an *expanding* macro: one whose expansion holds names that are
 /// not written at the use.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Hash)]
 pub struct SiteTok {
     pub name: Tok,
     /// End of the argument list, or 0 if the name stands alone.
@@ -73,12 +73,32 @@ pub struct SiteTok {
     pub def_at: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub enum Event {
     Macro(Macro),
     /// A reference that was blanked out of the parser's view.
     Ref(Tok),
     Site(SiteTok),
+}
+
+impl Lexed {
+    /// What a file's facts are made of besides the macro sets' discards
+    /// (see `FileFacts::lex_key`): its text, whether it is read as C++,
+    /// and everything the lexer made of it under the conditions in force.
+    pub fn key(&self, src: &[u8], cpp: bool) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = xxhash_rust::xxh3::Xxh3::new();
+        xxhash_rust::xxh3::xxh3_64(src).hash(&mut h);
+        cpp.hash(&mut h);
+        self.masked.hash(&mut h);
+        self.events.hash(&mut h);
+        self.includes.hash(&mut h);
+        self.blocks.hash(&mut h);
+        self.skipped.hash(&mut h);
+        self.undecided.hash(&mut h);
+        // (Never 0: 0 is "made before keys were".)
+        h.finish() | 1
+    }
 }
 
 impl Event {
