@@ -700,8 +700,9 @@ impl Cpp {
     /// the parameters they are passed as (`Put ("k")` of a `Put (const
     /// Slice& key)`: Slice's from a string), as (constructor, class).
     /// `given`: (position, what is known of the argument's type: a class,
-    /// or `literals`, a string's or a number's); `targets`: what the call
-    /// reaches, functions or the one macro it uses, which passes them on.
+    /// or `literals`, a string's, a number's or a `std::string`'s);
+    /// `targets`: what the call reaches, functions or the one macro it
+    /// uses, which passes them on.
     #[allow(clippy::too_many_arguments)]
     fn conversions(
         &self,
@@ -709,7 +710,7 @@ impl Cpp {
         aliases: &FxHashMap<u32, Vec<u32>>,
         given: &[(u32, u32)],
         targets: &[u32],
-        literals: (u32, u32),
+        literals: [u32; 3],
         lineage: &mut Vec<u32>,
         out: &mut Vec<(u32, u32)>,
     ) {
@@ -767,7 +768,7 @@ impl Cpp {
                 }
             }
         }
-        let literal = |t: u32| t == literals.0 || t == literals.1;
+        let literal = |t: u32| literals.contains(&t);
         let mut ctors: Vec<(u32, u32)> = Vec::new();
         for (fns, map) in work {
             for (j, k) in map {
@@ -1142,7 +1143,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     let t = Instant::now();
     let syms = &g.syms;
     // (What the facts call a string and a number passed.)
-    let literals = (g.name_id("\"\"").unwrap_or(NONE), g.name_id("0").unwrap_or(NONE));
+    let literals = ["\"\"", "0", "std::string"].map(|n| g.name_id(n).unwrap_or(NONE));
     let per_file: Vec<(Vec<[u32; 3]>, [u64; 4], Vec<[u32; 4]>, Vec<[u32; 3]>)> = files
         .par_iter()
         .enumerate()
@@ -2639,9 +2640,11 @@ Status* h(Status* p) { return p; }
     #[test]
     fn an_argument_passed_as_another_class_is_made_into_one() {
         let g = graph(&[
-            ("s.h", "class Slice {
+            ("s.h", "#include <string>
+class Slice {
  public:
   Slice(const char* s) {}
+  Slice(const std::string& s) {}
 };
 class Key {
  public:
@@ -2676,10 +2679,13 @@ inline void LogPrint(int level, tinyformat::FormatStringCheck<1> fmt, int x) {}
 void Elsewhere(const Other& o) {}
 "),
             ("s.cc", "#include \"s.h\"
-void a() { Put(\"k\", 1); Slice s(\"x\"); Status t(s); }
+void a() { Put(\"k\", 1); }
+void a2() { Slice s(\"x\"); Status t(s); }
 void b() { Name(\"n\"); Lookup(Key(\"k\")); }
-void c(int x) { strprintf(\"%d\", x); LogInfo(\"%d\", x); }
+void c(int x) { strprintf(\"%d\", x); }
+void c2(int x) { LogInfo(\"%d\", x); }
 void d() { Elsewhere(\"e\"); }
+void e(const std::string& k) { std::string s; Put(k, 1); Put(s, 2); }
 "),
         ]);
         let q = crate::graph::Qualifier::new(&g);
@@ -2688,19 +2694,25 @@ void d() { Elsewhere(\"e\"); }
                 .filter(|e| e.kind() == refkind::CALL && !e.ambiguous() && g.syms[e.other as usize].line < 25 && q.name(&g, e.other).contains("::"))
                 .map(|e| q.name(&g, e.other).into_owned()).collect();
             v.sort();
+            v.dedup();
             v
         };
         // `Put ("k", 1)` makes a Slice of the string; `Status t (s)` takes
         // the Slice it is given, made by the constructor of Status.
-        assert_eq!(made("a"), ["Slice::Slice", "Slice::Slice", "Status::Status"]);
+        assert_eq!(made("a"), ["Slice::Slice"]);
+        assert_eq!(made("a2"), ["Slice::Slice", "Status::Status"]);
         // A string is what `Name (const char*)` takes; an explicit
         // constructor converts nothing (`Key ("k")` is made, not converted).
         assert_eq!(made("b"), ["Key::Key"]);
         // Through a name for a function, and through macros passing on
         // what they are given.
-        assert_eq!(made("c"), ["FormatStringCheck::FormatStringCheck", "FormatStringCheck::FormatStringCheck"]);
+        for f in ["c", "c2"] {
+            assert_eq!(made(f), ["FormatStringCheck::FormatStringCheck"], "{f}");
+        }
         // Of a function no header read here declares, nothing.
         assert!(made("d").is_empty(), "{:?}", made("d"));
+        // A `std::string` passed as a Slice is made into one too.
+        assert_eq!(made("e"), ["Slice::Slice"]);
     }
 
     #[test]

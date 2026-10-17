@@ -356,6 +356,9 @@ struct Walk<'a> {
     /// Start bytes of identifier nodes already consumed as a def name or call target.
     skip: FxHashSet<usize>,
     locals: FxHashSet<&'a [u8]>,
+    /// C++: the locals and parameters of the function being read that are
+    /// `std::string`s, which a parameter of another class may be made of.
+    strings: FxHashSet<&'a [u8]>,
     /// The declaration in force for each local name of the function being
     /// read, as an index into the facts' `locals`.
     local_ids: FxHashMap<&'a [u8], u32>,
@@ -505,6 +508,7 @@ impl Extractor {
             names: FxHashMap::default(),
             skip: FxHashSet::default(),
             locals: FxHashSet::default(),
+            strings: FxHashSet::default(),
             local_ids: FxHashMap::default(),
             scope: None,
             site_defs: lexed
@@ -889,6 +893,7 @@ impl<'a> Walk<'a> {
                             let t = match builtin {
                                 Some(b) if pointer && self.text(b).ends_with(b"char") => self.intern_str("\"\""),
                                 Some(_) if !pointer => self.intern_str("0"),
+                                _ if self.is_string(q.child_by_field_id(ids.f_type), q.child_by_field_id(ids.f_declarator.get())) => self.intern_str("std::string"),
                                 _ if !pointer => self.type_name_of(q),
                                 _ => NONE,
                             };
@@ -915,6 +920,16 @@ impl<'a> Walk<'a> {
         }
     }
 
+    /// C++: is what a declaration of type `ty` declares with `declarator` a
+    /// `std::string` (or a reference to one), not a pointer?
+    fn is_string(&self, ty: Option<Node<'a>>, declarator: Option<Node<'a>>) -> bool {
+        ty.is_some_and(|t| matches!(self.text(t), b"std::string" | b"::std::string" | b"string"))
+            && declarator.is_none_or(|d| {
+                let d = if d.kind_id() == self.ids.init_declarator { d.child_by_field_id(self.ids.f_declarator.get()) } else { Some(d) };
+                d.is_some_and(|d| matches!(d.kind(), "identifier" | "reference_declarator" | "abstract_reference_declarator"))
+            })
+    }
+
     /// C++: how many arguments the reference just pushed was given, from the
     /// list in parentheses at `list`.
     fn note_args(&mut self, list: Option<Node<'a>>) {
@@ -939,6 +954,7 @@ impl<'a> Walk<'a> {
             let t = match a.kind() {
                 "string_literal" | "concatenated_string" | "raw_string_literal" => self.intern_str("\"\""),
                 "number_literal" | "char_literal" => self.intern_str("0"),
+                "identifier" if self.in_fn() && self.strings.contains(self.text(a)) => self.intern_str("std::string"),
                 "identifier" if self.in_fn() => match self.local_types.get(self.text(a)) {
                     Some(&t) => t,
                     None => continue,
@@ -963,6 +979,7 @@ impl<'a> Walk<'a> {
             self.flush_local_calls();
             self.scope = None;
             self.locals.clear();
+            self.strings.clear();
         }
     }
 
@@ -2632,6 +2649,7 @@ impl<'a> Walk<'a> {
                     _ => NONE,
                 };
                 self.locals.clear();
+                self.strings.clear();
                 self.local_ids.clear();
                 if let Some(d) = node.child_by_field_id(ids.f_declarator.get()) {
                     self.note_params(d);
@@ -2701,6 +2719,11 @@ impl<'a> Walk<'a> {
                             }
                         }
                         self.note_local(name, false);
+                        if self.cpp && !declares_function && self.is_string(node.child_by_field_id(ids.f_type), Some(d)) {
+                            self.strings.insert(self.text(name));
+                        } else {
+                            self.strings.remove(self.text(name));
+                        }
                         if self.cpp && !declares_function {
                             // `T x;`, `T x (a);`, `T x {a};` (not `T x = y;`,
                             // a copy, nor a pointer or a reference) make a T.
@@ -2802,6 +2825,9 @@ impl<'a> Walk<'a> {
                         }
                     }
                     self.note_local(name, true);
+                    if self.cpp && self.is_string(node.child_by_field_id(ids.f_type), node.child_by_field_id(ids.f_declarator.get())) {
+                        self.strings.insert(self.text(name));
+                    }
                 }
             }
             return true;
