@@ -63,6 +63,10 @@ pub struct Manifest {
     /// How each compilation reads the headers compiled more than one way.
     #[serde(default)]
     pub readings: crate::units::Readings,
+    /// Each file's `FileFacts::lex_key`, in the order of `files`: what
+    /// another root looks up before it reads any file's facts.
+    #[serde(default)]
+    pub keys: Vec<u64>,
 }
 
 pub struct Store {
@@ -108,9 +112,9 @@ impl Store {
         (m.format == FORMAT).then_some(m)
     }
 
-    pub fn save_manifest(&self, sets: u64, files: Vec<String>, verdicts: crate::units::Verdicts, readings: crate::units::Readings) {
+    pub fn save_manifest(&self, sets: u64, files: Vec<String>, verdicts: crate::units::Verdicts, readings: crate::units::Readings, keys: Vec<u64>) {
         self.prepare();
-        if let Ok(bytes) = bincode::serialize(&Manifest { format: FORMAT, sets, files, verdicts, readings }) {
+        if let Ok(bytes) = bincode::serialize(&Manifest { format: FORMAT, sets, files, verdicts, readings, keys }) {
             // Written aside and moved into place: a start never reads half of it.
             let tmp = self.dir.join("manifest.tmp");
             if std::fs::write(&tmp, bytes).is_ok() {
@@ -271,7 +275,9 @@ impl Store {
 /// made of it now (see `Extractor::extract_reusing`): the same text, read
 /// under the same conditions.
 pub struct Reuse {
-    stores: Vec<(Store, Mapping)>,
+    /// Each other index, how its paths are written, and the key it has of
+    /// each file (from its manifest: no file's facts are read to find out).
+    stores: Vec<(Store, Mapping, rustc_hash::FxHashMap<String, u64>)>,
     pub hits: std::sync::atomic::AtomicUsize,
 }
 
@@ -292,9 +298,13 @@ impl Reuse {
         // (Read where they are, without moving a `.si` to `.norn` as
         // opening a root does: these roots are not being opened.)
         let caches = |d: &Path| [d.join(".norn").join("cache"), d.join(".si").join("cache")];
-        let usable = |dir: PathBuf| -> Option<Store> {
+        let usable = |dir: PathBuf| -> Option<(Store, rustc_hash::FxHashMap<String, u64>)> {
             let s = Store::new(dir);
-            (s.dir != own && s.manifest().is_some()).then_some(s)
+            if s.dir == own {
+                return None;
+            }
+            let m = s.manifest().filter(|m| m.keys.len() == m.files.len())?;
+            Some((s, m.files.into_iter().zip(m.keys).collect()))
         };
         let mut stores = Vec::new();
         let mut stack = vec![(root.to_path_buf(), 0)];
@@ -310,8 +320,8 @@ impl Reuse {
                     continue;
                 }
                 let path = e.path();
-                if let Some(s) = caches(&path).into_iter().find_map(usable) {
-                    stores.push((s, Mapping::Inner(format!("{}/", crate::rel_path(root, &path)))));
+                if let Some((s, keys)) = caches(&path).into_iter().find_map(usable) {
+                    stores.push((s, Mapping::Inner(format!("{}/", crate::rel_path(root, &path))), keys));
                 }
                 if depth + 1 < Self::DEPTH {
                     stack.push((path, depth + 1));
@@ -319,8 +329,8 @@ impl Reuse {
             }
         }
         for outer in root.ancestors().skip(1).take(8) {
-            if let Some(s) = caches(outer).into_iter().find_map(usable) {
-                stores.push((s, Mapping::Outer(format!("{}/", crate::rel_path(outer, root)))));
+            if let Some((s, keys)) = caches(outer).into_iter().find_map(usable) {
+                stores.push((s, Mapping::Outer(format!("{}/", crate::rel_path(outer, root))), keys));
             }
         }
         (!stores.is_empty()).then(|| Reuse { stores, hits: Default::default() })
@@ -329,7 +339,7 @@ impl Reuse {
     /// The facts another index has of the file at `rel` (relative to this
     /// root) made with `key`, if one has.
     pub fn get(&self, rel: &str, key: u64) -> Option<FileFacts> {
-        for (store, mapping) in &self.stores {
+        for (store, mapping, keys) in &self.stores {
             let there = match mapping {
                 Mapping::Inner(prefix) => match rel.strip_prefix(prefix.as_str()) {
                     Some(r) => r.to_string(),
@@ -337,6 +347,9 @@ impl Reuse {
                 },
                 Mapping::Outer(prefix) => format!("{prefix}{rel}"),
             };
+            if keys.get(&there) != Some(&key) {
+                continue;
+            }
             if let Some(saved) = store.load(&there).filter(|s| s.facts.lex_key == key) {
                 return Some(saved.facts);
             }

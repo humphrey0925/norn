@@ -619,7 +619,8 @@ impl Session {
             let files = self.files.iter().map(|p| crate::rel_path(&self.root, p)).collect();
             let verdicts = self.conditions.source().map(|s| s.verdicts().as_ref().clone()).unwrap_or_default();
             store.save_sets(&self.sets);
-            store.save_manifest(self.sets.digest(), files, verdicts, crate::readings_of(&self.conditions).as_ref().clone());
+            let keys = self.facts.iter().map(|f| f.lex_key).collect();
+            store.save_manifest(self.sets.digest(), files, verdicts, crate::readings_of(&self.conditions).as_ref().clone(), keys);
         }
     }
 
