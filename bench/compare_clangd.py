@@ -152,7 +152,10 @@ class Clangd:
         return (self.root / rel).as_uri()
 
     def rel(self, uri):
-        path = urllib.parse.unquote(urllib.parse.urlparse(uri).path).lstrip("/")
+        path = urllib.parse.unquote(urllib.parse.urlparse(uri).path)
+        # (`file:///E:/x` is E:/x on Windows; on Linux the leading / stays.)
+        if len(path) > 2 and path[0] == "/" and path[2] == ":":
+            path = path[1:]
         try:
             rel = os.path.relpath(path, self.root)
         except ValueError:

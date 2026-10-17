@@ -40,7 +40,7 @@ TRUTH = {"c-only": "truth.json", "git-c": "truth-git.json", "redis": "truth-redi
          "stm32f4": "truth-stm32f4.json", "nrfx": "truth-nrfx.json",
          "nrfx-corpus": "truth-nrfx.json"}
 WSL_TOOLS = ("ctags", "cscope", "gtags")
-ALL_TOOLS = ("si", "cbm", "clangd", *WSL_TOOLS)
+ALL_TOOLS = ("si", "cbm", "clangd", "clangd-db", *WSL_TOOLS)
 SKIP_DIRS = (".git", ".si", ".norn")
 # Where the Windows tools run, as the results say it.
 HOST = "Windows, NTFS" if os.name == "nt" else "Linux (WSL2), ext4"
@@ -350,18 +350,29 @@ def tool_cbm(ctx, res):
 
 # ---------------------------------------------------------------- clangd
 
-def tool_clangd(ctx, res):
+def tool_clangd(ctx, res, real_db=None):
+    """clangd's background index. With `real_db` (a build's own
+    compile_commands.json, --clangd-db), on the tree that build was made
+    in, in place: what clangd does at its best. Without, on a copy, with a
+    database of nothing but the files: what a project without one gives it."""
     exe = ctx.args.clangd
     res["version"] = first_line([exe, "--version"])
-    res["platform"] = f"{HOST}, copy of the corpus without .git and .norn"
-    ctx.ensure_copy()
+    res["platform"] = f"{HOST}, " + ("the built tree in place" if real_db else "copy of the corpus without .git and .norn")
+    if not real_db:
+        ctx.ensure_copy()
+    root = ctx.corpus if real_db else ctx.copy
     db = ctx.work / "clangd"
     index_dir = db / ".cache" / "clangd" / "index"
     log = ctx.work / "clangd.log"
     flags = ctx.args.clangd_flags.split()
     res["command"] = (f"clangd --background-index --background-index-priority=normal --compile-commands-dir=<dir outside "
-                      f"the sources>; database: `clang {' '.join(flags)} -c <file>` for each of {len(ctx.c_files)} .c files")
+                      f"the sources>; database: " + (f"the build's own, {real_db}" if real_db else
+                                                     f"`clang {' '.join(flags)} -c <file>` for each of {len(ctx.c_files)} .c files"))
     res["notes"] = [
+        "The compilation database is the build's own (the one the ground truth was made from): every file's include "
+        "paths, definitions and target, on the tree that build was made in.",
+        "Timing ends when $/progress for backgroundIndexProgress ends and stays ended for "
+        f"{compare_clangd.QUIET_S:.0f}s; it starts at process start and includes opening one file to trigger it."] if real_db else [
         "The compilation database is synthetic: no include paths and no -D. Headers a file includes by a path "
         "relative to itself are found, others are not, and every #if is decided without the project's configuration. "
         "A real build's database would make clangd both slower (more headers per file) and more accurate.",
@@ -378,8 +389,12 @@ def tool_clangd(ctx, res):
         if client:
             client.stop()
         shutil.rmtree(db, ignore_errors=True)
-        compare_clangd.write_database(db, ctx.copy, ctx.c_files, flags)
-        client, wall = compare_clangd.index(exe, db, ctx.copy, log, deadline(), ctx.c_files[0])
+        if real_db:
+            db.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(real_db, db / "compile_commands.json")
+        else:
+            compare_clangd.write_database(db, root, ctx.c_files, flags)
+        client, wall = compare_clangd.index(exe, db, root, log, deadline(), ctx.c_files[0])
         if wall is None:
             client.stop()
             raise RuntimeError("clangd never reported background indexing")
@@ -388,7 +403,7 @@ def tool_clangd(ctx, res):
     try:
         res["index"] = {**median_run(runs), "index_dir": str(index_dir),
                         "note": "peak memory sampled every 20 ms until indexing ended"}
-        stray = [p for p in (ctx.copy / ".cache", ctx.copy / "compile_commands.json", ctx.corpus / ".cache") if p.exists()]
+        stray = [p for p in (root / ".cache", root / "compile_commands.json", ctx.corpus / ".cache") if p.exists()]
         res["index"]["wrote_into_sources"] = [str(p) for p in stray]
 
         find, callers, a_find, a_callers = compare_clangd.time_queries(client, ctx.names, ctx.args.reps)
@@ -408,19 +423,19 @@ def tool_clangd(ctx, res):
 
     # Incremental: what a restart costs with the index on disk, unchanged and
     # after one file was edited (clangd re-indexes what is stale as it loads).
-    client, same = compare_clangd.index(exe, db, ctx.copy, log, deadline(), ctx.c_files[0])
+    client, same = compare_clangd.index(exe, db, root, log, deadline(), ctx.c_files[0])
     client.stop()
     walls, peak, rewritten = [], 0, []
     for i in range(3):
         # A different edit each time: the index on disk now knows the last one.
-        with Edited(ctx.copy / ctx.edit_file, EDIT * (i + 1)):
+        with Edited(root / ctx.edit_file, EDIT * (i + 1)):
             edited_at = time.time()
-            client, after = compare_clangd.index(exe, db, ctx.copy, log, deadline(), ctx.c_files[0])
+            client, after = compare_clangd.index(exe, db, root, log, deadline(), ctx.c_files[0])
             peak = max(peak, client.peak)
             client.stop()
         walls.append(after)
         rewritten.append(sum(f.stat().st_mtime >= edited_at for f in index_dir.glob("*.idx")))
-    client, _ = compare_clangd.index(exe, db, ctx.copy, log, deadline(), ctx.c_files[0])  # back in step with the file
+    client, _ = compare_clangd.index(exe, db, root, log, deadline(), ctx.c_files[0])  # back in step with the file
     client.stop()
     quiet = f"no indexing reported within {compare_clangd.NO_WORK_S:.0f}s"
     done = [w for w in walls if w is not None]
@@ -432,6 +447,12 @@ def tool_clangd(ctx, res):
                 "background indexing: loading every shard, checking each file for staleness, re-indexing the stale one. "
                 "Median of three edits. An editor that keeps clangd running pays less: only the re-index on save. "
                 f"A run listed as null: {quiet}."}
+
+
+def tool_clangd_db(ctx, res):
+    if not ctx.args.clangd_db:
+        raise RuntimeError("clangd-db needs --clangd-db <the build's compile_commands.json>")
+    tool_clangd(ctx, res, real_db=ctx.args.clangd_db)
 
 
 def clangd_accuracy(ctx, client, deadline):
@@ -571,7 +592,7 @@ def tool_wsl(tool):
     return go
 
 
-TOOLS = {"si": tool_si, "cbm": tool_cbm, "clangd": tool_clangd, **{t: tool_wsl(t) for t in WSL_TOOLS}}
+TOOLS = {"si": tool_si, "cbm": tool_cbm, "clangd": tool_clangd, "clangd-db": tool_clangd_db, **{t: tool_wsl(t) for t in WSL_TOOLS}}
 
 NOTES = [
     "si, cbm and clangd ran on Windows/NTFS; ctags, cscope and global ran in WSL2 on ext4, on a copy of the same files. "
@@ -646,6 +667,7 @@ def main():
     ap.add_argument("--si", default=str(locate(Path(f"target/release/norn{exe}"))))
     ap.add_argument("--cbm", default=str(locate(Path(f"tools/cbm/codebase-memory-mcp{exe}"))))
     ap.add_argument("--cbm-mode", default="full", choices=["fast", "moderate", "full"])
+    ap.add_argument("--clangd-db", help="clangd-db: the build's own compile_commands.json; the corpus must be the tree it was built in")
     ap.add_argument("--clangd", default=shutil.which("clangd") or "C:/Program Files/LLVM/bin/clangd.exe")
     ap.add_argument("--clangd-flags", default="", help="extra compiler flags for every entry of the synthetic database")
     ap.add_argument("--sample-fraction", type=float, default=0.10,

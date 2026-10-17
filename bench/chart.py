@@ -9,11 +9,11 @@ import html
 import json
 from pathlib import Path
 
-ORDER = ["si", "clangd", "cbm", "cscope", "gtags", "ctags"]
-NAMES = {"si": "Norn", "cbm": "codebase-memory-mcp", "clangd": "clangd", "cscope": "cscope", "gtags": "GNU Global", "ctags": "Universal Ctags"}
+ORDER = ["si", "clangd-db", "clangd", "cbm", "cscope", "gtags", "ctags"]
+NAMES = {"si": "Norn", "clangd-db": "clangd + build database", "cbm": "codebase-memory-mcp", "clangd": "clangd", "cscope": "cscope", "gtags": "GNU Global", "ctags": "Universal Ctags"}
 CORPORA = {"redis": "Redis", "git-c": "git", "c-only": "binutils", "stm32f4": "STM32F4 HAL", "nrfx": "nrfx", "nrfx-corpus": "nrfx", "linux": "Linux"}
 # One colour per tool, readable on a light and a dark page alike.
-COLORS = {"si": "#f0a830", "clangd": "#4c8fd6", "cbm": "#8a6fd1", "cscope": "#4fae7a", "gtags": "#d0644f", "ctags": "#8c96a3"}
+COLORS = {"si": "#f0a830", "clangd-db": "#2f5f9e", "clangd": "#4c8fd6", "cbm": "#8a6fd1", "cscope": "#4fae7a", "gtags": "#d0644f", "ctags": "#8c96a3"}
 TEXT = "#7d8590"
 
 
@@ -208,6 +208,12 @@ def main():
              "- **clangd** is given a compilation database with no include paths and no `-D`: what a project",
              "  without a working `compile_commands.json` gives it. With a real build's database it would be",
              "  slower to index and more accurate.",
+             "- **clangd + build database** is clangd at its best: given each project's own `compile_commands.json`",
+             "  (the one its ground truth was made from), on the tree that build was made in. It runs in WSL 2",
+             "  (Linux, clangd 20) because those builds are Linux builds. It is the reference for what a",
+             "  compiler-based index finds when it is told exactly how every file is compiled.",
+             "- clangd's accuracy is measured on a sample of the functions clang saw (callers and callees of each",
+             "  through its call hierarchy); the other tools' on every call.",
              "- ctags records definitions only, and GNU Global references to a name rather than calls from a",
              "  function, so neither has a figure for calls.",
              "- Norn marks a call it cannot be sure of (under an `#if` the configuration does not settle) as",
