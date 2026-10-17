@@ -2,6 +2,7 @@
 
 ## 未發佈
 
+- 命令列 `norn` 有了手冊（[docs/cli.md](docs/cli.md)、[繁體中文](docs/cli.zh-TW.md)），`--help` 也說明每個參數；給的資料夾沒有索引、或原始碼樹裡沒有 C 原始檔時，改成說明原因並以 2 結束，不再當掉。
 - 不用設定也會採用 Kconfig build（Linux、U-Boot、Buildroot）留下的設定：樹裡或 build 資料夾（`make O=build`）的 `include/generated/autoconf.h` 或 `.config`；它沒設的 `CONFIG_` 一律當作未定義。
 - 開啟一個資料夾時，若它的子資料夾或上層資料夾已經建過索引，讀法相同的檔案直接沿用那份索引，不再重新解析。
 - **修正**：剛開啟工作區、索引還在讀取時就有請求進來（例如打開標頭檔），索引就緒後的下一個請求會讓伺服器崩潰，VS Code 會連續重啟它直到放棄。

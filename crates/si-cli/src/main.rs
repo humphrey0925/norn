@@ -1,5 +1,5 @@
-//! `si`: thin CLI over si-core. Every command prints one JSON object so the
-//! benchmark harness can consume it directly.
+//! `norn`: the command line over si-core. Every command but the servers and
+//! the listings prints one JSON object, for scripts to read.
 
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
@@ -18,7 +18,8 @@ mod mem;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
-#[command(name = "norn", version, about = "Norn: a Source-Insight-style code index for C")]
+#[command(name = "norn", version, about = "Norn: a code index for C, with the call graph, worked out without a build",
+         after_help = "Manual: https://github.com/humphrey0925/norn/blob/master/docs/cli.md")]
 struct Cli {
     /// Worker threads (0 = all cores).
     #[arg(long, global = true, default_value_t = 0)]
@@ -34,7 +35,9 @@ struct Cli {
 enum Cmd {
     /// Index a source tree and write the selected stores.
     Index {
+        /// The source tree.
         root: PathBuf,
+        /// The folder to write the index to.
         #[arg(long, default_value = "out")]
         out: PathBuf,
         /// Comma-separated: csr, csr-packed, sqlite-naive, sqlite-tuned, none.
@@ -52,17 +55,23 @@ enum Cmd {
         #[arg(long)]
         dump_binds: bool,
     },
-    /// One-shot query against a CSR index: find | callers | callees | refs | tree.
+    /// One query against an index `index` wrote: find | search | callers | callees | refs | tree.
     Query {
+        /// The folder `index --out` wrote.
         dir: PathBuf,
+        /// find | search | callers | callees | refs | tree.
         op: String,
+        /// A symbol's name (for `search`, what is typed: fragments, initials).
         name: String,
+        /// How far `tree` follows calls.
         #[arg(long, default_value_t = 3)]
         depth: u32,
     },
     /// In-process query latency for each store present in `dir`.
     BenchQuery {
+        /// The folder `index --out` wrote.
         dir: PathBuf,
+        /// Queries of each kind.
         #[arg(long, default_value_t = 2000)]
         n: usize,
         #[arg(long, default_value_t = 1)]
@@ -70,7 +79,9 @@ enum Cmd {
     },
     /// In-process incremental update cost: re-extract one file, relink.
     BenchIncr {
+        /// The source tree.
         root: PathBuf,
+        /// Edits to time.
         #[arg(long, default_value_t = 30)]
         n: usize,
         #[arg(long, default_value_t = 1)]
@@ -78,18 +89,25 @@ enum Cmd {
     },
     /// Names of randomly sampled function definitions (benchmark workload).
     Sample {
+        /// The folder `index --out` wrote.
         dir: PathBuf,
+        /// How many names.
         #[arg(long, default_value_t = 200)]
         n: usize,
         #[arg(long, default_value_t = 1)]
         seed: u64,
     },
-    /// Line-delimited JSON query server on stdin/stdout.
-    Serve { dir: PathBuf },
+    /// Line-delimited JSON query server on stdin/stdout, over an index `index` wrote.
+    Serve {
+        /// The folder `index --out` wrote.
+        dir: PathBuf,
+    },
     /// The same over the sources themselves, kept up to date: besides the
     /// queries, `{"op":"update","files":[...]}` after files change.
     Live {
+        /// The source tree.
         root: PathBuf,
+        /// `FROM=TO`: an `#include` of a file named FROM reads TO instead. Repeatable.
         #[arg(long, value_name = "FROM=TO")]
         include_alias: Vec<String>,
         #[command(flatten)]
@@ -98,22 +116,30 @@ enum Cmd {
     /// Language Server over stdin/stdout, for editors. The root is the
     /// workspace the editor names unless one is given here.
     Lsp {
+        /// The source tree (default: the workspace the editor opens).
         root: Option<PathBuf>,
+        /// `FROM=TO`: an `#include` of a file named FROM reads TO instead. Repeatable.
         #[arg(long, value_name = "FROM=TO")]
         include_alias: Vec<String>,
         #[command(flatten)]
         keep: Keep,
     },
     /// Every symbol as `file<TAB>line<TAB>kind<TAB>decl|def<TAB>name` (for accuracy checks).
-    Symbols { dir: PathBuf },
+    Symbols {
+        /// The folder `index --out` wrote.
+        dir: PathBuf,
+    },
     /// Every call edge, tab-separated (for accuracy checks).
-    Calls { dir: PathBuf },
+    Calls {
+        /// The folder `index --out` wrote.
+        dir: PathBuf,
+    },
 }
 
 /// Whether and where a live index is kept between runs.
 #[derive(clap::Args, Clone)]
 struct Keep {
-    /// Where to keep the index between runs (default: `.si/cache` under
+    /// Where to keep the index between runs (default: `.norn/cache` under
     /// the root).
     #[arg(long)]
     cache_dir: Option<PathBuf>,
@@ -214,6 +240,10 @@ fn index(root: &Path, out: &Path, stores: &str, stride: usize, options: &si_core
     // the build defines.
     let scope = si_core::scope::Scope::load(root);
     let files: Vec<PathBuf> = si_core::scan_scope(root, &scope).into_iter().step_by(stride.max(1)).collect();
+    if files.is_empty() {
+        eprintln!("norn: no C or C++ source files under {}", root.display());
+        std::process::exit(2);
+    }
     let mut conditions = si_core::conditions_of(root, &files);
     let scan_ms = ms(t);
 
@@ -300,8 +330,17 @@ fn index(root: &Path, out: &Path, stores: &str, stride: usize, options: &si_core
     })
 }
 
+/// The index `index` wrote into `dir`, or a word on what is wrong and out.
+fn load_index(dir: &Path) -> Graph {
+    let path = dir.join("graph.si");
+    Graph::load(&path).unwrap_or_else(|e| {
+        eprintln!("norn: no index to read at {} ({e}); write one with `norn index <ROOT> --out {}`", path.display(), dir.display());
+        std::process::exit(2)
+    })
+}
+
 fn query(dir: &Path, op: &str, name: &str, depth: u32) -> Value {
-    let g = Graph::load(&dir.join("graph.si")).expect("load graph.si");
+    let g = load_index(dir);
     run_query(&g, op, name, depth)
 }
 
@@ -390,14 +429,14 @@ fn sample_functions(g: &Graph, n: usize, seed: u64) -> (Vec<u32>, usize) {
 }
 
 fn sample(dir: &Path, n: usize, seed: u64) -> Value {
-    let g = Graph::load(&dir.join("graph.si")).expect("load graph.si");
+    let g = load_index(dir);
     let (sample, _) = sample_functions(&g, n, seed);
     json!(sample.iter().map(|&s| g.sym_name(s)).collect::<Vec<_>>())
 }
 
 fn bench_query(dir: &Path, n: usize, seed: u64) -> Value {
     let t = Instant::now();
-    let g = Graph::load(&dir.join("graph.si")).expect("load graph.si");
+    let g = load_index(dir);
     let load_ms = ms(t);
     let (sample, n_fns) = sample_functions(&g, n, seed);
 
@@ -558,7 +597,7 @@ fn live(root: &Path, keep: &Keep, options: &si_core::link::Options) {
         let req: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
         let resp = if req["op"] == "sync" || req["op"] == "scope" {
             // `scope` with `include`/`exclude` sets the project's folders
-            // (kept in .si/config.json); both bring the index in line with
+            // (kept in .norn/config.json); both bring the index in line with
             // the disk.
             let list = |key: &str| -> Vec<String> {
                 req[key].as_array().into_iter().flatten().filter_map(|v| v.as_str()).map(str::to_string).collect()
@@ -586,7 +625,7 @@ fn live(root: &Path, keep: &Keep, options: &si_core::link::Options) {
 }
 
 fn serve(dir: &Path) {
-    let g = Graph::load(&dir.join("graph.si")).expect("load graph.si");
+    let g = load_index(dir);
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     for line in std::io::stdin().lock().lines() {
@@ -598,7 +637,7 @@ fn serve(dir: &Path) {
 }
 
 fn symbols(dir: &Path) {
-    let g = Graph::load(&dir.join("graph.si")).expect("load graph.si");
+    let g = load_index(dir);
     let q = si_core::graph::Qualifier::new(&g);
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     for (id, s) in g.syms.iter().enumerate().filter(|(_, s)| s.kind != kind::FILE) {
@@ -613,7 +652,7 @@ fn symbols(dir: &Path) {
 /// `certain|ambiguous`, `decl|def` for the callee, the macro, member or
 /// variable the call was made through (or `-`), and `direct|indirect`.
 fn calls(dir: &Path) {
-    let g = Graph::load(&dir.join("graph.si")).expect("load graph.si");
+    let g = load_index(dir);
     let q = si_core::graph::Qualifier::new(&g);
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     for (id, s) in g.syms.iter().enumerate().filter(|(_, s)| s.kind == kind::FUNCTION) {

@@ -22,6 +22,7 @@
   <a href="#features">Features</a> ·
   <a href="#getting-started">Getting started</a> ·
   <a href="docs/norn-guide.md">User guide</a> ·
+  <a href="docs/cli.md">Command line</a> ·
   <a href="README.zh-TW.md">繁體中文</a>
 </p>
 
@@ -132,6 +133,10 @@ provider instead of competing with it. The full list is on the
 That is all. The server is included for Windows, Linux and macOS, on x64 and
 Arm64. The [user guide](docs/norn-guide.md) (Traditional Chinese) covers every
 view and setting.
+
+Without VS Code, the same indexer is a command of its own, `norn`, for the
+terminal, scripts, CI and other editors (as a language server): see
+[the command line](docs/cli.md).
 
 ## How it works
 

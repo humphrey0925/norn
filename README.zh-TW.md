@@ -22,6 +22,7 @@
   <a href="#功能">功能</a> ·
   <a href="#開始使用">開始使用</a> ·
   <a href="docs/norn-guide.md">使用指南</a> ·
+  <a href="docs/cli.zh-TW.md">命令列</a> ·
   <a href="README.md">English</a>
 </p>
 
@@ -120,6 +121,9 @@ configuration provider，而不是和它重複。完整功能列表見[擴充套
 
 這樣就好了。擴充套件已內含 Windows、Linux、macOS（x64 與 Arm64）的伺服器。每個檢視和設定的
 說明見[使用指南](docs/norn-guide.md)。
+
+不用 VS Code 時，同一個索引程式也是獨立的指令 `norn`，可在終端機、腳本、CI 和其他編輯器（作為
+語言伺服器）使用：見[命令列手冊](docs/cli.zh-TW.md)。
 
 ## 運作原理
 
