@@ -2,6 +2,7 @@
 
 ## 未發佈
 
+- 不用設定也會採用 Kconfig build（Linux、U-Boot、Buildroot）留下的設定：樹裡或 build 資料夾（`make O=build`）的 `include/generated/autoconf.h` 或 `.config`；它沒設的 `CONFIG_` 一律當作未定義。
 - 開啟一個資料夾時，若它的子資料夾或上層資料夾已經建過索引，讀法相同的檔案直接沿用那份索引，不再重新解析。
 - **修正**：剛開啟工作區、索引還在讀取時就有請求進來（例如打開標頭檔），索引就緒後的下一個請求會讓伺服器崩潰，VS Code 會連續重啟它直到放棄。
 - **修正**：開啟工作區後游標沒有移動時，Context 會一直顯示「Nothing the index knows here」，要移動游標才會更新。

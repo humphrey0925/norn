@@ -42,8 +42,8 @@ Norn reads the sources the way a person would, and the build's own description
 where there is one:
 
 - **No setup.** Open a folder. Norn finds the build's configuration in Arm DS-5,
-  Keil, IAR, Visual Studio, CMake, Makefile, PlatformIO or `compile_commands.json`
-  files and works out which `#if` branches are compiled.
+  Keil, IAR, Visual Studio, CMake, Makefile, PlatformIO, Kconfig or
+  `compile_commands.json` files and works out which `#if` branches are compiled.
 - **Calls, not just names.** It follows calls through macros and through function
   pointers stored in structs, and says how each call comes about.
 - **Fast enough to forget about.** The whole Linux kernel indexes in about a

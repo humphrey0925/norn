@@ -54,6 +54,11 @@
 //! configuration meant after a `#`: an Eclipse CDT `.cproject` (DS-5, Arm
 //! Development Studio), or the `c_cpp_properties.json` of VS Code's C/C++
 //! extension. The set then follows what is written there.
+//!
+//! When the project says nothing, what the tree's own build left is
+//! followed: a Kconfig build's configuration (`include/generated/autoconf.h`
+//! or `.config`, at the root or in a build folder of it), then the build
+//! descriptions `discover` finds.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
@@ -123,6 +128,12 @@ impl Project {
     /// is given sets of its own (or told to have none).
     fn found(root: &Path) -> Project {
         let mut project = Project::default();
+        // A Kconfig build's configuration (Linux, U-Boot, Buildroot,
+        // BusyBox) is the one it compiles with, so it comes first.
+        for (name, settings) in kconfig(root) {
+            project.active.get_or_insert_with(|| name.clone());
+            project.configurations.insert(name, settings);
+        }
         for (name, entry) in discover(root) {
             let mut unique = name.clone();
             for n in 2.. {
@@ -215,6 +226,39 @@ pub fn effective(settings: &Settings, root: &Path) -> Vec<Effective> {
     let own = Settings { defines: settings.defines.clone(), undefines: settings.undefines.clone(), ..Settings::default() };
     add(&Conditions::from_settings(&own, root), "");
     all.into_iter().map(|(name, (value, source))| Effective { name, value, source }).collect()
+}
+
+/// The configuration a Kconfig build left in the tree, at the root or in a
+/// folder of it (`make O=build`): its `include/generated/autoconf.h`, or
+/// failing that its `.config`. What it does not set is not set, so every
+/// other `CONFIG_` name is taken as undefined.
+fn kconfig(root: &Path) -> Vec<(String, Settings)> {
+    const MARK: &str = "Automatically generated file; DO NOT EDIT.";
+    let mut dirs = vec![String::new()];
+    if let Ok(entries) = std::fs::read_dir(root) {
+        let mut sub: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|n| !n.starts_with('.'))
+            .collect();
+        sub.sort();
+        dirs.extend(sub);
+    }
+    let mut out = Vec::new();
+    for dir in dirs {
+        let at = |f: &str| if dir.is_empty() { f.to_string() } else { format!("{dir}/{f}") };
+        let generated = |f: &str| {
+            // (The mark is in the first lines; the rest need not be read.)
+            let mut head = [0u8; 256];
+            let n = std::fs::File::open(root.join(f)).and_then(|mut file| std::io::Read::read(&mut file, &mut head)).unwrap_or(0);
+            String::from_utf8_lossy(&head[..n]).contains(MARK)
+        };
+        let Some(file) = [at("include/generated/autoconf.h"), at(".config")].into_iter().find(|f| generated(f)) else { continue };
+        let name = if dir.is_empty() { "Kconfig".to_string() } else { format!("Kconfig ({dir})") };
+        out.push((name, Settings { condition_files: vec![file], assume_undefined: vec!["CONFIG_".into()], ..Settings::default() }));
+    }
+    out
 }
 
 /// A build's own configurations found in the tree, as condition-file
@@ -1963,6 +2007,56 @@ C_DEFS = -DUSE_HAL_DRIVER
         // Once the project says what it has, even nothing, that stands.
         Project::default().save(&dir).unwrap();
         assert_eq!(Project::load(&dir), Project::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_kconfig_builds_configuration_is_followed_unasked() {
+        let dir = std::env::temp_dir().join(format!("si-cond-kconfig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("build/include/generated")).unwrap();
+        // A .config someone wrote by hand is not a build's.
+        std::fs::write(dir.join(".config"), "CONFIG_HAND=y
+").unwrap();
+        assert_eq!(Project::load(&dir), Project::default());
+        // `make O=build`: its autoconf.h, before its .config.
+        std::fs::write(dir.join("build/.config"), "#
+# Automatically generated file; DO NOT EDIT.
+# Linux/x86 6.12.0 Kernel Configuration
+CONFIG_SMP=y
+").unwrap();
+        std::fs::write(dir.join("build/include/generated/autoconf.h"),
+            "/*
+ *
+ * Automatically generated file; DO NOT EDIT.
+ * Linux/x86 6.12.0 Kernel Configuration
+ *
+ */
+#define CONFIG_SMP 1
+#define CONFIG_HZ 250
+#define CONFIG_EXT4_FS_MODULE 1
+").unwrap();
+        let p = Project::load(&dir);
+        assert_eq!(p.active.as_deref(), Some("Kconfig (build)"));
+        assert_eq!(p.current().condition_files, ["build/include/generated/autoconf.h"]);
+        let c = Conditions::from_settings(&Settings::load(&dir), &dir);
+        assert_eq!((c.defined(b"CONFIG_SMP"), c.eval(b"CONFIG_HZ == 250"), c.defined(b"CONFIG_EXT4_FS_MODULE")), (Tri::True, Tri::True, Tri::True));
+        // What it does not set is not set; other names are not its to say.
+        assert_eq!((c.defined(b"CONFIG_NUMA"), c.defined(b"__KERNEL__")), (Tri::False, Tri::Unknown));
+        // At the root, from its .config alone.
+        let _ = std::fs::remove_dir_all(dir.join("build"));
+        std::fs::write(dir.join(".config"), "#
+# Automatically generated file; DO NOT EDIT.
+# Linux/x86 6.12.0 Kernel Configuration
+CONFIG_SMP=y
+# CONFIG_NUMA is not set
+CONFIG_EXT4_FS=m
+").unwrap();
+        let p = Project::load(&dir);
+        assert_eq!(p.active.as_deref(), Some("Kconfig"));
+        let c = Conditions::from_settings(&Settings::load(&dir), &dir);
+        assert_eq!((c.defined(b"CONFIG_SMP"), c.defined(b"CONFIG_EXT4_FS"), c.defined(b"CONFIG_EXT4_FS_MODULE"), c.defined(b"CONFIG_NUMA")),
+            (Tri::True, Tri::False, Tri::True, Tri::False));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -70,6 +70,8 @@ navigation, and dimmed in the editor. It understands:
 - Keil µVision `.uvprojx`, IAR `.ewp`, Visual Studio `.vcxproj`
 - `compile_commands.json`, `compile_flags.txt`, `platformio.ini`
 - VS Code's `c_cpp_properties.json`
+- a Kconfig build's configuration (Linux, U-Boot, Buildroot): `include/generated/autoconf.h`
+  or `.config`, in the tree or a build folder of it
 - Makefiles and `CMakeLists.txt` (the definitions they state outright)
 - the compiler a build uses (GCC, Clang, Arm Compiler 5 and 6, IAR, MSVC) and what it
   predefines

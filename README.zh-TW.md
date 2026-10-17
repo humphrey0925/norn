@@ -39,7 +39,7 @@
 Norn 像人一樣直接讀原始碼，有 build 描述檔時也一併讀取：
 
 - **不用設定**：開啟資料夾即可。Norn 會從 Arm DS-5、Keil、IAR、Visual Studio、CMake、
-  Makefile、PlatformIO 或 `compile_commands.json` 找出 build 的設定，判斷哪些 `#if` 分支
+  Makefile、PlatformIO、Kconfig 或 `compile_commands.json` 找出 build 的設定，判斷哪些 `#if` 分支
   會被編譯。
 - **找的是呼叫，不只是名稱**：追得到透過巨集、以及透過存在結構裡的函式指標的呼叫，並標出
   每個呼叫是怎麼發生的。
