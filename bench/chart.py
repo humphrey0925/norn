@@ -26,6 +26,7 @@ def load(paths):
         d = json.loads(Path(p).read_text(encoding="utf-8"))
         c = d.get("corpus")
         name = c.get("name") if isinstance(c, dict) else Path(c or p).stem
+        name = CORPORA.get(name, name)
         if name in by:
             have = by[name]["tools"]
             for t, r in d.get("tools", {}).items():
@@ -33,7 +34,7 @@ def load(paths):
                     have[t] = r
             continue
         by[name] = d
-        runs.append((CORPORA.get(name, name), d))
+        runs.append((name, d))
     return runs
 
 

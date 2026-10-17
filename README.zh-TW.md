@@ -60,8 +60,9 @@ Norn 像人一樣直接讀原始碼，有 build 描述檔時也一併讀取：
 ## 基準測試
 
 在公開專案上量測，標準答案是 clang 對該專案實際 build 的結果。每個工具從零建立整個專案
-的索引並計時，回報的每個呼叫都和 clang 實際編譯的呼叫對照。clangd 拿到的是「沒有可用
-compilation database 的專案」能給它的資訊。ctags、cscope、GNU Global 建索引最快，因為它們
+的索引並計時，回報的每個呼叫都和 clang 實際編譯的呼叫對照。clangd 量了兩次：一次給它各專案真實 build 的
+compilation database（clangd 的最佳狀態，也是「完全知道每個檔案怎麼編譯」的參考標準），一次什麼都不給
+（沒有可用 `compile_commands.json` 的專案就是這樣）。Norn 什麼都不給。ctags、cscope、GNU Global 建索引最快，因為它們
 只記錄名稱和位置，不建呼叫圖。
 
 <!-- BENCHMARKS:BEGIN -->
@@ -69,13 +70,13 @@ compilation database 的專案」能給它的資訊。ctags、cscope、GNU Globa
 
 <p align="center"><img src="docs/benchmarks/index-time.svg" alt="Time to index" width="760"></p>
 
-| Project | Files | Norn | clangd | codebase-memory-mcp | cscope | GNU Global | Universal Ctags |
-|---|--:|:-:|:-:|:-:|:-:|:-:|:-:|
-| Redis | 801 | **100.0%<br><sub>0.32 s</sub>** | 95.8%<br><sub>11 s</sub> | 97.1%<br><sub>13 s</sub> | 96.9%<br><sub>0.26 s</sub> | n/a<br><sub>0.18 s</sub> | n/a<br><sub>0.17 s</sub> |
-| git | 919 | **99.9%<br><sub>0.25 s</sub>** | 64.2%<br><sub>32 s</sub> | 85.8%<br><sub>12 s</sub> | 87.9%<br><sub>0.27 s</sub> | n/a<br><sub>0.18 s</sub> | n/a<br><sub>0.17 s</sub> |
-| binutils | 1,622 | **99.6%<br><sub>2.72 s</sub>** | 32.2%<br><sub>16 s</sub> | 81.0%<br><sub>37 s</sub> | 70.6%<br><sub>1.34 s</sub> | n/a<br><sub>0.81 s</sub> | n/a<br><sub>0.99 s</sub> |
-| STM32F4 HAL | 253 | **96.5%<br><sub>0.64 s</sub>** | 0.0%<br><sub>1.14 s</sub> | 85.8%<br><sub>9.62 s</sub> | 75.7%<br><sub>0.44 s</sub> | n/a<br><sub>0.68 s</sub> | n/a<br><sub>0.60 s</sub> |
-| nrfx | 535 | **98.0%<br><sub>0.84 s</sub>** | 14.1%<br><sub>1.22 s</sub> | 94.2%<br><sub>8.29 s</sub> | 12.0%<br><sub>0.28 s</sub> | n/a<br><sub>0.36 s</sub> | n/a<br><sub>0.32 s</sub> |
+| Project | Files | Norn | clangd + build database | clangd | codebase-memory-mcp | cscope | GNU Global | Universal Ctags |
+|---|--:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| Redis | 801 | **100.0%<br><sub>0.32 s</sub>** | 100.0%<br><sub>1.67 s</sub> | 95.8%<br><sub>11 s</sub> | 97.1%<br><sub>13 s</sub> | 96.9%<br><sub>0.26 s</sub> | n/a<br><sub>0.18 s</sub> | n/a<br><sub>0.17 s</sub> |
+| git | 919 | **99.9%<br><sub>0.25 s</sub>** | 99.9%<br><sub>2.40 s</sub> | 64.2%<br><sub>32 s</sub> | 85.8%<br><sub>12 s</sub> | 87.9%<br><sub>0.27 s</sub> | n/a<br><sub>0.18 s</sub> | n/a<br><sub>0.17 s</sub> |
+| binutils | 1,622 | **99.6%<br><sub>2.72 s</sub>** | 92.7%<br><sub>9.72 s</sub> | 32.2%<br><sub>16 s</sub> | 81.0%<br><sub>37 s</sub> | 70.6%<br><sub>1.34 s</sub> | n/a<br><sub>0.81 s</sub> | n/a<br><sub>0.99 s</sub> |
+| STM32F4 HAL | 253 | **96.5%<br><sub>0.64 s</sub>** | 95.0%<br><sub>3.14 s</sub> | 0.0%<br><sub>1.14 s</sub> | 85.8%<br><sub>9.62 s</sub> | 75.7%<br><sub>0.44 s</sub> | n/a<br><sub>0.68 s</sub> | n/a<br><sub>0.60 s</sub> |
+| nrfx | 535 | **98.0%<br><sub>0.84 s</sub>** | 100.0%<br><sub>1.15 s</sub> | 14.1%<br><sub>1.22 s</sub> | 94.2%<br><sub>8.29 s</sub> | 12.0%<br><sub>0.28 s</sub> | n/a<br><sub>0.36 s</sub> | n/a<br><sub>0.32 s</sub> |
 
 <sub>每格：找到的呼叫比例（和 clang 對照），下方為建立索引的時間。</sub>
 

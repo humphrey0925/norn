@@ -66,8 +66,10 @@ where there is one:
 
 Measured on public projects against clang's own view of a real build of each.
 Each tool's cold index of the whole project is timed, and every call it reports
-is checked against the call clang compiles. clangd is given what a project
-without a working compilation database can give it. ctags, cscope and GNU Global
+is checked against the call clang compiles. clangd is measured twice: given each
+build's own compilation database (clangd at its best, the reference for an index
+that is told exactly how every file is compiled) and given none, as a project
+without a working `compile_commands.json` leaves it. Norn is given nothing. ctags, cscope and GNU Global
 index fastest because they record names and places, not a call graph.
 
 <!-- BENCHMARKS:BEGIN -->
@@ -75,13 +77,13 @@ index fastest because they record names and places, not a call graph.
 
 <p align="center"><img src="docs/benchmarks/index-time.svg" alt="Time to index" width="760"></p>
 
-| Project | Files | Norn | clangd | codebase-memory-mcp | cscope | GNU Global | Universal Ctags |
-|---|--:|:-:|:-:|:-:|:-:|:-:|:-:|
-| Redis | 801 | **100.0%<br><sub>0.32 s</sub>** | 95.8%<br><sub>11 s</sub> | 97.1%<br><sub>13 s</sub> | 96.9%<br><sub>0.26 s</sub> | n/a<br><sub>0.18 s</sub> | n/a<br><sub>0.17 s</sub> |
-| git | 919 | **99.9%<br><sub>0.25 s</sub>** | 64.2%<br><sub>32 s</sub> | 85.8%<br><sub>12 s</sub> | 87.9%<br><sub>0.27 s</sub> | n/a<br><sub>0.18 s</sub> | n/a<br><sub>0.17 s</sub> |
-| binutils | 1,622 | **99.6%<br><sub>2.72 s</sub>** | 32.2%<br><sub>16 s</sub> | 81.0%<br><sub>37 s</sub> | 70.6%<br><sub>1.34 s</sub> | n/a<br><sub>0.81 s</sub> | n/a<br><sub>0.99 s</sub> |
-| STM32F4 HAL | 253 | **96.5%<br><sub>0.64 s</sub>** | 0.0%<br><sub>1.14 s</sub> | 85.8%<br><sub>9.62 s</sub> | 75.7%<br><sub>0.44 s</sub> | n/a<br><sub>0.68 s</sub> | n/a<br><sub>0.60 s</sub> |
-| nrfx | 535 | **98.0%<br><sub>0.84 s</sub>** | 14.1%<br><sub>1.22 s</sub> | 94.2%<br><sub>8.29 s</sub> | 12.0%<br><sub>0.28 s</sub> | n/a<br><sub>0.36 s</sub> | n/a<br><sub>0.32 s</sub> |
+| Project | Files | Norn | clangd + build database | clangd | codebase-memory-mcp | cscope | GNU Global | Universal Ctags |
+|---|--:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| Redis | 801 | **100.0%<br><sub>0.32 s</sub>** | 100.0%<br><sub>1.67 s</sub> | 95.8%<br><sub>11 s</sub> | 97.1%<br><sub>13 s</sub> | 96.9%<br><sub>0.26 s</sub> | n/a<br><sub>0.18 s</sub> | n/a<br><sub>0.17 s</sub> |
+| git | 919 | **99.9%<br><sub>0.25 s</sub>** | 99.9%<br><sub>2.40 s</sub> | 64.2%<br><sub>32 s</sub> | 85.8%<br><sub>12 s</sub> | 87.9%<br><sub>0.27 s</sub> | n/a<br><sub>0.18 s</sub> | n/a<br><sub>0.17 s</sub> |
+| binutils | 1,622 | **99.6%<br><sub>2.72 s</sub>** | 92.7%<br><sub>9.72 s</sub> | 32.2%<br><sub>16 s</sub> | 81.0%<br><sub>37 s</sub> | 70.6%<br><sub>1.34 s</sub> | n/a<br><sub>0.81 s</sub> | n/a<br><sub>0.99 s</sub> |
+| STM32F4 HAL | 253 | **96.5%<br><sub>0.64 s</sub>** | 95.0%<br><sub>3.14 s</sub> | 0.0%<br><sub>1.14 s</sub> | 85.8%<br><sub>9.62 s</sub> | 75.7%<br><sub>0.44 s</sub> | n/a<br><sub>0.68 s</sub> | n/a<br><sub>0.60 s</sub> |
+| nrfx | 535 | **98.0%<br><sub>0.84 s</sub>** | 100.0%<br><sub>1.15 s</sub> | 14.1%<br><sub>1.22 s</sub> | 94.2%<br><sub>8.29 s</sub> | 12.0%<br><sub>0.28 s</sub> | n/a<br><sub>0.36 s</sub> | n/a<br><sub>0.32 s</sub> |
 
 <sub>Each cell: the share of calls found (checked against clang), and below it the time to index.</sub>
 
