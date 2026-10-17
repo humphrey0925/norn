@@ -1424,6 +1424,10 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                             if pick.is_empty() {
                                 cpp.nearest(cands, NONE, &mut lineage, &mut pick);
                             }
+                        } else if qual != NONE && cands.iter().any(|&c| cpp.class(c) == qual) {
+                            // A class known by its members alone, one a macro
+                            // makes (Boost.Test's case): its.
+                            cpp.nearest(cands, qual, &mut lineage, &mut pick);
                         } else if qual != NONE {
                             // A scope the corpus does not have (`std::max`):
                             // only a function of no class, and only a guess.
@@ -2862,12 +2866,22 @@ mod test_framework_tests {
                    BOOST_AUTO_TEST_SUITE_END()\n\
                    BOOST_FIXTURE_TEST_CASE(other, Setup)\n{\n  Count();\n}\n\
                    BOOST_AUTO_TEST_CASE(plain)\n{\n}\n";
-        assert_eq!(named(&[("t.cpp", src)]), ["Setup::Count", "other::test_method", "plain::test_method", "simple::test_method"]);
+        assert_eq!(
+            named(&[("t.cpp", src)]),
+            ["Setup::Count", "other::test_method", "other_invoker", "plain::test_method", "plain_invoker", "simple::test_method", "simple_invoker"]
+        );
         // What the fixture has, the test calls.
         let mut ex = Extractor::new();
         let g = link(&[ex.extract("t.cpp", src.as_bytes(), &MacroSets::default())]).0;
         let count = g.find("Count")[0];
         assert_eq!(g.refs_to(count).iter().filter(|e| e.kind() == refkind::CALL).count(), 2);
+        // The function the macro makes runs the case's test method.
+        let q = crate::graph::Qualifier::new(&g);
+        for case in ["simple", "other", "plain"] {
+            let invoker = g.find(&format!("{case}_invoker"))[0];
+            let runs: Vec<String> = g.refs_from(invoker).iter().filter(|e| e.kind() == refkind::CALL && !e.ambiguous()).map(|e| q.name(&g, e.other).into_owned()).collect();
+            assert_eq!(runs, [format!("{case}::test_method")]);
+        }
     }
 
     #[test]

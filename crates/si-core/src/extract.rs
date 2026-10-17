@@ -2556,6 +2556,20 @@ impl<'a> Walk<'a> {
                             let base = self.intern_str(&base);
                             self.out.cxx_mut().bases.push((own, base));
                         }
+                        if method == "test_method" {
+                            // Boost.Test runs the case from a function the
+                            // macro makes of it, `name_invoker`.
+                            let line = self.out.defs[def as usize].line;
+                            let name = self.intern_str(&format!("{test}_invoker"));
+                            self.out.defs.push(Def { name, line, end_line: line, kind: kind::FUNCTION, flags: flag::STATIC });
+                            let invoker = self.out.defs.len() as u32 - 1;
+                            self.note_owner(invoker, &[], None, node.start_byte());
+                            let called = self.intern_str(method);
+                            self.out.refs.push(Ref { name: called, line, scope: invoker, kind: refkind::CALL });
+                            let r = self.out.refs.len() as u32 - 1;
+                            let test = self.intern_str(&test);
+                            self.out.cxx_mut().ref_quals.push((r, test));
+                        }
                     } else {
                         self.method_class = self.note_owner(def, &scope, class, node.start_byte());
                         if class.is_some() {
