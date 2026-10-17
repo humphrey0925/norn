@@ -1371,6 +1371,16 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                         && (s.flags & flag::CONDITIONAL != 0 && !along() || s.file != fi as u32 && !sure.member[s.file as usize])
                         && compiled(*c) != crate::cond::Tri::True
                 };
+                // C++: a name called that only a macro the corpus defines
+                // once can mean is that macro, defined or not where it is
+                // tested (`#if !GTEST_DONT_DEFINE_ASSERT_EQ`): without it
+                // the call would not compile.
+                let sole_macro = in_cpp
+                    && kind == refkind::CALL
+                    && tmp.len() == 1
+                    && syms[tmp[0] as usize].kind == kind::MACRO
+                    && cands.iter().all(|&c| c == tmp[0] || !matches!(syms[c as usize].kind, kind::FUNCTION | kind::MACRO));
+                let optional = |c: &u32| !sole_macro && optional(c);
                 // (C++: overloads are one function, of one class in one file.)
                 let several = if in_cpp {
                     let first = (syms[tmp[0] as usize].file, cpp.class(tmp[0]));
@@ -2250,6 +2260,34 @@ void e() { HOLD(4); }
         // A macro whose text declares an object of the class.
         let held: Vec<String> = g.find("HOLD").iter().flat_map(|&m| g.refs_from(m)).filter(|e| e.kind() == refkind::CALL).map(|e| q.name(&g, e.other).into_owned()).collect();
         assert_eq!(held, ["Bar::Bar"]);
+    }
+
+    #[test]
+    fn a_macro_only_some_configurations_define_is_what_cpp_calls_by_its_name() {
+        let h = "#if !DONT_DEFINE_CHECK
+#define CHECK_IT(x) Check(x)
+#endif
+#ifdef USE_TWO
+#define TWO(x) Check(x)
+#else
+#define TWO(x) Other(x)
+#endif
+inline void Check(int x) {}
+inline void Other(int x) {}
+";
+        let src = "#include \"t.h\"\nvoid f() { CHECK_IT(1); }\nvoid g() { TWO(2); }\n";
+        // (What C calls by a name it has no declaration of may be another
+        // function: there the macro stays one reading.)
+        for (ext, sure) in [("cc", true), ("c", false)] {
+            let path = format!("t.{ext}");
+            let g = graph(&[("t.h", h), (&path, src)]);
+            let callers = |callee: &str| -> Vec<(String, bool)> {
+                crate::callers_through_macros(&g, g.find(callee)[0]).iter().filter(|c| g.syms[c.caller as usize].kind == kind::FUNCTION).map(|c| (g.sym_name(c.caller).to_string(), c.ambiguous)).collect()
+            };
+            assert!(callers("Check").contains(&("f".to_string(), !sure)), "{ext}: {:?}", callers("Check"));
+            // Two definitions of the name are two readings.
+            assert!(callers("Other").contains(&("g".to_string(), true)), "{ext}: {:?}", callers("Other"));
+        }
     }
 
     #[test]
