@@ -835,6 +835,7 @@ impl<'a> Walk<'a> {
         if let Some(slot) = self.site_defs.get_mut(&name.start_byte()) {
             *slot = self.out.defs.len() as u32;
         }
+        let at = name;
         let name = self.def_name(name);
         self.out.defs.push(Def {
             name,
@@ -843,7 +844,64 @@ impl<'a> Walk<'a> {
             kind,
             flags,
         });
-        (self.out.defs.len() - 1) as u32
+        let def = (self.out.defs.len() - 1) as u32;
+        if self.cpp && kind == kind::FUNCTION {
+            self.note_arity(def, at);
+        }
+        def
+    }
+
+    /// C++: how many arguments the function whose name is at `name` takes,
+    /// from its parameter list (defaults and `...` counted as such).
+    fn note_arity(&mut self, def: u32, name: Node<'a>) {
+        let ids = self.ids;
+        let mut n = name;
+        for _ in 0..4 {
+            match n.parent() {
+                Some(p) if p.kind_id() == ids.function_declarator => {
+                    let Some(list) = p.child_by_field_id(ids.f_parameters) else { return };
+                    let (mut least, mut most) = (0u8, 0u8);
+                    let mut c = list.walk();
+                    for q in list.named_children(&mut c).filter(|q| !q.is_extra()) {
+                        match q.kind() {
+                            "optional_parameter_declaration" => most = most.saturating_add(1),
+                            "variadic_parameter_declaration" | "variadic_parameter" => most = u8::MAX,
+                            // `(void)`.
+                            _ if q.named_child_count() == 1 && self.text(q) == b"void" => {}
+                            _ => {
+                                least = least.saturating_add(1);
+                                most = most.saturating_add(1);
+                            }
+                        }
+                    }
+                    if list.child_count() > 0 && (0..list.child_count()).any(|i| list.child(i).is_some_and(|x| x.kind() == "...")) {
+                        most = u8::MAX;
+                    }
+                    self.out.cxx_mut().arity.push((def, least, most));
+                    return;
+                }
+                Some(p) => n = p,
+                None => return,
+            }
+        }
+    }
+
+    /// C++: how many arguments the reference just pushed was given, from the
+    /// list in parentheses at `list`.
+    fn note_args(&mut self, list: Option<Node<'a>>) {
+        if let Some(n) = self.count_args(list) {
+            let r = self.out.refs.len() as u32 - 1;
+            self.out.cxx_mut().args.push((r, n));
+        }
+    }
+
+    /// How many arguments a list in parentheses holds (not one in braces,
+    /// which may be one `std::initializer_list`).
+    fn count_args(&self, list: Option<Node<'a>>) -> Option<u8> {
+        let list = list.filter(|l| matches!(l.kind(), "argument_list" | "parameter_list"))?;
+        let mut c = list.walk();
+        let n = list.named_children(&mut c).filter(|a| !a.is_extra()).count();
+        Some(n.min(u8::MAX as usize - 1) as u8)
     }
 
     fn leave_scope(&mut self, pos: usize) {
@@ -1116,7 +1174,7 @@ impl<'a> Walk<'a> {
 
     /// C++: a call of a constructor of `class` (or of the type of the member
     /// so named, with `hint` saying whose) made at `at`.
-    fn push_construction(&mut self, class: u32, at: Node<'a>, hint: u32) {
+    fn push_construction(&mut self, class: u32, at: Node<'a>, hint: u32, args: Option<u8>) {
         let scope = self.scope.map_or(0, |s| s.def);
         self.out.refs.push(Ref { name: class, line: at.start_position().row as u32 + 1, scope, kind: refkind::CALL });
         let r = self.out.refs.len() as u32 - 1;
@@ -1124,6 +1182,9 @@ impl<'a> Walk<'a> {
             self.out.ref_hints.push((r, hint));
         }
         self.out.cxx_mut().constructs.push(r);
+        if let Some(n) = args {
+            self.out.cxx_mut().args.push((r, n));
+        }
     }
 
     /// C++: the type of the elements of a container type (`std::vector<T>`:
@@ -1285,6 +1346,12 @@ impl<'a> Walk<'a> {
                     let scope = (self.out.defs.len() - 1) as u32;
                     for t in &m.refs {
                         self.push_tok_ref(t, scope);
+                        if self.cpp && t.call {
+                            if let Some(n) = self.args_in_text(t.end as usize, m.end as usize) {
+                                let r = self.out.refs.len() as u32 - 1;
+                                self.out.cxx_mut().args.push((r, n));
+                            }
+                        }
                         // C++: `gtest_ar.failure_message ()` of a `gtest_ar`
                         // the body declares: of its class.
                         if self.cpp && t.member {
@@ -1503,6 +1570,45 @@ impl<'a> Walk<'a> {
             i -= 1;
         }
         matches!(&s[i..end], b"struct" | b"class" | b"union" | b"enum" | b"namespace" | b"typename")
+    }
+
+    /// How many arguments the parentheses at `pos` in the text (a macro
+    /// body ending at `end`) hold; not known where `__VA_ARGS__` is one.
+    fn args_in_text(&self, pos: usize, end: usize) -> Option<u8> {
+        let s = self.orig;
+        let open = self.skip_space(pos);
+        if s.get(open) != Some(&b'(') {
+            return None;
+        }
+        let (mut depth, mut commas, mut empty) = (0, 0usize, true);
+        let mut i = open;
+        while i < end {
+            match s[i] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let n = if empty { 0 } else { commas + 1 };
+                        let vararg = s[open..i].windows(11).any(|w| w == b"__VA_ARGS__");
+                        return (!vararg).then_some(n.min(u8::MAX as usize - 1) as u8);
+                    }
+                }
+                b',' if depth == 1 => commas += 1,
+                b'"' | b'\'' => {
+                    let q = s[i];
+                    i += 1;
+                    while i < end && s[i] != q {
+                        i += 1 + (s[i] == b'\\') as usize;
+                    }
+                }
+                _ => {}
+            }
+            if depth >= 1 && i > open && !s[i].is_ascii_whitespace() && s[i] != b'\\' {
+                empty = false;
+            }
+            i += 1;
+        }
+        None
     }
 
     /// C++, in a macro body ending at `end`: is the name before `pos` made
@@ -2027,6 +2133,9 @@ impl<'a> Walk<'a> {
                         self.local_calls.push((self.text(f), f.start_position().row as u32 + 1));
                     } else {
                         self.push_ref(f, refkind::CALL);
+                        if self.cpp {
+                            self.note_args(node.child_by_field_id(ids.f_arguments));
+                        }
                         // A macro's arguments it does not use: not compiled.
                         let discards = self.sets.discards(self.text(f));
                         let asked = self.intern(self.text(f));
@@ -2063,6 +2172,7 @@ impl<'a> Walk<'a> {
                     if name.kind_id() == ids.identifier {
                         self.skip.insert(name.start_byte());
                         self.push_ref(name, refkind::CALL);
+                        self.note_args(node.child_by_field_id(ids.f_arguments));
                         if let Some(q) = parts.last().filter(|_| qualified) {
                             let (q, at) = (self.intern(q), self.out.refs.len() as u32 - 1);
                             self.out.cxx_mut().ref_quals.push((at, q));
@@ -2081,6 +2191,9 @@ impl<'a> Walk<'a> {
                             if member.kind_id() == ids.field_identifier || member.kind_id() == ids.identifier {
                                 self.skip.insert(member.start_byte());
                                 self.push_ref(member, refkind::ICALL);
+                                if self.cpp {
+                                    self.note_args(node.child_by_field_id(ids.f_arguments));
+                                }
                                 let at = self.out.refs.len() as u32 - 1;
                                 let hint = self.member_hint(target);
                                 if hint != NONE {
@@ -2312,18 +2425,21 @@ impl<'a> Walk<'a> {
                             let (inner, value) = if d.kind_id() == ids.init_declarator {
                                 (d.child_by_field_id(ids.f_declarator.get()), d.child_by_field_id(ids.f_value))
                             } else if object {
-                                (d.child_by_field_id(ids.f_declarator.get()), None)
+                                (d.child_by_field_id(ids.f_declarator.get()), d.child_by_field_id(ids.f_parameters))
                             } else {
                                 (Some(d), None)
                             };
-                            let object = inner.is_some_and(|i| i.kind_id() == ids.identifier || i.kind_id() == ids.array_declarator);
-                            let made = value.is_none_or(|v| matches!(v.kind(), "argument_list" | "initializer_list"));
+                            let plain = inner.is_some_and(|i| i.kind_id() == ids.identifier);
+                            let made_one = plain || inner.is_some_and(|i| i.kind_id() == ids.array_declarator);
+                            let made = object || value.is_none_or(|v| matches!(v.kind(), "argument_list" | "initializer_list"));
                             let class = match node.child_by_field_id(ids.f_type) {
-                                Some(t) if object && made => self.constructed_class(t),
+                                Some(t) if made_one && made => self.constructed_class(t),
                                 _ => NONE,
                             };
                             if class != NONE {
-                                self.push_construction(class, d, NONE);
+                                // (`T x;`: none; `T x {a}` may take a list.)
+                                let args = if value.is_none() && plain { Some(0) } else { self.count_args(value) };
+                                self.push_construction(class, d, NONE, args);
                             }
                         }
                         if let Some(value) = d.child_by_field_id(ids.f_value).filter(|_| d.kind_id() == ids.init_declarator) {
@@ -2456,7 +2572,9 @@ impl<'a> Walk<'a> {
             if let Some(t) = node.child_by_field_id(ids.f_type) {
                 let class = self.constructed_class(t);
                 if class != NONE {
-                    self.push_construction(class, node, NONE);
+                    let args = node.child_by_field_id(ids.f_arguments);
+                    let args = if args.is_none() && node.kind() == "new_expression" { Some(0) } else { self.count_args(args) };
+                    self.push_construction(class, node, NONE, args);
                 }
             }
             return true;
@@ -2469,7 +2587,9 @@ impl<'a> Walk<'a> {
                 if matches!(name.kind(), "field_identifier" | "type_identifier" | "identifier") {
                     let class = self.intern(self.text(name));
                     let hint = if self.method_class != NONE { self.push_hint(root::TYPE, self.method_class, &[]) } else { NONE };
-                    self.push_construction(class, node, hint);
+                    let mut c = node.walk();
+                    let args = node.named_children(&mut c).find(|n| n.kind() == "argument_list");
+                    self.push_construction(class, node, hint, self.count_args(args));
                 }
             }
             return true;

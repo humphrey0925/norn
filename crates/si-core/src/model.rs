@@ -333,6 +333,12 @@ pub struct Cxx {
     /// Of an operator defined as a function of no class (`bool operator==
     /// (const A&, const B&)`): (definition, its parameters' types).
     pub operator_params: Vec<(u32, u32, u32)>,
+    /// Of a function, how many arguments it takes: (definition, fewest,
+    /// most), `u8::MAX` for any number.
+    pub arity: Vec<(u32, u8, u8)>,
+    /// Of a call or an object made with arguments in parentheses, how
+    /// many: (reference, count).
+    pub args: Vec<(u32, u8)>,
 }
 
 static NO_CXX: Cxx = Cxx {
@@ -347,6 +353,8 @@ static NO_CXX: Cxx = Cxx {
     constructs: Vec::new(),
     operators: Vec::new(),
     operator_params: Vec::new(),
+    arity: Vec::new(),
+    args: Vec::new(),
 };
 
 /// A parameter or a local variable.
@@ -553,6 +561,8 @@ impl FileFacts {
             exact(&mut c.constructs);
             exact(&mut c.operators);
             exact(&mut c.operator_params);
+            exact(&mut c.arity);
+            exact(&mut c.args);
         }
         exact(&mut self.param_calls);
         exact(&mut self.arg_passes);
@@ -585,6 +595,7 @@ impl FileFacts {
             ("binds", of(&self.binds)),
             ("records", records + of(&self.aliases) + of(&self.field_types) + of(&self.typed) + self.cxx.as_ref().map_or(0, |c| {
                 std::mem::size_of::<Cxx>() + of(&c.owners) + of(&c.bases) + of(&c.ref_quals) + of(&c.namespaces) + of(&c.namespace_aliases) + of(&c.nested) + of(&c.elems)
+                    + of(&c.arity) + of(&c.args)
             })),
             ("hints", of(&self.hints) + of(&self.hint_path) + of(&self.ref_hints)),
             ("calls through", of(&self.param_calls) + of(&self.arg_passes)),

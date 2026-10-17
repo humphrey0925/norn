@@ -1605,6 +1605,9 @@ fn expand_file(
         for p in &mut c.operator_params {
             p.0 = new_index[p.0 as usize];
         }
+        for a in &mut c.arity {
+            a.0 = new_index[a.0 as usize];
+        }
     }
     for d in out.records.iter_mut().flat_map(|r| r.defs.iter_mut()).filter(|d| **d != NONE) {
         *d = new_index[*d as usize];

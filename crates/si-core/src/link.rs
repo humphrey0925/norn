@@ -562,6 +562,8 @@ struct Cpp {
     namespace_aliases: FxHashMap<u32, u32>,
     /// An operator of no class -> the types of its parameters.
     operator_params: FxHashMap<u32, (u32, u32)>,
+    /// A function -> how many arguments it takes, fewest and most.
+    arity: FxHashMap<u32, (u8, u8)>,
 }
 
 impl Cpp {
@@ -615,6 +617,7 @@ impl Cpp {
                 let t = |p: u32| if p == NONE { NONE } else { remap[fi][p as usize] };
                 c.operator_params.insert((base + def as usize) as u32, (t(p0), t(p1)));
             }
+            c.arity.extend(f.cxx().arity.iter().map(|&(def, least, most)| ((base + def as usize) as u32, (least, most))));
             for &(class, b) in &f.cxx().bases {
                 let (class, b) = (remap[fi][class as usize], remap[fi][b as usize]);
                 if class != b {
@@ -635,7 +638,42 @@ impl Cpp {
                 c.virtuals.insert((class, s.name));
             }
         }
+        // Default arguments are written where a function is declared, not
+        // where it is defined apart: a definition takes as few as a
+        // declaration of the name in its class with as many parameters.
+        let mut fewest: FxHashMap<(u32, u32, u8), u8> = FxHashMap::default();
+        for (&sym, &(least, most)) in &c.arity {
+            let s = &g.syms[sym as usize];
+            if s.flags & flag::DECL != 0 && least < most {
+                let e = fewest.entry((c.class(sym), s.name, most)).or_insert(least);
+                *e = (*e).min(least);
+            }
+        }
+        if !fewest.is_empty() {
+            let class_of = &c.class_of;
+            for (sym, a) in c.arity.iter_mut() {
+                let key = (class_of.get(sym).copied().unwrap_or(NONE), g.syms[*sym as usize].name, a.1);
+                if let Some(&least) = fewest.get(&key) {
+                    a.0 = a.0.min(least);
+                }
+            }
+        }
         c
+    }
+
+    /// Of overloads, keep those that take `n` arguments, if any does and
+    /// not all do. (One whose parameters are not known takes any number.)
+    /// Not for a declaration alone where definitions do not fit: that may
+    /// be one the compiler writes (`T () = default;`), which the reader
+    /// would rather see the class's for.
+    fn by_arity(&self, n: Option<u8>, cands: &mut Vec<u32>, syms: &[Sym]) {
+        let Some(n) = n else { return };
+        let fits = |c: &u32| self.arity.get(c).is_none_or(|&(least, most)| least <= n && n <= most);
+        let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
+        let defs = cands.iter().any(is_def);
+        if cands.iter().any(|c| fits(c) && (is_def(c) || !defs)) && !cands.iter().all(fits) {
+            cands.retain(fits);
+        }
     }
 
     fn on(&self) -> bool {
@@ -970,6 +1008,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
             let anywhere: std::cell::RefCell<FxHashMap<(u32, u32), crate::cond::Tri>> = Default::default();
             let constructs: FxHashSet<u32> = f.cxx().constructs.iter().copied().collect();
             let operands: FxHashMap<u32, (u32, u32, bool)> = f.cxx().operators.iter().map(|&(r, l, rr, binary)| (r, (l, rr, binary))).collect();
+            let args_of: FxHashMap<u32, u8> = f.cxx().args.iter().copied().collect();
             for (ri, r) in f.refs.iter().enumerate() {
                 if let Some(&(lh, rh, binary)) = operands.get(&(ri as u32)).filter(|_| in_cpp) {
                     // An operator used on objects: the left operand's
@@ -1102,6 +1141,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     if class != NONE {
                         tmp.extend(g.syms_named(class).iter().copied().filter(|&c| ctor_of(c, class)));
                     }
+                    cpp.by_arity(args_of.get(&(ri as u32)).copied(), &mut tmp, syms);
                     let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
                     if tmp.iter().any(is_def) {
                         tmp.retain(is_def);
@@ -1259,6 +1299,9 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 let callable = |c: &u32| matches!(syms[*c as usize].kind, kind::FUNCTION | kind::MACRO);
                 if matches!(kind, refkind::CALL | refkind::PCALL) && tmp.iter().any(callable) {
                     tmp.retain(callable);
+                }
+                if in_cpp {
+                    cpp.by_arity(args_of.get(&(ri as u32)).copied(), &mut tmp, syms);
                 }
                 let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
                 if tmp.iter().any(is_def) {
@@ -2310,6 +2353,42 @@ void g() { LOG(2); }
         assert_eq!(callers("AssertHelper::operator="), ["f"]);
         assert_eq!(callers("Message::Message"), ["f"]);
         assert_eq!(callers("SourceLocation::SourceLocation"), ["g"]);
+    }
+
+    #[test]
+    fn of_overloads_in_several_files_the_call_is_of_those_taking_its_arguments() {
+        let g = graph(&[
+            ("m.h", "class Message {
+ public:
+  Message();
+  Message(const Message& m) {}
+  void Put(int a, int b = 0);
+  void Put(const char* s, int a, int b) {}
+};
+#define MAKE() Message()
+inline void Use(int a) {}
+"),
+            ("m.cc", "#include \"m.h\"
+Message::Message() {}
+void Message::Put(int a, int b) {}
+void f() { Message m; Message n(m); Message* p = new Message(); MAKE(); }
+void g(Message& m) { m.Put(1); m.Put(\"x\", 1, 2); }
+"),
+        ]);
+        let q = crate::graph::Qualifier::new(&g);
+        let certain = |caller: &str, callee: &str| -> Vec<String> {
+            let mut v: Vec<String> = g.find(caller).iter().chain(g.find("MAKE").iter()).flat_map(|&s| g.refs_from(s))
+                .filter(|e| e.kind() == refkind::CALL && !e.ambiguous() && q.name(&g, e.other) == callee)
+                .map(|e| format!("{}:{}", g.file_path(g.syms[e.other as usize].file), g.syms[e.other as usize].line)).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        // `Message m;`, `new Message ()` and the macro's `Message ()` take
+        // none; `Message n (m)` one.
+        assert_eq!(certain("f", "Message::Message"), ["m.cc:2", "m.h:4"]);
+        // The default argument is in the declaration, not the definition.
+        assert_eq!(certain("g", "Message::Put"), ["m.cc:3", "m.h:6"]);
     }
 
     #[test]
