@@ -339,6 +339,13 @@ pub struct Cxx {
     /// Of a call or an object made with arguments in parentheses, how
     /// many: (reference, count).
     pub args: Vec<(u32, u8)>,
+    /// Of a function's parameters that are objects of a class or references
+    /// to one: (definition, position, the class's name).
+    pub params: Vec<(u32, u32, u32)>,
+    /// The objects made as copies of an object of their class (`return s;`
+    /// of a function returning a `Status`): by its copy or move constructor,
+    /// if it has one written.
+    pub copies: Vec<u32>,
 }
 
 static NO_CXX: Cxx = Cxx {
@@ -355,6 +362,8 @@ static NO_CXX: Cxx = Cxx {
     operator_params: Vec::new(),
     arity: Vec::new(),
     args: Vec::new(),
+    params: Vec::new(),
+    copies: Vec::new(),
 };
 
 /// A parameter or a local variable.
@@ -563,6 +572,8 @@ impl FileFacts {
             exact(&mut c.operator_params);
             exact(&mut c.arity);
             exact(&mut c.args);
+            exact(&mut c.params);
+            exact(&mut c.copies);
         }
         exact(&mut self.param_calls);
         exact(&mut self.arg_passes);
@@ -595,7 +606,7 @@ impl FileFacts {
             ("binds", of(&self.binds)),
             ("records", records + of(&self.aliases) + of(&self.field_types) + of(&self.typed) + self.cxx.as_ref().map_or(0, |c| {
                 std::mem::size_of::<Cxx>() + of(&c.owners) + of(&c.bases) + of(&c.ref_quals) + of(&c.namespaces) + of(&c.namespace_aliases) + of(&c.nested) + of(&c.elems)
-                    + of(&c.arity) + of(&c.args)
+                    + of(&c.arity) + of(&c.args) + of(&c.params) + of(&c.copies)
             })),
             ("hints", of(&self.hints) + of(&self.hint_path) + of(&self.ref_hints)),
             ("calls through", of(&self.param_calls) + of(&self.arg_passes)),

@@ -564,6 +564,8 @@ struct Cpp {
     operator_params: FxHashMap<u32, (u32, u32)>,
     /// A function -> how many arguments it takes, fewest and most.
     arity: FxHashMap<u32, (u8, u8)>,
+    /// (Function, position) -> the class of the parameter there.
+    params: FxHashMap<(u32, u32), u32>,
 }
 
 impl Cpp {
@@ -618,6 +620,7 @@ impl Cpp {
                 c.operator_params.insert((base + def as usize) as u32, (t(p0), t(p1)));
             }
             c.arity.extend(f.cxx().arity.iter().map(|&(def, least, most)| ((base + def as usize) as u32, (least, most))));
+            c.params.extend(f.cxx().params.iter().map(|&(def, at, t)| (((base + def as usize) as u32, at), remap[fi][t as usize])));
             for &(class, b) in &f.cxx().bases {
                 let (class, b) = (remap[fi][class as usize], remap[fi][b as usize]);
                 if class != b {
@@ -1009,6 +1012,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
             let constructs: FxHashSet<u32> = f.cxx().constructs.iter().copied().collect();
             let operands: FxHashMap<u32, (u32, u32, bool)> = f.cxx().operators.iter().map(|&(r, l, rr, binary)| (r, (l, rr, binary))).collect();
             let args_of: FxHashMap<u32, u8> = f.cxx().args.iter().copied().collect();
+            let copies: FxHashSet<u32> = f.cxx().copies.iter().copied().collect();
             for (ri, r) in f.refs.iter().enumerate() {
                 if let Some(&(lh, rh, binary)) = operands.get(&(ri as u32)).filter(|_| in_cpp) {
                     // An operator used on objects: the left operand's
@@ -1142,6 +1146,11 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                         tmp.extend(g.syms_named(class).iter().copied().filter(|&c| ctor_of(c, class)));
                     }
                     cpp.by_arity(args_of.get(&(ri as u32)).copied(), &mut tmp, syms);
+                    if copies.contains(&(ri as u32)) {
+                        // A copy: by the constructor taking one of its class,
+                        // or by the compiler's, which is no call here.
+                        tmp.retain(|c| cpp.params.get(&(*c, 0)) == Some(&class));
+                    }
                     let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
                     if tmp.iter().any(is_def) {
                         tmp.retain(is_def);
@@ -2389,6 +2398,38 @@ void g(Message& m) { m.Put(1); m.Put(\"x\", 1, 2); }
         assert_eq!(certain("f", "Message::Message"), ["m.cc:2", "m.h:4"]);
         // The default argument is in the declaration, not the definition.
         assert_eq!(certain("g", "Message::Put"), ["m.cc:3", "m.h:6"]);
+    }
+
+    #[test]
+    fn an_object_returned_by_value_is_copied_by_the_constructor_its_class_has() {
+        let g = graph(&[(
+            "s.cc",
+            "class Status {
+ public:
+  Status() {}
+  Status(const Status& s) {}
+  explicit Status(int code) {}
+};
+class Plain {
+ public:
+  Plain(int x) {}
+};
+Status f() { Status s; return s; }
+Plain g(Plain p) { return p; }
+Status* h(Status* p) { return p; }
+",
+        )]);
+        let made = |caller: &str| -> Vec<u32> {
+            let mut v: Vec<u32> = g.find(caller).iter().flat_map(|&s| g.refs_from(s)).filter(|e| e.kind() == refkind::CALL).map(|e| g.syms[e.other as usize].line).collect();
+            v.sort();
+            v
+        };
+        // `Status s;` by the one taking none, `return s;` by the copy.
+        assert_eq!(made("f"), [3, 4]);
+        // A class with no copy written is copied by the compiler's; a
+        // pointer is no object.
+        assert!(made("g").is_empty(), "{:?}", made("g"));
+        assert!(made("h").is_empty(), "{:?}", made("h"));
     }
 
     #[test]

@@ -390,6 +390,8 @@ struct Walk<'a> {
     classes: Vec<OpenClass>,
     /// The class of the method being read (`this`), or `NONE`.
     method_class: u32,
+    /// C++: the type the function being read returns by value, or `NONE`.
+    returns_object: u32,
     /// The end of the `friend` declaration being read: what it declares
     /// is no member.
     friend_end: usize,
@@ -524,6 +526,7 @@ impl Extractor {
             cpp,
             classes: Vec::new(),
             method_class: NONE,
+            returns_object: NONE,
             friend_end: 0,
             made_names: FxHashMap::default(),
             namespaces: if cpp { namespace_spans(&lexed.masked, &lexed.blocks) } else { Vec::new() },
@@ -862,7 +865,9 @@ impl<'a> Walk<'a> {
                     let Some(list) = p.child_by_field_id(ids.f_parameters) else { return };
                     let (mut least, mut most) = (0u8, 0u8);
                     let mut c = list.walk();
-                    for q in list.named_children(&mut c).filter(|q| !q.is_extra()) {
+                    let params: Vec<Node<'a>> = list.named_children(&mut c).filter(|q| !q.is_extra()).collect();
+                    for q in params {
+                        let at = most;
                         match q.kind() {
                             "optional_parameter_declaration" => most = most.saturating_add(1),
                             "variadic_parameter_declaration" | "variadic_parameter" => most = u8::MAX,
@@ -871,6 +876,15 @@ impl<'a> Walk<'a> {
                             _ => {
                                 least = least.saturating_add(1);
                                 most = most.saturating_add(1);
+                            }
+                        }
+                        // Of a parameter that is an object or a reference to
+                        // one, its class (`const Status& s`: `Status`).
+                        let pointer = q.child_by_field_id(ids.f_declarator.get()).is_some_and(|d| matches!(d.kind(), "pointer_declarator" | "abstract_pointer_declarator"));
+                        if most != at && most != u8::MAX && !pointer {
+                            let t = self.type_name_of(q);
+                            if t != NONE {
+                                self.out.cxx_mut().params.push((def, at as u32, t));
                             }
                         }
                     }
@@ -2349,6 +2363,12 @@ impl<'a> Walk<'a> {
                 if returns != NONE {
                     self.out.typed.push((def, returns));
                 }
+                // (Not of `T* f ()`, `T& f ()` nor `std::unique_ptr<T> f ()`.)
+                let by_value = node.child_by_field_id(ids.f_declarator.get()).is_some_and(|d| d.kind_id() == ids.function_declarator);
+                self.returns_object = match node.child_by_field_id(ids.f_type) {
+                    Some(t) if self.cpp && by_value => self.constructed_class(t),
+                    _ => NONE,
+                };
                 self.locals.clear();
                 self.local_ids.clear();
                 if let Some(d) = node.child_by_field_id(ids.f_declarator.get()) {
@@ -2525,6 +2545,24 @@ impl<'a> Walk<'a> {
         }
         if self.cpp && self.in_fn() {
             match node.kind() {
+                "return_statement" if self.returns_object != NONE => {
+                    // `return s;` of a function returning a `Status`: one
+                    // made from `s`, by the class's copy or move constructor.
+                    // (Not in a lambda, which returns its own.)
+                    let named = node.named_child(0).is_some_and(|v| v.kind_id() == ids.identifier || v.kind_id() == ids.field_expression);
+                    let mut up = node.parent();
+                    while let Some(p) = up.filter(|p| p.kind_id() != ids.function_definition) {
+                        if p.kind() == "lambda_expression" {
+                            break;
+                        }
+                        up = p.parent();
+                    }
+                    if named && up.is_some_and(|p| p.kind_id() == ids.function_definition) {
+                        self.push_construction(self.returns_object, node, NONE, Some(1));
+                        let r = self.out.refs.len() as u32 - 1;
+                        self.out.cxx_mut().copies.push(r);
+                    }
+                }
                 "binary_expression" => {
                     if let (Some(l), Some(op), Some(r)) =
                         (node.child_by_field_id(ids.f_left), node.child_by_field_id(ids.f_operator), node.child_by_field_id(ids.f_right))
