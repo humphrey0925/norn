@@ -2522,6 +2522,11 @@ class AssertHelper {
   AssertHelper(int type, const char* message);
   void operator=(const Message& message) const;
 };
+class AssertionResult {
+ public:
+  AssertionResult(bool ok) {}
+  template <typename T> AssertionResult& operator<<(const T& value) { return *this; }
+};
 }
 struct SourceLocation {
   SourceLocation(const char* func) {}
@@ -2530,6 +2535,7 @@ inline void Log(SourceLocation&& loc, int x) {}
 #define FAIL_AT(t) ::testing::AssertHelper(t, \"m\") \\
     = ::testing::Message()
 #define LOG(x) Log(SourceLocation{__func__}, x)
+#define CHECK_MSG(x) if (::testing::AssertionResult ar = ::testing::AssertionResult(x)) ; else ar << \"failed\"
 "),
             ("t.cc", "#include \"t.h\"
 namespace testing {
@@ -2539,6 +2545,7 @@ void AssertHelper::operator=(const Message& message) const {}
 }
 void f() { FAIL_AT(1); }
 void g() { LOG(2); }
+void h() { CHECK_MSG(true); }
 "),
         ]);
         let q = crate::graph::Qualifier::new(&g);
@@ -2557,6 +2564,8 @@ void g() { LOG(2); }
         assert_eq!(callers("AssertHelper::operator="), ["f"]);
         assert_eq!(callers("Message::Message"), ["f"]);
         assert_eq!(callers("SourceLocation::SourceLocation"), ["g"]);
+        // `ar << ...` of an `ar` the body declares: its class's.
+        assert_eq!(callers("AssertionResult::operator<<"), ["h"]);
     }
 
     #[test]

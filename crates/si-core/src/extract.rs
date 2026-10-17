@@ -1458,6 +1458,18 @@ impl<'a> Walk<'a> {
                                 let at = self.out.refs.len() as u32 - 1;
                                 self.out.cxx_mut().operators.push((at, left, right, true));
                             }
+                            // `gtest_ar << "..."` of a `gtest_ar` the body declares
+                            // (fmt's FMT_TEST_THROW_): its class's `operator<<`.
+                            let at = self.skip_space(t.end as usize);
+                            let shifted = self.orig.get(at..at + 2) == Some(b"<<") && self.orig.get(at + 2) != Some(&b'=');
+                            if let Some(ty) = (!t.member && shifted).then(|| self.body_type_of(self.tok_text(t), m.name.end as usize, m.end as usize)).flatten() {
+                                let ty = self.intern(ty);
+                                let left = self.push_hint(root::TYPE, ty, &[]);
+                                let name = self.intern_str("operator<<");
+                                self.out.refs.push(Ref { name, line: t.line, scope, kind: refkind::CALL });
+                                let at = self.out.refs.len() as u32 - 1;
+                                self.out.cxx_mut().operators.push((at, left, NONE, true));
+                            }
                         }
                     }
                     if self.cpp {
@@ -1531,6 +1543,26 @@ impl<'a> Walk<'a> {
         }
         let i = back(i);
         let object = &s[word_before(i)?..i];
+        self.body_type_of(object, start, end)
+    }
+
+    /// C++: the type a macro body `s[start..end]` declares the object
+    /// `object` of (`const AssertionResult gtest_ar = ...`), if it does.
+    fn body_type_of(&self, object: &'a [u8], start: usize, end: usize) -> Option<&'a [u8]> {
+        let s = self.orig;
+        let back = |mut i: usize| {
+            while i > start && matches!(s[i - 1], b' ' | b'\t' | b'\\' | b'\n' | b'\r') {
+                i -= 1;
+            }
+            i
+        };
+        let word_before = |i: usize| {
+            let mut a = i;
+            while a > start && (s[a - 1].is_ascii_alphanumeric() || s[a - 1] == b'_') {
+                a -= 1;
+            }
+            (a < i && !s[a].is_ascii_digit()).then_some(a)
+        };
         let body = &s[start..end];
         let mut from = 0;
         while let Some(at) = body[from..].windows(object.len()).position(|w| w == object).map(|p| p + from) {
