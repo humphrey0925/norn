@@ -170,3 +170,6 @@ cd vscode && npm ci && npm run compile
 
 Copyright 2026 humphrey0925 and the Norn contributors。以
 [Apache License 2.0](LICENSE) 授權。
+
+Source Insight 是 Source Dynamics, Inc. 的商標。Norn 與 Source Dynamics 沒有任何關係，也未獲其背書；
+提到這個名稱只是為了說明瀏覽方式的風格。其他名稱為其各自擁有者的商標。

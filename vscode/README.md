@@ -163,3 +163,7 @@ installed.
 
 Apache License 2.0. Third-party components and their licenses are listed in
 `THIRD_PARTY_NOTICES.txt`.
+
+Source Insight is a trademark of Source Dynamics, Inc. Norn is not affiliated with,
+or endorsed by, Source Dynamics; the name is used only to describe the style of
+navigation. Other names are trademarks of their owners.

@@ -187,3 +187,7 @@ which the CLA check asks you to sign on your first pull request.
 
 Copyright 2026 humphrey0925 and the Norn contributors. Licensed under the
 [Apache License, Version 2.0](LICENSE).
+
+Source Insight is a trademark of Source Dynamics, Inc. Norn is not affiliated with,
+or endorsed by, Source Dynamics; the name is used only to describe the style of
+navigation. Other names are trademarks of their owners.
