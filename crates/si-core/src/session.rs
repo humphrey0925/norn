@@ -108,6 +108,9 @@ pub struct Update {
     pub macros_reclassified: usize,
     pub extract_ms: f64,
     pub link_ms: f64,
+    /// At opening, with nothing of this root saved: files whose facts were
+    /// taken from an inner or outer folder's index (see `store::Reuse`).
+    pub reused: usize,
     /// At opening: the graph the caller holds is this session's (see
     /// `Session::open_deferred`).
     pub graph_kept: bool,
@@ -123,6 +126,12 @@ fn is_source(path: &Path) -> bool {
 
 impl Session {
     pub fn open(root: &Path, options: Options) -> Session {
+        Session::open_reusing(root, options, None)
+    }
+
+    /// The same, taking from other roots' indexes the facts of files they
+    /// have read just so (an inner or outer folder opened before).
+    pub fn open_reusing(root: &Path, options: Options, reuse: Option<&crate::store::Reuse>) -> Session {
         let scope = Scope::load(root);
         let files = crate::scan_scope(root, &scope);
         let mut conditions = crate::conditions_of(root, &files);
@@ -131,7 +140,7 @@ impl Session {
         let sets = MacroSets::of_files(&defines, &paths).with_conditions(conditions.clone());
         drop(paths);
         let defines = Packed::all(defines);
-        let facts = crate::extract_all(root, &files, &sets);
+        let facts = crate::extract_all_reusing(root, &files, &sets, reuse);
         let mut cache = Cache::default();
         let options = Options { readings: crate::readings_of(&conditions), ..options };
         let (graph, stats) = link_cached(&facts, &options, &mut cache);
@@ -358,14 +367,18 @@ impl Session {
             up.extract_ms = ms(t) - up.link_ms;
             return (session, up);
         }
-        // Nothing usable saved: index everything; it is saved afterwards.
-        let mut session = Session::open(root, options);
+        // Nothing usable saved: index everything (but what an inner or
+        // outer folder's index has of the same files read the same way);
+        // it is saved afterwards.
+        let reuse = crate::store::Reuse::find(root, store.dir());
+        let mut session = Session::open_reusing(root, options, reuse.as_ref());
         store.invalidate();
         session.unsaved = session.files.clone();
         session.unsaved_manifest = true;
         session.graph_unsaved = true;
         session.store = Some(store);
-        let up = Update { extracted: session.files.len(), extract_ms: ms(t), ..Update::default() };
+        let reused = reuse.map_or(0, |r| r.hits.into_inner());
+        let up = Update { extracted: session.files.len() - reused, reused, extract_ms: ms(t), ..Update::default() };
         (session, up)
     }
 
@@ -824,6 +837,108 @@ mod tests {
 
     fn functions(s: &Session, name: &str) -> usize {
         s.graph.find(name).iter().filter(|&&x| s.graph.syms[x as usize].kind == kind::FUNCTION).count()
+    }
+
+    /// Everything the graph says, as lines: each symbol where it is, each
+    /// reference from one to another.
+    fn shape(s: &Session) -> Vec<String> {
+        let g = &s.graph;
+        let mut v = Vec::new();
+        for i in 0..g.syms.len() as u32 {
+            let y = &g.syms[i as usize];
+            v.push(format!("{} {} {} {} {}", g.sym_name(i), g.file_path(y.file), y.line, y.kind, y.flags));
+            for e in g.refs_from(i) {
+                v.push(format!("{} -> {} {} {}", g.sym_name(i), g.sym_name(e.other), e.line(), e.kind()));
+            }
+        }
+        v.sort();
+        v
+    }
+
+    /// Opened as the editor opens a folder: with its own cache, saved.
+    fn opened(root: &Path) -> (Session, Update) {
+        let (mut s, up) = Session::open_deferred(root, Options::default(), Store::default_dir(root), None);
+        while s.save_some(usize::MAX) {}
+        (s, up)
+    }
+
+    #[test]
+    fn an_outer_folder_takes_the_facts_an_inner_folder_s_index_has_of_the_same_reading() {
+        let d = Dir::new("reuse-inner");
+        d.write("sub/a.h", "#define TWICE(x) ((x) * 2)
+int helper (int);
+");
+        d.write("sub/a.c", "#include \"a.h\"
+int helper (int v) { return TWICE (v); }
+int run (void) { return helper (1); }
+");
+        d.write("top.c", "int top (void) { return 0; }
+");
+        opened(&d.0.join("sub"));
+        let (outer, up) = opened(&d.0);
+        assert_eq!((up.reused, up.extracted), (2, 1));
+        // What was taken is what reading the files anew makes.
+        assert_eq!(shape(&outer), shape(&Session::open(&d.0, Options::default())));
+        // And the other way round: an inner folder takes from the outer's.
+        std::fs::remove_dir_all(d.0.join("sub").join(".norn")).unwrap();
+        let (inner, up) = opened(&d.0.join("sub"));
+        assert_eq!((up.reused, up.extracted), (2, 0));
+        assert_eq!(shape(&inner), shape(&Session::open(&d.0.join("sub"), Options::default())));
+    }
+
+    /// On a whole tree: `NORN_REUSE_TREE` (a copy: indexes are written
+    /// into it) and `NORN_REUSE_INNER` (a folder in it). What the outer
+    /// index takes from the inner's, and the inner from the outer's, is
+    /// what reading the tree anew makes.
+    #[test]
+    #[ignore]
+    fn on_a_tree_an_index_taken_from_another_folder_s_is_the_index_made_anew() {
+        let (Some(tree), Some(inner)) = (std::env::var_os("NORN_REUSE_TREE"), std::env::var_os("NORN_REUSE_INNER")) else { return };
+        let tree = PathBuf::from(tree);
+        let inner = tree.join(inner);
+        let clear = |d: &Path| {
+            let _ = std::fs::remove_dir_all(d.join(".norn").join("cache"));
+        };
+        for (first, second) in [(&inner, &tree), (&tree, &inner)] {
+            clear(&tree);
+            clear(&inner);
+            let t = Instant::now();
+            opened(first);
+            let first_ms = ms(t);
+            let t = Instant::now();
+            let (s, up) = opened(second);
+            let second_ms = ms(t);
+            let t = Instant::now();
+            let fresh = Session::open(second, Options::default());
+            let fresh_ms = ms(t);
+            eprintln!("{} then {}: {} files, {} taken, {} read; {first_ms:.0} ms, then {second_ms:.0} ms (anew: {fresh_ms:.0} ms)",
+                      first.display(), second.display(), s.files.len(), up.reused, up.extracted);
+            assert!(up.reused > 0);
+            assert_eq!(shape(&s), shape(&fresh), "{} then {}", first.display(), second.display());
+        }
+    }
+
+    #[test]
+    fn a_file_the_outer_folder_reads_otherwise_is_read_anew() {
+        let d = Dir::new("reuse-other");
+        // Inside `sub`, FAST is not known; with the whole tree, it is 1.
+        d.write("config.h", "#define FAST 1
+");
+        d.write("sub/b.c", "#include \"../config.h\"
+#if FAST
+int fast (void) { return 1; }
+#else
+int slow (void) { return 0; }
+#endif
+");
+        d.write("sub/c.c", "int plain (void) { return 2; }
+");
+        let (inner, _) = opened(&d.0.join("sub"));
+        assert_eq!(functions(&inner, "slow"), 1);
+        let (outer, up) = opened(&d.0);
+        assert_eq!(up.reused, 1, "only c.c reads the same");
+        assert_eq!((functions(&outer, "fast"), functions(&outer, "slow")), (1, 0));
+        assert_eq!(shape(&outer), shape(&Session::open(&d.0, Options::default())));
     }
 
     #[test]

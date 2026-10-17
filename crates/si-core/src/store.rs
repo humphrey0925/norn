@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped whenever what extraction records, or how it is laid out, changes:
 /// facts written by another version are not read.
-const FORMAT: u32 = 25;
+const FORMAT: u32 = 26;
 
 /// Size and modification time of a source file when its facts were made.
 pub type Stamp = (u64, u64);
@@ -262,5 +262,85 @@ impl Store {
     /// Before expansions are written over: the list no longer vouches for them.
     pub fn invalidate_expansions(&self) {
         let _ = std::fs::remove_file(self.dir.join("expansions"));
+    }
+}
+
+/// The indexes of other roots this one's facts may be taken from: an inner
+/// folder's (opened on its own before) and an outer one's (a tree this one
+/// is in). A file's facts are taken only where its `lex_key` is the one
+/// made of it now (see `Extractor::extract_reusing`): the same text, read
+/// under the same conditions.
+pub struct Reuse {
+    stores: Vec<(Store, Mapping)>,
+    pub hits: std::sync::atomic::AtomicUsize,
+}
+
+/// How a path under this root is written under the other.
+enum Mapping {
+    /// The other root is the folder `prefix` (with a trailing `/`) in this one.
+    Inner(String),
+    /// This root is the folder `prefix` (with a trailing `/`) in the other.
+    Outer(String),
+}
+
+impl Reuse {
+    /// Folders this deep in the root are looked in for an index of their own.
+    const DEPTH: usize = 6;
+
+    /// The other indexes there are, if any (`own`: this root's, left out).
+    pub fn find(root: &Path, own: &Path) -> Option<Reuse> {
+        // (Read where they are, without moving a `.si` to `.norn` as
+        // opening a root does: these roots are not being opened.)
+        let caches = |d: &Path| [d.join(".norn").join("cache"), d.join(".si").join("cache")];
+        let usable = |dir: PathBuf| -> Option<Store> {
+            let s = Store::new(dir);
+            (s.dir != own && s.manifest().is_some()).then_some(s)
+        };
+        let mut stores = Vec::new();
+        let mut stack = vec![(root.to_path_buf(), 0)];
+        while let Some((dir, depth)) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for e in entries.flatten() {
+                if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.') || matches!(&*name, "node_modules" | "target") {
+                    continue;
+                }
+                let path = e.path();
+                if let Some(s) = caches(&path).into_iter().find_map(usable) {
+                    stores.push((s, Mapping::Inner(format!("{}/", crate::rel_path(root, &path)))));
+                }
+                if depth + 1 < Self::DEPTH {
+                    stack.push((path, depth + 1));
+                }
+            }
+        }
+        for outer in root.ancestors().skip(1).take(8) {
+            if let Some(s) = caches(outer).into_iter().find_map(usable) {
+                stores.push((s, Mapping::Outer(format!("{}/", crate::rel_path(outer, root)))));
+            }
+        }
+        (!stores.is_empty()).then(|| Reuse { stores, hits: Default::default() })
+    }
+
+    /// The facts another index has of the file at `rel` (relative to this
+    /// root) made with `key`, if one has.
+    pub fn get(&self, rel: &str, key: u64) -> Option<FileFacts> {
+        for (store, mapping) in &self.stores {
+            let there = match mapping {
+                Mapping::Inner(prefix) => match rel.strip_prefix(prefix.as_str()) {
+                    Some(r) => r.to_string(),
+                    None => continue,
+                },
+                Mapping::Outer(prefix) => format!("{prefix}{rel}"),
+            };
+            if let Some(saved) = store.load(&there).filter(|s| s.facts.lex_key == key) {
+                return Some(saved.facts);
+            }
+        }
+        None
     }
 }

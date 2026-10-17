@@ -241,6 +241,14 @@ pub struct FileFacts {
     pub mask_ns: u64,
     pub parse_ns: u64,
     pub walk_ns: u64,
+    /// What the facts were made of, but for the macro sets' discards: the
+    /// file's text and the lexer's whole output (`mask::Lexed::key`). Equal
+    /// keys and equal answers to `discards_asked` mean equal facts, whatever
+    /// the root, the path or the other files.
+    pub lex_key: u64,
+    /// The macros asked what arguments they discard (by name, as numbered
+    /// in this file), and the answers, sorted.
+    pub discards_asked: Vec<(u32, u64)>,
     names: Names,
     pub defs: Vec<Def>,
     pub refs: Vec<Ref>,
@@ -438,6 +446,15 @@ impl Names {
 impl FileFacts {
     pub fn new(path: String) -> Self {
         FileFacts { path, ..Default::default() }
+    }
+
+    /// The same facts as those of a file at `path`: the same text read
+    /// under the same conditions from another root (an inner or outer
+    /// folder's index). Only the path differs; it is the file's first name.
+    pub fn rebased(mut self, path: String) -> Self {
+        self.names.ids[0] = crate::names::id(&path);
+        self.path = path;
+        self
     }
 
     /// Read as C++?

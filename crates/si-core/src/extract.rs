@@ -421,7 +421,27 @@ impl Extractor {
 
     /// The facts depend on the file's content and on `transparent`.
     pub fn extract(&mut self, path: &str, src: &[u8], transparent: &MacroSets) -> FileFacts {
+        self.extract_reusing(path, src, transparent, &|_| None).0
+    }
+
+    /// The same, but the facts already made of this very text under these
+    /// very conditions (`reuse` by `FileFacts::lex_key`, from another
+    /// root's index) are taken rather than made again, if every macro they
+    /// asked about discards what it did then. Says whether they were.
+    pub fn extract_reusing(&mut self, path: &str, src: &[u8], transparent: &MacroSets, reuse: &dyn Fn(u64) -> Option<FileFacts>) -> (FileFacts, bool) {
+        let t = std::time::Instant::now();
+        let lexed = mask::lex_file(src, transparent, Some(path));
+        let cpp = is_cpp(path, src);
+        let key = lexed.key(src, cpp);
+        if let Some(saved) = reuse(key) {
+            let same = saved.lex_key == key && saved.discards_asked.iter().all(|&(n, d)| transparent.discards(saved.name(n as usize).as_bytes()) == d);
+            if same {
+                return (saved.rebased(path.to_string()), true);
+            }
+        }
+        let mask_ns = t.elapsed().as_nanos() as u64;
         let mut out = FileFacts::new(path.to_string());
+        out.lex_key = key;
         out.hash = xxhash_rust::xxh3::xxh3_64(src);
         out.bytes = src.len() as u32;
         let file_name = out.push_name(path);
@@ -434,8 +454,6 @@ impl Extractor {
             let id = out.push_name(&String::from_utf8_lossy(name));
             out.defined_names.push(id);
         }
-        let t = std::time::Instant::now();
-        let lexed = mask::lex_file(src, transparent, Some(path));
         for &(a, e, conditional) in &lexed.includes {
             let id = out.push_name(&String::from_utf8_lossy(&src[a as usize..e as usize]));
             out.includes.push(id);
@@ -443,8 +461,7 @@ impl Extractor {
         }
         out.inactive = inactive_lines(src, &lexed.skipped);
         out.undecided = undecided_lines(src, &lexed.undecided);
-        out.mask_ns = t.elapsed().as_nanos() as u64;
-        let cpp = is_cpp(path, src);
+        out.mask_ns = mask_ns;
         if cpp {
             out.cxx = Some(Box::default());
         }
@@ -462,7 +479,7 @@ impl Extractor {
         let t = std::time::Instant::now();
         let Some(tree) = parser.parse(&lexed.masked, None) else {
             out.has_error = true;
-            return out;
+            return (out, false);
         };
         out.parse_ns = t.elapsed().as_nanos() as u64;
         let t = std::time::Instant::now();
@@ -553,6 +570,8 @@ impl Extractor {
         }
         w.out.walk_ns = t.elapsed().as_nanos() as u64;
         let mut out = w.out;
+        out.discards_asked.sort_unstable();
+        out.discards_asked.dedup();
         // A function defined where it may not be compiled (the stub in the
         // `#else` of a header) is only one reading of its name.
         for d in out.defs.iter_mut().filter(|d| d.kind == kind::FUNCTION) {
@@ -561,7 +580,7 @@ impl Extractor {
             }
         }
         out.shrink();
-        out
+        (out, false)
     }
 }
 
@@ -1895,6 +1914,8 @@ impl<'a> Walk<'a> {
                         self.push_ref(f, refkind::CALL);
                         // A macro's arguments it does not use: not compiled.
                         let discards = self.sets.discards(self.text(f));
+                        let asked = self.intern(self.text(f));
+                        self.out.discards_asked.push((asked, discards));
                         if discards != 0 {
                             if let Some(args) = node.child_by_field_id(ids.f_arguments) {
                                 let mut c = args.walk();
