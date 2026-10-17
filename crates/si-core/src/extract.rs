@@ -1559,6 +1559,27 @@ impl<'a> Walk<'a> {
         n.children_by_field_id(self.ids.f_declarator, &mut c).collect()
     }
 
+    /// C++, in a function: `UniValue result (UniValue::VOBJ);` or `T x (n);`,
+    /// which the parser reads as a function's declaration: an object made,
+    /// its arguments taken for parameters with a type and no name. (With no
+    /// arguments, `T x ();` declares a function, as the compiler has it.)
+    fn object_not_function(&self, d: Node<'a>) -> bool {
+        let ids = self.ids;
+        if d.kind_id() != ids.function_declarator || d.child_by_field_id(ids.f_declarator.get()).is_none_or(|n| n.kind_id() != ids.identifier) {
+            return false;
+        }
+        let Some(list) = d.child_by_field_id(ids.f_parameters) else { return false };
+        let mut c = list.walk();
+        let params: Vec<Node<'a>> = list.named_children(&mut c).filter(|p| p.kind() != "comment").collect();
+        !params.is_empty()
+            && params.iter().all(|p| {
+                let ty = p.child_by_field_id(ids.f_type);
+                p.kind_id() == ids.parameter_declaration
+                    && p.named_child_count() == 1
+                    && ty.is_some_and(|t| t.kind_id() == ids.type_identifier || t.kind_id() == ids.qualified_identifier)
+            })
+    }
+
     /// Does the declarator declare a function or a pointer to one?
     fn declares_function(&self, mut n: Node<'a>) -> bool {
         for _ in 0..32 {
@@ -2167,7 +2188,9 @@ impl<'a> Walk<'a> {
                         self.local_roots.remove(self.text(name));
                         self.local_elems.remove(self.text(name));
                         self.local_keys.remove(self.text(name));
-                        if self.cpp && !self.declares_function(d) {
+                        let object = self.cpp && self.object_not_function(d);
+                        let declares_function = !object && self.declares_function(d);
+                        if self.cpp && !declares_function {
                             if let Some(ty) = node.child_by_field_id(ids.f_type) {
                                 let (e, key) = (self.element_type(ty), self.key_type(ty));
                                 if e != NONE {
@@ -2178,7 +2201,7 @@ impl<'a> Walk<'a> {
                                 }
                             }
                         }
-                        if declared != NONE && !self.declares_function(d) {
+                        if declared != NONE && !declares_function {
                             self.local_types.insert(self.text(name), declared);
                         } else {
                             self.local_types.remove(self.text(name));
@@ -2189,11 +2212,13 @@ impl<'a> Walk<'a> {
                             }
                         }
                         self.note_local(name, false);
-                        if self.cpp && !self.declares_function(d) {
+                        if self.cpp && !declares_function {
                             // `T x;`, `T x (a);`, `T x {a};` (not `T x = y;`,
                             // a copy, nor a pointer or a reference) make a T.
                             let (inner, value) = if d.kind_id() == ids.init_declarator {
                                 (d.child_by_field_id(ids.f_declarator.get()), d.child_by_field_id(ids.f_value))
+                            } else if object {
+                                (d.child_by_field_id(ids.f_declarator.get()), None)
                             } else {
                                 (Some(d), None)
                             };

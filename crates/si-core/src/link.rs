@@ -2263,6 +2263,35 @@ void e() { HOLD(4); }
     }
 
     #[test]
+    fn an_object_the_parser_takes_for_a_function_is_made_and_typed() {
+        let g = graph(&[(
+            "u.cc",
+            "class UniValue {
+ public:
+  enum VType { VNULL, VOBJ };
+  UniValue(VType t) {}
+  void pushKV(int k) {}
+};
+struct Other { void pushKV(int k) {} };
+void f() { UniValue result(UniValue::VOBJ); result.pushKV(1); }
+void g(UniValue::VType n) { UniValue r(n); r.pushKV(2); }
+void h() { UniValue proto(); UniValue other(int x); }
+",
+        )]);
+        let q = crate::graph::Qualifier::new(&g);
+        let certain = |caller: &str| -> Vec<String> {
+            let mut v: Vec<String> = g.find(caller).iter().flat_map(|&s| g.refs_from(s)).filter(|e| e.kind() == refkind::CALL && !e.ambiguous()).map(|e| q.name(&g, e.other).into_owned()).collect();
+            v.sort();
+            v
+        };
+        for f in ["f", "g"] {
+            assert_eq!(certain(f), ["UniValue::UniValue", "UniValue::pushKV"], "{f}");
+        }
+        // With no arguments, or a parameter named, it declares a function.
+        assert!(certain("h").is_empty(), "{:?}", certain("h"));
+    }
+
+    #[test]
     fn a_macro_only_some_configurations_define_is_what_cpp_calls_by_its_name() {
         let h = "#if !DONT_DEFINE_CHECK
 #define CHECK_IT(x) Check(x)
