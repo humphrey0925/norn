@@ -14,7 +14,7 @@
 //! indexed by the ordinary extraction.
 
 use crate::mask::is_keyword;
-use crate::model::{flag, kind, refkind, site, Bind, Def, FileFacts, Ref, Site, NONE};
+use crate::model::{flag, kind, refkind, root, site, Bind, Def, FileFacts, MemberHint, Ref, Site, NONE};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -862,12 +862,15 @@ struct Found {
     /// C++: classes the expansion defines, with a class they derive from
     /// (gtest's `TEST_F (Fixture, Name)`, a class of the fixture's).
     bases: Vec<(String, String)>,
+    /// C++: functions whose result the expansion calls, `make (m) (x)`
+    /// (gtest's `ASSERT_THAT`): the result's `operator()` is called.
+    result_calls: Vec<String>,
 }
 
 impl Found {
     /// Add this expansion's names to `known`; was any of them new?
     fn novel(self, known: &mut FxHashSet<String>) -> bool {
-        let names = self.single.into_iter().chain(self.decls.into_iter().map(|d| d.0)).chain(self.refs.into_iter().map(|r| r.0)).chain(self.bases.into_iter().map(|b| b.0 + ":" + &b.1));
+        let names = self.single.into_iter().chain(self.decls.into_iter().map(|d| d.0)).chain(self.refs.into_iter().map(|r| r.0)).chain(self.bases.into_iter().map(|b| b.0 + ":" + &b.1)).chain(self.result_calls.into_iter().map(|c| c + "()"));
         // (Every one of them inserted: no stopping at the first new one.)
         let mut new = false;
         for n in names {
@@ -877,7 +880,7 @@ impl Found {
     }
 
     fn is_empty(&self) -> bool {
-        self.single.is_none() && self.decls.is_empty() && self.refs.is_empty() && self.bases.is_empty()
+        self.single.is_none() && self.decls.is_empty() && self.refs.is_empty() && self.bases.is_empty() && self.result_calls.is_empty()
     }
 
     /// What a definition whose name is this use is really called.
@@ -996,6 +999,16 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
         let next = toks.get(i + 1);
         let next_is = |s: &str| next.is_some_and(|x| x.is(s));
         let name = || t.text.to_string();
+        if cpp && next_is("(") && t.origin != Origin::Site {
+            let mut depth = 0;
+            let close = toks[i + 1..].iter().position(|x| {
+                depth += x.is("(") as i32 - x.is(")") as i32;
+                depth == 0
+            });
+            if close.is_some_and(|c| toks.get(i + 2 + c).is_some_and(|x| x.is("("))) {
+                found.result_calls.push(name());
+            }
+        }
         if cpp && !in_fn && paren == 0 && brace == 0 && prev.is_some_and(|p| p.is("::")) && next_is("(") {
             // C++: `A::B::f (...)`, a member defined apart (what gtest's
             // `TEST (Suite, Name)` ends in: `Suite_Name_Test::TestBody ()`),
@@ -1534,6 +1547,17 @@ fn expand_file(
             let (class, base) = (names.id(&mut out, class), names.id(&mut out, base));
             if !out.cxx().bases.contains(&(class, base)) {
                 out.cxx_mut().bases.push((class, base));
+            }
+        }
+        for callee in &m.found.result_calls {
+            let (callee, op) = (names.id(&mut out, callee), names.id(&mut out, "operator()"));
+            if seen_refs.insert((op, m.line, m.scope, refkind::CALL)) {
+                let path = out.hint_path.len() as u32;
+                out.hints.push(MemberHint { root_kind: root::FUNC, root: callee, path, len: 0 });
+                let hint = out.hints.len() as u32 - 1;
+                out.refs.push(Ref { name: op, line: m.line, scope: m.scope, kind: refkind::CALL });
+                let at = out.refs.len() as u32 - 1;
+                out.cxx_mut().operators.push((at, hint, NONE, false));
             }
         }
         for (n, kind, owner) in m.found.refs {

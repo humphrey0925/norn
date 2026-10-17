@@ -2985,6 +2985,28 @@ mod test_framework_tests {
     }
 
     #[test]
+    fn a_call_of_what_a_call_returns_is_its_operator_call() {
+        // gtest's ASSERT_THAT: `pred_format (#v1, v1)` of a `pred_format`
+        // that is `MakePredicateFormatterFromMatcher (matcher)`.
+        let files = [
+            ("t.h", "class Formatter {\n public:\n  bool operator()(const char* t, int x) const { return true; }\n};\n\
+                     class Other {\n public:\n  bool operator()(const char* t, int x) const { return false; }\n};\n\
+                     Formatter MakeFormatter(int m) { return Formatter(); }\n\
+                     #define PRED1(pred, v) if (pred(#v, v)) ;\n#define CHECK_THAT(v, m) PRED1(MakeFormatter(m), v)\n"),
+            ("t.cc", "#include \"t.h\"\nvoid f() { CHECK_THAT(1, 2); }\nvoid g() { MakeFormatter(3)(\"x\", 4); }\n"),
+        ];
+        let sets = MacroSets::from_defines(files.iter().flat_map(|(_, src)| crate::mask::defines(src.as_bytes(), &crate::cond::Conditions::default())));
+        let mut ex = Extractor::new();
+        let facts: Vec<FileFacts> = files.iter().map(|(path, src)| ex.extract(path, src.as_bytes(), &sets)).collect();
+        let g = link(&facts).0;
+        let q = crate::graph::Qualifier::new(&g);
+        for caller in ["f", "g"] {
+            let calls: Vec<String> = g.find(caller).iter().flat_map(|&s| g.refs_from(s)).filter(|e| e.kind() == refkind::CALL && !e.ambiguous() && g.sym_name(e.other) == "operator()").map(|e| q.name(&g, e.other).into_owned()).collect();
+            assert_eq!(calls, ["Formatter::operator()"], "{caller}");
+        }
+    }
+
+    #[test]
     fn a_test_macro_the_corpus_defines_is_expanded_not_guessed() {
         // A macro of that name of the corpus's own: what it makes is read
         // from its expansion, and nothing is made of the name.

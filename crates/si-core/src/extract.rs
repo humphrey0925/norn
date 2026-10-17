@@ -2471,6 +2471,9 @@ impl<'a> Walk<'a> {
                         self.push_ref(target, refkind::CALL);
                     } else if tk == ids.identifier {
                         self.local_calls.push((self.text(target), target.start_position().row as u32 + 1));
+                    } else if self.cpp && tk == ids.call_expression {
+                        // `make (m) (x)`: the `operator()` of what `make` returns.
+                        self.push_operator(b"()", target, None, node);
                     }
                 }
                 None => self.out.indirect_calls += 1,
