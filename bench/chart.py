@@ -200,7 +200,8 @@ def main():
              "  (`bench/gt_extract.py`): every function definition, and every call with the function it",
              "  reaches. A tool's *calls found* is the share of those calls it reports with the right target;",
              "  *precision* is the share of the calls it reports as certain that are right.",
-             "- **Index**: a cold index of the whole project, wall-clock, with peak memory and the size on disk.",
+             "- **Index**: an index of the whole project from nothing (the files already in the OS cache),",
+             "  wall-clock, with peak memory and the size on disk.",
              "- **Update**: the time to bring the index up to date after one file is edited.",
              "- **Queries**: median latency of finding a symbol by name and of listing a function's callers,",
              "  each tool queried the way it is meant to be (a warm server where it has one).",
@@ -214,8 +215,7 @@ def main():
              "  ones it reports as certain, and *precision* is measured on those. The other tools mark none.",
              "- Norn, clangd and codebase-memory-mcp run on Windows (NTFS); ctags, cscope and GNU Global, which",
              "  are Unix tools, run in WSL 2 on a copy of each project on its ext4 file system.",
-             "- The charts compare the tools measured on every project; codebase-memory-mcp was measured on",
-             "  Redis and git only, and is in their tables.", "",
+             "- Each tool indexes each project three times; the median is reported.", "",
              f"Machine: {m.get('cpu', '?')}, {m.get('physical_cores', '?')} cores, "
              f"{(m.get('ram_bytes') or 0) / 2**30:.0f} GB RAM, {m.get('os', '?')}. "
              f"Measured {runs[0][1].get('date', '?')[:10]}.", ""]

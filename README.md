@@ -46,7 +46,7 @@ where there is one:
   files and works out which `#if` branches are compiled.
 - **Calls, not just names.** It follows calls through macros and through function
   pointers stored in structs, and says how each call comes about.
-- **Fast enough to forget about.** The whole Linux kernel indexes in under a
+- **Fast enough to forget about.** The whole Linux kernel indexes in about a
   minute on a desktop PC; saving a file updates the index in milliseconds.
 - **Checked against the compiler.** Measured call by call against clang's own
   view of real builds of public projects (see [Benchmarks](#benchmarks)).
@@ -75,13 +75,13 @@ index fastest because they record names and places, not a call graph.
 
 <p align="center"><img src="docs/benchmarks/index-time.svg" alt="Time to index" width="760"></p>
 
-| Project | Files | Norn | clangd | cscope | GNU Global | Universal Ctags |
-|---|--:|:-:|:-:|:-:|:-:|:-:|
-| Redis | 801 | **100.0%<br><sub>0.69 s</sub>** | 95.8%<br><sub>24 s</sub> | 96.9%<br><sub>0.31 s</sub> | n/a<br><sub>0.21 s</sub> | n/a<br><sub>0.30 s</sub> |
-| git | 919 | **99.9%<br><sub>0.25 s</sub>** | 64.2%<br><sub>34 s</sub> | 87.9%<br><sub>0.37 s</sub> | n/a<br><sub>0.22 s</sub> | n/a<br><sub>0.31 s</sub> |
-| binutils | 1,622 | **99.6%<br><sub>2.71 s</sub>** | 32.2%<br><sub>23 s</sub> | 70.6%<br><sub>1.54 s</sub> | n/a<br><sub>0.87 s</sub> | n/a<br><sub>1.38 s</sub> |
-| STM32F4 HAL | 253 | **96.5%<br><sub>0.88 s</sub>** | 0.0%<br><sub>2.19 s</sub> | 75.7%<br><sub>0.53 s</sub> | n/a<br><sub>0.70 s</sub> | n/a<br><sub>0.73 s</sub> |
-| nrfx | 535 | **98.0%<br><sub>0.79 s</sub>** | 14.1%<br><sub>1.66 s</sub> | 12.0%<br><sub>0.31 s</sub> | n/a<br><sub>0.38 s</sub> | n/a<br><sub>0.35 s</sub> |
+| Project | Files | Norn | clangd | codebase-memory-mcp | cscope | GNU Global | Universal Ctags |
+|---|--:|:-:|:-:|:-:|:-:|:-:|:-:|
+| Redis | 801 | **100.0%<br><sub>0.32 s</sub>** | 95.8%<br><sub>11 s</sub> | 97.1%<br><sub>13 s</sub> | 96.9%<br><sub>0.26 s</sub> | n/a<br><sub>0.18 s</sub> | n/a<br><sub>0.17 s</sub> |
+| git | 919 | **99.9%<br><sub>0.25 s</sub>** | 64.2%<br><sub>32 s</sub> | 85.8%<br><sub>12 s</sub> | 87.9%<br><sub>0.27 s</sub> | n/a<br><sub>0.18 s</sub> | n/a<br><sub>0.17 s</sub> |
+| binutils | 1,622 | **99.6%<br><sub>2.72 s</sub>** | 32.2%<br><sub>16 s</sub> | 81.0%<br><sub>37 s</sub> | 70.6%<br><sub>1.34 s</sub> | n/a<br><sub>0.81 s</sub> | n/a<br><sub>0.99 s</sub> |
+| STM32F4 HAL | 253 | **96.5%<br><sub>0.64 s</sub>** | 0.0%<br><sub>1.14 s</sub> | 85.8%<br><sub>9.62 s</sub> | 75.7%<br><sub>0.44 s</sub> | n/a<br><sub>0.68 s</sub> | n/a<br><sub>0.60 s</sub> |
+| nrfx | 535 | **98.0%<br><sub>0.84 s</sub>** | 14.1%<br><sub>1.22 s</sub> | 94.2%<br><sub>8.29 s</sub> | 12.0%<br><sub>0.28 s</sub> | n/a<br><sub>0.36 s</sub> | n/a<br><sub>0.32 s</sub> |
 
 <sub>Each cell: the share of calls found (checked against clang), and below it the time to index.</sub>
 

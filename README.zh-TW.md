@@ -43,7 +43,7 @@ Norn 像人一樣直接讀原始碼，有 build 描述檔時也一併讀取：
   會被編譯。
 - **找的是呼叫，不只是名稱**：追得到透過巨集、以及透過存在結構裡的函式指標的呼叫，並標出
   每個呼叫是怎麼發生的。
-- **快到不用在意**：整個 Linux kernel 在一般桌機上不到一分鐘建好索引；存檔後幾毫秒內更新。
+- **快到不用在意**：整個 Linux kernel 在一般桌機上大約一分鐘建好索引；存檔後幾毫秒內更新。
 - **和編譯器對照過**：在公開專案上，逐一呼叫和 clang 實際編譯的結果比對（見[基準測試](#基準測試)）。
 - **只在本機執行**：不連網，不收集任何資料。
 
@@ -69,13 +69,13 @@ compilation database 的專案」能給它的資訊。ctags、cscope、GNU Globa
 
 <p align="center"><img src="docs/benchmarks/index-time.svg" alt="Time to index" width="760"></p>
 
-| Project | Files | Norn | clangd | cscope | GNU Global | Universal Ctags |
-|---|--:|:-:|:-:|:-:|:-:|:-:|
-| Redis | 801 | **100.0%<br><sub>0.69 s</sub>** | 95.8%<br><sub>24 s</sub> | 96.9%<br><sub>0.31 s</sub> | n/a<br><sub>0.21 s</sub> | n/a<br><sub>0.30 s</sub> |
-| git | 919 | **99.9%<br><sub>0.25 s</sub>** | 64.2%<br><sub>34 s</sub> | 87.9%<br><sub>0.37 s</sub> | n/a<br><sub>0.22 s</sub> | n/a<br><sub>0.31 s</sub> |
-| binutils | 1,622 | **99.6%<br><sub>2.71 s</sub>** | 32.2%<br><sub>23 s</sub> | 70.6%<br><sub>1.54 s</sub> | n/a<br><sub>0.87 s</sub> | n/a<br><sub>1.38 s</sub> |
-| STM32F4 HAL | 253 | **96.5%<br><sub>0.88 s</sub>** | 0.0%<br><sub>2.19 s</sub> | 75.7%<br><sub>0.53 s</sub> | n/a<br><sub>0.70 s</sub> | n/a<br><sub>0.73 s</sub> |
-| nrfx | 535 | **98.0%<br><sub>0.79 s</sub>** | 14.1%<br><sub>1.66 s</sub> | 12.0%<br><sub>0.31 s</sub> | n/a<br><sub>0.38 s</sub> | n/a<br><sub>0.35 s</sub> |
+| Project | Files | Norn | clangd | codebase-memory-mcp | cscope | GNU Global | Universal Ctags |
+|---|--:|:-:|:-:|:-:|:-:|:-:|:-:|
+| Redis | 801 | **100.0%<br><sub>0.32 s</sub>** | 95.8%<br><sub>11 s</sub> | 97.1%<br><sub>13 s</sub> | 96.9%<br><sub>0.26 s</sub> | n/a<br><sub>0.18 s</sub> | n/a<br><sub>0.17 s</sub> |
+| git | 919 | **99.9%<br><sub>0.25 s</sub>** | 64.2%<br><sub>32 s</sub> | 85.8%<br><sub>12 s</sub> | 87.9%<br><sub>0.27 s</sub> | n/a<br><sub>0.18 s</sub> | n/a<br><sub>0.17 s</sub> |
+| binutils | 1,622 | **99.6%<br><sub>2.72 s</sub>** | 32.2%<br><sub>16 s</sub> | 81.0%<br><sub>37 s</sub> | 70.6%<br><sub>1.34 s</sub> | n/a<br><sub>0.81 s</sub> | n/a<br><sub>0.99 s</sub> |
+| STM32F4 HAL | 253 | **96.5%<br><sub>0.64 s</sub>** | 0.0%<br><sub>1.14 s</sub> | 85.8%<br><sub>9.62 s</sub> | 75.7%<br><sub>0.44 s</sub> | n/a<br><sub>0.68 s</sub> | n/a<br><sub>0.60 s</sub> |
+| nrfx | 535 | **98.0%<br><sub>0.84 s</sub>** | 14.1%<br><sub>1.22 s</sub> | 94.2%<br><sub>8.29 s</sub> | 12.0%<br><sub>0.28 s</sub> | n/a<br><sub>0.36 s</sub> | n/a<br><sub>0.32 s</sub> |
 
 <sub>每格：找到的呼叫比例（和 clang 對照），下方為建立索引的時間。</sub>
 

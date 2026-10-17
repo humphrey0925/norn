@@ -12,7 +12,7 @@ embedded C, SDKs with a header per chip, vendor trees that only build with a
 proprietary toolchain, kernels, and anything too large or too old to have a
 working compilation database.
 
-- **Fast.** The whole Linux kernel indexes in under a minute on a desktop
+- **Fast.** The whole Linux kernel indexes in about a minute on a desktop
   PC; saving a file updates the index in tens of milliseconds. The index is cached, so reopening a
   workspace is instant.
 - **Accurate.** Checked call by call against clang on public projects: on
