@@ -1294,12 +1294,63 @@ struct Nest {
     /// Open braces, each with the paren depth outside it.
     braces: Vec<(Brace, u32)>,
     parens: u32,
+    /// C++: how many of the outermost braces are namespaces' (`namespace
+    /// leveldb {`), in which what is written is at file scope all the same.
+    namespaces: usize,
 }
 
 impl Nest {
     fn unparseable_here(&self) -> bool {
         self.parens > 0 || self.braces.last().is_some_and(|b| b.0 == Brace::Init)
     }
+
+    /// At file scope: outside every bracket, or a namespace's alone.
+    fn at_top(&self) -> bool {
+        self.braces.len() <= self.namespaces && self.parens == 0
+    }
+}
+
+/// Does the `{` at `pos` open a namespace's body (`namespace a {`,
+/// `inline namespace v1 {`, `namespace a::b {`, `namespace {`), or C
+/// linkage's?
+fn opens_namespace(s: &[u8], pos: usize) -> bool {
+    let back = |mut i: usize| {
+        while i > 0 && s[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        i
+    };
+    let word = |e: usize| {
+        let mut a = e;
+        while a > 0 && is_ident(s[a - 1]) {
+            a -= 1;
+        }
+        a
+    };
+    let mut e = back(pos);
+    // (So does `extern "C" {`.)
+    for lang in [&b"\"C\""[..], b"\"C++\""] {
+        if s[..e].ends_with(lang) {
+            let e = back(e - lang.len());
+            return &s[word(e)..e] == b"extern";
+        }
+    }
+    for _ in 0..8 {
+        let a = word(e);
+        if a == e {
+            return false;
+        }
+        if &s[a..e] == b"namespace" {
+            return true;
+        }
+        e = back(a);
+        if e >= 2 && &s[e - 2..e] == b"::" {
+            e = back(e - 2);
+        } else if &s[word(e)..e] != b"namespace" {
+            return false;
+        }
+    }
+    false
 }
 
 /// `buf` is empty when only the report is wanted.
@@ -1539,7 +1590,11 @@ impl<'a> Lexer<'a> {
                     if self.nest.braces.is_empty() {
                         self.block = (!init).then_some(self.c.i);
                     }
+                    let namespace = self.all_blocks && self.nest.at_top() && opens_namespace(self.c.s, self.c.i);
                     self.nest.braces.push((if init { Brace::Init } else { Brace::Block }, self.nest.parens));
+                    if namespace {
+                        self.nest.namespaces = self.nest.braces.len();
+                    }
                     if self.all_blocks {
                         self.open_blocks.push((!init).then_some(self.c.i));
                     }
@@ -1555,6 +1610,7 @@ impl<'a> Lexer<'a> {
                         self.nest = Nest::default();
                     } else if let Some((_, parens)) = self.nest.braces.pop() {
                         self.nest.parens = parens;
+                        self.nest.namespaces = self.nest.namespaces.min(self.nest.braces.len());
                     }
                     self.c.i += 1;
                     if let Some(start) = closed {
@@ -1710,7 +1766,7 @@ impl<'a> Lexer<'a> {
                 // What it expands to is read all the same (`scoped_guard
                 // (mutex, &m)` calls class_mutex_constructor in its head).
                 if let Some(&function_like) = sets.expanding.get(&s[a..e]) {
-                    self.site(Tok { start: a as u32, end: e as u32, line, call: false, member: false }, function_like, before);
+                    self.site(Tok { start: a as u32, end: e as u32, line, call: false, member: false }, function_like, before, before_byte);
                 }
                 blank(&mut self.out.masked, a, e);
                 for (k, &b) in b"while".iter().enumerate() {
@@ -1721,7 +1777,7 @@ impl<'a> Lexer<'a> {
             }
         }
         if let Some(&function_like) = sets.expanding.get(&s[a..e]).filter(|_| seen(&s[a..e])) {
-            self.site(Tok { start: a as u32, end: e as u32, line, call: false, member: false }, function_like, before);
+            self.site(Tok { start: a as u32, end: e as u32, line, call: false, member: false }, function_like, before, before_byte);
         }
         let shared = sets.transparent.get(&s[a..e]).filter(|_| seen(&s[a..e]));
         let Some(&function_like) = shared.or_else(|| self.own_transparent.get(&s[a..e])) else {
@@ -1776,7 +1832,7 @@ impl<'a> Lexer<'a> {
     /// Just past the name of an expanding macro: note the use and its
     /// arguments. The cursor does not move, so the arguments are still read
     /// as ordinary code.
-    fn site(&mut self, name: Tok, function_like: bool, before: (u32, u32)) {
+    fn site(&mut self, name: Tok, function_like: bool, before: (u32, u32), prev: u8) {
         use crate::model::site;
         let save = (self.c.i, self.c.line);
         let mut args_end = 0;
@@ -1795,13 +1851,30 @@ impl<'a> Lexer<'a> {
         // parser would take it for the start of whatever follows; its
         // meaning is in its expansion, which the link reads.
         let alone = args_end != 0
-            && self.nest.braces.is_empty()
-            && self.nest.parens == 0
+            && self.nest.at_top()
             && match self.c.peek(0) {
                 b';' | 0 => true,
                 b'(' | b'{' | b'=' | b'[' | b',' | b')' => false,
                 _ => self.c.line > last_line,
             };
+        // So is one in braces, a statement or a member of its own with no
+        // `;` after it (bitcoin's `SER_PARAMS_OPFUNC` in a struct), alone
+        // between what ends one and what begins another: the parser would
+        // lose the rest of the class, or of the file. (C++, whose blocks are
+        // all followed.)
+        let alone = alone
+            || self.all_blocks
+                && self.nest.braces.last().is_some_and(|b| b.0 == Brace::Block)
+                && self.nest.parens == 0
+                // (Or after another such: `BINARY_OP (IsEq, ==)` on each line.)
+                && (matches!(prev, b';' | b'{' | b'}' | b':')
+                    || prev == b')'
+                        && (1..=name.start as usize).contains(&self.hidden_until)
+                        && self.c.s[self.hidden_until..name.start as usize].iter().all(|b| b.is_ascii_whitespace()))
+                && match self.c.peek(0) {
+                    b'}' => true,
+                    b => (is_ident_start(b) || b == b'#' || b == b'~') && self.c.line > last_line,
+                };
         if alone {
             // With the storage class before it, which would otherwise be
             // left to open the next declaration.
@@ -1821,8 +1894,9 @@ impl<'a> Lexer<'a> {
                 }
                 start = k;
             }
-            blank(&mut self.out.masked, start, args_end as usize);
-            self.hidden_until = args_end as usize;
+            let end = if args_end != 0 { args_end } else { name.end } as usize;
+            blank(&mut self.out.masked, start, end);
+            self.hidden_until = end;
         }
         let mut flags = match self.c.peek(0) {
             b'(' => site::CALLED,
@@ -1841,7 +1915,7 @@ impl<'a> Lexer<'a> {
                 (self.c.i, self.c.line) = at;
             }
         }
-        let top = self.nest.braces.is_empty() && self.nest.parens == 0;
+        let top = self.nest.at_top();
         // `const bfd_target MY (vec) = { ... }`: the parser cannot make a
         // declaration of this, so the initializer is taken here.
         let (mut init, mut init_array) = ((0, 0), false);
@@ -2315,8 +2389,53 @@ pub fn lex_file(src: &[u8], transparent: &MacroSets, path: Option<&str>) -> Lexe
         // (Reported as they closed: inner ones first.)
         l.out.blocks.sort_unstable();
         l.out.blocks.dedup_by_key(|b| b.0);
+        blank_linkage(src, &mut l.out.masked);
     }
     l.out
+}
+
+/// C++: `extern "C" {` and its `}`, each alone in an `#ifdef __cplusplus`
+/// of its own (a C header made for C++ too): the parser reads each group
+/// of directives apart and cannot close in one a brace another opens, so
+/// it loses the file. Both are blanked; what is between is read as at file
+/// scope, as it is.
+fn blank_linkage(src: &[u8], masked: &mut [u8]) {
+    let mut lines: Vec<(usize, usize)> = Vec::new();
+    let mut a = 0;
+    for (i, &b) in src.iter().enumerate() {
+        if b == b'\n' {
+            lines.push((a, i));
+            a = i + 1;
+        }
+    }
+    lines.push((a, src.len()));
+    let text = |l: (usize, usize)| {
+        let t = &src[l.0..l.1];
+        let t = t.windows(2).position(|w| w == b"//").map_or(t, |c| &t[..c]);
+        t.trim_ascii()
+    };
+    // (The lines around one, blank ones aside.)
+    let near = |i: usize, step: isize| (1..8).map(|k| i as isize + k * step).take_while(|&j| j >= 0 && (j as usize) < lines.len()).map(|j| text(lines[j as usize])).find(|t| !t.is_empty()).unwrap_or(b"");
+    for i in 0..lines.len() {
+        let here = text(lines[i]);
+        // `extern "C" {` last in the group, `}` first in one of `__cplusplus`.
+        let blank = if here == b"}" {
+            let before = near(i, -1);
+            before.starts_with(b"#") && before.windows(11).any(|w| w == b"__cplusplus") && !before.windows(5).any(|w| w == b"endif")
+        } else if here.starts_with(b"extern") && here.ends_with(b"{") && here.windows(3).any(|w| w == b"\"C\"") {
+            let after = near(i, 1);
+            after.starts_with(b"#") && (after.windows(5).any(|w| w == b"endif") || after.windows(4).any(|w| w == b"else"))
+        } else {
+            false
+        };
+        if blank {
+            for b in &mut masked[lines[i].0..lines[i].1] {
+                if *b != b'\r' {
+                    *b = b' ';
+                }
+            }
+        }
+    }
 }
 
 /// Every name the file `#define`s, in whatever branch: a plain scan of its
@@ -2545,6 +2664,26 @@ void f (void) { dump (1, 2); }
 ", &t);
         assert!(m.contains("static int dump = 1;"), "{m}");
         assert!(!m.contains("dump (1, 2)"), "{m}");
+    }
+
+    #[test]
+    fn what_cpp_cannot_parse_alone_on_its_lines_is_hidden() {
+        let t = transparent(
+            "#define OPFUNC \\\n  template <typename T> auto operator()(T&& t) const { return W{*this, t}; }\n\
+             #define BINARY_OP(name, op) template <class X> bool name(const X& x) { return x op x; }\n",
+        );
+        let src = "#ifdef __cplusplus\nextern \"C\" {\n#endif\nint f(void);\n#ifdef __cplusplus\n}\n#endif\n\
+                   class A {\n  struct P {\n    int x;\n    OPFUNC\n  };\n  BINARY_OP(IsEq, ==)\n  BINARY_OP(IsNe, !=)\n  int g();\n};\n";
+        let m = String::from_utf8(lex_file(src.as_bytes(), &t, Some("a.h")).masked).unwrap();
+        // A member a macro makes, with no `;` after it, and a C header's
+        // `extern "C" {` and `}` each in a group of its own.
+        for gone in ["OPFUNC", "BINARY_OP", "extern", "\n}\n"] {
+            assert!(!m.contains(gone), "{gone}: {m}");
+        }
+        assert!(m.contains("int f(void);") && m.contains("int g();"), "{m}");
+        // (Not in a function, where it may be one statement of an `if`.)
+        let m = String::from_utf8(lex_file(b"class B {};\nvoid h() {\n  if (a)\n    BINARY_OP(x, ==)\n  else\n    g();\n}\n", &t, Some("b.cc")).masked).unwrap();
+        assert!(m.contains("BINARY_OP"), "{m}");
     }
 
     #[test]

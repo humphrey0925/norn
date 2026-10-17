@@ -333,6 +333,44 @@ pub struct Cxx {
     /// Of an operator defined as a function of no class (`bool operator==
     /// (const A&, const B&)`): (definition, its parameters' types).
     pub operator_params: Vec<(u32, u32, u32)>,
+    /// Of a function, how many arguments it takes: (definition, fewest,
+    /// most), `u8::MAX` for any number.
+    pub arity: Vec<(u32, u8, u8)>,
+    /// Of a call or an object made with arguments in parentheses, how
+    /// many: (reference, count).
+    pub args: Vec<(u32, u8)>,
+    /// Of a function's parameters that are objects of a class or references
+    /// to one: (definition, position, the class's name).
+    pub params: Vec<(u32, u32, u32)>,
+    /// The objects made as copies of an object of their class (`return s;`
+    /// of a function returning a `Status`): by its copy or move constructor,
+    /// if it has one written.
+    pub copies: Vec<u32>,
+    /// Of a call's arguments, what is known of their types: (reference,
+    /// position, a class's name, or `""` for a string, `0` for a number).
+    pub arg_types: Vec<(u32, u32, u32)>,
+    /// The constructors declared `explicit`, which convert nothing.
+    pub explicit: Vec<u32>,
+    /// What macros pass their arguments on to.
+    pub forwards: Vec<Forward>,
+}
+
+/// A macro's parameter passed on as an argument of a call in its body
+/// (`#define LogInfo(...) LogPrintLevel_(ALL, Info, true, __VA_ARGS__)`).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Forward {
+    /// The macro, as a definition of this file.
+    pub def: u32,
+    /// The function or macro called, and what it is qualified with (or `NONE`).
+    pub callee: u32,
+    pub qual: u32,
+    /// The parameter's position and the argument's. With `rest`, the
+    /// parameter is `...` and stands for the arguments from there on (as a
+    /// name that stands for a function, `#define strprintf tfm::format`,
+    /// does for all of its use's).
+    pub param: u32,
+    pub arg: u32,
+    pub rest: bool,
 }
 
 static NO_CXX: Cxx = Cxx {
@@ -347,6 +385,13 @@ static NO_CXX: Cxx = Cxx {
     constructs: Vec::new(),
     operators: Vec::new(),
     operator_params: Vec::new(),
+    arity: Vec::new(),
+    args: Vec::new(),
+    params: Vec::new(),
+    copies: Vec::new(),
+    arg_types: Vec::new(),
+    explicit: Vec::new(),
+    forwards: Vec::new(),
 };
 
 /// A parameter or a local variable.
@@ -553,6 +598,13 @@ impl FileFacts {
             exact(&mut c.constructs);
             exact(&mut c.operators);
             exact(&mut c.operator_params);
+            exact(&mut c.arity);
+            exact(&mut c.args);
+            exact(&mut c.params);
+            exact(&mut c.copies);
+            exact(&mut c.arg_types);
+            exact(&mut c.explicit);
+            exact(&mut c.forwards);
         }
         exact(&mut self.param_calls);
         exact(&mut self.arg_passes);
@@ -585,6 +637,7 @@ impl FileFacts {
             ("binds", of(&self.binds)),
             ("records", records + of(&self.aliases) + of(&self.field_types) + of(&self.typed) + self.cxx.as_ref().map_or(0, |c| {
                 std::mem::size_of::<Cxx>() + of(&c.owners) + of(&c.bases) + of(&c.ref_quals) + of(&c.namespaces) + of(&c.namespace_aliases) + of(&c.nested) + of(&c.elems)
+                    + of(&c.arity) + of(&c.args) + of(&c.params) + of(&c.copies) + of(&c.arg_types) + of(&c.explicit) + of(&c.forwards)
             })),
             ("hints", of(&self.hints) + of(&self.hint_path) + of(&self.ref_hints)),
             ("calls through", of(&self.param_calls) + of(&self.arg_passes)),

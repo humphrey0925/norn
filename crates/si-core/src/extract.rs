@@ -2,7 +2,7 @@
 
 use crate::mask::{self, Event, Tok, MacroSets};
 use crate::model::{
-    flag, kind, refkind, root, site, ArgPass, Bind, Def, FileFacts, InitSite, MacroBody, MemberHint, ParamCall, Record,
+    flag, kind, refkind, root, site, ArgPass, Bind, Def, FileFacts, Forward, InitSite, MacroBody, MemberHint, ParamCall, Record,
     Ref, Site, NONE,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -142,7 +142,9 @@ impl Ids {
 /// `.inl`, which may be C) by what it says: C has no `namespace`,
 /// `template <`, `class X {`, access labels, `std::` or `extern "C++"`.
 /// (Not `::`: a C file's `asm` has it.) What a C header has for C++ only,
-/// under `#ifdef __cplusplus`, does not count.
+/// under `#ifdef __cplusplus`, counts only where it defines a class or a
+/// template (minisketch.h's wrapper class), which the C parser would read
+/// as nothing; not `extern "C" {` nor a namespace.
 pub fn is_cpp(path: &str, src: &[u8]) -> bool {
     let ext = path.rsplit_once('.').map_or("", |(_, e)| e);
     match ext {
@@ -159,6 +161,8 @@ fn looks_cpp(src: &[u8]) -> bool {
     let mut line_start = true;
     // Inside `#ifdef __cplusplus`: how many `#if`s deep.
     let mut for_cpp = 0u32;
+    // A class or a template there.
+    let mut defined_for_cpp = false;
     let skip_comment = |i: &mut usize| {
         *i += 2;
         while *i + 1 < n && !(src[*i] == b'*' && src[*i + 1] == b'/') {
@@ -225,10 +229,6 @@ fn looks_cpp(src: &[u8]) -> bool {
         }
         let first_on_line = line_start;
         line_start = false;
-        if for_cpp > 0 {
-            i += 1;
-            continue;
-        }
         if b == b'"' || b == b'\'' {
             let q = b;
             let start = i;
@@ -240,7 +240,7 @@ fn looks_cpp(src: &[u8]) -> bool {
                 i += 1;
             }
             i += 1;
-            if q == b'"' && words.last() == Some(&&b"extern"[..]) && src.get(start..i) == Some(b"\"C++\"") {
+            if q == b'"' && words.last() == Some(&&b"extern"[..]) && src.get(start..i) == Some(b"\"C++\"") && for_cpp == 0 {
                 return true;
             }
             words.clear();
@@ -254,13 +254,13 @@ fn looks_cpp(src: &[u8]) -> bool {
             let w = &src[start..i];
             // An access label stands first on its line (`unsigned public: 1;`
             // is a C bit field).
-            if first_on_line && (w == b"public" || w == b"private" || w == b"protected") {
+            if first_on_line && (w == b"public" || w == b"private" || w == b"protected") && for_cpp == 0 {
                 let colon = i + src[i..].iter().position(|c| !c.is_ascii_whitespace()).unwrap_or(0);
                 if src.get(colon) == Some(&b':') && src.get(colon + 1) != Some(&b':') {
                     return true;
                 }
             }
-            if w == b"std" && src.get(i..i + 2) == Some(b"::") {
+            if w == b"std" && src.get(i..i + 2) == Some(b"::") && for_cpp == 0 {
                 return true;
             }
             if words.len() == 4 {
@@ -278,13 +278,15 @@ fn looks_cpp(src: &[u8]) -> bool {
             b':' => before == Some(b"class") && src.get(i + 1) != Some(&b':'),
             _ => false,
         };
-        if cpp {
+        if cpp && for_cpp == 0 {
             return true;
         }
+        // (Not a namespace: nedmalloc.h gives C++ users its functions in one.)
+        defined_for_cpp |= cpp && !(b == b'{' && (before == Some(b"namespace") || last == Some(b"namespace")));
         words.clear();
         i += 1;
     }
-    false
+    defined_for_cpp
 }
 
 /// C++ templates whose `->` (or `*`) reaches the object of the type they
@@ -354,6 +356,9 @@ struct Walk<'a> {
     /// Start bytes of identifier nodes already consumed as a def name or call target.
     skip: FxHashSet<usize>,
     locals: FxHashSet<&'a [u8]>,
+    /// C++: the locals and parameters of the function being read that are
+    /// `std::string`s, which a parameter of another class may be made of.
+    strings: FxHashSet<&'a [u8]>,
     /// The declaration in force for each local name of the function being
     /// read, as an index into the facts' `locals`.
     local_ids: FxHashMap<&'a [u8], u32>,
@@ -390,6 +395,8 @@ struct Walk<'a> {
     classes: Vec<OpenClass>,
     /// The class of the method being read (`this`), or `NONE`.
     method_class: u32,
+    /// C++: the type the function being read returns by value, or `NONE`.
+    returns_object: u32,
     /// The end of the `friend` declaration being read: what it declares
     /// is no member.
     friend_end: usize,
@@ -501,6 +508,7 @@ impl Extractor {
             names: FxHashMap::default(),
             skip: FxHashSet::default(),
             locals: FxHashSet::default(),
+            strings: FxHashSet::default(),
             local_ids: FxHashMap::default(),
             scope: None,
             site_defs: lexed
@@ -524,6 +532,7 @@ impl Extractor {
             cpp,
             classes: Vec::new(),
             method_class: NONE,
+            returns_object: NONE,
             friend_end: 0,
             made_names: FxHashMap::default(),
             namespaces: if cpp { namespace_spans(&lexed.masked, &lexed.blocks) } else { Vec::new() },
@@ -835,6 +844,7 @@ impl<'a> Walk<'a> {
         if let Some(slot) = self.site_defs.get_mut(&name.start_byte()) {
             *slot = self.out.defs.len() as u32;
         }
+        let at = name;
         let name = self.def_name(name);
         self.out.defs.push(Def {
             name,
@@ -843,7 +853,125 @@ impl<'a> Walk<'a> {
             kind,
             flags,
         });
-        (self.out.defs.len() - 1) as u32
+        let def = (self.out.defs.len() - 1) as u32;
+        if self.cpp && kind == kind::FUNCTION {
+            self.note_arity(def, at);
+        }
+        def
+    }
+
+    /// C++: how many arguments the function whose name is at `name` takes,
+    /// from its parameter list (defaults and `...` counted as such).
+    fn note_arity(&mut self, def: u32, name: Node<'a>) {
+        let ids = self.ids;
+        let mut n = name;
+        for _ in 0..4 {
+            match n.parent() {
+                Some(p) if p.kind_id() == ids.function_declarator => {
+                    let Some(list) = p.child_by_field_id(ids.f_parameters) else { return };
+                    let (mut least, mut most) = (0u8, 0u8);
+                    let mut c = list.walk();
+                    let params: Vec<Node<'a>> = list.named_children(&mut c).filter(|q| !q.is_extra()).collect();
+                    for q in params {
+                        let at = most;
+                        match q.kind() {
+                            "optional_parameter_declaration" => most = most.saturating_add(1),
+                            "variadic_parameter_declaration" | "variadic_parameter" => most = u8::MAX,
+                            // `(void)`.
+                            _ if q.named_child_count() == 1 && self.text(q) == b"void" => {}
+                            _ => {
+                                least = least.saturating_add(1);
+                                most = most.saturating_add(1);
+                            }
+                        }
+                        // Of a parameter that is an object or a reference to
+                        // one, its class (`const Status& s`: `Status`); one
+                        // that takes a string or a number as it is, `""` or `0`.
+                        let pointer = q.child_by_field_id(ids.f_declarator.get()).is_some_and(|d| matches!(d.kind(), "pointer_declarator" | "abstract_pointer_declarator"));
+                        let builtin = q.child_by_field_id(ids.f_type).filter(|t| matches!(t.kind(), "primitive_type" | "sized_type_specifier"));
+                        if most != at && most != u8::MAX {
+                            let t = match builtin {
+                                Some(b) if pointer && self.text(b).ends_with(b"char") => self.intern_str("\"\""),
+                                Some(_) if !pointer => self.intern_str("0"),
+                                _ if self.is_string(q.child_by_field_id(ids.f_type), q.child_by_field_id(ids.f_declarator.get())) => self.intern_str("std::string"),
+                                _ if !pointer => self.type_name_of(q),
+                                _ => NONE,
+                            };
+                            if t != NONE {
+                                self.out.cxx_mut().params.push((def, at as u32, t));
+                            }
+                        }
+                    }
+                    if list.child_count() > 0 && (0..list.child_count()).any(|i| list.child(i).is_some_and(|x| x.kind() == "...")) {
+                        most = u8::MAX;
+                    }
+                    self.out.cxx_mut().arity.push((def, least, most));
+                    if let Some(d) = p.parent() {
+                        let mut c = d.walk();
+                        if d.children(&mut c).any(|x| x.kind() == "explicit_function_specifier") {
+                            self.out.cxx_mut().explicit.push(def);
+                        }
+                    }
+                    return;
+                }
+                Some(p) => n = p,
+                None => return,
+            }
+        }
+    }
+
+    /// C++: is what a declaration of type `ty` declares with `declarator` a
+    /// `std::string` (or a reference to one), not a pointer?
+    fn is_string(&self, ty: Option<Node<'a>>, declarator: Option<Node<'a>>) -> bool {
+        ty.is_some_and(|t| matches!(self.text(t), b"std::string" | b"::std::string" | b"string"))
+            && declarator.is_none_or(|d| {
+                let d = if d.kind_id() == self.ids.init_declarator { d.child_by_field_id(self.ids.f_declarator.get()) } else { Some(d) };
+                d.is_some_and(|d| matches!(d.kind(), "identifier" | "reference_declarator" | "abstract_reference_declarator"))
+            })
+    }
+
+    /// C++: how many arguments the reference just pushed was given, from the
+    /// list in parentheses at `list`.
+    fn note_args(&mut self, list: Option<Node<'a>>) {
+        if let Some(n) = self.count_args(list) {
+            let r = self.out.refs.len() as u32 - 1;
+            self.out.cxx_mut().args.push((r, n));
+        }
+        self.note_arg_types(list);
+    }
+
+    /// C++: of the arguments of the reference just pushed, what is known of
+    /// their types: a string or a number written (`""`, `0`), or a local
+    /// object's class. An argument of another type than its parameter's
+    /// class is made into one by a constructor of that class.
+    fn note_arg_types(&mut self, list: Option<Node<'a>>) {
+        let Some(list) = list.filter(|l| l.kind() == "argument_list") else { return };
+        let r = self.out.refs.len() as u32 - 1;
+        let mut c = list.walk();
+        let args: Vec<Node<'a>> = list.named_children(&mut c).filter(|a| !a.is_extra()).collect();
+        for (i, a) in args.into_iter().enumerate() {
+            let a = self.strip(a);
+            let t = match a.kind() {
+                "string_literal" | "concatenated_string" | "raw_string_literal" => self.intern_str("\"\""),
+                "number_literal" | "char_literal" => self.intern_str("0"),
+                "identifier" if self.in_fn() && self.strings.contains(self.text(a)) => self.intern_str("std::string"),
+                "identifier" if self.in_fn() => match self.local_types.get(self.text(a)) {
+                    Some(&t) => t,
+                    None => continue,
+                },
+                _ => continue,
+            };
+            self.out.cxx_mut().arg_types.push((r, i as u32, t));
+        }
+    }
+
+    /// How many arguments a list in parentheses holds (not one in braces,
+    /// which may be one `std::initializer_list`).
+    fn count_args(&self, list: Option<Node<'a>>) -> Option<u8> {
+        let list = list.filter(|l| matches!(l.kind(), "argument_list" | "parameter_list"))?;
+        let mut c = list.walk();
+        let n = list.named_children(&mut c).filter(|a| !a.is_extra()).count();
+        Some(n.min(u8::MAX as usize - 1) as u8)
     }
 
     fn leave_scope(&mut self, pos: usize) {
@@ -851,6 +979,7 @@ impl<'a> Walk<'a> {
             self.flush_local_calls();
             self.scope = None;
             self.locals.clear();
+            self.strings.clear();
         }
     }
 
@@ -942,9 +1071,16 @@ impl<'a> Walk<'a> {
             let k = n.kind_id();
             if self.cpp && k == ids.subscript_expression {
                 // `v[i]`: an element.
-                let (kind, root, prefix) = self.element_of(n.child_by_field_id(ids.f_argument)?)?;
-                path.extend(prefix);
-                return Some((kind, root));
+                let of = n.child_by_field_id(ids.f_argument)?;
+                if let Some((kind, root, prefix)) = self.element_of(of) {
+                    path.extend(prefix);
+                    return Some((kind, root));
+                }
+                // `val[0]` of a class with an `operator[]`: what that returns
+                // (of an object whose type is known).
+                let r = self.object_root(of, path).filter(|r| r.0 == root::TYPE)?;
+                path.push(self.intern_str("[]"));
+                return Some(r);
             }
             if k == ids.parenthesized_expression {
                 n = n.named_child(0)?;
@@ -1116,7 +1252,7 @@ impl<'a> Walk<'a> {
 
     /// C++: a call of a constructor of `class` (or of the type of the member
     /// so named, with `hint` saying whose) made at `at`.
-    fn push_construction(&mut self, class: u32, at: Node<'a>, hint: u32) {
+    fn push_construction(&mut self, class: u32, at: Node<'a>, hint: u32, args: Option<u8>) {
         let scope = self.scope.map_or(0, |s| s.def);
         self.out.refs.push(Ref { name: class, line: at.start_position().row as u32 + 1, scope, kind: refkind::CALL });
         let r = self.out.refs.len() as u32 - 1;
@@ -1124,6 +1260,9 @@ impl<'a> Walk<'a> {
             self.out.ref_hints.push((r, hint));
         }
         self.out.cxx_mut().constructs.push(r);
+        if let Some(n) = args {
+            self.out.cxx_mut().args.push((r, n));
+        }
     }
 
     /// C++: the type of the elements of a container type (`std::vector<T>`:
@@ -1285,6 +1424,12 @@ impl<'a> Walk<'a> {
                     let scope = (self.out.defs.len() - 1) as u32;
                     for t in &m.refs {
                         self.push_tok_ref(t, scope);
+                        if self.cpp && t.call {
+                            if let Some(n) = self.args_in_text(t.end as usize, m.end as usize) {
+                                let r = self.out.refs.len() as u32 - 1;
+                                self.out.cxx_mut().args.push((r, n));
+                            }
+                        }
                         // C++: `gtest_ar.failure_message ()` of a `gtest_ar`
                         // the body declares: of its class.
                         if self.cpp && t.member {
@@ -1303,13 +1448,49 @@ impl<'a> Walk<'a> {
                             }
                             // `UniqueLock<T> name (...)` in the body (bitcoin's
                             // `LOCK`): an object of that class made, if it is one.
-                            if self.declares_object_after(t.end as usize) {
+                            // `SourceLocation{__func__}` (bitcoin's `LogPrintLevel_`)
+                            // too: one made.
+                            let braced = !t.member && self.next_byte(t.end as usize) == Some(b'{') && !self.tag_before(t.start as usize);
+                            if self.declares_object_after(t.end as usize) || braced {
                                 let name = self.intern(self.tok_text(t));
                                 self.out.refs.push(Ref { name, line: t.line, scope, kind: refkind::CALL });
                                 let r = self.out.refs.len() as u32 - 1;
                                 self.out.cxx_mut().constructs.push(r);
                             }
+                            // `::testing::internal::AssertHelper (...) = ::testing::Message ()`
+                            // (gtest's `GTEST_MESSAGE_AT_`): the class's `operator=`,
+                            // if it is a class, given what is made on the right.
+                            if let Some(right) = (!t.member).then(|| self.assigned_after(t.end as usize, m.end as usize)).flatten() {
+                                let ty = self.intern(self.tok_text(t));
+                                let left = self.push_hint(root::TYPE, ty, &[]);
+                                let right = match right {
+                                    Some(r) => {
+                                        let r = self.intern(r);
+                                        self.push_hint(root::TYPE, r, &[])
+                                    }
+                                    None => NONE,
+                                };
+                                let name = self.intern_str("operator=");
+                                self.out.refs.push(Ref { name, line: t.line, scope, kind: refkind::CALL });
+                                let at = self.out.refs.len() as u32 - 1;
+                                self.out.cxx_mut().operators.push((at, left, right, true));
+                            }
+                            // `gtest_ar << "..."` of a `gtest_ar` the body declares
+                            // (fmt's FMT_TEST_THROW_): its class's `operator<<`.
+                            let at = self.skip_space(t.end as usize);
+                            let shifted = self.orig.get(at..at + 2) == Some(b"<<") && self.orig.get(at + 2) != Some(&b'=');
+                            if let Some(ty) = (!t.member && shifted).then(|| self.body_type_of(self.tok_text(t), m.name.end as usize, m.end as usize)).flatten() {
+                                let ty = self.intern(ty);
+                                let left = self.push_hint(root::TYPE, ty, &[]);
+                                let name = self.intern_str("operator<<");
+                                self.out.refs.push(Ref { name, line: t.line, scope, kind: refkind::CALL });
+                                let at = self.out.refs.len() as u32 - 1;
+                                self.out.cxx_mut().operators.push((at, left, NONE, true));
+                            }
                         }
+                    }
+                    if self.cpp {
+                        self.note_forwards(scope, m.name.end as usize, m.end as usize, m.name.call);
                     }
                     if m.keep {
                         let text = String::from_utf8_lossy(&self.orig[m.name.end as usize..m.end as usize]);
@@ -1379,6 +1560,26 @@ impl<'a> Walk<'a> {
         }
         let i = back(i);
         let object = &s[word_before(i)?..i];
+        self.body_type_of(object, start, end)
+    }
+
+    /// C++: the type a macro body `s[start..end]` declares the object
+    /// `object` of (`const AssertionResult gtest_ar = ...`), if it does.
+    fn body_type_of(&self, object: &'a [u8], start: usize, end: usize) -> Option<&'a [u8]> {
+        let s = self.orig;
+        let back = |mut i: usize| {
+            while i > start && matches!(s[i - 1], b' ' | b'\t' | b'\\' | b'\n' | b'\r') {
+                i -= 1;
+            }
+            i
+        };
+        let word_before = |i: usize| {
+            let mut a = i;
+            while a > start && (s[a - 1].is_ascii_alphanumeric() || s[a - 1] == b'_') {
+                a -= 1;
+            }
+            (a < i && !s[a].is_ascii_digit()).then_some(a)
+        };
         let body = &s[start..end];
         let mut from = 0;
         while let Some(at) = body[from..].windows(object.len()).position(|w| w == object).map(|p| p + from) {
@@ -1453,6 +1654,279 @@ impl<'a> Walk<'a> {
             return false;
         }
         matches!(s.get(skip(i)), Some(b'(' | b'{' | b';'))
+    }
+
+    /// Past spaces and line continuations from `pos` in the text.
+    fn skip_space(&self, mut i: usize) -> usize {
+        let s = self.orig;
+        while i < s.len() && (s[i].is_ascii_whitespace() || (s[i] == b'\\' && s.get(i + 1).is_some_and(|b| *b == b'\n' || *b == b'\r'))) {
+            i += 1;
+        }
+        i
+    }
+
+    /// The first byte of the text at `pos` past spaces.
+    fn next_byte(&self, pos: usize) -> Option<u8> {
+        self.orig.get(self.skip_space(pos)).copied()
+    }
+
+    /// Is the word before `pos` one that makes a type of the name after it
+    /// (`struct X {`)?
+    fn tag_before(&self, pos: usize) -> bool {
+        let s = self.orig;
+        let mut i = pos;
+        while i > 0 && matches!(s[i - 1], b' ' | b'\t' | b'\\' | b'\n' | b'\r') {
+            i -= 1;
+        }
+        let end = i;
+        while i > 0 && (s[i - 1].is_ascii_alphanumeric() || s[i - 1] == b'_') {
+            i -= 1;
+        }
+        matches!(&s[i..end], b"struct" | b"class" | b"union" | b"enum" | b"namespace" | b"typename")
+    }
+
+    /// C++: which of its parameters the macro `def`, whose text after its
+    /// name is `orig[from..end]`, passes on as arguments of the calls its
+    /// body makes; or, of a name standing for a function (`#define
+    /// strprintf tfm::format`), that its use's arguments are the function's.
+    fn note_forwards(&mut self, def: u32, from: usize, end: usize, function_like: bool) {
+        let s = self.orig;
+        let skip = |mut i: usize| {
+            while i < end && (s[i].is_ascii_whitespace() || s[i] == b'\\') {
+                i += 1;
+            }
+            i
+        };
+        let word = |i: usize| {
+            let mut e = i;
+            while e < end && (s[e].is_ascii_alphanumeric() || s[e] == b'_') {
+                e += 1;
+            }
+            e
+        };
+        // The parameters, `...` (or GNU's `args...`) last.
+        let mut params: Vec<&'a [u8]> = Vec::new();
+        let mut rest: Option<(u32, &'a [u8])> = None;
+        let mut i = from;
+        if function_like {
+            i = skip(i);
+            if s.get(i) != Some(&b'(') {
+                return;
+            }
+            i += 1;
+            loop {
+                i = skip(i);
+                if i >= end {
+                    return;
+                }
+                if s[i] == b')' {
+                    i += 1;
+                    break;
+                }
+                if s[i..].starts_with(b"...") {
+                    rest = Some((params.len() as u32, b"__VA_ARGS__"));
+                    i += 3;
+                } else {
+                    let e = word(i);
+                    if e == i {
+                        return;
+                    }
+                    let name = &s[i..e];
+                    i = skip(e);
+                    if s[i..].starts_with(b"...") {
+                        rest = Some((params.len() as u32, name));
+                        i += 3;
+                    } else {
+                        params.push(name);
+                    }
+                }
+                i = skip(i);
+                if s.get(i) == Some(&b',') {
+                    i += 1;
+                }
+            }
+        }
+        // A name through scopes at `i`: (qualifier or `NONE`, name, end).
+        let qualified = |mut i: usize| -> Option<(Option<&'a [u8]>, &'a [u8], usize)> {
+            let (mut qual, mut name) = (None, None);
+            loop {
+                if s.get(i..i + 2) == Some(b"::") {
+                    i = skip(i + 2);
+                }
+                let e = word(i);
+                if e == i || s[i].is_ascii_digit() {
+                    return name.map(|n| (qual, n, i));
+                }
+                qual = name.or(qual);
+                name = Some(&s[i..e]);
+                let j = skip(e);
+                if s.get(j..j + 2) != Some(b"::") {
+                    return Some((qual, &s[i..e], j));
+                }
+                i = j;
+            }
+        };
+        let body = skip(i);
+        if !function_like {
+            // `#define strprintf tfm::format`.
+            if let Some((qual, name, _)) = qualified(body).filter(|q| skip(q.2) >= end) {
+                let (callee, qual) = (self.intern(name), qual.map_or(NONE, |q| self.intern(q)));
+                self.out.cxx_mut().forwards.push(Forward { def, callee, qual, param: 0, arg: 0, rest: true });
+            }
+            return;
+        }
+        let mut i = body;
+        while i < end {
+            let b = s[i];
+            if b == b'"' || b == b'\'' {
+                i += 1;
+                while i < end && s[i] != b {
+                    i += 1 + (s[i] == b'\\') as usize;
+                }
+                i += 1;
+                continue;
+            }
+            let starts = (b.is_ascii_alphabetic() || b == b'_' || (b == b':' && s.get(i + 1) == Some(&b':')))
+                && (i == 0 || !(s[i - 1].is_ascii_alphanumeric() || s[i - 1] == b'_' || s[i - 1] == b'.' || (s[i - 1] == b'>' && i >= 2 && s[i - 2] == b'-')));
+            let Some((qual, name, open)) = starts.then(|| qualified(i)).flatten() else {
+                i += 1;
+                continue;
+            };
+            if s.get(open) != Some(&b'(') || crate::mask::is_keyword(name) || name == b"defined" {
+                i = open.max(i + 1);
+                continue;
+            }
+            // The arguments, at the top level of the parentheses.
+            let (mut depth, mut k, mut a) = (0i32, 0u32, open + 1);
+            let mut j = open;
+            let mut found: Vec<(u32, u32, bool)> = Vec::new();
+            while j < end {
+                match s[j] {
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' | b',' if depth == 1 => {
+                        let mut text = &s[a..j];
+                        while let [b' ' | b'\t' | b'\\' | b'\r' | b'\n', more @ ..] = text {
+                            text = more;
+                        }
+                        while let [more @ .., b' ' | b'\t' | b'\\' | b'\r' | b'\n'] = text {
+                            text = more;
+                        }
+                        let text = text.strip_prefix(b"##").map_or(text, |t| t.trim_ascii_start());
+                        if let Some(p) = params.iter().position(|&p| p == text) {
+                            found.push((p as u32, k, false));
+                        } else if let Some((p, _)) = rest.filter(|r| r.1 == text) {
+                            found.push((p, k, true));
+                        }
+                        if s[j] == b',' {
+                            k += 1;
+                            a = j + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    b')' | b']' | b'}' => depth -= 1,
+                    b'"' | b'\'' => {
+                        let q = s[j];
+                        j += 1;
+                        while j < end && s[j] != q {
+                            j += 1 + (s[j] == b'\\') as usize;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            if !found.is_empty() {
+                let (callee, qual) = (self.intern(name), qual.map_or(NONE, |q| self.intern(q)));
+                for (param, arg, rest) in found {
+                    self.out.cxx_mut().forwards.push(Forward { def, callee, qual, param, arg, rest });
+                }
+            }
+            i = open + 1;
+        }
+    }
+
+    /// How many arguments the parentheses at `pos` in the text (a macro
+    /// body ending at `end`) hold; not known where `__VA_ARGS__` is one.
+    fn args_in_text(&self, pos: usize, end: usize) -> Option<u8> {
+        let s = self.orig;
+        let open = self.skip_space(pos);
+        if s.get(open) != Some(&b'(') {
+            return None;
+        }
+        let (mut depth, mut commas, mut empty) = (0, 0usize, true);
+        let mut i = open;
+        while i < end {
+            match s[i] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let n = if empty { 0 } else { commas + 1 };
+                        let vararg = s[open..i].windows(11).any(|w| w == b"__VA_ARGS__");
+                        return (!vararg).then_some(n.min(u8::MAX as usize - 1) as u8);
+                    }
+                }
+                b',' if depth == 1 => commas += 1,
+                b'"' | b'\'' => {
+                    let q = s[i];
+                    i += 1;
+                    while i < end && s[i] != q {
+                        i += 1 + (s[i] == b'\\') as usize;
+                    }
+                }
+                _ => {}
+            }
+            if depth >= 1 && i > open && !s[i].is_ascii_whitespace() && s[i] != b'\\' {
+                empty = false;
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// C++, in a macro body ending at `end`: is the name before `pos` made
+    /// and then assigned to, `T (...) = ...`? Then the class the right side
+    /// makes, if it does (`= ::testing::Message ()`).
+    fn assigned_after(&self, pos: usize, end: usize) -> Option<Option<&'a [u8]>> {
+        let s = self.orig;
+        let mut i = self.skip_space(pos);
+        if s.get(i) != Some(&b'(') {
+            return None;
+        }
+        let mut depth = 0;
+        while i < end {
+            depth += (s[i] == b'(') as i32 - (s[i] == b')') as i32;
+            i += 1;
+            if depth == 0 {
+                break;
+            }
+        }
+        i = self.skip_space(i);
+        if depth != 0 || i + 1 >= end || s[i] != b'=' || s[i + 1] == b'=' {
+            return None;
+        }
+        // The right side: a name, through scopes, then `(` or `{`.
+        let mut i = self.skip_space(i + 1);
+        let mut last = None;
+        loop {
+            if s.get(i..i + 2) == Some(b"::") {
+                i = self.skip_space(i + 2);
+            }
+            let a = i;
+            while i < end && (s[i].is_ascii_alphanumeric() || s[i] == b'_') {
+                i += 1;
+            }
+            if a == i || s[a].is_ascii_digit() {
+                break;
+            }
+            last = Some(&s[a..i]);
+            i = self.skip_space(i);
+            if s.get(i..i + 2) != Some(b"::") {
+                break;
+            }
+        }
+        Some(last.filter(|_| matches!(s.get(i), Some(b'(' | b'{'))))
     }
 
     /// C++: the name before `::` before `pos` in the text (`B` of `A::B::f`,
@@ -1557,6 +2031,29 @@ impl<'a> Walk<'a> {
     fn declarators(&self, n: Node<'a>) -> Vec<Node<'a>> {
         let mut c = n.walk();
         n.children_by_field_id(self.ids.f_declarator, &mut c).collect()
+    }
+
+    /// C++, in a function: `UniValue result (UniValue::VOBJ);` or `T x (n);`,
+    /// which the parser reads as a function's declaration: an object made,
+    /// its arguments taken for parameters with a type and no name. (With no
+    /// arguments, `T x ();` declares a function, as the compiler has it.)
+    fn object_not_function(&self, d: Node<'a>) -> bool {
+        let ids = self.ids;
+        if d.kind_id() != ids.function_declarator || d.child_by_field_id(ids.f_declarator.get()).is_none_or(|n| n.kind_id() != ids.identifier) {
+            return false;
+        }
+        let Some(list) = d.child_by_field_id(ids.f_parameters) else { return false };
+        let mut c = list.walk();
+        let params: Vec<Node<'a>> = list.named_children(&mut c).filter(|p| p.kind() != "comment").collect();
+        // (`CPubKey pubKey (vSolutions[0]);`: an element taken for an array.)
+        let element = |p: &Node<'a>| p.named_child_count() == 2 && p.child_by_field_id(ids.f_declarator.get()).is_some_and(|d| d.kind() == "abstract_array_declarator" && d.named_child_count() == 1);
+        !params.is_empty()
+            && params.iter().all(|p| {
+                let ty = p.child_by_field_id(ids.f_type);
+                p.kind_id() == ids.parameter_declaration
+                    && (p.named_child_count() == 1 || element(p))
+                    && ty.is_some_and(|t| t.kind_id() == ids.type_identifier || t.kind_id() == ids.qualified_identifier)
+            })
     }
 
     /// Does the declarator declare a function or a pointer to one?
@@ -1912,6 +2409,9 @@ impl<'a> Walk<'a> {
                         self.local_calls.push((self.text(f), f.start_position().row as u32 + 1));
                     } else {
                         self.push_ref(f, refkind::CALL);
+                        if self.cpp {
+                            self.note_args(node.child_by_field_id(ids.f_arguments));
+                        }
                         // A macro's arguments it does not use: not compiled.
                         let discards = self.sets.discards(self.text(f));
                         let asked = self.intern(self.text(f));
@@ -1948,6 +2448,7 @@ impl<'a> Walk<'a> {
                     if name.kind_id() == ids.identifier {
                         self.skip.insert(name.start_byte());
                         self.push_ref(name, refkind::CALL);
+                        self.note_args(node.child_by_field_id(ids.f_arguments));
                         if let Some(q) = parts.last().filter(|_| qualified) {
                             let (q, at) = (self.intern(q), self.out.refs.len() as u32 - 1);
                             self.out.cxx_mut().ref_quals.push((at, q));
@@ -1966,6 +2467,9 @@ impl<'a> Walk<'a> {
                             if member.kind_id() == ids.field_identifier || member.kind_id() == ids.identifier {
                                 self.skip.insert(member.start_byte());
                                 self.push_ref(member, refkind::ICALL);
+                                if self.cpp {
+                                    self.note_args(node.child_by_field_id(ids.f_arguments));
+                                }
                                 let at = self.out.refs.len() as u32 - 1;
                                 let hint = self.member_hint(target);
                                 if hint != NONE {
@@ -1984,6 +2488,9 @@ impl<'a> Walk<'a> {
                         self.push_ref(target, refkind::CALL);
                     } else if tk == ids.identifier {
                         self.local_calls.push((self.text(target), target.start_position().row as u32 + 1));
+                    } else if self.cpp && tk == ids.call_expression {
+                        // `make (m) (x)`: the `operator()` of what `make` returns.
+                        self.push_operator(b"()", target, None, node);
                     }
                 }
                 None => self.out.indirect_calls += 1,
@@ -2110,6 +2617,20 @@ impl<'a> Walk<'a> {
                             let base = self.intern_str(&base);
                             self.out.cxx_mut().bases.push((own, base));
                         }
+                        if method == "test_method" {
+                            // Boost.Test runs the case from a function the
+                            // macro makes of it, `name_invoker`.
+                            let line = self.out.defs[def as usize].line;
+                            let name = self.intern_str(&format!("{test}_invoker"));
+                            self.out.defs.push(Def { name, line, end_line: line, kind: kind::FUNCTION, flags: flag::STATIC });
+                            let invoker = self.out.defs.len() as u32 - 1;
+                            self.note_owner(invoker, &[], None, node.start_byte());
+                            let called = self.intern_str(method);
+                            self.out.refs.push(Ref { name: called, line, scope: invoker, kind: refkind::CALL });
+                            let r = self.out.refs.len() as u32 - 1;
+                            let test = self.intern_str(&test);
+                            self.out.cxx_mut().ref_quals.push((r, test));
+                        }
                     } else {
                         self.method_class = self.note_owner(def, &scope, class, node.start_byte());
                         if class.is_some() {
@@ -2121,7 +2642,14 @@ impl<'a> Walk<'a> {
                 if returns != NONE {
                     self.out.typed.push((def, returns));
                 }
+                // (Not of `T* f ()`, `T& f ()` nor `std::unique_ptr<T> f ()`.)
+                let by_value = node.child_by_field_id(ids.f_declarator.get()).is_some_and(|d| d.kind_id() == ids.function_declarator);
+                self.returns_object = match node.child_by_field_id(ids.f_type) {
+                    Some(t) if self.cpp && by_value => self.constructed_class(t),
+                    _ => NONE,
+                };
                 self.locals.clear();
+                self.strings.clear();
                 self.local_ids.clear();
                 if let Some(d) = node.child_by_field_id(ids.f_declarator.get()) {
                     self.note_params(d);
@@ -2167,7 +2695,9 @@ impl<'a> Walk<'a> {
                         self.local_roots.remove(self.text(name));
                         self.local_elems.remove(self.text(name));
                         self.local_keys.remove(self.text(name));
-                        if self.cpp && !self.declares_function(d) {
+                        let object = self.cpp && self.object_not_function(d);
+                        let declares_function = !object && self.declares_function(d);
+                        if self.cpp && !declares_function {
                             if let Some(ty) = node.child_by_field_id(ids.f_type) {
                                 let (e, key) = (self.element_type(ty), self.key_type(ty));
                                 if e != NONE {
@@ -2178,7 +2708,7 @@ impl<'a> Walk<'a> {
                                 }
                             }
                         }
-                        if declared != NONE && !self.declares_function(d) {
+                        if declared != NONE && !declares_function {
                             self.local_types.insert(self.text(name), declared);
                         } else {
                             self.local_types.remove(self.text(name));
@@ -2189,22 +2719,33 @@ impl<'a> Walk<'a> {
                             }
                         }
                         self.note_local(name, false);
-                        if self.cpp && !self.declares_function(d) {
+                        if self.cpp && !declares_function && self.is_string(node.child_by_field_id(ids.f_type), Some(d)) {
+                            self.strings.insert(self.text(name));
+                        } else {
+                            self.strings.remove(self.text(name));
+                        }
+                        if self.cpp && !declares_function {
                             // `T x;`, `T x (a);`, `T x {a};` (not `T x = y;`,
                             // a copy, nor a pointer or a reference) make a T.
                             let (inner, value) = if d.kind_id() == ids.init_declarator {
                                 (d.child_by_field_id(ids.f_declarator.get()), d.child_by_field_id(ids.f_value))
+                            } else if object {
+                                (d.child_by_field_id(ids.f_declarator.get()), d.child_by_field_id(ids.f_parameters))
                             } else {
                                 (Some(d), None)
                             };
-                            let object = inner.is_some_and(|i| i.kind_id() == ids.identifier || i.kind_id() == ids.array_declarator);
-                            let made = value.is_none_or(|v| matches!(v.kind(), "argument_list" | "initializer_list"));
+                            let plain = inner.is_some_and(|i| i.kind_id() == ids.identifier);
+                            let made_one = plain || inner.is_some_and(|i| i.kind_id() == ids.array_declarator);
+                            let made = object || value.is_none_or(|v| matches!(v.kind(), "argument_list" | "initializer_list"));
                             let class = match node.child_by_field_id(ids.f_type) {
-                                Some(t) if object && made => self.constructed_class(t),
+                                Some(t) if made_one && made => self.constructed_class(t),
                                 _ => NONE,
                             };
                             if class != NONE {
-                                self.push_construction(class, d, NONE);
+                                // (`T x;`: none; `T x {a}` may take a list.)
+                                let args = if value.is_none() && plain { Some(0) } else { self.count_args(value) };
+                                self.push_construction(class, d, NONE, args);
+                                self.note_arg_types(value);
                             }
                         }
                         if let Some(value) = d.child_by_field_id(ids.f_value).filter(|_| d.kind_id() == ids.init_declarator) {
@@ -2284,12 +2825,33 @@ impl<'a> Walk<'a> {
                         }
                     }
                     self.note_local(name, true);
+                    if self.cpp && self.is_string(node.child_by_field_id(ids.f_type), node.child_by_field_id(ids.f_declarator.get())) {
+                        self.strings.insert(self.text(name));
+                    }
                 }
             }
             return true;
         }
         if self.cpp && self.in_fn() {
             match node.kind() {
+                "return_statement" if self.returns_object != NONE => {
+                    // `return s;` of a function returning a `Status`: one
+                    // made from `s`, by the class's copy or move constructor.
+                    // (Not in a lambda, which returns its own.)
+                    let named = node.named_child(0).is_some_and(|v| v.kind_id() == ids.identifier || v.kind_id() == ids.field_expression);
+                    let mut up = node.parent();
+                    while let Some(p) = up.filter(|p| p.kind_id() != ids.function_definition) {
+                        if p.kind() == "lambda_expression" {
+                            break;
+                        }
+                        up = p.parent();
+                    }
+                    if named && up.is_some_and(|p| p.kind_id() == ids.function_definition) {
+                        self.push_construction(self.returns_object, node, NONE, Some(1));
+                        let r = self.out.refs.len() as u32 - 1;
+                        self.out.cxx_mut().copies.push(r);
+                    }
+                }
                 "binary_expression" => {
                     if let (Some(l), Some(op), Some(r)) =
                         (node.child_by_field_id(ids.f_left), node.child_by_field_id(ids.f_operator), node.child_by_field_id(ids.f_right))
@@ -2337,7 +2899,10 @@ impl<'a> Walk<'a> {
             if let Some(t) = node.child_by_field_id(ids.f_type) {
                 let class = self.constructed_class(t);
                 if class != NONE {
-                    self.push_construction(class, node, NONE);
+                    let list = node.child_by_field_id(ids.f_arguments);
+                    let args = if list.is_none() && node.kind() == "new_expression" { Some(0) } else { self.count_args(list) };
+                    self.push_construction(class, node, NONE, args);
+                    self.note_arg_types(list);
                 }
             }
             return true;
@@ -2350,7 +2915,10 @@ impl<'a> Walk<'a> {
                 if matches!(name.kind(), "field_identifier" | "type_identifier" | "identifier") {
                     let class = self.intern(self.text(name));
                     let hint = if self.method_class != NONE { self.push_hint(root::TYPE, self.method_class, &[]) } else { NONE };
-                    self.push_construction(class, node, hint);
+                    let mut c = node.walk();
+                    let args = node.named_children(&mut c).find(|n| n.kind() == "argument_list");
+                    self.push_construction(class, node, hint, self.count_args(args));
+                    self.note_arg_types(args);
                 }
             }
             return true;
@@ -2774,8 +3342,9 @@ mod tests {
         // nedmalloc.h: a namespace for C++ users.
         assert!(!is_cpp("a.h", b"#ifdef __cplusplus\nnamespace nedalloc {\n#endif\nvoid *nedmalloc(size_t);\n#ifdef __cplusplus\n}\n#endif\n"));
         assert!(!is_cpp("a.h", b"#if defined(__cplusplus)\nextern \"C\" {\nnamespace x {}\n#endif\nint f(void);\n"));
-        // ... but the other branch counts.
+        // ... but the other branch counts, and so does a class for C++.
         assert!(is_cpp("a.h", b"#ifndef __cplusplus\nint f(void);\n#else\n#endif\nnamespace y {}\n"));
+        assert!(is_cpp("a.h", b"#ifdef __cplusplus\nextern \"C\" {\n#endif\nint f(void);\n#ifdef __cplusplus\n}\nclass W {\n public:\n  int g();\n};\n#endif\n"));
     }
 
     #[test]

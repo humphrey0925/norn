@@ -438,9 +438,14 @@ impl Types<'_> {
         let found = match hint.root_kind {
             root::TYPE => self.follow(name, path, fi, g, closure),
             kind_of_root => {
-                // C++: `T ()`, a class made, is of that class.
+                // C++: `T ()`, a class made, is of that class; unless a
+                // function of no class has the name, which hides the class
+                // (bitcoin's `Params ()`, beside `Consensus::Params`).
                 if kind_of_root == root::FUNC && self.cpp.types.contains(&name) {
-                    return self.follow(name, path, fi, g, closure);
+                    in_sight(g.syms_named(name), &g.syms, own.clone(), closure, &[], |s| s.kind == kind::FUNCTION, scratch);
+                    if !scratch.iter().any(|s| self.cpp.class(*s) == NONE && self.of_symbol.contains_key(s)) {
+                        return self.follow(name, path, fi, g, closure);
+                    }
                 }
                 // The variable or function the name means here, then its type.
                 let wanted = if kind_of_root == root::VAR { kind::GLOBAL } else { kind::FUNCTION };
@@ -490,7 +495,15 @@ impl Types<'_> {
         while i < path.len() {
             let m = self.remap[fi][path[i] as usize];
             if Some(m) == element {
-                // Of what is no member (`p[i]` of a pointer): of its type.
+                // Of a class with an `operator[]`, what that returns; of
+                // what is no member (`p[i]` of a pointer), of its type.
+                // (One returning a `char` or a library type: not known. What
+                // it returns is said where it is defined, too.)
+                if let Some((name, op)) = g.name_id("operator[]").and_then(|name| Some((name, self.class_member(t, name, fi, g, closure)?))) {
+                    let class = self.cpp.class(op);
+                    let returns = |s: &u32| (*s == op || self.cpp.class(*s) == class).then(|| self.of_symbol.get(s)).flatten();
+                    t = *g.syms_named(name).iter().find_map(returns)?;
+                }
                 i += 1;
                 continue;
             }
@@ -588,6 +601,15 @@ struct Cpp {
     namespace_aliases: FxHashMap<u32, u32>,
     /// An operator of no class -> the types of its parameters.
     operator_params: FxHashMap<u32, (u32, u32)>,
+    /// A function -> how many arguments it takes, fewest and most.
+    arity: FxHashMap<u32, (u8, u8)>,
+    /// (Function, position) -> the class of the parameter there.
+    params: FxHashMap<(u32, u32), u32>,
+    /// The constructors that convert nothing.
+    explicit: FxHashSet<u32>,
+    /// A macro -> what it passes its arguments on to: (the function or
+    /// macro called, its qualifier, the parameter, the argument, `...`).
+    forwards: FxHashMap<u32, Vec<(u32, u32, u32, u32, bool)>>,
 }
 
 impl Cpp {
@@ -641,6 +663,13 @@ impl Cpp {
                 let t = |p: u32| if p == NONE { NONE } else { remap[fi][p as usize] };
                 c.operator_params.insert((base + def as usize) as u32, (t(p0), t(p1)));
             }
+            c.arity.extend(f.cxx().arity.iter().map(|&(def, least, most)| ((base + def as usize) as u32, (least, most))));
+            c.params.extend(f.cxx().params.iter().map(|&(def, at, t)| (((base + def as usize) as u32, at), remap[fi][t as usize])));
+            c.explicit.extend(f.cxx().explicit.iter().map(|&def| (base + def as usize) as u32));
+            for w in &f.cxx().forwards {
+                let qual = if w.qual == NONE { NONE } else { remap[fi][w.qual as usize] };
+                c.forwards.entry((base + w.def as usize) as u32).or_default().push((remap[fi][w.callee as usize], qual, w.param, w.arg, w.rest));
+            }
             for &(class, b) in &f.cxx().bases {
                 let (class, b) = (remap[fi][class as usize], remap[fi][b as usize]);
                 if class != b {
@@ -661,7 +690,184 @@ impl Cpp {
                 c.virtuals.insert((class, s.name));
             }
         }
+        // Default arguments are written where a function is declared, not
+        // where it is defined apart: a definition takes as few as a
+        // declaration of the name in its class with as many parameters.
+        let mut fewest: FxHashMap<(u32, u32, u8), u8> = FxHashMap::default();
+        for (&sym, &(least, most)) in &c.arity {
+            let s = &g.syms[sym as usize];
+            if s.flags & flag::DECL != 0 && least < most {
+                let e = fewest.entry((c.class(sym), s.name, most)).or_insert(least);
+                *e = (*e).min(least);
+            }
+        }
+        if !fewest.is_empty() {
+            let class_of = &c.class_of;
+            for (sym, a) in c.arity.iter_mut() {
+                let key = (class_of.get(sym).copied().unwrap_or(NONE), g.syms[*sym as usize].name, a.1);
+                if let Some(&least) = fewest.get(&key) {
+                    a.0 = a.0.min(least);
+                }
+            }
+        }
+        // So is `explicit`: a constructor defined apart is so where one of
+        // its class declared with as many parameters, the first of the same
+        // class, is.
+        let key = |c: &Cpp, sym: u32| (c.class(sym), g.syms[sym as usize].name, c.arity.get(&sym).map_or(u8::MAX, |a| a.1), c.params.get(&(sym, 0)).copied().unwrap_or(NONE));
+        let declared: FxHashSet<_> = c.explicit.iter().filter(|&&s| g.syms[s as usize].flags & flag::DECL != 0).map(|&s| key(&c, s)).collect();
+        if !declared.is_empty() {
+            let defs: Vec<u32> = c.arity.keys().copied().filter(|&s| g.syms[s as usize].flags & flag::DECL == 0 && declared.contains(&key(&c, s))).collect();
+            c.explicit.extend(defs);
+        }
         c
+    }
+
+    /// The constructors that make a call's arguments into the classes of
+    /// the parameters they are passed as (`Put ("k")` of a `Put (const
+    /// Slice& key)`: Slice's from a string), as (constructor, class).
+    /// `given`: (position, what is known of the argument's type: a class,
+    /// or `literals`, a string's, a number's or a `std::string`'s);
+    /// `targets`: what the call reaches, functions or the one macro it
+    /// uses, which passes them on.
+    #[allow(clippy::too_many_arguments)]
+    fn conversions(
+        &self,
+        g: &Graph,
+        aliases: &FxHashMap<u32, Vec<u32>>,
+        given: &[(u32, u32)],
+        targets: &[u32],
+        literals: [u32; 3],
+        lineage: &mut Vec<u32>,
+        out: &mut Vec<(u32, u32)>,
+    ) {
+        let syms = &g.syms;
+        let is = |c: u32, k: u8| syms[c as usize].kind == k;
+        // (what may be called, (position in the call, position there))
+        let mut work: Vec<(Vec<u32>, Vec<(u32, u32)>)> = Vec::new();
+        let start: Vec<(u32, u32)> = given.iter().map(|&(j, _)| (j, j)).collect();
+        if !targets.is_empty() && targets.iter().all(|&t| is(t, kind::FUNCTION)) {
+            work.push((targets.to_vec(), start));
+        } else if let [m] = *targets {
+            // Through the macros that pass the arguments on.
+            let mut macros = vec![(m, start, 0)];
+            while let Some((m, map, depth)) = macros.pop() {
+                let Some(rows) = self.forwards.get(&m).filter(|_| is(m, kind::MACRO)) else { continue };
+                let mut callees: Vec<(u32, u32)> = rows.iter().map(|r| (r.0, r.1)).collect();
+                callees.sort_unstable();
+                callees.dedup();
+                for (callee, qual) in callees {
+                    let mapped: Vec<(u32, u32)> = map
+                        .iter()
+                        .filter_map(|&(j, p)| {
+                            rows.iter().filter(|r| r.0 == callee && r.1 == qual).find_map(|r| if r.4 { (p >= r.2).then(|| r.3 + (p - r.2)) } else { (p == r.2).then_some(r.3) }).map(|k| (j, k))
+                        })
+                        .collect();
+                    if mapped.is_empty() {
+                        continue;
+                    }
+                    let named = g.syms_named(callee);
+                    let mut fns: Vec<u32> = named.iter().copied().filter(|&c| is(c, kind::FUNCTION)).collect();
+                    if fns.is_empty() {
+                        if let [next] = *named.iter().copied().filter(|&c| is(c, kind::MACRO)).collect::<Vec<_>>() {
+                            if depth < 4 {
+                                macros.push((next, mapped, depth + 1));
+                            }
+                        }
+                        continue;
+                    }
+                    // `tfm::format`: of that namespace, or class; a name
+                    // not qualified, a function of no class.
+                    let qual = self.namespace_aliases.get(&qual).copied().unwrap_or(qual);
+                    let keep = |c: &u32| {
+                        if qual == NONE {
+                            self.class(*c) == NONE
+                        } else if self.namespaces.contains(&qual) {
+                            self.ns(*c) == qual
+                        } else {
+                            self.class(*c) == qual
+                        }
+                    };
+                    if fns.iter().any(keep) {
+                        fns.retain(keep);
+                    }
+                    work.push((fns, mapped));
+                }
+            }
+        }
+        let literal = |t: u32| literals.contains(&t);
+        let mut ctors: Vec<(u32, u32)> = Vec::new();
+        for (fns, map) in work {
+            for (j, k) in map {
+                let Some(&(_, a)) = given.iter().find(|x| x.0 == j) else { continue };
+                // A candidate taking it as it is is the one called.
+                if fns.iter().any(|&c| self.params.get(&(c, k)) == Some(&a)) {
+                    continue;
+                }
+                lineage.clear();
+                if !literal(a) {
+                    self.lineage(a, lineage);
+                }
+                // The classes the candidates take there, and of each the
+                // constructors that would make one of the argument: taking
+                // one argument, not `explicit`; of a string or a number one
+                // whose parameter is no class of the corpus, of an object
+                // one taking its class (or a base).
+                let ctor_of = |c: u32, class: u32| is(c, kind::FUNCTION) && self.class(c) == class;
+                let has_ctor = |class: u32| g.syms_named(class).iter().any(|&c| ctor_of(c, class));
+                let from = |c: u32| match self.params.get(&(c, 0)) {
+                    None => true,
+                    Some(&p) if literal(p) => p == a,
+                    Some(p) => !literal(a) && lineage.contains(p),
+                };
+                ctors.clear();
+                let mut classes: Vec<u32> = fns.iter().filter_map(|&c| self.params.get(&(c, k)).copied()).filter(|&t| !literal(t)).collect();
+                classes.sort_unstable();
+                classes.dedup();
+                for t in classes {
+                    // (An object of a class derived from it is passed as is.)
+                    if lineage.contains(&t) {
+                        ctors.clear();
+                        break;
+                    }
+                    let mut class = t;
+                    if !has_ctor(class) {
+                        match aliases.get(&class).into_iter().flatten().copied().find(|&x| has_ctor(x)) {
+                            Some(tag) => class = tag,
+                            None => continue,
+                        }
+                    }
+                    for &c in g.syms_named(class) {
+                        if ctor_of(c, class) && !self.explicit.contains(&c) && self.arity.get(&c).is_none_or(|&(least, most)| least <= 1 && 1 <= most) && from(c) {
+                            ctors.push((c, class));
+                        }
+                    }
+                }
+                // Only where one class can take it.
+                if ctors.iter().any(|x| x.1 != ctors[0].1) {
+                    continue;
+                }
+                let is_def = |c: &(u32, u32)| syms[c.0 as usize].flags & flag::DECL == 0;
+                if ctors.iter().any(is_def) {
+                    ctors.retain(is_def);
+                }
+                out.extend_from_slice(&ctors);
+            }
+        }
+    }
+
+    /// Of overloads, keep those that take `n` arguments, if any does and
+    /// not all do. (One whose parameters are not known takes any number.)
+    /// Not for a declaration alone where definitions do not fit: that may
+    /// be one the compiler writes (`T () = default;`), which the reader
+    /// would rather see the class's for.
+    fn by_arity(&self, n: Option<u8>, cands: &mut Vec<u32>, syms: &[Sym]) {
+        let Some(n) = n else { return };
+        let fits = |c: &u32| self.arity.get(c).is_none_or(|&(least, most)| least <= n && n <= most);
+        let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
+        let defs = cands.iter().any(is_def);
+        if cands.iter().any(|c| fits(c) && (is_def(c) || !defs)) && !cands.iter().all(fits) {
+            cands.retain(fits);
+        }
     }
 
     fn on(&self) -> bool {
@@ -969,6 +1175,8 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     //    includes; anything with external visibility.
     let t = Instant::now();
     let syms = &g.syms;
+    // (What the facts call a string and a number passed.)
+    let literals = ["\"\"", "0", "std::string"].map(|n| g.name_id(n).unwrap_or(NONE));
     let per_file: Vec<(Vec<[u32; 3]>, [u64; 4], Vec<[u32; 4]>, Vec<[u32; 3]>)> = files
         .par_iter()
         .enumerate()
@@ -1004,6 +1212,23 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
             let anywhere: std::cell::RefCell<FxHashMap<(u32, u32), crate::cond::Tri>> = Default::default();
             let constructs: FxHashSet<u32> = f.cxx().constructs.iter().copied().collect();
             let operands: FxHashMap<u32, (u32, u32, bool)> = f.cxx().operators.iter().map(|&(r, l, rr, binary)| (r, (l, rr, binary))).collect();
+            let args_of: FxHashMap<u32, u8> = f.cxx().args.iter().copied().collect();
+            let copies: FxHashSet<u32> = f.cxx().copies.iter().copied().collect();
+            let mut arg_types: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+            for &(r, at, t) in &f.cxx().arg_types {
+                arg_types.entry(r).or_default().push((at, remap[fi][t as usize]));
+            }
+            let mut made: Vec<(u32, u32)> = Vec::new();
+            // The objects a call's arguments are made into (see `Cpp::conversions`).
+            let mut convert = |ri: usize, r: &crate::model::Ref, targets: &[u32], ambiguous: bool, lineage: &mut Vec<u32>, edges: &mut Vec<[u32; 3]>| {
+                let Some(given) = arg_types.get(&(ri as u32)) else { return };
+                made.clear();
+                cpp.conversions(&g, &aliases, given, targets, literals, lineage, &mut made);
+                for &(c, class) in &made {
+                    let several = made.iter().any(|&(o, k)| k == class && syms[o as usize].file != syms[c as usize].file);
+                    edges.push([base + r.scope, c, pack_meta(r.line, ambiguous || several, refkind::CALL)]);
+                }
+            };
             for (ri, r) in f.refs.iter().enumerate() {
                 if let Some(&(lh, rh, binary)) = operands.get(&(ri as u32)).filter(|_| in_cpp) {
                     // An operator used on objects: the left operand's
@@ -1136,6 +1361,12 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     if class != NONE {
                         tmp.extend(g.syms_named(class).iter().copied().filter(|&c| ctor_of(c, class)));
                     }
+                    cpp.by_arity(args_of.get(&(ri as u32)).copied(), &mut tmp, syms);
+                    if copies.contains(&(ri as u32)) {
+                        // A copy: by the constructor taking one of its class,
+                        // or by the compiler's, which is no call here.
+                        tmp.retain(|c| cpp.params.get(&(*c, 0)) == Some(&class));
+                    }
                     let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
                     if tmp.iter().any(is_def) {
                         tmp.retain(is_def);
@@ -1149,6 +1380,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     counts[ambiguous as usize] += 1;
                     let meta = pack_meta(r.line, ambiguous, refkind::CALL);
                     edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta]));
+                    convert(ri, r, &tmp, ambiguous, &mut lineage, &mut edges);
                     continue;
                 }
                 let (kind, maybe) = (r.kind & !refkind::MAYBE, r.kind & refkind::MAYBE != 0);
@@ -1240,6 +1472,10 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                             if pick.is_empty() {
                                 cpp.nearest(cands, NONE, &mut lineage, &mut pick);
                             }
+                        } else if qual != NONE && cands.iter().any(|&c| cpp.class(c) == qual) {
+                            // A class known by its members alone, one a macro
+                            // makes (Boost.Test's case): its.
+                            cpp.nearest(cands, qual, &mut lineage, &mut pick);
                         } else if qual != NONE {
                             // A scope the corpus does not have (`std::max`):
                             // only a function of no class, and only a guess.
@@ -1293,6 +1529,9 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 let callable = |c: &u32| matches!(syms[*c as usize].kind, kind::FUNCTION | kind::MACRO);
                 if matches!(kind, refkind::CALL | refkind::PCALL) && tmp.iter().any(callable) {
                     tmp.retain(callable);
+                }
+                if in_cpp {
+                    cpp.by_arity(args_of.get(&(ri as u32)).copied(), &mut tmp, syms);
                 }
                 let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
                 if tmp.iter().any(is_def) {
@@ -1405,6 +1644,16 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                         && (s.flags & flag::CONDITIONAL != 0 && !along() || s.file != fi as u32 && !sure.member[s.file as usize])
                         && compiled(*c) != crate::cond::Tri::True
                 };
+                // C++: a name called that only a macro the corpus defines
+                // once can mean is that macro, defined or not where it is
+                // tested (`#if !GTEST_DONT_DEFINE_ASSERT_EQ`): without it
+                // the call would not compile.
+                let sole_macro = in_cpp
+                    && kind == refkind::CALL
+                    && tmp.len() == 1
+                    && syms[tmp[0] as usize].kind == kind::MACRO
+                    && cands.iter().all(|&c| c == tmp[0] || !matches!(syms[c as usize].kind, kind::FUNCTION | kind::MACRO));
+                let optional = |c: &u32| !sole_macro && optional(c);
                 // (C++: overloads are one function, of one class in one file.)
                 let several = if in_cpp {
                     let first = (syms[tmp[0] as usize].file, cpp.class(tmp[0]));
@@ -1492,6 +1741,15 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 } else {
                     let meta = pack_meta(r.line, ambiguous, edge_kind);
                     edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta]));
+                }
+                // (Not of a function no header read here declares: gtest's
+                // `printf ("...")` is the C library's, not fmt's.)
+                let hidden = tmp.iter().any(|&c| {
+                    let seen = |d: &u32| syms[*d as usize].file == fi as u32 || closure.member[syms[*d as usize].file as usize];
+                    syms[c as usize].kind == kind::FUNCTION && !g.syms_named(syms[c as usize].name).iter().any(|d| seen(d) && cpp.class(*d) == cpp.class(c))
+                });
+                if in_cpp && edge_kind != refkind::USE && !hidden {
+                    convert(ri, r, &tmp, ambiguous, &mut lineage, &mut edges);
                 }
                 // A virtual method called on an object may run an override:
                 // those of the classes derived from its class.
@@ -2331,6 +2589,305 @@ void e() { HOLD(4); }
     }
 
     #[test]
+    fn a_macro_body_makes_objects_and_assigns_to_them() {
+        let g = graph(&[
+            ("t.h", "namespace testing {
+class Message {
+ public:
+  Message();
+};
+class AssertHelper {
+ public:
+  AssertHelper(int type, const char* message);
+  void operator=(const Message& message) const;
+};
+class AssertionResult {
+ public:
+  AssertionResult(bool ok) {}
+  template <typename T> AssertionResult& operator<<(const T& value) { return *this; }
+};
+}
+struct SourceLocation {
+  SourceLocation(const char* func) {}
+};
+inline void Log(SourceLocation&& loc, int x) {}
+#define FAIL_AT(t) ::testing::AssertHelper(t, \"m\") \\
+    = ::testing::Message()
+#define LOG(x) Log(SourceLocation{__func__}, x)
+#define CHECK_MSG(x) if (::testing::AssertionResult ar = ::testing::AssertionResult(x)) ; else ar << \"failed\"
+"),
+            ("t.cc", "#include \"t.h\"
+namespace testing {
+Message::Message() {}
+AssertHelper::AssertHelper(int type, const char* message) {}
+void AssertHelper::operator=(const Message& message) const {}
+}
+void f() { FAIL_AT(1); }
+void g() { LOG(2); }
+void h() { CHECK_MSG(true); }
+"),
+        ]);
+        let q = crate::graph::Qualifier::new(&g);
+        let callers = |callee: &str| -> Vec<String> {
+            let mut v: Vec<String> = g.syms.iter().enumerate()
+                .filter(|(i, s)| s.kind == kind::FUNCTION && s.flags & flag::DECL == 0 && q.name(&g, *i as u32) == callee)
+                .flat_map(|(i, _)| crate::callers_through_macros(&g, i as u32))
+                .filter(|c| g.syms[c.caller as usize].kind == kind::FUNCTION && !c.ambiguous)
+                .map(|c| g.sym_name(c.caller).to_string())
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        assert_eq!(callers("AssertHelper::AssertHelper"), ["f"]);
+        assert_eq!(callers("AssertHelper::operator="), ["f"]);
+        assert_eq!(callers("Message::Message"), ["f"]);
+        assert_eq!(callers("SourceLocation::SourceLocation"), ["g"]);
+        // `ar << ...` of an `ar` the body declares: its class's.
+        assert_eq!(callers("AssertionResult::operator<<"), ["h"]);
+    }
+
+    #[test]
+    fn of_overloads_in_several_files_the_call_is_of_those_taking_its_arguments() {
+        let g = graph(&[
+            ("m.h", "class Message {
+ public:
+  Message();
+  Message(const Message& m) {}
+  void Put(int a, int b = 0);
+  void Put(const char* s, int a, int b) {}
+};
+#define MAKE() Message()
+inline void Use(int a) {}
+"),
+            ("m.cc", "#include \"m.h\"
+Message::Message() {}
+void Message::Put(int a, int b) {}
+void f() { Message m; Message n(m); Message* p = new Message(); MAKE(); }
+void g(Message& m) { m.Put(1); m.Put(\"x\", 1, 2); }
+"),
+        ]);
+        let q = crate::graph::Qualifier::new(&g);
+        let certain = |caller: &str, callee: &str| -> Vec<String> {
+            let mut v: Vec<String> = g.find(caller).iter().chain(g.find("MAKE").iter()).flat_map(|&s| g.refs_from(s))
+                .filter(|e| e.kind() == refkind::CALL && !e.ambiguous() && q.name(&g, e.other) == callee)
+                .map(|e| format!("{}:{}", g.file_path(g.syms[e.other as usize].file), g.syms[e.other as usize].line)).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        // `Message m;`, `new Message ()` and the macro's `Message ()` take
+        // none; `Message n (m)` one.
+        assert_eq!(certain("f", "Message::Message"), ["m.cc:2", "m.h:4"]);
+        // The default argument is in the declaration, not the definition.
+        assert_eq!(certain("g", "Message::Put"), ["m.cc:3", "m.h:6"]);
+    }
+
+    #[test]
+    fn an_object_returned_by_value_is_copied_by_the_constructor_its_class_has() {
+        let g = graph(&[(
+            "s.cc",
+            "class Status {
+ public:
+  Status() {}
+  Status(const Status& s) {}
+  explicit Status(int code) {}
+};
+class Plain {
+ public:
+  Plain(int x) {}
+};
+Status f() { Status s; return s; }
+Plain g(Plain p) { return p; }
+Status* h(Status* p) { return p; }
+",
+        )]);
+        let made = |caller: &str| -> Vec<u32> {
+            let mut v: Vec<u32> = g.find(caller).iter().flat_map(|&s| g.refs_from(s)).filter(|e| e.kind() == refkind::CALL).map(|e| g.syms[e.other as usize].line).collect();
+            v.sort();
+            v
+        };
+        // `Status s;` by the one taking none, `return s;` by the copy.
+        assert_eq!(made("f"), [3, 4]);
+        // A class with no copy written is copied by the compiler's; a
+        // pointer is no object.
+        assert!(made("g").is_empty(), "{:?}", made("g"));
+        assert!(made("h").is_empty(), "{:?}", made("h"));
+    }
+
+    #[test]
+    fn an_argument_passed_as_another_class_is_made_into_one() {
+        let g = graph(&[
+            ("s.h", "#include <string>
+class Slice {
+ public:
+  Slice(const char* s) {}
+  Slice(const std::string& s) {}
+};
+class Key {
+ public:
+  explicit Key(const char* s) {}
+};
+class Status {
+ public:
+  Status(const Slice& msg) {}
+};
+void Put(const Slice& key, int n) {}
+void Name(const char* s) {}
+void Name(const Slice& s) {}
+void Lookup(const Key& k) {}
+namespace tinyformat {
+template <unsigned n>
+struct FormatStringCheck {
+  FormatStringCheck(const char* str) {}
+};
+template <typename... Args>
+void format(FormatStringCheck<sizeof...(Args)> fmt, const Args&... args) {}
+}
+namespace tfm = tinyformat;
+#define strprintf tfm::format
+inline void LogPrint(int level, tinyformat::FormatStringCheck<1> fmt, int x) {}
+#define LogLevel_(level, ...) LogPrint(level, __VA_ARGS__)
+#define LogInfo(...) LogLevel_(1, __VA_ARGS__)
+"),
+            ("o.h", "class Other {
+ public:
+  Other(const char* s) {}
+};
+void Elsewhere(const Other& o) {}
+"),
+            ("s.cc", "#include \"s.h\"
+void a() { Put(\"k\", 1); }
+void a2() { Slice s(\"x\"); Status t(s); }
+void b() { Name(\"n\"); Lookup(Key(\"k\")); }
+void c(int x) { strprintf(\"%d\", x); }
+void c2(int x) { LogInfo(\"%d\", x); }
+void d() { Elsewhere(\"e\"); }
+void e(const std::string& k) { std::string s; Put(k, 1); Put(s, 2); }
+"),
+        ]);
+        let q = crate::graph::Qualifier::new(&g);
+        let made = |caller: &str| -> Vec<String> {
+            let mut v: Vec<String> = g.find(caller).iter().flat_map(|&s| g.refs_from(s))
+                .filter(|e| e.kind() == refkind::CALL && !e.ambiguous() && g.syms[e.other as usize].line < 25 && q.name(&g, e.other).contains("::"))
+                .map(|e| q.name(&g, e.other).into_owned()).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        // `Put ("k", 1)` makes a Slice of the string; `Status t (s)` takes
+        // the Slice it is given, made by the constructor of Status.
+        assert_eq!(made("a"), ["Slice::Slice"]);
+        assert_eq!(made("a2"), ["Slice::Slice", "Status::Status"]);
+        // A string is what `Name (const char*)` takes; an explicit
+        // constructor converts nothing (`Key ("k")` is made, not converted).
+        assert_eq!(made("b"), ["Key::Key"]);
+        // Through a name for a function, and through macros passing on
+        // what they are given.
+        for f in ["c", "c2"] {
+            assert_eq!(made(f), ["FormatStringCheck::FormatStringCheck"], "{f}");
+        }
+        // Of a function no header read here declares, nothing.
+        assert!(made("d").is_empty(), "{:?}", made("d"));
+        // A `std::string` passed as a Slice is made into one too.
+        assert_eq!(made("e"), ["Slice::Slice"]);
+    }
+
+    #[test]
+    fn what_operator_subscript_or_a_function_hiding_a_class_returns_is_typed() {
+        let g = graph(&[(
+            "u.cc",
+            "class UniValue {
+ public:
+  const UniValue& operator[](unsigned i) const;
+  const char* get_str() const { return \"\"; }
+};
+class Slice {
+ public:
+  char operator[](unsigned i) const { return 0; }
+  int size() const { return 0; }
+};
+struct Other { const char* get_str() const { return \"\"; } int size() const { return 1; } };
+namespace Consensus { struct Params { int Height() const { return 0; } }; }
+class CChainParams { public: int Height() const { return 1; } };
+const CChainParams& Params();
+const UniValue& UniValue::operator[](unsigned i) const { return *this; }
+void f(const Slice& s) { UniValue val; val[0].get_str(); s[0].size(); }
+int g() { return Params().Height(); }
+",
+        )]);
+        let q = crate::graph::Qualifier::new(&g);
+        let certain = |caller: &str| -> Vec<String> {
+            let mut v: Vec<String> = g.find(caller).iter().flat_map(|&s| g.refs_from(s)).filter(|e| e.kind() == refkind::CALL && !e.ambiguous()).map(|e| q.name(&g, e.other).into_owned()).collect();
+            v.sort();
+            v
+        };
+        // `val[0]` is what UniValue's `operator[]` returns; `s[0]`, a char,
+        // is of no class.
+        assert_eq!(certain("f"), ["Slice::operator[]", "UniValue::get_str", "UniValue::operator[]"]);
+        // `Params ()` calls the function, not a class of that name.
+        assert_eq!(certain("g"), ["CChainParams::Height", "Params"]);
+    }
+
+    #[test]
+    fn an_object_the_parser_takes_for_a_function_is_made_and_typed() {
+        let g = graph(&[(
+            "u.cc",
+            "class UniValue {
+ public:
+  enum VType { VNULL, VOBJ };
+  UniValue(VType t) {}
+  void pushKV(int k) {}
+};
+struct Other { void pushKV(int k) {} };
+void f() { UniValue result(UniValue::VOBJ); result.pushKV(1); }
+void g(UniValue::VType n) { UniValue r(n); r.pushKV(2); }
+void k(const UniValue::VType* types) { UniValue e(types[0]); e.pushKV(3); }
+void h() { UniValue proto(); UniValue other(int x); }
+",
+        )]);
+        let q = crate::graph::Qualifier::new(&g);
+        let certain = |caller: &str| -> Vec<String> {
+            let mut v: Vec<String> = g.find(caller).iter().flat_map(|&s| g.refs_from(s)).filter(|e| e.kind() == refkind::CALL && !e.ambiguous()).map(|e| q.name(&g, e.other).into_owned()).collect();
+            v.sort();
+            v
+        };
+        for f in ["f", "g", "k"] {
+            assert_eq!(certain(f), ["UniValue::UniValue", "UniValue::pushKV"], "{f}");
+        }
+        // With no arguments, or a parameter named, it declares a function.
+        assert!(certain("h").is_empty(), "{:?}", certain("h"));
+    }
+
+    #[test]
+    fn a_macro_only_some_configurations_define_is_what_cpp_calls_by_its_name() {
+        let h = "#if !DONT_DEFINE_CHECK
+#define CHECK_IT(x) Check(x)
+#endif
+#ifdef USE_TWO
+#define TWO(x) Check(x)
+#else
+#define TWO(x) Other(x)
+#endif
+inline void Check(int x) {}
+inline void Other(int x) {}
+";
+        let src = "#include \"t.h\"\nvoid f() { CHECK_IT(1); }\nvoid g() { TWO(2); }\n";
+        // (What C calls by a name it has no declaration of may be another
+        // function: there the macro stays one reading.)
+        for (ext, sure) in [("cc", true), ("c", false)] {
+            let path = format!("t.{ext}");
+            let g = graph(&[("t.h", h), (&path, src)]);
+            let callers = |callee: &str| -> Vec<(String, bool)> {
+                crate::callers_through_macros(&g, g.find(callee)[0]).iter().filter(|c| g.syms[c.caller as usize].kind == kind::FUNCTION).map(|c| (g.sym_name(c.caller).to_string(), c.ambiguous)).collect()
+            };
+            assert!(callers("Check").contains(&("f".to_string(), !sure)), "{ext}: {:?}", callers("Check"));
+            // Two definitions of the name are two readings.
+            assert!(callers("Other").contains(&("g".to_string(), true)), "{ext}: {:?}", callers("Other"));
+        }
+    }
+
+    #[test]
     fn an_operator_on_objects_is_a_call_of_the_one_their_types_take() {
         let h = r#"class Writer {
  public:
@@ -2458,18 +3015,85 @@ mod test_framework_tests {
                    BOOST_AUTO_TEST_SUITE_END()\n\
                    BOOST_FIXTURE_TEST_CASE(other, Setup)\n{\n  Count();\n}\n\
                    BOOST_AUTO_TEST_CASE(plain)\n{\n}\n";
-        assert_eq!(named(&[("t.cpp", src)]), ["Setup::Count", "other::test_method", "plain::test_method", "simple::test_method"]);
+        assert_eq!(
+            named(&[("t.cpp", src)]),
+            ["Setup::Count", "other::test_method", "other_invoker", "plain::test_method", "plain_invoker", "simple::test_method", "simple_invoker"]
+        );
         // What the fixture has, the test calls.
         let mut ex = Extractor::new();
         let g = link(&[ex.extract("t.cpp", src.as_bytes(), &MacroSets::default())]).0;
         let count = g.find("Count")[0];
         assert_eq!(g.refs_to(count).iter().filter(|e| e.kind() == refkind::CALL).count(), 2);
+        // The function the macro makes runs the case's test method.
+        let q = crate::graph::Qualifier::new(&g);
+        for case in ["simple", "other", "plain"] {
+            let invoker = g.find(&format!("{case}_invoker"))[0];
+            let runs: Vec<String> = g.refs_from(invoker).iter().filter(|e| e.kind() == refkind::CALL && !e.ambiguous()).map(|e| q.name(&g, e.other).into_owned()).collect();
+            assert_eq!(runs, [format!("{case}::test_method")]);
+        }
     }
 
     #[test]
     fn a_googletest_test_is_its_test_body() {
         let src = "class DBTest { public: void Put(); };\nTEST(Coding, Fixed32) {\n}\nTEST_F(DBTest, Empty) {\n  Put();\n}\n";
         assert_eq!(named(&[("t.cc", src)]), ["Coding_Fixed32_Test::TestBody", "DBTest::Put", "DBTest_Empty_Test::TestBody"]);
+    }
+
+    #[test]
+    fn a_macro_defining_a_function_in_a_namespace_is_as_one_at_file_scope() {
+        // leveldb's first `TEST (Coding, Fixed32)` after `namespace leveldb {`
+        // was a function named TEST.
+        let files = [
+            ("t.h", "#define TEST(a, b) void a##_##b##_Test()\n"),
+            ("t.cc", "#include \"t.h\"\nnamespace leveldb {\nTEST(Coding, Fixed32) {\n}\nTEST(Coding, Fixed64) {\n}\n}\n"),
+        ];
+        let sets = MacroSets::from_defines(files.iter().flat_map(|(_, src)| crate::mask::defines(src.as_bytes(), &crate::cond::Conditions::default())));
+        let mut ex = Extractor::new();
+        let facts: Vec<FileFacts> = files.iter().map(|(path, src)| ex.extract(path, src.as_bytes(), &sets)).collect();
+        let g = link(&facts).0;
+        assert!(g.find("TEST").iter().all(|&s| g.syms[s as usize].kind == kind::MACRO));
+        assert_eq!(g.find("Coding_Fixed32_Test").len(), 1);
+        assert_eq!(g.find("Coding_Fixed64_Test").len(), 1);
+    }
+
+    #[test]
+    fn a_class_a_macro_defines_derives_from_what_it_says() {
+        // gtest's TEST_F, of a corpus that has gtest: the test's class
+        // derives from the fixture, whose methods the body calls.
+        let files = [
+            ("t.h", "#define TEST_F(f, n) class f##_##n##_Test : public ::testing::f { void TestBody(); }; void f##_##n##_Test::TestBody()\n"),
+            ("t.cc", "#include \"t.h\"\nnamespace testing { class LogTest { public: void Write(int x) {} }; }\nclass Other { public: void Write(int x) {} };\nTEST_F(LogTest, BadLength) {\n  Write(1);\n}\n"),
+        ];
+        let sets = MacroSets::from_defines(files.iter().flat_map(|(_, src)| crate::mask::defines(src.as_bytes(), &crate::cond::Conditions::default())));
+        let mut ex = Extractor::new();
+        let facts: Vec<FileFacts> = files.iter().map(|(path, src)| ex.extract(path, src.as_bytes(), &sets)).collect();
+        let g = link(&facts).0;
+        let q = crate::graph::Qualifier::new(&g);
+        let body = g.find("TestBody").iter().copied().find(|&s| g.syms[s as usize].flags & flag::DECL == 0).expect("TestBody");
+        let calls: Vec<String> = g.refs_from(body).iter().filter(|e| e.kind() == refkind::CALL && !e.ambiguous()).map(|e| q.name(&g, e.other).into_owned()).collect();
+        assert_eq!(calls, ["LogTest::Write"]);
+    }
+
+    #[test]
+    fn a_call_of_what_a_call_returns_is_its_operator_call() {
+        // gtest's ASSERT_THAT: `pred_format (#v1, v1)` of a `pred_format`
+        // that is `MakePredicateFormatterFromMatcher (matcher)`.
+        let files = [
+            ("t.h", "class Formatter {\n public:\n  bool operator()(const char* t, int x) const { return true; }\n};\n\
+                     class Other {\n public:\n  bool operator()(const char* t, int x) const { return false; }\n};\n\
+                     Formatter MakeFormatter(int m) { return Formatter(); }\n\
+                     #define PRED1(pred, v) if (pred(#v, v)) ;\n#define CHECK_THAT(v, m) PRED1(MakeFormatter(m), v)\n"),
+            ("t.cc", "#include \"t.h\"\nvoid f() { CHECK_THAT(1, 2); }\nvoid g() { MakeFormatter(3)(\"x\", 4); }\n"),
+        ];
+        let sets = MacroSets::from_defines(files.iter().flat_map(|(_, src)| crate::mask::defines(src.as_bytes(), &crate::cond::Conditions::default())));
+        let mut ex = Extractor::new();
+        let facts: Vec<FileFacts> = files.iter().map(|(path, src)| ex.extract(path, src.as_bytes(), &sets)).collect();
+        let g = link(&facts).0;
+        let q = crate::graph::Qualifier::new(&g);
+        for caller in ["f", "g"] {
+            let calls: Vec<String> = g.find(caller).iter().flat_map(|&s| g.refs_from(s)).filter(|e| e.kind() == refkind::CALL && !e.ambiguous() && g.sym_name(e.other) == "operator()").map(|e| q.name(&g, e.other).into_owned()).collect();
+            assert_eq!(calls, ["Formatter::operator()"], "{caller}");
+        }
     }
 
     #[test]
