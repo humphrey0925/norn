@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+**The Linux kernel with its configuration: 78% of calls certain, up from 70%**
+
+- A Kconfig configuration of Linux says which architecture it is for. The other architectures' folders, and `tools/` and `scripts/` (programs the host runs), are taken as not built: still indexed and searched, but where a name or an `#include` could mean what is there or what the build compiles, it means what the build compiles. The setting is `"notBuilt": [...]`, for any project to use.
+- With it, what Kbuild and the compiler it names define for C: `__KERNEL__`, the compiler's own macros (`__clang__` and its version, or `__GNUC__`), the architecture's (`__x86_64__`); `__ASSEMBLY__` and `__CHECKER__` not defined.
+- `__ASSEMBLER__` is never defined in C: the many headers inside `#ifndef __ASSEMBLER__` are no longer undecided.
+- A macro defined in a source file is not taken as a meaning of a name in another source file that does not include it (`kfree` from `lib/decompress_unxz.c`).
+- On the Linux kernel (x86_64 defconfig, against clang), with the build's configuration in the tree: calls found and certain 69.9% → 78.4%, all calls found 90.3% → 91.5%, precision of certain calls 98.7% → 99.4%. Without a configuration, little changes (certain 59.7% → 59.9%). Redis, git, binutils, STM32F4 HAL and nrfx unchanged.
+
 ## 0.23.2
 
 **On the Visual Studio Marketplace, with complete third-party notices**

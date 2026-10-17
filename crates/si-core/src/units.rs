@@ -808,7 +808,13 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
             p == tail || p.ends_with(&tail) && p.as_bytes()[p.len() - tail.len() - 1] == b'/'
         };
         let near = |id: u32| dir.split('/').zip(dir_of(&paths[id as usize]).split('/')).take_while(|(a, b)| a == b).count();
-        let fitting: Vec<u32> = named.iter().filter(fits).copied().collect();
+        let mut fitting: Vec<u32> = named.iter().filter(fits).copied().collect();
+        // (Of a folder the build compiles, where one is: not another
+        // architecture's.)
+        let built = |c: &u32| !crate::link::outside(&paths[*c as usize], conditions.not_built());
+        if fitting.iter().any(built) {
+            fitting.retain(built);
+        }
         let nearest = fitting.iter().map(|&c| near(c)).max();
         fitting.into_iter().filter(|&c| Some(near(c)) == nearest).collect()
     };
@@ -888,7 +894,11 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
     }
     // What a compilation starts from: a file that is not a header, or a
     // header nothing here includes (it is somebody's, out of sight).
-    let roots: Vec<u32> = (0..n as u32).filter(|&i| !crate::is_header(&paths[i as usize]) || !included[i as usize]).collect();
+    // (Not those in folders the build does not compile.)
+    let roots: Vec<u32> = (0..n as u32)
+        .filter(|&i| !crate::is_header(&paths[i as usize]) || !included[i as usize])
+        .filter(|&i| !crate::link::outside(&paths[i as usize], conditions.not_built()))
+        .collect();
     let sizes: Vec<usize> = steps.iter().map(Vec::len).collect();
     let seen = || sizes.iter().map(|&n| (0..n).map(|_| AtomicU8::new(0)).collect()).collect();
     let mut slots = 0;

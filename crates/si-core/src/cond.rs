@@ -15,6 +15,9 @@
 //!   "conditionFiles": [".config", "include/generated/autoconf.h"] }
 //! ```
 //!
+//! (and `"notBuilt": ["tools", "arch/arm64"]`, folders the build does not
+//! compile: see [`Settings::not_built`].)
+//!
 //! `defines` gives names a value (empty for a bare `#define`); `undefines`
 //! says a name is not defined; `assumeUndefined` says the same of every
 //! name with one of these prefixes that is not defined here (a kernel
@@ -87,6 +90,12 @@ pub struct Settings {
     /// name it has no definition of).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undecided: Option<String>,
+    /// Folders the build does not compile (another architecture's, a
+    /// separate program's): indexed and searched, but where a name or an
+    /// `#include` may mean what is there or what is elsewhere, it means
+    /// what is elsewhere.
+    #[serde(default, rename = "notBuilt", skip_serializing_if = "Vec::is_empty")]
+    pub not_built: Vec<String>,
 }
 
 impl Settings {
@@ -256,7 +265,63 @@ fn kconfig(root: &Path) -> Vec<(String, Settings)> {
         };
         let Some(file) = [at("include/generated/autoconf.h"), at(".config")].into_iter().find(|f| generated(f)) else { continue };
         let name = if dir.is_empty() { "Kconfig".to_string() } else { format!("Kconfig ({dir})") };
-        out.push((name, Settings { condition_files: vec![file], assume_undefined: vec!["CONFIG_".into()], ..Settings::default() }));
+        // Linux's says which architecture it is for ("Linux/x86 6.12.0
+        // Kernel Configuration"): the others' folders, and the programs
+        // of `tools/` and `scripts/` that the host runs, are not built.
+        let arch = std::fs::read(root.join(&file)).ok().and_then(|text| {
+            let head = String::from_utf8_lossy(&text[..text.len().min(512)]).into_owned();
+            let at = head.find("Linux/")? + "Linux/".len();
+            Some(head[at..].split(|c: char| c.is_whitespace()).next()?.to_string())
+        });
+        let mut not_built = Vec::new();
+        let mut defines = std::collections::BTreeMap::new();
+        let mut undefines = Vec::new();
+        if let Some(arch) = arch.filter(|a| !a.is_empty() && root.join("arch").join(a).is_dir()) {
+            // What Kbuild and the compiler it names define for C.
+            let text = std::fs::read(root.join(&file)).map(|t| String::from_utf8_lossy(&t).into_owned()).unwrap_or_default();
+            let value = |name: &str| {
+                text.lines().find_map(|l| {
+                    let l = l.trim();
+                    let rest = l.strip_prefix("#define ").map(|r| r.trim_start()).unwrap_or(l);
+                    let rest = rest.strip_prefix(name)?;
+                    let v = rest.strip_prefix('=').unwrap_or(rest).trim();
+                    (!v.is_empty() && rest.starts_with([' ', '\t', '='])).then(|| v.to_string())
+                })
+            };
+            let on = |name: &str| value(name).is_some_and(|v| v == "1" || v == "y");
+            let version = |name: &str| value(name).and_then(|v| v.parse::<u32>().ok()).filter(|&v| v > 0);
+            defines.insert("__KERNEL__".to_string(), "1".to_string());
+            undefines.extend(["__ASSEMBLY__", "__CHECKER__", "__GENKSYMS__"].map(String::from));
+            if on("CONFIG_CC_IS_CLANG") {
+                let v = version("CONFIG_CLANG_VERSION").unwrap_or(0);
+                for (n, x) in [("__clang__", 1), ("__clang_major__", v / 10000), ("__clang_minor__", v / 100 % 100), ("__GNUC__", 4), ("__GNUC_MINOR__", 2), ("__GNUC_PATCHLEVEL__", 1)] {
+                    defines.insert(n.to_string(), x.to_string());
+                }
+            } else if let Some(v) = on("CONFIG_CC_IS_GCC").then(|| version("CONFIG_GCC_VERSION")).flatten() {
+                for (n, x) in [("__GNUC__", v / 10000), ("__GNUC_MINOR__", v / 100 % 100), ("__GNUC_PATCHLEVEL__", v % 100)] {
+                    defines.insert(n.to_string(), x.to_string());
+                }
+                undefines.push("__clang__".to_string());
+            }
+            if arch == "x86" {
+                let (yes, no) = if on("CONFIG_X86_64") { ("__x86_64__", "__i386__") } else { ("__i386__", "__x86_64__") };
+                defines.insert(yes.to_string(), "1".to_string());
+                undefines.push(no.to_string());
+            }
+            let mut others: Vec<String> = std::fs::read_dir(root.join("arch"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .filter(|a2| *a2 != arch)
+                .map(|a2| format!("arch/{a2}"))
+                .collect();
+            others.sort();
+            not_built.extend(others);
+            not_built.extend(["tools", "scripts"].iter().filter(|d| root.join(d).is_dir()).map(|d| d.to_string()));
+        }
+        out.push((name, Settings { condition_files: vec![file], assume_undefined: vec!["CONFIG_".into()], not_built, defines, undefines, ..Settings::default() }));
     }
     out
 }
@@ -683,6 +748,8 @@ pub struct Conditions {
     no_source: bool,
     /// A name nothing settles is taken as not defined (`undecided: off`).
     undecided_off: bool,
+    /// Folders the build does not compile (`notBuilt`), as `a/b/`.
+    not_built: Vec<String>,
 }
 
 /// The macros whose value the sources settle, and in which files each is
@@ -1017,7 +1084,19 @@ impl Conditions {
         c.assume_all = settings.assume_undefined.iter().any(|p| p == "*");
         c.no_source = settings.source_defines == Some(false);
         c.undecided_off = settings.undecided.as_deref() == Some("off");
+        c.not_built = settings
+            .not_built
+            .iter()
+            .map(|d| d.replace('\\', "/").trim_matches('/').to_string())
+            .filter(|d| !d.is_empty() && d != ".")
+            .map(|d| d + "/")
+            .collect();
         c
+    }
+
+    /// The folders the build does not compile, each as `a/b/`.
+    pub fn not_built(&self) -> &[String] {
+        &self.not_built
     }
 
     /// `NAME` as `value`; `NAME(a, b)` (`-D'MAX(a,b)=...'`) a macro with
@@ -1125,7 +1204,7 @@ impl Conditions {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.defined.is_empty() && self.undefined.is_empty() && self.assume_undefined.is_empty() && !self.assume_all && !self.assume_built && !self.undecided_off
+        self.defined.is_empty() && self.undefined.is_empty() && self.assume_undefined.is_empty() && !self.assume_all && !self.assume_built && !self.undecided_off && self.not_built.is_empty()
     }
 
     /// Do these conditions assume anything about names they do not list?
@@ -1193,7 +1272,8 @@ impl Conditions {
         let a = self.assume_undefined.iter().fold(self.assume_all as u64 | (self.assume_built as u64) << 1, |acc, k| acc ^ h(k, 13));
         let s = self.in_source.iter().fold(0, |acc, k| acc ^ h(k, 14));
         let c = self.source.as_ref().map_or(0, |s| s.digest()) ^ self.no_source as u64 ^ (self.undecided_off as u64) << 1;
-        d ^ u ^ a ^ s ^ c
+        let b = self.not_built.iter().fold(0, |acc, k| acc ^ h(k.as_bytes(), 15));
+        d ^ u ^ a ^ s ^ c ^ b
     }
 
     pub fn defined(&self, name: &[u8]) -> Tri {
@@ -1201,6 +1281,8 @@ impl Conditions {
             Tri::True
         } else if self.undefined.contains(name)
             || self.undecided_off
+            // (Defined only where assembly is preprocessed, never in C.)
+            || name == b"__ASSEMBLER__" && !self.in_source.contains(name)
             || !self.in_source.contains(name) && (self.assume_all || self.assume_built && !builtin(name) || self.assume_undefined.iter().any(|p| name.starts_with(p)))
         {
             Tri::False
@@ -2051,9 +2133,22 @@ CONFIG_SMP=y
 CONFIG_SMP=y
 # CONFIG_NUMA is not set
 CONFIG_EXT4_FS=m
+CONFIG_X86_64=y
+CONFIG_CC_IS_CLANG=y
+CONFIG_CLANG_VERSION=180103
 ").unwrap();
+        // Linux's names its architecture: the others', and the host's
+        // programs, are not built.
+        for d in ["arch/x86", "arch/arm64", "arch/riscv", "tools/lib"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
         let p = Project::load(&dir);
         assert_eq!(p.active.as_deref(), Some("Kconfig"));
+        assert_eq!(p.current().not_built, ["arch/arm64", "arch/riscv", "tools"]);
+        let c = Conditions::from_settings(&p.current(), &dir);
+        assert_eq!(c.not_built(), ["arch/arm64/", "arch/riscv/", "tools/"]);
+        // And what Kbuild and its compiler define for C.
+        assert_eq!((c.defined(b"__KERNEL__"), c.defined(b"__ASSEMBLY__"), c.defined(b"__ASSEMBLER__"), c.defined(b"__x86_64__")), (Tri::True, Tri::False, Tri::False, Tri::True));
         let c = Conditions::from_settings(&Settings::load(&dir), &dir);
         assert_eq!((c.defined(b"CONFIG_SMP"), c.defined(b"CONFIG_EXT4_FS"), c.defined(b"CONFIG_EXT4_FS_MODULE"), c.defined(b"CONFIG_NUMA")),
             (Tri::True, Tri::False, Tri::True, Tri::False));

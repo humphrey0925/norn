@@ -86,6 +86,11 @@ fn join(dir: &str, rel: &str) -> String {
     parts.join("/")
 }
 
+/// Whether `path` is in one of `folders` (each `a/b/`).
+pub(crate) fn outside(path: &str, folders: &[String]) -> bool {
+    folders.iter().any(|f| path.starts_with(f.as_str()))
+}
+
 /// For each file, the files it includes directly. Without the build's `-I`
 /// list an operand is matched by path suffix: the includer's own directory
 /// wins, then the candidates sharing the longest directory prefix with it.
@@ -99,6 +104,8 @@ pub struct Options {
     /// How each compilation reads the headers compiled more than one way
     /// (see `units`).
     pub readings: std::sync::Arc<crate::units::Readings>,
+    /// Folders the build does not compile, as `a/b/` (`notBuilt`).
+    pub not_built: Vec<String>,
 }
 
 /// How an `#include` operand is found among the indexed files, without the
@@ -107,6 +114,8 @@ pub(crate) struct Includes<'a> {
     paths: Vec<&'a str>,
     by_path: FxHashMap<&'a str, u32>,
     by_base: FxHashMap<&'a str, Vec<u32>>,
+    /// Per file, whether it is in a folder the build does not compile.
+    outside: Vec<bool>,
 }
 
 impl<'a> Includes<'a> {
@@ -117,7 +126,14 @@ impl<'a> Includes<'a> {
         for (i, p) in paths.iter().enumerate() {
             by_base.entry(p.rsplit('/').next().unwrap_or(p)).or_default().push(i as u32);
         }
-        Includes { paths, by_path, by_base }
+        let outside = vec![false; paths.len()];
+        Includes { paths, by_path, by_base, outside }
+    }
+
+    /// The same, the files in `folders` (`a/b/`) not compiled by the build.
+    pub(crate) fn not_built(mut self, folders: &[String]) -> Includes<'a> {
+        self.outside = self.paths.iter().map(|p| outside(p, folders)).collect();
+        self
     }
 
     /// The files `operand`, written in an `#include` of `includer`, may
@@ -160,9 +176,12 @@ impl<'a> Includes<'a> {
         // And of those the least deep: `arch/x86/include/` before
         // `tools/arch/x86/include/`, a copy kept for another program.
         let shallow = |id: u32| if above(id).is_none() { -(root(id).split('/').filter(|s| !s.is_empty()).count() as i64) } else { 0 };
+        // A folder the build does not compile is another architecture's,
+        // say: of those not above the includer, one the build compiles.
+        let built = |id: u32| !self.outside[id as usize];
         let shared = |id: u32| {
             let other = dir_of(paths[id as usize]);
-            (above(id), include_folder(id), shallow(id), dir.split('/').zip(other.split('/')).take_while(|(a, b)| a == b).count())
+            (above(id), built(id), include_folder(id), shallow(id), dir.split('/').zip(other.split('/')).take_while(|(a, b)| a == b).count())
         };
         match cands.iter().map(|&c| shared(c)).max() {
             Some(best) => {
@@ -175,8 +194,8 @@ impl<'a> Includes<'a> {
 }
 
 /// Returns the edges twice: all of them, and those not under an `#if`.
-fn include_edges(files: &[FileFacts], aliases: &[(String, String)], stats: &mut LinkStats) -> (Vec<Vec<u32>>, Vec<Vec<u32>>) {
-    let found = Includes::new(files.iter().map(|f| f.path.as_str()));
+fn include_edges(files: &[FileFacts], aliases: &[(String, String)], not_built: &[String], stats: &mut LinkStats) -> (Vec<Vec<u32>>, Vec<Vec<u32>>) {
+    let found = Includes::new(files.iter().map(|f| f.path.as_str())).not_built(not_built);
     let edges: Vec<(Vec<u32>, u64, Vec<u32>)> = files
         .par_iter()
         .map(|f| {
@@ -214,11 +233,14 @@ fn include_edges(files: &[FileFacts], aliases: &[(String, String)], stats: &mut 
 struct Closure {
     member: Vec<bool>,
     list: Vec<u32>,
+    /// Whether the file is compiled on its own (not a header, nor a source
+    /// included in another, which see what the includer defines first).
+    unit: bool,
 }
 
 impl Closure {
     fn new(n: usize) -> Self {
-        Closure { member: vec![false; n], list: Vec::new() }
+        Closure { member: vec![false; n], list: Vec::new(), unit: false }
     }
 
     /// Everything `file` includes, directly or not (itself excluded).
@@ -258,9 +280,13 @@ fn in_sight(
     out.clear();
     // A definition in the same file shadows everything else (covers `static`).
     out.extend(cands.iter().filter(|&&c| own.contains(&c) && want(&syms[c as usize])));
+    // (From a source file, a macro of another source file is seen only
+    // where that one is included. A header sees what the files including
+    // it define first.)
     let external = |c: &&u32| {
         let s = &syms[**c as usize];
-        want(s) && (s.flags & flag::STATIC == 0 || s.flags & flag::HEADER != 0)
+        let unseen = closure.unit && s.kind == kind::MACRO && s.flags & flag::HEADER == 0 && !closure.member[s.file as usize];
+        want(s) && (s.flags & flag::STATIC == 0 || s.flags & flag::HEADER != 0) && !unseen
     };
     // Unless all it is is a prototype and a stub that may not be compiled
     // (`#ifdef CONFIG_SMP` the prototype, `#else` the stub, both here): the
@@ -730,7 +756,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     // 0. Which file includes which, then macro expansion: it needs the
     //    definitions other files give, and adds definitions and references.
     let t = Instant::now();
-    let (includes, sure_includes) = include_edges(files, &options.include_aliases, &mut stats);
+    let (includes, sure_includes) = include_edges(files, &options.include_aliases, &options.not_built, &mut stats);
     stats.include_ms = ms(t);
     let t = Instant::now();
     (stats.sites, stats.expanded_defs, stats.expanded_refs) = crate::expand::expand(files, &includes, &sure_includes, cache);
@@ -901,9 +927,10 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     // The files no compilation reads (a header only `#if`s the conditions
     // switch off include): what is defined there is no reading of a name
     // others define, from a file that is read.
+    // (So are those in a folder the build does not compile.)
     let unread: Vec<bool> = {
         let set: FxHashSet<&str> = readings.unread.iter().map(String::as_str).collect();
-        files.iter().map(|f| set.contains(f.path.as_str())).collect()
+        files.iter().map(|f| set.contains(f.path.as_str()) || outside(&f.path, &options.not_built)).collect()
     };
     // What they say together: yes where some say yes and none no (one
     // that does not know may just not read the file), no where all say
@@ -931,6 +958,12 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         )
     };
 
+    // The files some file includes (a `.c` read as part of another).
+    let mut included = vec![false; files.len()];
+    for to in includes.iter().flatten() {
+        included[*to as usize] = true;
+    }
+
     // 3. Resolve references. Each file is independent given the symbol table.
     //    A name means, in order: a definition in this file; one in a file it
     //    includes; anything with external visibility.
@@ -941,6 +974,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         .enumerate()
         .map_init(|| (Closure::new(files.len()), Closure::new(files.len())), |(closure, sure), (fi, f)| {
             closure.fill(fi as u32, &includes);
+            closure.unit = crate::is_unit(&f.path) && !included[fi];
             // What the file reads in every configuration.
             sure.fill(fi as u32, &sure_includes);
             let base = g.files[fi].sym_start;
@@ -1387,9 +1421,10 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     let c = tmp[0];
                     let n_readers = readers.get().map_or(0, |r| r.len());
                     eprintln!(
-                        "edgewhy   {at}:{}: {} target(s), maybe {maybe}, guessed {guessed}, optional {}, conditional {}, compiled {:?}, in its unit {}, readers {n_readers}",
+                        "edgewhy   {at}:{}: {} target(s) {:?}, maybe {maybe}, guessed {guessed}, optional {}, conditional {}, compiled {:?}, in its unit {}, readers {n_readers}",
                         r.line,
                         tmp.len(),
+                        tmp.iter().map(|&t| format!("{}{}", files[syms[t as usize].file as usize].path, if optional(&t) { " (optional)" } else { "" })).collect::<Vec<_>>(),
                         tmp.iter().any(optional),
                         syms[c as usize].flags & flag::CONDITIONAL != 0,
                         compiled(c),
@@ -1961,6 +1996,49 @@ struct writer w = { .run = do_write };
         ]);
         assert_eq!(targets(&g, "f", "helper"), ["gas/impl.c"]);
         assert!(targets(&g, "g", "helper").is_empty());
+    }
+
+    #[test]
+    fn a_macro_of_another_source_file_is_not_seen() {
+        let g = graph(&[
+            ("include/slab.h", "void kfree (void *p);\n"),
+            ("mm/slub.c", "#include \"../include/slab.h\"\nvoid kfree (void *p) { }\n"),
+            ("lib/unxz.c", "#ifdef STATIC\n#define kfree(p) free (p)\n#endif\nvoid h (void *p) { kfree (p); }\n"),
+            ("kernel/a.c", "#include \"../include/slab.h\"\nvoid f (void *p) { kfree (p); }\n"),
+        ]);
+        assert_eq!(targets(&g, "f", "kfree"), ["mm/slub.c"]);
+    }
+
+    #[test]
+    fn a_folder_the_build_does_not_compile_gives_way() {
+        let files = [
+            ("arch/x86/include/asm/bitops.h", "static inline int set_bit (int n) { return n; }\n"),
+            ("arch/arm64/include/asm/bitops.h", "static inline int set_bit (int n) { return n; }\n"),
+            ("tools/lib/slab.c", "void kfree (void *p) { }\n"),
+            ("mm/slab.c", "void kfree (void *p) { }\n"),
+            ("kernel/a.c", "#include <asm/bitops.h>\nvoid f (void *p) { set_bit (1); kfree (p); }\n"),
+            ("arch/arm64/kernel/b.c", "#include <asm/bitops.h>\nvoid g (void) { set_bit (2); }\n"),
+        ];
+        let mut ex = Extractor::new();
+        let facts: Vec<FileFacts> = files.iter().map(|(path, src)| ex.extract(path, src.as_bytes(), &MacroSets::default())).collect();
+        let sure = |g: &Graph, caller: &str, name: &str| -> Vec<(String, bool)> {
+            g.find(caller)
+                .iter()
+                .flat_map(|&s| g.refs_from(s))
+                .filter(|e| g.sym_name(e.other) == name)
+                .map(|e| (g.file_path(g.syms[e.other as usize].file).to_string(), !e.ambiguous()))
+                .collect()
+        };
+        // Not told: either may be meant.
+        let g = link(&facts).0;
+        assert_eq!(sure(&g, "f", "kfree").len(), 2);
+        // Told: what the build compiles, for certain; another
+        // architecture's own code still reads its own header.
+        let options = Options { not_built: vec!["arch/arm64/".into(), "tools/".into()], ..Options::default() };
+        let g = link_with(&facts, &options).0;
+        assert_eq!(sure(&g, "f", "kfree"), [("mm/slab.c".to_string(), true)]);
+        assert_eq!(sure(&g, "f", "set_bit"), [("arch/x86/include/asm/bitops.h".to_string(), true)]);
+        assert_eq!(sure(&g, "g", "set_bit"), [("arch/arm64/include/asm/bitops.h".to_string(), true)]);
     }
 
     #[test]

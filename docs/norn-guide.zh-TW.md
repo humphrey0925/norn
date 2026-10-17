@@ -252,7 +252,7 @@ Norn 會**自動採用專案裡找得到的建置設定**，往下找三層資�
 | Make / CMake | `Makefile`、`*.mk`、`CMakeLists.txt` |
 | Kconfig（Linux、U-Boot、Buildroot、BusyBox） | `include/generated/autoconf.h` 或 `.config`，在樹裡或 build 資料夾（`make O=build`） |
 
-專案檔裡的每個建置組態（Debug、Release、各個 target）會成為一組設定，第一組自動生效。Kconfig 的設定沒設的 `CONFIG_` 一律當作未定義，和 Kbuild 一樣。
+專案檔裡的每個建置組態（Debug、Release、各個 target）會成為一組設定，第一組自動生效。Kconfig 的設定沒設的 `CONFIG_` 一律當作未定義，和 Kbuild 一樣；Linux 的設定寫明了架構，其他架構的資料夾和 `tools/`、`scripts/` 仍會被索引，但同一個名字可能指那裡或指 build 會編譯的東西時，一律指後者。任何專案都可以在 `.norn/config.json` 用 `"notBuilt": ["vendor/other-board"]` 對自己的資料夾這樣設定。
 
 完全找不到建置設定時，Norn 仍會盡量判斷：原始碼自己定義的巨集照樣生效；判斷不出來的分支兩邊都保留，相關的呼叫標示為不確定。
 

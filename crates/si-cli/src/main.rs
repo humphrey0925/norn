@@ -257,7 +257,7 @@ fn index(root: &Path, out: &Path, stores: &str, stride: usize, options: &si_core
     let facts_bytes: usize = facts.iter().map(FileFacts::heap_bytes).sum();
 
     let t = Instant::now();
-    let options = &si_core::link::Options { readings: si_core::readings_of(&conditions), ..options.clone() };
+    let options = &si_core::link::Options { readings: si_core::readings_of(&conditions), not_built: conditions.not_built().to_vec(), ..options.clone() };
     let (g, ls) = si_core::link::link_with(&facts, options);
     let link_ms = ms(t);
 

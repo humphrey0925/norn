@@ -142,7 +142,7 @@ impl Session {
         let defines = Packed::all(defines);
         let facts = crate::extract_all_reusing(root, &files, &sets, reuse);
         let mut cache = Cache::default();
-        let options = Options { readings: crate::readings_of(&conditions), ..options };
+        let options = Options { readings: crate::readings_of(&conditions), not_built: conditions.not_built().to_vec(), ..options };
         let (graph, stats) = link_cached(&facts, &options, &mut cache);
         let stamps = files.par_iter().map(|p| stamp(p)).collect();
         Session {
@@ -582,7 +582,7 @@ impl Session {
             facts,
             sets,
             cache,
-            options: Options { readings: crate::readings_of(&conditions), ..options.clone() },
+            options: Options { readings: crate::readings_of(&conditions), not_built: conditions.not_built().to_vec(), ..options.clone() },
             store: None,
             stamps,
             scope: Scope::load(root),
@@ -797,6 +797,7 @@ impl Session {
         // this runs, and the link would make the new one beside it.
         self.graph = Graph::default();
         self.options.readings = crate::readings_of(&self.conditions);
+        self.options.not_built = self.conditions.not_built().to_vec();
         (self.graph, self.stats) = link_cached(&self.facts, &self.options, &mut self.cache);
         up.link_ms = ms(t);
         self.graph_unsaved = true;
