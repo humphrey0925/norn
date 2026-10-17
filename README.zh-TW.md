@@ -85,6 +85,7 @@ compilation database（clangd 的最佳狀態，也是「完全知道每個檔�
 
 量測方法、每個專案的完整數字、各工具的版本：見 [docs/benchmarks](docs/benchmarks/README.md)（英文）。
 那裡的每個數字都由 [`bench/compare.py`](bench/compare.py) 產生，沒有任何手打的數字。
+要從零重新量一次（EC2 或任何 Ubuntu 24.04）：見 [bench/ec2](bench/ec2/README.md)。
 
 ## 功能
 
@@ -130,7 +131,8 @@ configuration provider，而不是和它重複。完整功能列表見[擴充套
 ```
 
 Norn 用 Rust 寫成。每個檔案先依 build 的設定和原始碼自己的定義判斷前置處理器條件，再用
-tree-sitter 解析一次。每個檔案的結果依內容雜湊快取；把它們連結成呼叫圖只要幾毫秒，所以存檔後
+tree-sitter 解析一次。每個檔案的結果依內容雜湊快取，開啟的資料夾若在已建過索引的資料夾裡面或外面，讀法相同的檔案
+直接沿用那份結果；把它們連結成呼叫圖只要幾毫秒，所以存檔後
 索引幾乎立刻更新。呼叫圖以壓縮稀疏列（CSR）儲存，查一個函式的呼叫者遠不到一微秒。
 
 ## 從原始碼建置

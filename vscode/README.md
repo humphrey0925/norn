@@ -14,7 +14,7 @@ working compilation database.
 
 - **Fast.** The whole Linux kernel indexes in about a minute on a desktop
   PC; saving a file updates the index in tens of milliseconds. The index is cached, so reopening a
-  workspace is instant.
+  workspace is instant, and opening a folder inside or around one already indexed reuses that index.
 - **Accurate.** Checked call by call against clang on public projects: on
   Redis, 99.3% of calls found with 99.8% precision; on STM32F4 HAL, 96.5%
   found with 100% precision.

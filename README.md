@@ -92,7 +92,8 @@ index fastest because they record names and places, not a call graph.
 
 How the numbers are made, every figure for every project, and the versions of
 the tools: [docs/benchmarks](docs/benchmarks/README.md). Every number there is
-produced by [`bench/compare.py`](bench/compare.py); none is typed in.
+produced by [`bench/compare.py`](bench/compare.py); none is typed in. To measure it
+again from nothing, on EC2 or any Ubuntu 24.04: [bench/ec2](bench/ec2/README.md).
 
 ## Features
 
@@ -144,8 +145,9 @@ sources ─► tree-sitter parse ─► facts per file ─► link ─► call g
 Norn is written in Rust. Each file is parsed once with tree-sitter after its
 preprocessor conditions are worked out, from the build's configuration and from
 what the sources themselves define. The facts of each file are cached by content
-hash; linking them into a call graph takes milliseconds, so saving a file
-updates the index almost at once. The graph is kept in compressed sparse rows,
+hash, and a folder opened inside or around one already indexed takes those
+facts for every file it reads the same way; linking them into a call graph takes
+milliseconds, so saving a file updates the index almost at once. The graph is kept in compressed sparse rows,
 which answer a callers query in well under a microsecond.
 
 ## Building from source

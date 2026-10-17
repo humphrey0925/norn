@@ -228,7 +228,8 @@ def main():
              *(["- Norn, clangd and codebase-memory-mcp run on Windows (NTFS); ctags, cscope and GNU Global, which",
                 "  are Unix tools, run in WSL 2 on a copy of each project on its ext4 file system."] if on_windows else
                ["- Every tool runs on the same Linux machine, on an ext4 file system."]),
-             "- Each tool indexes each project three times; the median is reported.", "",
+             "- Each tool indexes each project three times; the median is reported.",
+             "- To measure it all again from nothing, on EC2 or any Ubuntu 24.04: [bench/ec2](../../bench/ec2/README.md).", "",
              f"Machine: {m.get('cpu', '?')}, {m.get('physical_cores', '?')} cores, "
              f"{(m.get('ram_bytes') or 0) / 2**30:.0f} GB RAM, {m.get('os', '?')}. "
              f"Measured {runs[0][1].get('date', '?')[:10]}.", ""]

@@ -35,6 +35,7 @@ Norn against other ways of indexing C, on public projects. Every number here is 
 - Norn, clangd and codebase-memory-mcp run on Windows (NTFS); ctags, cscope and GNU Global, which
   are Unix tools, run in WSL 2 on a copy of each project on its ext4 file system.
 - Each tool indexes each project three times; the median is reported.
+- To measure it all again from nothing, on EC2 or any Ubuntu 24.04: [bench/ec2](../../bench/ec2/README.md).
 
 Machine: Intel64 Family 6 Model 183 Stepping 1, GenuineIntel, 20 cores, 64 GB RAM, Windows-10-10.0.26200-SP0. Measured 2026-10-17.
 
