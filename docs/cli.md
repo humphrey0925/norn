@@ -290,7 +290,7 @@ With none, it follows the tree's own build files: Arm DS-5 / Eclipse CDT
 `compile_flags.txt`, `platformio.ini`, `c_cpp_properties.json`, Makefiles
 and `CMakeLists.txt`, and a Kconfig build's `include/generated/autoconf.h`
 or `.config`. What can be written there is described in the
-[user guide](norn-guide.md#10-編譯條件) and in
+[user guide](norn-guide.md#10-compile-conditions) and in
 [`cond.rs`](../crates/si-core/src/cond.rs).
 
 ## Exit status and errors

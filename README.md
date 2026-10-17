@@ -131,7 +131,7 @@ provider instead of competing with it. The full list is on the
 2. Open a folder with C sources.
 
 That is all. The server is included for Windows, Linux and macOS, on x64 and
-Arm64. The [user guide](docs/norn-guide.md) (Traditional Chinese) covers every
+Arm64. The [user guide](docs/norn-guide.md) covers every
 view and setting.
 
 Without VS Code, the same indexer is a command of its own, `norn`, for the

@@ -262,7 +262,7 @@ norn bench-incr <ROOT> [--n <N>] [--seed <S>]
 Keil、IAR、Visual Studio、`compile_commands.json`、`compile_flags.txt`、`platformio.ini`、
 `c_cpp_properties.json`、Makefile 和 `CMakeLists.txt`，以及 Kconfig build 的
 `include/generated/autoconf.h` 或 `.config`。可以寫哪些設定，見
-[使用指南](norn-guide.md#10-編譯條件)和 [`cond.rs`](../crates/si-core/src/cond.rs)。
+[使用指南](norn-guide.zh-TW.md#10-編譯條件)和 [`cond.rs`](../crates/si-core/src/cond.rs)。
 
 ## 結束碼與錯誤
 
