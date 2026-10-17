@@ -43,7 +43,14 @@ WSL_TOOLS = ("ctags", "cscope", "gtags")
 ALL_TOOLS = ("si", "cbm", "clangd", "clangd-db", *WSL_TOOLS)
 SKIP_DIRS = (".git", ".si", ".norn")
 # Where the Windows tools run, as the results say it.
-HOST = "Windows, NTFS" if os.name == "nt" else "Linux (WSL2), ext4"
+def _host():
+    if os.name == "nt":
+        return "Windows, NTFS"
+    wsl = "microsoft" in Path("/proc/version").read_text(errors="replace").lower() if Path("/proc/version").exists() else False
+    return "Linux (WSL2), ext4" if wsl else "Linux"
+
+
+HOST = _host()
 EDIT = b"\n/* bench edit */\n"
 
 
@@ -70,6 +77,9 @@ def locate(rel):
 
 def wsl_path(path):
     p = Path(path).resolve()
+    # (On Linux itself, a path is already the one the Unix tools take.)
+    if os.name != "nt":
+        return p.as_posix()
     return f"/mnt/{p.drive[0].lower()}{p.as_posix()[2:]}"
 
 
@@ -506,6 +516,11 @@ def clangd_accuracy(ctx, client, deadline):
 # ---------------------------------------------------------------- ctags, cscope, global (WSL)
 
 def wsl(ctx, *cmd, timeout=None):
+    """A command for the Unix tools: in WSL on Windows, directly on Linux
+    (both from the home directory, which `--wsl-dir` is relative to)."""
+    if os.name != "nt":
+        return subprocess.run(list(cmd), capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              stdin=subprocess.DEVNULL, timeout=timeout, cwd=Path.home())
     return subprocess.run(["wsl", "-d", ctx.args.wsl_distro, "--cd", "~", "--", *cmd], capture_output=True, text=True,
                           encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, timeout=timeout)
 
