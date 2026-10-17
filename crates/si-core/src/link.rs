@@ -2263,6 +2263,56 @@ void e() { HOLD(4); }
     }
 
     #[test]
+    fn a_macro_body_makes_objects_and_assigns_to_them() {
+        let g = graph(&[
+            ("t.h", "namespace testing {
+class Message {
+ public:
+  Message();
+};
+class AssertHelper {
+ public:
+  AssertHelper(int type, const char* message);
+  void operator=(const Message& message) const;
+};
+}
+struct SourceLocation {
+  SourceLocation(const char* func) {}
+};
+inline void Log(SourceLocation&& loc, int x) {}
+#define FAIL_AT(t) ::testing::AssertHelper(t, \"m\") \\
+    = ::testing::Message()
+#define LOG(x) Log(SourceLocation{__func__}, x)
+"),
+            ("t.cc", "#include \"t.h\"
+namespace testing {
+Message::Message() {}
+AssertHelper::AssertHelper(int type, const char* message) {}
+void AssertHelper::operator=(const Message& message) const {}
+}
+void f() { FAIL_AT(1); }
+void g() { LOG(2); }
+"),
+        ]);
+        let q = crate::graph::Qualifier::new(&g);
+        let callers = |callee: &str| -> Vec<String> {
+            let mut v: Vec<String> = g.syms.iter().enumerate()
+                .filter(|(i, s)| s.kind == kind::FUNCTION && s.flags & flag::DECL == 0 && q.name(&g, *i as u32) == callee)
+                .flat_map(|(i, _)| crate::callers_through_macros(&g, i as u32))
+                .filter(|c| g.syms[c.caller as usize].kind == kind::FUNCTION && !c.ambiguous)
+                .map(|c| g.sym_name(c.caller).to_string())
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        assert_eq!(callers("AssertHelper::AssertHelper"), ["f"]);
+        assert_eq!(callers("AssertHelper::operator="), ["f"]);
+        assert_eq!(callers("Message::Message"), ["f"]);
+        assert_eq!(callers("SourceLocation::SourceLocation"), ["g"]);
+    }
+
+    #[test]
     fn an_object_the_parser_takes_for_a_function_is_made_and_typed() {
         let g = graph(&[(
             "u.cc",

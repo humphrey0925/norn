@@ -1303,11 +1303,32 @@ impl<'a> Walk<'a> {
                             }
                             // `UniqueLock<T> name (...)` in the body (bitcoin's
                             // `LOCK`): an object of that class made, if it is one.
-                            if self.declares_object_after(t.end as usize) {
+                            // `SourceLocation{__func__}` (bitcoin's `LogPrintLevel_`)
+                            // too: one made.
+                            let braced = !t.member && self.next_byte(t.end as usize) == Some(b'{') && !self.tag_before(t.start as usize);
+                            if self.declares_object_after(t.end as usize) || braced {
                                 let name = self.intern(self.tok_text(t));
                                 self.out.refs.push(Ref { name, line: t.line, scope, kind: refkind::CALL });
                                 let r = self.out.refs.len() as u32 - 1;
                                 self.out.cxx_mut().constructs.push(r);
+                            }
+                            // `::testing::internal::AssertHelper (...) = ::testing::Message ()`
+                            // (gtest's `GTEST_MESSAGE_AT_`): the class's `operator=`,
+                            // if it is a class, given what is made on the right.
+                            if let Some(right) = (!t.member).then(|| self.assigned_after(t.end as usize, m.end as usize)).flatten() {
+                                let ty = self.intern(self.tok_text(t));
+                                let left = self.push_hint(root::TYPE, ty, &[]);
+                                let right = match right {
+                                    Some(r) => {
+                                        let r = self.intern(r);
+                                        self.push_hint(root::TYPE, r, &[])
+                                    }
+                                    None => NONE,
+                                };
+                                let name = self.intern_str("operator=");
+                                self.out.refs.push(Ref { name, line: t.line, scope, kind: refkind::CALL });
+                                let at = self.out.refs.len() as u32 - 1;
+                                self.out.cxx_mut().operators.push((at, left, right, true));
                             }
                         }
                     }
@@ -1453,6 +1474,79 @@ impl<'a> Walk<'a> {
             return false;
         }
         matches!(s.get(skip(i)), Some(b'(' | b'{' | b';'))
+    }
+
+    /// Past spaces and line continuations from `pos` in the text.
+    fn skip_space(&self, mut i: usize) -> usize {
+        let s = self.orig;
+        while i < s.len() && (s[i].is_ascii_whitespace() || (s[i] == b'\\' && s.get(i + 1).is_some_and(|b| *b == b'\n' || *b == b'\r'))) {
+            i += 1;
+        }
+        i
+    }
+
+    /// The first byte of the text at `pos` past spaces.
+    fn next_byte(&self, pos: usize) -> Option<u8> {
+        self.orig.get(self.skip_space(pos)).copied()
+    }
+
+    /// Is the word before `pos` one that makes a type of the name after it
+    /// (`struct X {`)?
+    fn tag_before(&self, pos: usize) -> bool {
+        let s = self.orig;
+        let mut i = pos;
+        while i > 0 && matches!(s[i - 1], b' ' | b'\t' | b'\\' | b'\n' | b'\r') {
+            i -= 1;
+        }
+        let end = i;
+        while i > 0 && (s[i - 1].is_ascii_alphanumeric() || s[i - 1] == b'_') {
+            i -= 1;
+        }
+        matches!(&s[i..end], b"struct" | b"class" | b"union" | b"enum" | b"namespace" | b"typename")
+    }
+
+    /// C++, in a macro body ending at `end`: is the name before `pos` made
+    /// and then assigned to, `T (...) = ...`? Then the class the right side
+    /// makes, if it does (`= ::testing::Message ()`).
+    fn assigned_after(&self, pos: usize, end: usize) -> Option<Option<&'a [u8]>> {
+        let s = self.orig;
+        let mut i = self.skip_space(pos);
+        if s.get(i) != Some(&b'(') {
+            return None;
+        }
+        let mut depth = 0;
+        while i < end {
+            depth += (s[i] == b'(') as i32 - (s[i] == b')') as i32;
+            i += 1;
+            if depth == 0 {
+                break;
+            }
+        }
+        i = self.skip_space(i);
+        if depth != 0 || i + 1 >= end || s[i] != b'=' || s[i + 1] == b'=' {
+            return None;
+        }
+        // The right side: a name, through scopes, then `(` or `{`.
+        let mut i = self.skip_space(i + 1);
+        let mut last = None;
+        loop {
+            if s.get(i..i + 2) == Some(b"::") {
+                i = self.skip_space(i + 2);
+            }
+            let a = i;
+            while i < end && (s[i].is_ascii_alphanumeric() || s[i] == b'_') {
+                i += 1;
+            }
+            if a == i || s[a].is_ascii_digit() {
+                break;
+            }
+            last = Some(&s[a..i]);
+            i = self.skip_space(i);
+            if s.get(i..i + 2) != Some(b"::") {
+                break;
+            }
+        }
+        Some(last.filter(|_| matches!(s.get(i), Some(b'(' | b'{'))))
     }
 
     /// C++: the name before `::` before `pos` in the text (`B` of `A::B::f`,

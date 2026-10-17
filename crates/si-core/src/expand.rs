@@ -958,11 +958,21 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
             // named with its classes.
             let mut parts = vec![name()];
             let mut j = i;
-            while j >= 2 && toks[j - 1].is("::") && toks[j - 2].k == K::Ident {
+            while j >= 2 && toks[j - 1].is("::") && toks[j - 2].k == K::Ident && !is_keyword(toks[j - 2].text.as_bytes()) {
                 parts.push(toks[j - 2].text.to_string());
                 j -= 2;
             }
             parts.reverse();
+            // What comes before a name defined is a type, or nothing: after
+            // `::` of its own, `=`, `else` or `return` it is a call
+            // (gtest's `else ::testing::internal::AssertHelper (...)`).
+            let before = j.checked_sub(1).map(|k| &toks[k]);
+            let declared = before.is_none_or(|b| {
+                (decl_prev(b) && !matches!(&*b.text, "throw" | "new" | "delete" | "co_return")) || [";", "}", "{", ")", "&", "&&", ">"].iter().any(|s| b.is(s))
+            });
+            if !declared {
+                continue;
+            }
             let mut depth = 0;
             let close = toks[i + 1..].iter().position(|x| {
                 depth += x.is("(") as i32 - x.is(")") as i32;
@@ -1898,6 +1908,23 @@ mod tests {
             ("case y: return #x;", false),
         ] {
             assert_eq!(hides_names(body.as_bytes(), &p), want, "{body}");
+        }
+    }
+
+    #[test]
+    fn a_qualified_name_after_else_or_an_operator_is_called_not_defined() {
+        let s = Site { name: 0, args: NONE, line: 1, scope: 0, def: NONE, flags: 0 };
+        let decls = |src: &str| -> Vec<String> {
+            recognise(&tokenize(src.as_bytes(), Origin::Body), &s, "M", true).decls.into_iter().map(|d| d.0).collect()
+        };
+        assert_eq!(decls("void Suite_Name_Test::TestBody ()"), ["Suite_Name_Test::TestBody"]);
+        assert_eq!(decls("Suite_Name_Test::TestBody () {"), ["Suite_Name_Test::TestBody"]);
+        for src in [
+            "if (ok) ; else ::testing::internal::AssertHelper (1, \"m\") = ::testing::Message ()",
+            "x = ::testing::Message ()",
+            "return internal::Make (1)",
+        ] {
+            assert!(decls(src).is_empty(), "{src}: {:?}", decls(src));
         }
     }
 
