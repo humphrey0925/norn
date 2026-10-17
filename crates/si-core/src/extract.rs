@@ -1054,9 +1054,16 @@ impl<'a> Walk<'a> {
             let k = n.kind_id();
             if self.cpp && k == ids.subscript_expression {
                 // `v[i]`: an element.
-                let (kind, root, prefix) = self.element_of(n.child_by_field_id(ids.f_argument)?)?;
-                path.extend(prefix);
-                return Some((kind, root));
+                let of = n.child_by_field_id(ids.f_argument)?;
+                if let Some((kind, root, prefix)) = self.element_of(of) {
+                    path.extend(prefix);
+                    return Some((kind, root));
+                }
+                // `val[0]` of a class with an `operator[]`: what that returns
+                // (of an object whose type is known).
+                let r = self.object_root(of, path).filter(|r| r.0 == root::TYPE)?;
+                path.push(self.intern_str("[]"));
+                return Some(r);
             }
             if k == ids.parenthesized_expression {
                 n = n.named_child(0)?;
@@ -1989,11 +1996,13 @@ impl<'a> Walk<'a> {
         let Some(list) = d.child_by_field_id(ids.f_parameters) else { return false };
         let mut c = list.walk();
         let params: Vec<Node<'a>> = list.named_children(&mut c).filter(|p| p.kind() != "comment").collect();
+        // (`CPubKey pubKey (vSolutions[0]);`: an element taken for an array.)
+        let element = |p: &Node<'a>| p.named_child_count() == 2 && p.child_by_field_id(ids.f_declarator.get()).is_some_and(|d| d.kind() == "abstract_array_declarator" && d.named_child_count() == 1);
         !params.is_empty()
             && params.iter().all(|p| {
                 let ty = p.child_by_field_id(ids.f_type);
                 p.kind_id() == ids.parameter_declaration
-                    && p.named_child_count() == 1
+                    && (p.named_child_count() == 1 || element(p))
                     && ty.is_some_and(|t| t.kind_id() == ids.type_identifier || t.kind_id() == ids.qualified_identifier)
             })
     }

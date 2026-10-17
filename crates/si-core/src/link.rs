@@ -412,9 +412,14 @@ impl Types<'_> {
         let found = match hint.root_kind {
             root::TYPE => self.follow(name, path, fi, g, closure),
             kind_of_root => {
-                // C++: `T ()`, a class made, is of that class.
+                // C++: `T ()`, a class made, is of that class; unless a
+                // function of no class has the name, which hides the class
+                // (bitcoin's `Params ()`, beside `Consensus::Params`).
                 if kind_of_root == root::FUNC && self.cpp.types.contains(&name) {
-                    return self.follow(name, path, fi, g, closure);
+                    in_sight(g.syms_named(name), &g.syms, own.clone(), closure, &[], |s| s.kind == kind::FUNCTION, scratch);
+                    if !scratch.iter().any(|s| self.cpp.class(*s) == NONE && self.of_symbol.contains_key(s)) {
+                        return self.follow(name, path, fi, g, closure);
+                    }
                 }
                 // The variable or function the name means here, then its type.
                 let wanted = if kind_of_root == root::VAR { kind::GLOBAL } else { kind::FUNCTION };
@@ -464,7 +469,15 @@ impl Types<'_> {
         while i < path.len() {
             let m = self.remap[fi][path[i] as usize];
             if Some(m) == element {
-                // Of what is no member (`p[i]` of a pointer): of its type.
+                // Of a class with an `operator[]`, what that returns; of
+                // what is no member (`p[i]` of a pointer), of its type.
+                // (One returning a `char` or a library type: not known. What
+                // it returns is said where it is defined, too.)
+                if let Some((name, op)) = g.name_id("operator[]").and_then(|name| Some((name, self.class_member(t, name, fi, g, closure)?))) {
+                    let class = self.cpp.class(op);
+                    let returns = |s: &u32| (*s == op || self.cpp.class(*s) == class).then(|| self.of_symbol.get(s)).flatten();
+                    t = *g.syms_named(name).iter().find_map(returns)?;
+                }
                 i += 1;
                 continue;
             }
@@ -2682,6 +2695,42 @@ void d() { Elsewhere(\"e\"); }
     }
 
     #[test]
+    fn what_operator_subscript_or_a_function_hiding_a_class_returns_is_typed() {
+        let g = graph(&[(
+            "u.cc",
+            "class UniValue {
+ public:
+  const UniValue& operator[](unsigned i) const;
+  const char* get_str() const { return \"\"; }
+};
+class Slice {
+ public:
+  char operator[](unsigned i) const { return 0; }
+  int size() const { return 0; }
+};
+struct Other { const char* get_str() const { return \"\"; } int size() const { return 1; } };
+namespace Consensus { struct Params { int Height() const { return 0; } }; }
+class CChainParams { public: int Height() const { return 1; } };
+const CChainParams& Params();
+const UniValue& UniValue::operator[](unsigned i) const { return *this; }
+void f(const Slice& s) { UniValue val; val[0].get_str(); s[0].size(); }
+int g() { return Params().Height(); }
+",
+        )]);
+        let q = crate::graph::Qualifier::new(&g);
+        let certain = |caller: &str| -> Vec<String> {
+            let mut v: Vec<String> = g.find(caller).iter().flat_map(|&s| g.refs_from(s)).filter(|e| e.kind() == refkind::CALL && !e.ambiguous()).map(|e| q.name(&g, e.other).into_owned()).collect();
+            v.sort();
+            v
+        };
+        // `val[0]` is what UniValue's `operator[]` returns; `s[0]`, a char,
+        // is of no class.
+        assert_eq!(certain("f"), ["Slice::operator[]", "UniValue::get_str", "UniValue::operator[]"]);
+        // `Params ()` calls the function, not a class of that name.
+        assert_eq!(certain("g"), ["CChainParams::Height", "Params"]);
+    }
+
+    #[test]
     fn an_object_the_parser_takes_for_a_function_is_made_and_typed() {
         let g = graph(&[(
             "u.cc",
@@ -2694,6 +2743,7 @@ void d() { Elsewhere(\"e\"); }
 struct Other { void pushKV(int k) {} };
 void f() { UniValue result(UniValue::VOBJ); result.pushKV(1); }
 void g(UniValue::VType n) { UniValue r(n); r.pushKV(2); }
+void k(const UniValue::VType* types) { UniValue e(types[0]); e.pushKV(3); }
 void h() { UniValue proto(); UniValue other(int x); }
 ",
         )]);
@@ -2703,7 +2753,7 @@ void h() { UniValue proto(); UniValue other(int x); }
             v.sort();
             v
         };
-        for f in ["f", "g"] {
+        for f in ["f", "g", "k"] {
             assert_eq!(certain(f), ["UniValue::UniValue", "UniValue::pushKV"], "{f}");
         }
         // With no arguments, or a parameter named, it declares a function.
