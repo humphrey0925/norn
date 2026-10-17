@@ -2941,6 +2941,23 @@ mod test_framework_tests {
     }
 
     #[test]
+    fn a_macro_defining_a_function_in_a_namespace_is_as_one_at_file_scope() {
+        // leveldb's first `TEST (Coding, Fixed32)` after `namespace leveldb {`
+        // was a function named TEST.
+        let files = [
+            ("t.h", "#define TEST(a, b) void a##_##b##_Test()\n"),
+            ("t.cc", "#include \"t.h\"\nnamespace leveldb {\nTEST(Coding, Fixed32) {\n}\nTEST(Coding, Fixed64) {\n}\n}\n"),
+        ];
+        let sets = MacroSets::from_defines(files.iter().flat_map(|(_, src)| crate::mask::defines(src.as_bytes(), &crate::cond::Conditions::default())));
+        let mut ex = Extractor::new();
+        let facts: Vec<FileFacts> = files.iter().map(|(path, src)| ex.extract(path, src.as_bytes(), &sets)).collect();
+        let g = link(&facts).0;
+        assert!(g.find("TEST").iter().all(|&s| g.syms[s as usize].kind == kind::MACRO));
+        assert_eq!(g.find("Coding_Fixed32_Test").len(), 1);
+        assert_eq!(g.find("Coding_Fixed64_Test").len(), 1);
+    }
+
+    #[test]
     fn a_test_macro_the_corpus_defines_is_expanded_not_guessed() {
         // A macro of that name of the corpus's own: what it makes is read
         // from its expansion, and nothing is made of the name.

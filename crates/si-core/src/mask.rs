@@ -1294,12 +1294,63 @@ struct Nest {
     /// Open braces, each with the paren depth outside it.
     braces: Vec<(Brace, u32)>,
     parens: u32,
+    /// C++: how many of the outermost braces are namespaces' (`namespace
+    /// leveldb {`), in which what is written is at file scope all the same.
+    namespaces: usize,
 }
 
 impl Nest {
     fn unparseable_here(&self) -> bool {
         self.parens > 0 || self.braces.last().is_some_and(|b| b.0 == Brace::Init)
     }
+
+    /// At file scope: outside every bracket, or a namespace's alone.
+    fn at_top(&self) -> bool {
+        self.braces.len() <= self.namespaces && self.parens == 0
+    }
+}
+
+/// Does the `{` at `pos` open a namespace's body (`namespace a {`,
+/// `inline namespace v1 {`, `namespace a::b {`, `namespace {`), or C
+/// linkage's?
+fn opens_namespace(s: &[u8], pos: usize) -> bool {
+    let back = |mut i: usize| {
+        while i > 0 && s[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        i
+    };
+    let word = |e: usize| {
+        let mut a = e;
+        while a > 0 && is_ident(s[a - 1]) {
+            a -= 1;
+        }
+        a
+    };
+    let mut e = back(pos);
+    // (So does `extern "C" {`.)
+    for lang in [&b"\"C\""[..], b"\"C++\""] {
+        if s[..e].ends_with(lang) {
+            let e = back(e - lang.len());
+            return &s[word(e)..e] == b"extern";
+        }
+    }
+    for _ in 0..8 {
+        let a = word(e);
+        if a == e {
+            return false;
+        }
+        if &s[a..e] == b"namespace" {
+            return true;
+        }
+        e = back(a);
+        if e >= 2 && &s[e - 2..e] == b"::" {
+            e = back(e - 2);
+        } else if &s[word(e)..e] != b"namespace" {
+            return false;
+        }
+    }
+    false
 }
 
 /// `buf` is empty when only the report is wanted.
@@ -1539,7 +1590,11 @@ impl<'a> Lexer<'a> {
                     if self.nest.braces.is_empty() {
                         self.block = (!init).then_some(self.c.i);
                     }
+                    let namespace = self.all_blocks && self.nest.at_top() && opens_namespace(self.c.s, self.c.i);
                     self.nest.braces.push((if init { Brace::Init } else { Brace::Block }, self.nest.parens));
+                    if namespace {
+                        self.nest.namespaces = self.nest.braces.len();
+                    }
                     if self.all_blocks {
                         self.open_blocks.push((!init).then_some(self.c.i));
                     }
@@ -1555,6 +1610,7 @@ impl<'a> Lexer<'a> {
                         self.nest = Nest::default();
                     } else if let Some((_, parens)) = self.nest.braces.pop() {
                         self.nest.parens = parens;
+                        self.nest.namespaces = self.nest.namespaces.min(self.nest.braces.len());
                     }
                     self.c.i += 1;
                     if let Some(start) = closed {
@@ -1795,8 +1851,7 @@ impl<'a> Lexer<'a> {
         // parser would take it for the start of whatever follows; its
         // meaning is in its expansion, which the link reads.
         let alone = args_end != 0
-            && self.nest.braces.is_empty()
-            && self.nest.parens == 0
+            && self.nest.at_top()
             && match self.c.peek(0) {
                 b';' | 0 => true,
                 b'(' | b'{' | b'=' | b'[' | b',' | b')' => false,
@@ -1860,7 +1915,7 @@ impl<'a> Lexer<'a> {
                 (self.c.i, self.c.line) = at;
             }
         }
-        let top = self.nest.braces.is_empty() && self.nest.parens == 0;
+        let top = self.nest.at_top();
         // `const bfd_target MY (vec) = { ... }`: the parser cannot make a
         // declaration of this, so the initializer is taken here.
         let (mut init, mut init_array) = ((0, 0), false);
