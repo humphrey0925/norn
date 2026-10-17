@@ -38,7 +38,7 @@ bench/ec2/run.sh        # the comparison; results in ~/bench/results
 | Project | Source | Built with |
 |---|---|---|
 | Redis | redis/redis `fcc9b53` | `make` |
-| git | git/git `777489f` | `make NO_CURL=1 NO_OPENSSL=1 NO_GETTEXT=1` |
+| git | git/git `777489f` | `make NO_CURL=1 NO_OPENSSL=1 NO_GETTEXT=1 NO_TCLTK=1` |
 | binutils | sourceware binutils-gdb `ced7bfc`, without gdb | `configure` as in `corpora.sh`, `make` |
 | STM32F4 HAL | ST's stm32f4xx-hal-driver `1f6451c` and cmsis-device-f4 `9192c7b`, Arm's CMSIS_5 `55b1983`, laid out as STM32CubeMX does | clang for the Cortex-M4 (STM32F407) |
 | nrfx | Nordic's nrfx `d1f2c35` for an nRF52840, Arm's CMSIS_5 | clang for the Cortex-M4 |

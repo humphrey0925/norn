@@ -192,6 +192,8 @@ def main():
         lambda d, t: get(d, t, "index", "wall_s"), short_secs, log=True, best_high=False), encoding="utf-8")
 
     m = runs[0][1].get("machine", {})
+    # (Where Norn ran: the Windows machine, or Linux, as on EC2.)
+    on_windows = any(str(d["tools"].get("si", {}).get("platform", "")).startswith("Windows") for _, d in runs)
     lines = ["# Benchmarks", "",
              "Norn against other ways of indexing C, on public projects. Every number here is produced by",
              "`bench/compare.py` and turned into this page by `bench/chart.py`; nothing is typed in.", "",
@@ -210,9 +212,12 @@ def main():
              "  without a working `compile_commands.json` gives it. With a real build's database it would be",
              "  slower to index and more accurate.",
              "- **clangd + build database** is clangd at its best: given each project's own `compile_commands.json`",
-             "  (the one its ground truth was made from), on the tree that build was made in. It runs in WSL 2",
-             "  (Linux, clangd 20) because those builds are Linux builds. It is the reference for what a",
-             "  compiler-based index finds when it is told exactly how every file is compiled.",
+             *(["  (the one its ground truth was made from), on the tree that build was made in. It runs in WSL 2",
+                "  (Linux, clangd 20) because those builds are Linux builds. It is the reference for what a",
+                "  compiler-based index finds when it is told exactly how every file is compiled."] if on_windows else
+               ["  (the one its ground truth was made from), on the tree that build was made in. It is the",
+                "  reference for what a compiler-based index finds when it is told exactly how every file is",
+                "  compiled."]),
              "- clangd's accuracy is measured on a sample of the functions clang saw (callers and callees of each",
              "  through its call hierarchy); the other tools' on every call.",
              "- ctags records definitions only, and GNU Global references to a name rather than calls from a",
@@ -220,8 +225,9 @@ def main():
              "- Norn marks a call it cannot be sure of (under an `#if` the configuration does not settle) as",
              "  uncertain. *Calls found* counts every call a tool reports; *of them certain* counts only the",
              "  ones it reports as certain, and *precision* is measured on those. The other tools mark none.",
-             "- Norn, clangd and codebase-memory-mcp run on Windows (NTFS); ctags, cscope and GNU Global, which",
-             "  are Unix tools, run in WSL 2 on a copy of each project on its ext4 file system.",
+             *(["- Norn, clangd and codebase-memory-mcp run on Windows (NTFS); ctags, cscope and GNU Global, which",
+                "  are Unix tools, run in WSL 2 on a copy of each project on its ext4 file system."] if on_windows else
+               ["- Every tool runs on the same Linux machine, on an ext4 file system."]),
              "- Each tool indexes each project three times; the median is reported.", "",
              f"Machine: {m.get('cpu', '?')}, {m.get('physical_cores', '?')} cores, "
              f"{(m.get('ram_bytes') or 0) / 2**30:.0f} GB RAM, {m.get('os', '?')}. "

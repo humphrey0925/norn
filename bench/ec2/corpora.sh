@@ -7,6 +7,7 @@
 # and the ground truth in $REPO/out/gt. Ubuntu 24.04 (bench/ec2/setup.sh).
 #   bench/ec2/corpora.sh [name...]     (default: all five)
 set -euo pipefail
+trap 'echo "failed (exit $?) at line $LINENO; the build logs are in $W/build" >&2' ERR
 REPO=${REPO:-$(cd "$(dirname "$0")/../.." && pwd)}
 W=${W:-$HOME/bench}
 GT=$REPO/out/gt
@@ -53,7 +54,7 @@ git_() {
   fetch https://github.com/git/git 777489f9e09c8d0dd6b12f9d90de6376330577a2 "$W/src/git"
   release "$W/src/git" "$W/corpus/git-c"
   rm -rf "$W/build/git" && cp -a "$W/corpus/git-c" "$W/build/git"
-  (cd "$W/build/git" && bear -- make -j"$J" NO_CURL=1 NO_OPENSSL=1 NO_GETTEXT=1 > ../git.log 2>&1)
+  (cd "$W/build/git" && bear -- make -j"$J" NO_CURL=1 NO_OPENSSL=1 NO_GETTEXT=1 NO_TCLTK=1 > ../git.log 2>&1)
   truth "$W/build/git" "$W/build/git" truth-git.json
 }
 
