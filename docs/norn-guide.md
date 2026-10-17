@@ -401,7 +401,7 @@ Norn.
 If you did not allow it, add to the workspace's `settings.json`:
 
 ```json
-"C_Cpp.default.configurationProvider": "humphrey0925.norn"
+"C_Cpp.default.configurationProvider": "humphrey0925.norn-c"
 ```
 
 The include paths are those of the build configuration and every indexed

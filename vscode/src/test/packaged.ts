@@ -11,7 +11,7 @@ import * as vscode from "vscode";
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export async function run(): Promise<void> {
-  const ext = vscode.extensions.all.find((e) => e.packageJSON.name === "norn")!;
+  const ext = vscode.extensions.all.find((e) => e.packageJSON.name === "norn-c")!;
   const own = ext.extensionPath.toLowerCase();
   // Every path joined from a URI, as the views make theirs.
   const reached = new Set<string>();

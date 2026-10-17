@@ -1,249 +1,258 @@
-# Norn 變更紀錄
+# Changelog
+
+## 0.23.1
+
+**On the Visual Studio Marketplace**
+
+- The extension's identifier is now `humphrey0925.norn-c`: the Marketplace already has another extension named `norn`, which kept 0.23.0 off it. The name shown, the commands, the settings (`norn.*`) and the `.norn` folder are unchanged. If 0.23.0 was installed from a `.vsix`, Norn says so, so that the old one can be uninstalled and the folder is not indexed twice.
+- The user guide is in English too ([docs/norn-guide.md](docs/norn-guide.md)); the Traditional Chinese one is now [docs/norn-guide.zh-TW.md](docs/norn-guide.zh-TW.md). Both describe the present version.
+- For the C/C++ extension the setting is now `"C_Cpp.default.configurationProvider": "humphrey0925.norn-c"`: a folder whose settings name `humphrey0925.norn` needs it changed.
+- The changelog is in English.
 
 ## 0.23.0
 
-**Kconfig 專案免設定、索引跨資料夾沿用、命令列手冊**
+**Kconfig projects with nothing to set, an index reused across folders, a manual for the command line**
 
-- 命令列 `norn` 有了手冊（[docs/cli.md](docs/cli.md)、[繁體中文](docs/cli.zh-TW.md)），`--help` 也說明每個參數；給的資料夾沒有索引、或原始碼樹裡沒有 C 原始檔時，改成說明原因並以 2 結束，不再當掉。
-- 不用設定也會採用 Kconfig build（Linux、U-Boot、Buildroot）留下的設定：樹裡或 build 資料夾（`make O=build`）的 `include/generated/autoconf.h` 或 `.config`；它沒設的 `CONFIG_` 一律當作未定義。
-- 開啟一個資料夾時，若它的子資料夾或上層資料夾已經建過索引，讀法相同的檔案直接沿用那份索引，不再重新解析。
-- **修正**：剛開啟工作區、索引還在讀取時就有請求進來（例如打開標頭檔），索引就緒後的下一個請求會讓伺服器崩潰，VS Code 會連續重啟它直到放棄。
-- **修正**：開啟工作區後游標沒有移動時，Context 會一直顯示「Nothing the index knows here」，要移動游標才會更新。
-- 函式的文件註解和定義之間隔一個空行（GNU 風格）時，懸停也會顯示這段註解。
-- 設定 `NORN_TRACE` 時，伺服器崩潰的訊息也會寫進追蹤檔。
+- The `norn` command line has a manual ([docs/cli.md](docs/cli.md), [Traditional Chinese](docs/cli.zh-TW.md)), and `--help` describes every argument. Given a folder with no index, or a tree with no C sources, it now says so and exits with 2 instead of crashing.
+- With nothing set, the configuration a Kconfig build (Linux, U-Boot, Buildroot, BusyBox) leaves is followed: `include/generated/autoconf.h` or `.config`, in the tree or in a build folder (`make O=build`). Every `CONFIG_` name it does not set is taken as not set.
+- Opening a folder inside or around one already indexed takes that index's facts for every file read the same way, instead of parsing it again.
+- **Fixed**: a request arriving while the saved index was still being read (opening a header, say) made the next request after the index was ready crash the server, and VS Code restarted it until it gave up.
+- **Fixed**: until the cursor moved after a workspace was opened, Context said "Nothing the index knows here".
+- Hover shows a function's documentation comment also when a blank line separates it from the definition (GNU style).
+- With `NORN_TRACE` set, a server crash is written to the trace file too.
 
 ## 0.22.0
 
-**不靠 C/C++ 擴充套件也能完整編輯 C**
+**Editing C in full without the C/C++ extension**
 
-沒有安裝 C/C++ 擴充套件，或把它的 IntelliSense 關掉（`C_Cpp.intelliSenseEngine: disabled`）時，下面這些由 Norn 提供；IntelliSense 開著時交給它，不重複。
+Without the C/C++ extension, or with its IntelliSense turned off (`C_Cpp.intelliSenseEngine: disabled`), Norn provides the following; with IntelliSense on, it leaves them to it.
 
-- 懸停：函式、變數、型別顯示宣告原文和上方的文件註解（定義沒有註解時用標頭檔原型的）；參數和區域變數顯示宣告。
-- 參數提示：打 `(`、`,` 時顯示宣告並標出目前的參數。
-- 自動完成：`.`、`->` 之後列出成員（可沿 `a.b->` 往下、解開 typedef）；目前函式的參數和區域變數；C 關鍵字；`#include` 的路徑。
-- 依名稱的種類上色：巨集、函式、型別、全域變數、參數、區域變數、成員、列舉值；static 和宣告處另有標記。
-- 摺疊：大括號區塊、`#if` 各分支、多行註解、連續的 `#include`。
-- 重新命名：照索引找出同一個東西的所有寫法；static 函式和變數只改自己的檔案，巨集和全域名稱也會改到目前設定關掉的 `#if` 分支裡的寫法。
-- 呼叫時在引數前顯示參數名稱（inlay hint；引數本身就是那個名字時不顯示）。不想看可以關掉 `editor.inlayHints.enabled`。
-- 格式化：有 clang-format 時使用；專案有 `.clang-format` 照它，沒有則用和 C/C++ 擴充套件相同的 Visual Studio 樣式。
+- Hover: functions, variables and types show their declaration as written and the documentation comment above it (the header prototype's when the definition has none); parameters and locals show their declaration.
+- Signature help: on `(` and `,`, the declaration with the current parameter marked.
+- Completion: members after `.` and `->` (down `a.b->`, through typedefs); the parameters and locals of the function; C keywords; `#include` paths.
+- Highlighting by what a name is: macro, function, type, global, parameter, local, member, enumerator; static and declarations marked as well.
+- Folding: braces, each branch of an `#if`, comments of several lines, runs of `#include`.
+- Rename: every spelling of the same thing, from the index; a static function or variable only in its own file, and macros and global names also in `#if` branches the conditions in force switch off.
+- Parameter names before the arguments of a call (inlay hints; not when the argument is already that name). Turn off `editor.inlayHints.enabled` to hide them.
+- Formatting with clang-format when it is installed: the project's `.clang-format`, or else the Visual Studio style the C/C++ extension uses.
 
-**一直都有的**
+**Always there**
 
-- 用到的名字沒有任何讀到的標頭檔宣告時，燈泡提供「Add #include」，寫法沿用專案其他檔案的寫法。
-- `#include` 可以點，F12 開啟對應的檔案；同一個名字在檔案裡的其他用處會反白；Alt+O 切換標頭檔和原始檔（C/C++ 擴充套件沒裝時）。
-- 目前設定不編譯的行會變暗（C/C++ 擴充套件不做時）。
+- Where a name is used that no header read declares, the light bulb offers "Add #include", written the way the project's other files write it.
+- `#include` lines are links and F12 opens the file; the other uses of a name in the file are highlighted; Alt+O switches between header and source (without the C/C++ extension).
+- Lines the conditions in force do not compile are dimmed (when the C/C++ extension does not).
 
-**判斷更準**
+**Decided more accurately**
 
-- 從 build 描述檔認出編譯器（GCC、Arm Compiler 5／6、IAR 等），用它自己定義的巨集判斷 `#if`。
-- 巨集展開後被丟掉的引數裡寫的呼叫，不算成呼叫。
+- The compiler is recognised from the build description (GCC, Arm Compiler 5 and 6, IAR and others), and the macros it defines decide `#if`.
+- Calls written in a macro's argument that the expansion drops are not counted as calls.
 
 ## 0.21.1
 
-**巨集的值算得更完整**
+**More macro values worked out**
 
-- 改用專案實際的設定和 build 檔計算，依設定而定的巨集（例如 `CHIP_B_EN = BOARD_KIND == BOARD_KIND_B`）也算得出來。
-- 型別本身是巨集時（`#define U32 unsigned long`），`(U32)0x10` 這類轉型也能正確略過；轉型到已知位寬的型別會照位寬截斷。
-- 同一個巨集在好幾個晶片的標頭檔裡各有一份時，選「讀到目前這個檔案的編譯單位」實際讀的那一份；分不出來時再比目錄遠近。
-- 用到變數或結構成員、算不出單一數值時，能算的部分先算掉，其餘保留成算式，例如 `(void *)(0x400800 + ((U32)(gRing.Used[2] & 3) << 4))`。展開照 C 前置處理器的規則，包含 `##` 黏接。
-- 算不出來時會說明原因，例如哪個名字有好幾份定義、哪個巨集的引數個數不對。
-- 和 C/C++ 擴充套件一起使用時，定義和展開交給 IntelliSense 顯示，Norn 只補上一行上色的值，不再重複。
+- Worked out with the project's actual conditions and build files, so that a macro depending on the configuration (`CHIP_B_EN = BOARD_KIND == BOARD_KIND_B`) has a value too.
+- When a type is itself a macro (`#define U32 unsigned long`), casts such as `(U32)0x10` are dropped correctly; a cast to a type of known width cuts the value to that width.
+- For a macro defined in the headers of several chips, the definition read by the compilation units that read this file is chosen; failing that, the nearest folder.
+- Where a variable or member is used and there is no single value, what can be worked out is, and the rest is left as an expression, such as `(void *)(0x400800 + ((U32)(gRing.Used[2] & 3) << 4))`. Expansion follows the C preprocessor's rules, `##` included.
+- When there is no value, it says why: which name has several definitions, which macro has the wrong number of arguments.
+- Alongside the C/C++ extension, IntelliSense shows the definition and its expansion, and Norn adds only a line with the value.
 
-**不在目前設定裡的東西預設查不到**
+**What the conditions in force do not read is left out**
 
-在目前的設定下沒有任何編譯單位會讀到的標頭檔（例如只被 `#if SOC == 2` 這種確定不成立的分支 include），它裡面的符號不會出現在 Project Symbols、符號搜尋、自動完成、Relation 和 Call Hierarchy 裡；Go to Definition 和巨集的值也只在沒有其他選擇時才用它。換到另一組設定後就會重新出現。
+A header no compilation unit reads under the conditions in force (one included only from an `#if SOC == 2` that is certainly false, say) has its symbols left out of Project Symbols, symbol search, completion, Relation and the call hierarchy; Go to Definition and macro values use it only when there is nothing else. Under another set of conditions that reads it, they come back.
 
-**和 IntelliSense 的判斷一致**
+**Decided as IntelliSense decides**
 
-設定來自 build 本身的描述檔（DS-5 的 `.cproject`、C/C++ 擴充套件的 `c_cpp_properties.json`）時，裡面沒寫、原始碼也沒定義的名字視為未定義，和編譯器、IntelliSense 一致；例如 `#ifdef _FEATURE_X_` 會照 `#else` 判斷，不再列為「不確定」。編譯器自己定義的巨集（`__CC_ARM`、`__GNUC__`、`_WIN32` 等）維持「不確定」。
+When the conditions come from the build's own description (a DS-5 `.cproject`, the C/C++ extension's `c_cpp_properties.json`), a name it does not define and the sources do not define is taken as not defined, as the compiler and IntelliSense take it: `#ifdef _FEATURE_X_` takes the `#else` instead of being undecided. The macros a compiler defines itself (`__CC_ARM`, `__GNUC__`, `_WIN32` and the like) stay undecided.
 
-**依編譯器或晶片挑選的標頭檔不再互相干擾**
+**Headers chosen by compiler or chip no longer interfere**
 
-同一組 `#if` 用不同分支各 include 一個標頭檔時（例如 CMSIS 依編譯器挑 `cmsis_gcc.h` 或 `cmsis_iccarm.h`），一個分支的巨集不再套用到另一個分支的標頭檔上。新增 STM32F4 HAL（含 CMSIS）作為和 clang 比對的專案：定義正確率從 93.73% 升到 99.55%，呼叫找到從 91.44% 升到 96.54%。git、redis、binutils 不變。
+When the branches of one `#if` each include a header (CMSIS choosing `cmsis_gcc.h` or `cmsis_iccarm.h` by compiler), the macros of one branch no longer apply to the other's header. STM32F4 HAL (with CMSIS) joins the projects checked against clang: definitions right went from 93.73% to 99.55%, calls found from 91.44% to 96.54%. git, Redis and binutils are unchanged.
 
-**自動完成更快**
+**Faster completion**
 
-改從預先排序的名稱清單做前綴查詢，並在結果完整時讓 VS Code 自行過濾，不必每打一個字就重新查詢。
+Completion looks names up by prefix in a sorted list, and lets VS Code filter a complete result itself instead of asking again at every key.
 
 ## 0.21.0
 
-**巨集的值**
+**Macro values**
 
-游標停在巨集或 enum 常數上，會顯示它的定義和算出來的值，例如 `#define BUF_Q3 BUF_Q(3)` 旁邊顯示 `= 4108 (0x100C)`，就像 enum 常數一樣。
+Hover over a macro or an enum constant to see its definition and its value: beside `#define BUF_Q3 BUF_Q(3)`, `= 4108 (0x100C)`, as for an enum constant.
 
-- 會沿著用到的其他巨集一路展開，用判斷 `#if` 的同一套規則計算。
-- `(U32)` 這類型別轉換會略過；enum 常數照 C 的規則推算（沒寫值的就是前一個加一）。
-- 帶參數的巨集，停在呼叫處（例如 `BUF_Q(3)`）時會代入那裡的引數。
-- 同一個巨集有好幾份條件定義時，每一份各自列出自己的值，並標出哪些只在某個判不出來的 `#if` 成立時才有效。
-- 用到 `sizeof`、變數或找不到定義的名字時，只顯示定義。
+- The macros it uses are expanded in turn, and worked out by the rules that decide `#if`.
+- Casts such as `(U32)` are dropped; enum constants are counted as C counts them (one more than the one before, when no value is written).
+- On a call of a macro with parameters (`BUF_Q(3)`), the arguments there are put in.
+- For a macro with several conditional definitions, each is listed with its own value, marked when it holds only if an undecided `#if` is true.
+- Where `sizeof`, a variable or a name with no definition is used, only the definition is shown.
 
-**自動完成**
+**Completion**
 
-輸入名稱時，會從 Norn 的索引裡找出符合的函式、巨集、型別、變數，和 C/C++ 擴充套件的建議一起列出。不需要先編譯，也不需要設定 include 路徑。
+As you type a name, the functions, macros, types and variables of Norn's index that match are offered beside the C/C++ extension's suggestions. Nothing needs building and no include path needs setting.
 
-**呼叫是否「確定」判得更準**
+**Calls marked certain more accurately**
 
-透過層層巨集被呼叫的巨集，呼叫點大多不再判為「不確定」；剩下的要看 build 有沒有定義某個開關，原始碼裡確實判斷不出來。
+Most calls of macros reached through layers of macros are no longer marked uncertain; what is left depends on whether the build defines a switch, which the sources really cannot tell.
 
-修正的情況包括：
+Among the cases fixed:
 
-- 標頭檔在某個判不出來的 `#if` 底下被 include 時，它自己的 `#else` 分支裡的定義，以前被誤判為不確定。
-- include guard 沒被認出來的幾種寫法：`#if !defined(G)`、`#endif` 後面還有內容、guard 前面先有 `#include`；以及 build 時才產生、專案裡找不到的標頭檔之後的 guard。
-- 一行 include 可能對到好幾個同名檔時，改用專案其他檔案最常 include 的那個目錄來選，就像 `-I` 路徑的效果。
-- 呼叫和巨集定義包在同一個未定的 `#if` 裡，或呼叫和 include 那個標頭檔的地方在同一個未定的 `#if` 裡（例如整個 `.c` 包在 `#if FEATURE_EN` 裡），現在算確定。
-- 標頭檔裡的呼叫，只要讀到它的編譯單位都沒有說「巨集不存在」就算確定，不再因為少數單位判不出來而全部變不確定。
+- The definitions in a header's own `#else`, when the header is included under an undecided `#if`, were taken as uncertain.
+- Include guards not recognised: `#if !defined(G)`, something after the `#endif`, an `#include` before the guard; and the guard after a header the build generates and the project does not have.
+- When an include could be one of several files of the same name, the folder the project's other files include from most is chosen, as an `-I` path would.
+- A call and the macro's definition in the same undecided `#if`, or a call and the include of the header in the same undecided `#if` (a whole `.c` inside `#if FEATURE_EN`), are now certain.
+- A call in a header is certain when no compilation unit reading it says the macro does not exist, instead of becoming uncertain everywhere because a few units cannot tell.
 
-和 clang 實際建置的結果比對，git 的確定呼叫從 99.23% 升到 99.29%，binutils 從 95.45% 升到 95.49%，redis 不變；確定者正確率維持在 99.6% 以上。建立索引的速度和記憶體不變。
+Against clang's view of the real builds, certain calls went from 99.23% to 99.29% on git and from 95.45% to 95.49% on binutils, Redis unchanged; the precision of certain calls stays above 99.6%. Indexing time and memory are unchanged.
 
-**其他**
+**Other**
 
-- Project Symbols 把函式原型和宣告分開列出，不再和定義混在一起。
-- 右鍵選單和 F12 的「Go to Definition」改用 Norn 的結果：在變數上跳到它的宣告，在函式上跳到定義；已經在定義上時，再按一次跳到原型。Ctrl+F12、Shift+F12 分別是 Implementations 和 References。
-- 修正一個偶發問題：同一個程式裡同時建立兩次索引時，條件判斷的暫存結果可能互相干擾。
+- Project Symbols lists prototypes and declarations apart from definitions.
+- Go to Definition (context menu and F12) uses Norn's answer: on a variable, its declaration; on a function, its definition; on the definition, its prototype. Ctrl+F12 and Shift+F12 are Implementations and References.
+- Fixed an occasional problem: two indexes built at once in the same process could disturb each other's condition results.
 
 ## 0.20.0
 
-**支援 C++**
+**C++**
 
-C++ 檔案（`.cpp`、`.cc`、`.cxx`、`.hpp`、`.hh` 等）現在也會被索引，和 C 檔案一起查。類別、方法、命名空間、樣板、override、建構子、運算子多載、lambda、`auto`、結構化綁定都找得到，成員會連同它的類別一起顯示。只有 C 的專案不受影響：C++ 才用到的資料只在有 C++ 符號時才保存。
+C++ files (`.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh` and the like) are indexed too, with the C files. Classes, methods, namespaces, templates, overrides, constructors, operator overloads, lambdas, `auto` and structured bindings are found, and members are shown with their class. Projects of C alone are unaffected: what only C++ needs is kept only when there are C++ symbols.
 
-和 clang 實際建置的結果比對：
+Against clang's view of the real builds:
 
-| 專案 | 呼叫找到 | 確定者 | 確定者正確 |
+| Project | Calls found | Certain | Certain and right |
 |---|---|---|---|
 | fmt | 74.96% | 61.06% | 96.44% |
 | leveldb | 86.78% | 67.86% | 93.09% |
 | bitcoin | 86.17% | 78.42% | 95.44% |
 
-C++ 的準確度仍比 C 低，主要漏在隱式轉換的建構子，以及測試框架裡串接的 `operator<<`。
+C++ is still less accurate than C, mostly missing constructors called through an implicit conversion and the chains of `operator<<` of test frameworks.
 
-**建立索引更快**
+**Faster indexing**
 
-- 大型專案第一次建立索引快了數倍。原因是每個編譯單位都會重新判斷同一批標頭檔的 `#if`，巨集互相引用時還會重複展開。現在只要條件用到的巨集狀態沒變，就沿用已判斷的結果。
-- Linux kernel 約快 5%（建立索引 58 秒 → 55 秒）。
-- 其他 C 專案的速度、記憶體、索引大小與準確度不變。
+- The first index of a large project is several times faster. Every compilation unit decided the `#if` of the same headers again, expanding macros that refer to each other again and again; a result is now reused while the macros its condition uses stay as they were.
+- The Linux kernel about 5% faster (58 s to 55 s).
+- Other C projects: speed, memory, index size and accuracy unchanged.
 
-**`#if` 照 C99 規則計算**
+**`#if` worked out by C99's rules**
 
-- 八進位（`010` 是 8，以前誤讀成 10）、十六進位、二進位、`u`/`l`/`ll` 後綴、超出範圍的數字自動轉為無號。
-- 字元常數（`'A'`、`'\n'`、`'\x41'`）、所有運算子與優先順序、`?:`、有號無號混合比較（`-1 > 0u` 為真）、短路求值。
-- 帶參數的巨集（如 `GIT_GNUC_PREREQ(4, 5)`）會代入引數計算。
-- C 標準未定義的情形（除以零、有號溢位、超出範圍的位移）和多字元常數，維持「不確定」。
+- Octal (`010` is 8; it was read as 10), hexadecimal, binary, the `u`/`l`/`ll` suffixes, and numbers out of range becoming unsigned.
+- Character constants (`'A'`, `'\n'`, `'\x41'`), every operator at its precedence, `?:`, comparisons of signed with unsigned (`-1 > 0u` is true), short-circuit evaluation.
+- Macros with parameters (`GIT_GNUC_PREREQ(4, 5)`) are worked out with their arguments.
+- What C leaves undefined (division by zero, signed overflow, shifts out of range) and multi-character constants stay undecided.
 
 ## 0.19.12
 
-- **Relation 的 References 改在 Context 視窗顯示**：單擊一筆 reference，Context 視窗會顯示那一行的前後文，編輯器停在原處。要開檔就雙擊或按 Enter；Ctrl＋點擊會在旁邊的編輯器群組開啟。
-- **References 變快**：清單改成直接向 Norn 的索引查詢（`si/references`），連同每一行的文字一起取回。以前是透過 VS Code 去問所有的 reference provider，裝了 C/C++ 擴充套件時它也會掃一次整個資料夾，而且每個檔案都要在編輯器裡打開才拿得到那一行的文字，所以很慢。
-- 游標位在被條件編譯關掉的程式碼裡時，References 會跟其他面板一樣，顯示那段程式碼為什麼沒被編譯。
+- **References from Relation show in Context**: click a reference and Context shows the code around that line while the editor stays where it is. Double-click or Enter opens it; Ctrl+click opens it in the editor group beside.
+- **Faster References**: the list comes straight from Norn's index (`si/references`), with each line's text. It used to go through every reference provider VS Code has, which with the C/C++ extension also searched the whole folder, and each file had to be opened in an editor to get its line's text.
+- With the cursor in code the conditions switch off, References says why that code is not compiled, as the other views do.
 
 ## 0.19.11
 
-- **新增第三方授權聲明** `THIRD_PARTY_NOTICES.txt`，放在發布的 7z 和 VS Code 擴充套件裡。內容涵蓋 Norn 內含的所有他人軟體，包括 server 連結的 71 個 Rust 套件、擴充套件打包的 10 個 npm 套件，以及面板用的 codicons 圖示字型（CC-BY-4.0）。每個套件都列出名稱、版本、授權、來源，以及作者附的授權原文。
-- 功能與 0.19.10 相同。
+- **Third-party notices**: `THIRD_PARTY_NOTICES.txt`, in the release and in the extension, covers all the software of others Norn contains: the 71 Rust crates the server links, the 10 npm packages the extension bundles, and the codicons icon font of the views (CC-BY-4.0). Each with its name, version, license, source and the authors' license text.
+- Otherwise the same as 0.19.10.
 
 ## 0.19.10
 
-**kernel 準確度持續提升**
+**The kernel more accurate again**
 
-和 clang 實際建置的結果比對（x86_64 defconfig），kernel 上的準確度：
+Against clang's view of the real build (x86_64 defconfig), on the kernel:
 
-| 指標 | 0.19.9 | 0.19.10 |
+| | 0.19.9 | 0.19.10 |
 |---|---|---|
-| 定義找到 | 88.30% | **91.99%** |
-| 呼叫找到 | 84.62% | **90.62%** |
-| 確定者正確 | 96.59% | **98.62%** |
+| Definitions found | 88.30% | **91.99%** |
+| Calls found | 84.62% | **90.62%** |
+| Certain and right | 96.59% | **98.62%** |
 
-Redis、binutils、git 的準確度維持不變或略升；kernel 索引時間和記憶體沒有變差。
+Redis, binutils and git the same or a little better; the kernel's indexing time and memory no worse.
 
-**改進項目**
+**What changed**
 
-- **迴圈巨集**：`for_each_online_cpu(i)`、`list_for_each_entry(...)` 這類展開成 `for` 迴圈的巨集，以前會讓解析器誤判，連帶漏掉後面一大段函式（例如 `kernel/sched/core.c` 的 `schedule()`）。現在會當成迴圈來讀。
-- **`SYSCALL_DEFINEx(...)` 系統呼叫**：巨集後面的函式本體現在會歸給正確的函式（`__do_sys_xxx`），`__x64_sys_xxx → __se_sys_xxx → __do_sys_xxx` 這串包裝函式也都連得起來。
-- **巨集有多份定義時**：每一份定義都會至少被讀一次，不會因為排在後面就被略過（例如追蹤點 `DEFINE_EVENT` 產生的 `trace_xxx()`）。
-- **空殼與真正定義**：以下情況現在都會同時列出真正的定義：
-  - 同一個標頭檔裡同時有宣告和空殼（例如 `percpu_counter.h`）。
-  - 空殼放在只有部分設定才會 include 的標頭檔裡（例如 `rcutiny.h`）。
-  - 空殼是由巨集產生的（例如 `pci.h` 的 `pci_read_config_*`）。
-- **include 路徑**：同名的架構標頭檔有好幾份時，不再誤選 `tools/` 底下給其他程式用的複本（以前會讓 `msleep` 連到 `tools` 裡的迷你 C 函式庫）。
+- **Loop macros**: `for_each_online_cpu(i)`, `list_for_each_entry(...)` and the like, which expand to a `for`, confused the parser and lost much of the function after them (`schedule()` in `kernel/sched/core.c`, say). They are now read as loops.
+- **`SYSCALL_DEFINEx(...)`**: the body after the macro belongs to the right function (`__do_sys_xxx`), and the wrappers `__x64_sys_xxx → __se_sys_xxx → __do_sys_xxx` are linked.
+- **Macros with several definitions**: each definition is read at least once, none skipped for coming later (the `trace_xxx()` that tracepoints' `DEFINE_EVENT` makes, say).
+- **Stubs and the real definition**: the real definition is now listed too when
+  - the declaration and a stub are in the same header (`percpu_counter.h`);
+  - the stub is in a header only some configurations include (`rcutiny.h`);
+  - the stub is made by a macro (`pci_read_config_*` in `pci.h`).
+- **Include paths**: of several architecture headers of the same name, the copies under `tools/` for other programs are no longer chosen (they linked `msleep` to the small C library there).
 
-**注意**：升級後第一次開啟會重建一次索引。
+**Note**: the first opening after the upgrade builds the index again.
 
 ## 0.19.9
 
-**巨集產生的函式連得更準（以 Linux kernel 驗證）**
+**Functions made by macros linked more accurately (checked on the Linux kernel)**
 
-和 clang 實際建置的結果比對（x86_64 defconfig），kernel 上的準確度：
+Against clang's view of the real build (x86_64 defconfig), on the kernel:
 
-| 指標 | 0.19.8 | 0.19.9 |
+| | 0.19.8 | 0.19.9 |
 |---|---|---|
-| 定義找到 | 85.83% | **88.30%** |
-| 呼叫找到 | 81.82% | **84.62%** |
-| 確定者正確 | 96.11% | **96.59%** |
+| Definitions found | 85.83% | **88.30%** |
+| Calls found | 81.82% | **84.62%** |
+| Certain and right | 96.11% | **96.59%** |
 
-**改進項目**
+**What changed**
 
-- **追蹤點函式**：經過好幾層 `TRACE_EVENT` 巨集產生的 `trace_xxx()` 這類函式，現在找得到，呼叫也連得上。kernel 會用不同的 `TRACE_EVENT` 定義把同一個標頭檔讀好幾次，以前 Norn 會誤把產生 `trace_xxx()` 的那一份丟掉。
-- **`guard(mutex)(m)` 這類巨集**：巨集展開成函式名稱、呼叫的括號在巨集外面時，現在會正確認成呼叫（例如連到 `class_mutex_constructor`）。
-- **標頭檔空殼與真正定義**：真正的定義也在 `#if` 裡時（例如 `#ifdef CONFIG_PRINTK` 底下的 `_dev_info`），現在兩者都會列出。以前所有 `dev_info()` 都只連到空殼。
+- **Tracepoints**: functions such as `trace_xxx()`, made through several layers of `TRACE_EVENT`, are found and their calls linked. The kernel reads the same header several times under different `TRACE_EVENT` definitions, and Norn used to drop the one that makes `trace_xxx()`.
+- **Macros like `guard(mutex)(m)`**: a macro that expands to a function's name, with the call's parentheses outside it, is a call (to `class_mutex_constructor`, say).
+- **Header stubs and the real definition**: when the real definition is under an `#if` too (`_dev_info` under `#ifdef CONFIG_PRINTK`), both are listed. Every `dev_info()` used to lead to the stub alone.
 
-**修正**
+**Fixed**
 
-- 擴充套件重新啟動但視窗沒有重新載入時（例如更新之後），Relation 和 Context 的鎖定按鈕可能還顯示上次的「已鎖定」，實際上卻沒有鎖定。現在啟動時一律從「未鎖定」開始，和按鈕一致。
+- When the extension restarted without the window reloading (after an update, say), the lock buttons of Relation and Context could still show "locked" when they were not. They now always start unlocked, as the buttons say.
 
 ## 0.19.8
 
-**更貼近實際編譯結果（以 Linux kernel 驗證）**
+**Closer to what is really compiled (checked on the Linux kernel)**
 
-和 clang 實際建置的結果比對（x86_64 defconfig），kernel 上的準確度：
+Against clang's view of the real build (x86_64 defconfig), on the kernel:
 
-| 指標 | 0.19.7 | 0.19.8 |
+| | 0.19.7 | 0.19.8 |
 |---|---|---|
-| 呼叫找到 | 79.22% | **81.82%** |
-| 找到且確定 | 56.10% | **59.03%** |
-| 確定者正確 | 94.35% | **96.11%** |
+| Calls found | 79.22% | **81.82%** |
+| Found and certain | 56.10% | **59.03%** |
+| Certain and right | 94.35% | **96.11%** |
 
-**改進項目**
+**What changed**
 
-- 標頭檔中 `#ifdef CONFIG_X` 放宣告、`#else` 放空殼的寫法：條件判斷不出來時，除了空殼，也會列出 `.c` 檔裡真正的定義。函式和巨集都適用。
-- 不再把其他程式的標頭檔當成自己的。像 kernel 的 `tools/` 是獨立的使用者空間程式，以前會被誤認，導致 `kfree` 等呼叫連錯。
-- 標頭檔裡的 `static` 函式，只算 include 它的檔案看得到。
-- 巨集只在看得到它的地方生效：
-  - `.c` 檔裡定義的巨集只在該檔有效。
-  - 標頭檔裡的巨集只對 include 它的檔案、而且是在定義之後才生效。
+- A declaration under `#ifdef CONFIG_X` in a header with a stub under `#else`: when the condition cannot be decided, the real definition in the `.c` is listed beside the stub. For functions and macros alike.
+- Other programs' headers are no longer taken as the project's own. The kernel's `tools/` are separate user-space programs, and were mistaken for it, linking calls such as `kfree` wrongly.
+- A `static` function in a header is seen only by the files that include it.
+- A macro holds only where it is seen:
+  - one defined in a `.c` only in that file;
+  - one in a header only in the files that include it, after its definition.
 
-**注意**：升級後第一次開啟會重建一次索引。
+**Note**: the first opening after the upgrade builds the index again.
 
 ## 0.19.7
 
-- **修正**：巨集的值是運算式時沒有被計算。例如 `#define ENABLE_SELF_TEST (0 && ENABLE_OPT && ...)`，現在會照 `#if` 的規則算出 0，那段程式碼視為沒有被編譯，不再出現在 Relation 裡。
-- **修正**：巨集的值超過 120 個字元就不保存的限制已移除，值不論多長都會完整保存。
-- **新增設定** `"undecided": "off"`（選用，預設不開）：開啟後，判斷不出值的巨集一律當成沒定義。預設維持和 Source Insight 相同的行為：判斷不出來的分支兩邊都保留。
+- **Fixed**: a macro whose value is an expression was not worked out. `#define ENABLE_SELF_TEST (0 && ENABLE_OPT && ...)` now comes to 0 by the rules of `#if`, the code under it is taken as not compiled, and it no longer shows in Relation.
+- **Fixed**: macro values longer than 120 characters were not kept; any length is now kept whole.
+- **New setting** `"undecided": "off"` (optional, off by default): every macro with no known value is taken as not defined. By default a branch that cannot be decided is kept both ways.
 
 ## 0.19.6
 
-- **新增**：呼叫如果位在條件判斷不出來的 `#if` 裡，Relation 會加上橘色標記「under #if (OPTION_A)」，指出是哪一個 `#if` 決定它會不會被編譯。在 Compile Conditions 裡設定那個巨集，就能確定下來。
-- **新增**：函式上方的摘要會註明有幾個呼叫者取決於判斷不出來的 `#if`，例如「3 callers (1 only if an undecided #if)」。
-- **注意**：升級後第一次開啟會重建一次索引。
+- **New**: a call inside an `#if` the conditions cannot decide is marked in orange in Relation, "under #if (OPTION_A)", naming the `#if` it depends on. Set that macro in Compile Conditions to settle it.
+- **New**: the line above a function says how many callers depend on an undecided `#if`: "3 callers (1 only if an undecided #if)".
+- **Note**: the first opening after the upgrade builds the index again.
 
 ## 0.19.5
 
-- **修正**：游標放在被 `#if` 關掉的程式碼上時，以前會用游標下的名稱去查有編譯到的地方，看起來像被關掉的程式碼也有呼叫關係。現在：
-  - Relation、Context 會顯示「Not compiled: line N switched off by the compile conditions in force」。
-  - 跳到定義、找參考不會有結果。
-- **注意**：升級後第一次開啟會重建一次索引。
+- **Fixed**: with the cursor in code an `#if` switches off, the name under it was looked up where it is compiled, as if the switched-off code had calls. Now:
+  - Relation and Context say "Not compiled: line N switched off by the compile conditions in force";
+  - Go to Definition and Find References find nothing.
+- **Note**: the first opening after the upgrade builds the index again.
 
 ## 0.19.4
 
-- **修正**：Project Symbols、Relation、Context 面板的圖示不見了。從 0.19.0 改用打包方式後，圖示字型沒有被放進安裝包，0.19.0～0.19.3 都有這個問題。
-- 發布前新增兩道檢查：直接檢查安裝包內容，以及把安裝包解開後在 VS Code 實際執行。缺少執行時需要的檔案就不會發布。
+- **Fixed**: the icons of Project Symbols, Relation and Context were missing. Since the packaging changed in 0.19.0 the icon font was left out of the package, in 0.19.0 to 0.19.3.
+- Two checks before a release: the package's contents are checked, and the unpacked package is run in VS Code. A package missing a file it needs is not released.
 
 ## 0.19.3
 
-- **啟動更快**：從存檔啟動時，不再從頭重算巨集集合，也不再把所有原始檔讀一遍。kernel 從啟動到索引完整：8.7–9.2 秒 → 5.6–6.2 秒。
-- **修正**：Windows 讀檔會更新「最後存取時間」，VS Code 把它當成檔案變更回報，導致沒有修改的檔案被重新解析（git 第一次開啟時有 458 個）。現在內容沒變就不會重做。
-- **修正**：只靠 `#include` 引入的非 .c/.h 檔案（例如 `.def`），在同步時沒有跟著增減。
+- **Faster start**: starting from the saved index no longer works out the macro sets again or reads every source file. The kernel, from start to a complete index: 8.7–9.2 s to 5.6–6.2 s.
+- **Fixed**: on Windows, reading a file updates its last access time, which VS Code reported as a change, so unchanged files were parsed again (458 on first opening git). Files whose content has not changed are no longer read again.
+- **Fixed**: files other than .c/.h brought in only by `#include` (`.def`, say) were not added or removed in a sync.
 
 ## 0.19.2
 
-- **新增**指令「Norn: Search Symbols…」：輸入名稱片段或縮寫來搜尋符號，預設帶入游標下的名稱。
-- **修正**：設定項目的說明文字裡殘留舊名稱「si」。
+- **New** command **Norn: Search Symbols…**: search by fragments of a name or its initials, with the name under the cursor typed.
+- **Fixed**: setting descriptions still had the old name "si".

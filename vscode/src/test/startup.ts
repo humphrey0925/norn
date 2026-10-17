@@ -13,7 +13,7 @@ export async function run(): Promise<void> {
   const trace = process.env.NORN_TRACE!;
   // When the extension host was there to run anything, for comparison.
   fs.writeFileSync(trace + ".host", String(Date.now() - Math.round(process.uptime() * 1000)));
-  const ext = vscode.extensions.all.find((e) => e.packageJSON.name === "norn")!;
+  const ext = vscode.extensions.all.find((e) => e.packageJSON.name === "norn-c")!;
   await ext.activate();
   for (let i = 0; i < 3000 && !(fs.existsSync(trace) && fs.readFileSync(trace, "utf8").includes("index ready")); i++) {
     await sleep(100);

@@ -312,7 +312,7 @@ Norn 會**自動採用專案裡找得到的建置設定**，往下找三層資�
 如果當初按了不允許，可以在工作區的 `settings.json` 加上：
 
 ```json
-"C_Cpp.default.configurationProvider": "humphrey0925.norn"
+"C_Cpp.default.configurationProvider": "humphrey0925.norn-c"
 ```
 
 include 路徑包含建置設定裡寫的路徑，以及所有含有標頭檔的已索引資料夾。這個機制不會寫入任何檔案。

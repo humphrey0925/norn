@@ -84,7 +84,7 @@ async function main() {
   // `cpp`: with the C/C++ extension (installed into the test's own
   // extensions folder: `node out/test/runTest.js cpp`), Norn its provider.
   const cpp = process.argv[2] === "cpp";
-  const withCpp = cpp ? { "C_Cpp.default.configurationProvider": "humphrey0925.norn" } : {};
+  const withCpp = cpp ? { "C_Cpp.default.configurationProvider": "humphrey0925.norn-c" } : {};
   fs.writeFileSync(path.join(work, ".vscode", "settings.json"), JSON.stringify({ ...withCpp, ...(process.env.SI_TEST_BUNDLED || packaged ? {} : { "norn.serverPath": `"${server}"` }), ...(process.env.SI_DEMO_THEME ? { "workbench.colorTheme": process.env.SI_DEMO_THEME } : {}) }));
   try {
     await runTests({

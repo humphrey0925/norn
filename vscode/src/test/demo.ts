@@ -9,7 +9,7 @@ export async function run(): Promise<void> {
   const folder = vscode.workspace.workspaceFolders![0].uri.fsPath;
   const doc = await vscode.workspace.openTextDocument(path.join(folder, ...(process.env.SI_DEMO_FILE ?? "bfd/bfdio.c").split("/")));
   const editor = await vscode.window.showTextDocument(doc);
-  await vscode.extensions.all.find((e) => e.packageJSON.name === "norn")!.activate();
+  await vscode.extensions.all.find((e) => e.packageJSON.name === "norn-c")!.activate();
   for (let i = 0; i < 60; i++) {
     const s = await vscode.commands.executeCommand<vscode.SymbolInformation[]>("vscode.executeWorkspaceSymbolProvider", "bfd_read");
     if (s?.length) break;

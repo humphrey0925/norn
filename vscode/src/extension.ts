@@ -708,6 +708,14 @@ async function fromSi(context: vscode.ExtensionContext) {
       .showWarningMessage("SI Code Index is now Norn. The extension of the old name is still installed and would index this folder a second time: uninstall it.", "Show It")
       .then((pick) => pick && vscode.commands.executeCommand("workbench.extensions.search", "@installed si-code-index"));
   }
+  // 0.23.0 was named `norn`, a name the Marketplace has for another
+  // extension; from 0.23.1 it is `norn-c`.
+  if (context.extension.id !== "humphrey0925.norn" && vscode.extensions.getExtension("humphrey0925.norn") && !context.globalState.get("norn.toldOfNorn")) {
+    void context.globalState.update("norn.toldOfNorn", true);
+    void vscode.window
+      .showWarningMessage("Norn 0.23.0, installed from a .vsix under an earlier name, is still installed and would index this folder a second time: uninstall it.", "Show It")
+      .then((pick) => pick && vscode.commands.executeCommand("workbench.extensions.search", "@installed humphrey0925.norn"));
+  }
 }
 
 /** One row of the Conditions view. */

@@ -29,7 +29,7 @@ export async function run(): Promise<void> {
   // The cursor on a name before there is an index: Context asks at once.
   const early = doc.positionAt(doc.getText().indexOf("bfd_seek (abfd, 0, SEEK_CUR)") + 2);
   let editor = await vscode.window.showTextDocument(doc, { selection: new vscode.Range(early, early) });
-  const ext = vscode.extensions.all.find((e) => e.packageJSON.name === "norn")!;
+  const ext = vscode.extensions.all.find((e) => e.packageJSON.name === "norn-c")!;
   await ext.activate();
   await vscode.commands.executeCommand("norn.context.focus");
   editor = await vscode.window.showTextDocument(doc, { selection: new vscode.Range(early, early) });

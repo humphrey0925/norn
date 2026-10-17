@@ -25,7 +25,7 @@ export async function run(): Promise<void> {
   assert.ok(vscode.extensions.getExtension("ms-vscode.cpptools"), "the C/C++ extension is not installed in the test's extensions folder");
   const doc = await vscode.workspace.openTextDocument(path.join(folder, "bfd", "bfdio.c"));
   await vscode.window.showTextDocument(doc);
-  const ext = vscode.extensions.all.find((e) => e.packageJSON.name === "norn")!;
+  const ext = vscode.extensions.all.find((e) => e.packageJSON.name === "norn-c")!;
   await ext.activate();
   // The same module the extension host loaded: its probe is the extension's.
   // eslint-disable-next-line @typescript-eslint/no-var-requires
