@@ -1,8 +1,14 @@
 # Changelog
 
+## 0.23.2
+
+**On the Visual Studio Marketplace, with complete third-party notices**
+
+- Third-party notices are complete: each release has `THIRD_PARTY_NOTICES-<platform>.txt` beside the server executables (0.23.0 and 0.23.1 shipped them without); and the notices now include the Rust standard library, musl (in the static Linux servers), and the MIT license of tree-sitter-cpp, whose crate ships none.
+
 ## 0.23.1
 
-**On the Visual Studio Marketplace**
+**Renamed norn-c for the Marketplace**
 
 - The extension's identifier is now `humphrey0925.norn-c`: the Marketplace already has another extension named `norn`, which kept 0.23.0 off it. The name shown, the commands, the settings (`norn.*`) and the `.norn` folder are unchanged. If 0.23.0 was installed from a `.vsix`, Norn says so, so that the old one can be uninstalled and the folder is not indexed twice.
 - The user guide is in English too ([docs/norn-guide.md](docs/norn-guide.md)); the Traditional Chinese one is now [docs/norn-guide.zh-TW.md](docs/norn-guide.zh-TW.md). Both describe the present version.

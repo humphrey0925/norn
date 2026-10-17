@@ -24,6 +24,8 @@ C 原始碼建索引，查詢符號和呼叫關係，提供給腳本和編輯器
 | Linux x64 / Arm64（靜態連結，任何發行版） | `norn-linux-x64`、`norn-linux-arm64` |
 | macOS Intel / Apple 晶片 | `norn-darwin-x64`、`norn-darwin-arm64` |
 
+每個執行檔旁邊都有一份 `THIRD_PARTY_NOTICES-<平台>.txt`，列出它內含的他人軟體及其授權；轉發執行檔時請一起附上。
+
 改名為 `norn`（Windows 為 `norn.exe`），放到 `PATH` 裡；Linux 和 macOS 要加上執行權限
 （`chmod +x norn`）。macOS 的執行檔沒有簽章，第一次執行時到「系統設定 → 隱私權與安全性」
 允許，或執行 `xattr -d com.apple.quarantine norn`。

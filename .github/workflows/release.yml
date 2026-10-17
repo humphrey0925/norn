@@ -101,6 +101,9 @@ jobs:
         run: |
           (cd vscode && npm ci && npm run compile)
           node release/package.js ${{ matrix.vsc }} "$SERVER" dist
+          # The server is released on its own too: with the notices of
+          # what is in it beside it.
+          node release/notices.js dist/THIRD_PARTY_NOTICES-${{ matrix.vsc }}.txt
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.vsc }}

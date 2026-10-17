@@ -26,6 +26,9 @@ executable for every platform beside the extension, checked by `SHA256SUMS`:
 | Linux x64 / Arm64 (static, any distribution) | `norn-linux-x64`, `norn-linux-arm64` |
 | macOS Intel / Apple silicon | `norn-darwin-x64`, `norn-darwin-arm64` |
 
+Beside each is `THIRD_PARTY_NOTICES-<platform>.txt`: the licenses of the
+software of others built into it, to keep with it if you pass it on.
+
 Rename it to `norn` (`norn.exe` on Windows), put it on your `PATH`, and on
 Linux and macOS make it executable (`chmod +x norn`). The macOS executables
 are not signed: the first time, allow it under System Settings → Privacy &

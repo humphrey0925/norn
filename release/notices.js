@@ -98,6 +98,30 @@ for (const c of crates.filter((c) => !c.texts.length)) {
   }
 }
 
+// A package that ships no license text at all has the one its repository
+// carries, kept in release/licenses as <name>-LICENSE.
+for (const c of crates.filter((c) => !c.texts.length)) {
+  const kept = path.join(root, "release", "licenses", `${c.name}-LICENSE`);
+  if (fs.existsSync(kept)) {
+    c.texts = [{ name: `LICENSE (from ${c.from}, the crate shipping none)`, text: fs.readFileSync(kept, "utf8").trimEnd() }];
+  }
+}
+
+// --- Linked in by the toolchain ---------------------------------------------
+// Rust's standard library is in every server; a Linux server, linked
+// statically against musl, has musl's C library in it too.
+const kept = (f) => fs.readFileSync(path.join(root, "release", "licenses", f), "utf8").trimEnd();
+const toolchain = [
+  {
+    name: "Rust standard library", version: "(the Rust toolchain the server is built with)", license: "MIT OR Apache-2.0",
+    from: "https://github.com/rust-lang/rust",
+    texts: [{ name: "LICENSE-MIT", text: kept("rust-LICENSE-MIT") }],
+  },
+];
+if (target.endsWith("-musl")) {
+  toolchain.push({ name: "musl", version: "1.2.5", license: "MIT", from: "https://musl.libc.org/", texts: [{ name: "COPYRIGHT", text: kept("musl-COPYRIGHT") }] });
+}
+
 // --- Written out ------------------------------------------------------------
 const byName = (a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version);
 const rule = "=".repeat(78);
@@ -115,8 +139,9 @@ const lines = [
 const missing = [];
 const given = new Map();
 for (const [title, list] of [
-  ["Part 1. The Norn server (norn.exe): Rust crates linked into it", crates],
+  ["Part 1. The Norn server (norn): Rust crates linked into it", crates],
   ["Part 2. The VS Code extension: npm packages bundled into it", [...npm.values()]],
+  ["Part 3. The Norn server: libraries the toolchain links into it", toolchain],
 ]) {
   list.sort(byName);
   lines.push(rule, title, `${list.length} packages`, rule, "");
@@ -140,4 +165,4 @@ for (const [title, list] of [
 }
 fs.mkdirSync(path.dirname(out), { recursive: true });
 fs.writeFileSync(out, lines.join("\n") + "\n");
-console.log(`${path.relative(root, out)}: ${crates.length} crates, ${npm.size} npm packages; ${missing.length} without a license file${missing.length ? ":\n  " + missing.join("\n  ") : ""}`);
+console.log(`${path.relative(root, out)}: ${crates.length} crates, ${npm.size} npm packages, ${toolchain.map((t) => t.name).join(" and ")}; ${missing.length} without a license file${missing.length ? ":\n  " + missing.join("\n  ") : ""}`);
