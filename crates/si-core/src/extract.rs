@@ -142,7 +142,9 @@ impl Ids {
 /// `.inl`, which may be C) by what it says: C has no `namespace`,
 /// `template <`, `class X {`, access labels, `std::` or `extern "C++"`.
 /// (Not `::`: a C file's `asm` has it.) What a C header has for C++ only,
-/// under `#ifdef __cplusplus`, does not count.
+/// under `#ifdef __cplusplus`, counts only where it defines a class or a
+/// template (minisketch.h's wrapper class), which the C parser would read
+/// as nothing; not `extern "C" {` nor a namespace.
 pub fn is_cpp(path: &str, src: &[u8]) -> bool {
     let ext = path.rsplit_once('.').map_or("", |(_, e)| e);
     match ext {
@@ -159,6 +161,8 @@ fn looks_cpp(src: &[u8]) -> bool {
     let mut line_start = true;
     // Inside `#ifdef __cplusplus`: how many `#if`s deep.
     let mut for_cpp = 0u32;
+    // A class or a template there.
+    let mut defined_for_cpp = false;
     let skip_comment = |i: &mut usize| {
         *i += 2;
         while *i + 1 < n && !(src[*i] == b'*' && src[*i + 1] == b'/') {
@@ -225,10 +229,6 @@ fn looks_cpp(src: &[u8]) -> bool {
         }
         let first_on_line = line_start;
         line_start = false;
-        if for_cpp > 0 {
-            i += 1;
-            continue;
-        }
         if b == b'"' || b == b'\'' {
             let q = b;
             let start = i;
@@ -240,7 +240,7 @@ fn looks_cpp(src: &[u8]) -> bool {
                 i += 1;
             }
             i += 1;
-            if q == b'"' && words.last() == Some(&&b"extern"[..]) && src.get(start..i) == Some(b"\"C++\"") {
+            if q == b'"' && words.last() == Some(&&b"extern"[..]) && src.get(start..i) == Some(b"\"C++\"") && for_cpp == 0 {
                 return true;
             }
             words.clear();
@@ -254,13 +254,13 @@ fn looks_cpp(src: &[u8]) -> bool {
             let w = &src[start..i];
             // An access label stands first on its line (`unsigned public: 1;`
             // is a C bit field).
-            if first_on_line && (w == b"public" || w == b"private" || w == b"protected") {
+            if first_on_line && (w == b"public" || w == b"private" || w == b"protected") && for_cpp == 0 {
                 let colon = i + src[i..].iter().position(|c| !c.is_ascii_whitespace()).unwrap_or(0);
                 if src.get(colon) == Some(&b':') && src.get(colon + 1) != Some(&b':') {
                     return true;
                 }
             }
-            if w == b"std" && src.get(i..i + 2) == Some(b"::") {
+            if w == b"std" && src.get(i..i + 2) == Some(b"::") && for_cpp == 0 {
                 return true;
             }
             if words.len() == 4 {
@@ -278,13 +278,15 @@ fn looks_cpp(src: &[u8]) -> bool {
             b':' => before == Some(b"class") && src.get(i + 1) != Some(&b':'),
             _ => false,
         };
-        if cpp {
+        if cpp && for_cpp == 0 {
             return true;
         }
+        // (Not a namespace: nedmalloc.h gives C++ users its functions in one.)
+        defined_for_cpp |= cpp && !(b == b'{' && (before == Some(b"namespace") || last == Some(b"namespace")));
         words.clear();
         i += 1;
     }
-    false
+    defined_for_cpp
 }
 
 /// C++ templates whose `->` (or `*`) reaches the object of the type they
@@ -3256,8 +3258,9 @@ mod tests {
         // nedmalloc.h: a namespace for C++ users.
         assert!(!is_cpp("a.h", b"#ifdef __cplusplus\nnamespace nedalloc {\n#endif\nvoid *nedmalloc(size_t);\n#ifdef __cplusplus\n}\n#endif\n"));
         assert!(!is_cpp("a.h", b"#if defined(__cplusplus)\nextern \"C\" {\nnamespace x {}\n#endif\nint f(void);\n"));
-        // ... but the other branch counts.
+        // ... but the other branch counts, and so does a class for C++.
         assert!(is_cpp("a.h", b"#ifndef __cplusplus\nint f(void);\n#else\n#endif\nnamespace y {}\n"));
+        assert!(is_cpp("a.h", b"#ifdef __cplusplus\nextern \"C\" {\n#endif\nint f(void);\n#ifdef __cplusplus\n}\nclass W {\n public:\n  int g();\n};\n#endif\n"));
     }
 
     #[test]

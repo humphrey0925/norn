@@ -317,6 +317,11 @@ fn hides(toks: &[T], is_param: impl Fn(&T) -> bool) -> bool {
     if n >= 2 && toks[0].is("{") && toks[n - 1].is("}") {
         return true;
     }
+    // C++: a template defined (bitcoin's `SER_PARAMS_OPFUNC`, an
+    // `operator ()`), which a class body takes as a member of its own.
+    if toks.windows(2).any(|w| w[0].k == K::Ident && &*w[0].text == "template" && w[1].is("<")) {
+        return true;
+    }
     let (mut paren, mut brace) = (0i32, 0i32);
     for i in 0..n {
         let t = &toks[i];
@@ -1918,6 +1923,7 @@ mod tests {
             ("return x;", false),
             ("do { x = y; } while (0)", false),
             ("case y: return #x;", false),
+            ("/** a (b). */ \\\n template <typename T> \\\n auto operator()(T&& t) const { return W{*this, t}; }", true),
         ] {
             assert_eq!(hides_names(body.as_bytes(), &p), want, "{body}");
         }
