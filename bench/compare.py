@@ -38,7 +38,9 @@ ROOT = Path(__file__).resolve().parent.parent
 TRUTH = {"c-only": "truth.json", "git-c": "truth-git.json", "redis": "truth-redis-src.json", "linux": "truth-linux.json",
          "leveldb": "truth-leveldb.json", "fmt": "truth-fmt.json", "bitcoin": "truth-bitcoin.json",
          "stm32f4": "truth-stm32f4.json", "nrfx": "truth-nrfx.json",
-         "nrfx-corpus": "truth-nrfx.json"}
+         "nrfx-corpus": "truth-nrfx.json",
+         "curl": "truth-curl.json", "sqlite": "truth-sqlite.json", "mbedtls": "truth-mbedtls.json",
+         "freertos": "truth-freertos.json", "lwip": "truth-lwip.json", "u-boot": "truth-u-boot.json"}
 WSL_TOOLS = ("ctags", "cscope", "gtags")
 ALL_TOOLS = ("si", "cbm", "clangd", "clangd-db", *WSL_TOOLS)
 SKIP_DIRS = (".git", ".si", ".norn")
