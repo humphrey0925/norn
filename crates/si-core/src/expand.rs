@@ -377,8 +377,10 @@ struct Parsed {
     conditional: bool,
     /// Defined under `#ifndef` of its own name.
     fallback: bool,
-    /// The file it is defined in.
+    /// The file it is defined in, and which of its definitions it is
+    /// (they are in the order of the file).
     file: u32,
+    at: u32,
     /// For each body token, the parameter it names, or `NONE`.
     param_at: Vec<u32>,
 }
@@ -414,7 +416,7 @@ fn parse(text: &str, function_like: bool, guard: &str) -> Parsed {
     let param_at =
         toks.iter().map(|t| params.iter().position(|p| t.k == K::Ident && *p == t.text).map_or(NONE, |i| i as u32)).collect();
     let hides = hides(&toks, |t| params.contains(&t.text));
-    Parsed { params, variadic, function_like, body: toks, hides, guards, conditional: false, fallback: false, file: 0, param_at }
+    Parsed { params, variadic, function_like, body: toks, hides, guards, conditional: false, fallback: false, file: 0, at: 0, param_at }
 }
 
 struct Table<'a> {
@@ -450,6 +452,8 @@ struct Engine<'a> {
     /// Names with several definitions met in this run, with how many.
     met: Vec<(Box<str>, usize)>,
     active: Vec<Text>,
+    /// The definitions those are expanded by, in the same order.
+    active_defs: Vec<&'a Parsed>,
     steps: u32,
     hiding: FxHashMap<Box<str>, bool>,
     /// Set when the engine stands for all the translation units of this
@@ -494,6 +498,7 @@ impl<'a> Engine<'a> {
             choice: Choice::default(),
             met: Vec::new(),
             active: Vec::new(),
+            active_defs: Vec::new(),
             steps: 0,
             hiding: FxHashMap::default(),
             merged: None,
@@ -611,6 +616,19 @@ impl<'a> Engine<'a> {
         if n == 0 {
             return None;
         }
+        // In the body of a definition, a name its own file defined before
+        // it is that definition (`#undef X` / `#define X`, stage after
+        // stage, as the kernel's `trace_events.h` does, beside `perf.h`'s).
+        // (Not where the definitions are branches of an `#if`: each is
+        // one reading.)
+        if let Some(parent) = self.active_defs.last().copied().filter(|p| !p.conditional) {
+            let here: Vec<&'a Parsed> = self.cands[name].iter().copied().filter(|p| p.file == parent.file).collect();
+            if here.iter().all(|p| !p.conditional) {
+                if let Some(p) = here.into_iter().filter(|p| p.at < parent.at).max_by_key(|p| p.at) {
+                    return Some(p);
+                }
+            }
+        }
         let i = match self.choice.get(name) {
             Some(&i) => i.min(n - 1),
             None => {
@@ -631,6 +649,7 @@ impl<'a> Engine<'a> {
             let mut t = match item {
                 Item::End => {
                     self.active.pop();
+                    self.active_defs.pop();
                     continue;
                 }
                 Item::Tok(t) => t,
@@ -665,6 +684,7 @@ impl<'a> Engine<'a> {
                     let a = match item {
                         Item::End => {
                             self.active.pop();
+                            self.active_defs.pop();
                             continue;
                         }
                         Item::Tok(a) => a,
@@ -692,6 +712,7 @@ impl<'a> Engine<'a> {
             self.steps += 1;
             let body = self.substitute(m, args);
             self.active.push(t.text);
+            self.active_defs.push(m);
             stack.push(Item::End);
             stack.extend(body.into_iter().rev().map(Item::Tok));
         }
@@ -739,6 +760,7 @@ impl<'a> Engine<'a> {
                         let depth = self.active.len();
                         let e = self.expand(args[p].clone());
                         self.active.truncate(depth);
+                        self.active_defs.truncate(depth);
                         expanded[p] = Some(e);
                     }
                     res.extend(expanded[p].iter().flatten().cloned());
@@ -797,6 +819,7 @@ impl<'a> Engine<'a> {
             self.choice = choice.clone();
             self.met.clear();
             self.active.clear();
+            self.active_defs.clear();
             self.steps = 0;
             let t = std::time::Instant::now();
             let out = self.expand(toks.to_vec());
@@ -1925,13 +1948,14 @@ pub fn expand(files: &[FileFacts], includes: &[Vec<u32>], sure_includes: &[Vec<u
             .par_iter()
             .enumerate()
             .map(|(fi, f)| {
-                let one = |m: &crate::model::MacroBody| Parsed {
+                let one = |(i, m): (usize, &crate::model::MacroBody)| Parsed {
                     conditional: m.conditional,
                     fallback: m.fallback,
                     file: fi as u32,
+                    at: i as u32,
                     ..parse(f.name(m.text as usize), m.function_like, guard_text(f, m))
                 };
-                f.macros.iter().map(one).collect()
+                f.macros.iter().enumerate().map(one).collect()
             })
             .collect();
         let mut table = Table::new(files, by_name, parsed);
@@ -2071,5 +2095,43 @@ mod tests {
             let v = eng.variants(&tokenize(src.as_bytes(), Origin::Site), &Choice::default(), |_| true);
             assert_eq!(texts(&v[0].0), want, "{src}");
         }
+    }
+
+    #[test]
+    fn in_a_body_a_name_is_what_its_own_file_defined_before() {
+        // `perf.h` and `events.h` each define INNER, then OUTER with it.
+        let defs: [(&str, &[(&str, &str)]); 2] = [
+            ("perf.h", &[("INNER", "(n) aaa_ ## n"), ("OUTER", "(n) INNER (n)")]),
+            ("events.h", &[("INNER", "(n) do_ ## n"), ("OUTER", "(n) INNER (n) raw_ ## n")]),
+        ];
+        let files: Vec<FileFacts> = defs
+            .iter()
+            .map(|(path, macros)| {
+                let mut f = FileFacts::new((*path).into());
+                for (name, text) in macros.iter() {
+                    let (name, text) = (f.push_name(name), f.push_text(text));
+                    f.macros.push(crate::model::MacroBody { name, text, function_like: true, guard: NONE, conditional: false, fallback: false });
+                }
+                f
+            })
+            .collect();
+        let parsed: Vec<Vec<Parsed>> = files
+            .iter()
+            .enumerate()
+            .map(|(fi, f)| f.macros.iter().enumerate().map(|(i, m)| Parsed { file: fi as u32, at: i as u32, ..parse(f.name(m.text as usize), true, "") }).collect())
+            .collect();
+        let mut by_name: FxHashMap<&str, Vec<(u32, u32)>> = FxHashMap::default();
+        for (fi, f) in files.iter().enumerate() {
+            for (i, m) in f.macros.iter().enumerate() {
+                by_name.entry(f.name(m.name as usize)).or_default().push((fi as u32, i as u32));
+            }
+        }
+        let table = Table::new(&files, by_name, parsed);
+        let mut eng = Engine::new(&table, vec![true, true]);
+        let v = eng.variants(&tokenize(b"OUTER (sched)", Origin::Site), &Choice::default(), |_| true);
+        let all: Vec<String> = v.iter().map(|(t, _)| texts(t)).collect();
+        // Never `events.h`'s OUTER with `perf.h`'s INNER.
+        assert!(all.contains(&"do_sched raw_sched".to_string()), "{all:?}");
+        assert!(!all.contains(&"aaa_sched raw_sched".to_string()), "{all:?}");
     }
 }
