@@ -2470,6 +2470,40 @@ void f (int *m) { class_mutex_constructor (m); }
     }
 
     #[test]
+    fn a_folder_the_build_does_not_compile_renames_nothing_it_does() {
+        // m68k's `#define clear_bit_unlock clear_bit`, seen by a header that
+        // may read anything (it includes a header the build makes).
+        let dir = std::env::temp_dir().join(format!("si-link-apart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let files = [
+            ("arch/m68k/include/asm/bitops.h", "#define clear_bit_unlock clear_bit
+"),
+            ("include/lock.h", "#include \"generated/made.h\"
+static inline void clear_bit_unlock (long n) { }
+"),
+            ("a.c", "#include \"include/lock.h\"
+"),
+        ];
+        for (p, src) in &files {
+            std::fs::create_dir_all(dir.join(p).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(p), src).unwrap();
+        }
+        let full: Vec<std::path::PathBuf> = files.iter().map(|(p, _)| dir.join(p)).collect();
+        let defined = |not_built: Vec<String>| {
+            let settings = crate::cond::Settings { not_built, ..Default::default() };
+            let mut conditions = crate::cond::Conditions::from_settings(&settings, &dir);
+            let sets = crate::prescan_under(&dir, &full, &mut conditions);
+            let facts = crate::extract_all(&dir, &full, &sets);
+            let g = link(&facts).0;
+            ["clear_bit_unlock", "clear_bit"].map(|n| g.find(n).iter().any(|&s| g.syms[s as usize].kind == kind::FUNCTION))
+        };
+        // (Not told: a `clear_bit` is made of it beside.)
+        assert!(defined(vec![])[1]);
+        assert_eq!(defined(vec!["arch/m68k".into()]), [true, false]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_macro_that_does_without_the_function_of_its_name_is_another_reading() {
         // libiberty's `htab_size`: the macro reads the member; the function,
         // defined as `(htab_size)`, is for those who take its address.

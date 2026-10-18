@@ -354,7 +354,7 @@ pub fn prescan_under(root: &Path, files: &[PathBuf], conditions: &mut cond::Cond
     let paths: Vec<String> = files.iter().map(|p| rel_path(root, p)).collect();
     let mut sets = MacroSets::of_defines(defines.iter().flatten());
     step("sets", &mut t);
-    sets.scope(&defines, &paths);
+    sets.scope(&defines, &paths, conditions.not_built());
     let sets = sets.with_conditions(conditions.clone());
     step("scope", &mut t);
     trim_memory();

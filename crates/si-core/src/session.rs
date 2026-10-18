@@ -137,7 +137,7 @@ impl Session {
         let mut conditions = crate::conditions_of(root, &files);
         let defines: Vec<Vec<Define>> = crate::settle(root, &files, &mut conditions);
         let paths: Vec<String> = files.iter().map(|p| crate::rel_path(root, p)).collect();
-        let sets = MacroSets::of_files(&defines, &paths).with_conditions(conditions.clone());
+        let sets = MacroSets::of_files(&defines, &paths, conditions.not_built()).with_conditions(conditions.clone());
         drop(paths);
         let defines = Packed::all(defines);
         let facts = crate::extract_all_reusing(root, &files, &sets, reuse);
@@ -550,7 +550,7 @@ impl Session {
         // Saved with the manifest; made again if not (a save from before
         // they were).
         let sets = store.load_sets(manifest.sets, &conditions).unwrap_or_else(|| {
-            let sets = MacroSets::of_files(&defines, &manifest.files).with_conditions(conditions.clone());
+            let sets = MacroSets::of_files(&defines, &manifest.files, conditions.not_built()).with_conditions(conditions.clone());
             if sets.digest() == manifest.sets {
                 store.save_sets(&sets);
             }
@@ -747,7 +747,7 @@ impl Session {
         if defines_changed {
             let per_file: Vec<Vec<Define>> = self.defines.iter().map(Packed::get).collect();
             let paths: Vec<String> = self.files.iter().map(|p| crate::rel_path(&self.root, p)).collect();
-            let sets = MacroSets::of_files(&per_file, &paths).with_conditions(self.conditions.clone());
+            let sets = MacroSets::of_files(&per_file, &paths, self.conditions.not_built()).with_conditions(self.conditions.clone());
             reclassified = self.sets.reclassified(&sets);
             self.sets = sets;
         }
