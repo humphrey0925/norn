@@ -78,8 +78,24 @@ enum Origin {
 /// nothing to copy. What is kept is small: identifiers, numbers and
 /// punctuation, which recur; string literals, which do not, are all the
 /// one empty string (nothing here reads what a string says).
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy)]
 struct Text(&'static str);
+
+// (Every text is the pool's one copy of it: the same text is the same
+// pointer, compared and hashed as one.)
+impl PartialEq for Text {
+    fn eq(&self, other: &Text) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+}
+
+impl Eq for Text {}
+
+impl std::hash::Hash for Text {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        (self.0.as_ptr() as usize).hash(h)
+    }
+}
 
 const SHARDS: usize = 64;
 /// Every text in use, by shard of its hash. The set owns the strings; a
@@ -442,7 +458,7 @@ struct Table<'a> {
     parsed: Vec<Vec<Parsed>>,
 }
 
-type Choice = FxHashMap<Box<str>, usize>;
+type Choice = FxHashMap<Text, usize>;
 
 enum Item {
     Tok(T),
@@ -455,11 +471,11 @@ struct Engine<'a> {
     table: &'a Table<'a>,
     /// Files that can be in a translation unit with this one.
     visible: Vec<bool>,
-    cands: FxHashMap<Box<str>, Vec<&'a Parsed>>,
+    cands: FxHashMap<Text, Vec<&'a Parsed>>,
     /// Which definition to use for each name with several.
     choice: Choice,
     /// Names with several definitions met in this run, with how many.
-    met: Vec<(Box<str>, usize)>,
+    met: Vec<(Text, usize)>,
     active: Vec<Text>,
     /// The definitions those are expanded by, in the same order.
     active_defs: Vec<&'a Parsed>,
@@ -467,7 +483,7 @@ struct Engine<'a> {
     /// file makes after that line is not there yet.
     site: Option<(u32, u32)>,
     steps: u32,
-    hiding: FxHashMap<Box<str>, bool>,
+    hiding: FxHashMap<Text, bool>,
     /// Set when the engine stands for all the translation units of this
     /// file together.
     merged: Option<u32>,
@@ -522,6 +538,7 @@ impl<'a> Engine<'a> {
 
     /// Is there a translation unit here in which `name` is no macro?
     fn maybe_undefined(&mut self, name: &str) -> bool {
+        let text = Text::of(name);
         match self.merged {
             // Several units at once: sure only if the file itself always
             // defines the name.
@@ -530,19 +547,19 @@ impl<'a> Engine<'a> {
             }),
             None => {
                 let sure = std::mem::take(&mut self.sure);
-                let all = self.candidates(name).iter().all(|p| p.conditional || !sure.get(p.file as usize).copied().unwrap_or(true));
+                let all = self.candidates(text).iter().all(|p| p.conditional || !sure.get(p.file as usize).copied().unwrap_or(true));
                 self.sure = sure;
                 all
             }
         }
     }
 
-    fn candidates(&mut self, name: &str) -> &[&'a Parsed] {
-        if !self.cands.contains_key(name) {
+    fn candidates(&mut self, name: Text) -> &[&'a Parsed] {
+        if !self.cands.contains_key(&name) {
             // The definitions this unit can see, one of each text, in the
             // order of the texts (which must not depend on which file was
             // read first).
-            let all = self.table.by_text.get(name).map_or(&[][..], |v| &v[..]);
+            let all = self.table.by_text.get(name.0).map_or(&[][..], |v| &v[..]);
             let one_of_each = |defs: &mut dyn Iterator<Item = &(u32, u32, u32)>| -> Vec<(u32, u32, u32)> {
                 let mut out: Vec<(u32, u32, u32)> = Vec::new();
                 for &d in defs {
@@ -583,13 +600,13 @@ impl<'a> Engine<'a> {
                 list.retain(|p| !p.fallback);
             }
             // In the cache first, so that a guard that leads back here ends.
-            self.cands.insert(name.into(), list.clone());
+            self.cands.insert(name, list.clone());
             let open: Vec<&'a Parsed> = list.iter().copied().filter(|p| p.guards.iter().all(|g| self.feasible(g))).collect();
             if !open.is_empty() && open.len() < list.len() {
-                self.cands.insert(name.into(), open);
+                self.cands.insert(name, open);
             }
         }
-        &self.cands[name]
+        &self.cands[&name]
     }
 
     /// Can the guard hold in some translation unit with this file? It cannot
@@ -597,7 +614,7 @@ impl<'a> Engine<'a> {
     fn feasible(&mut self, guard: &(Text, i64, bool)) -> bool {
         let (name, value, negated) = guard;
         let values: Option<Vec<i64>> = self
-            .candidates(name)
+            .candidates(*name)
             .iter()
             .map(|p| match &p.body[..] {
                 [t] if !p.function_like => int(&t.text),
@@ -613,18 +630,18 @@ impl<'a> Engine<'a> {
     /// Can a use of `name` here expand to names not written at the use? The
     /// set of expanding macros is by name over the whole corpus; this asks
     /// the definitions this file can see.
-    fn hides(&mut self, name: &str) -> bool {
-        if let Some(&known) = self.hiding.get(name) {
+    fn hides(&mut self, name: Text) -> bool {
+        if let Some(&known) = self.hiding.get(&name) {
             return known;
         }
-        self.hiding.insert(name.into(), false);
+        self.hiding.insert(name, false);
         let cands = self.candidates(name).to_vec();
-        let found = cands.iter().any(|p| p.hides || p.body.iter().any(|t| t.k == K::Ident && self.hides(&t.text)));
-        self.hiding.insert(name.into(), found);
+        let found = cands.iter().any(|p| p.hides || p.body.iter().any(|t| t.k == K::Ident && self.hides(t.text)));
+        self.hiding.insert(name, found);
         found
     }
 
-    fn pick(&mut self, name: &str) -> Option<&'a Parsed> {
+    fn pick(&mut self, name: Text) -> Option<&'a Parsed> {
         let n = self.candidates(name).len();
         if n == 0 {
             return None;
@@ -635,28 +652,28 @@ impl<'a> Engine<'a> {
         // (Not where the definitions are branches of an `#if`: each is
         // one reading.)
         if let Some(parent) = self.active_defs.last().copied().filter(|p| !p.conditional) {
-            let here: Vec<&'a Parsed> = self.cands[name].iter().copied().filter(|p| p.file == parent.file).collect();
+            let here: Vec<&'a Parsed> = self.cands[&name].iter().copied().filter(|p| p.file == parent.file).collect();
             if here.iter().all(|p| !p.conditional) {
                 if let Some(p) = here.into_iter().filter(|p| p.at < parent.at).max_by_key(|p| p.at) {
                     return Some(p);
                 }
             }
         }
-        let i = match self.choice.get(name) {
+        let i = match self.choice.get(&name) {
             Some(&i) => i.min(n - 1),
             None => {
-                self.choice.insert(name.into(), 0);
+                self.choice.insert(name, 0);
                 0
             }
         };
-        if n > 1 && !self.met.iter().any(|m| &*m.0 == name) {
-            self.met.push((name.into(), n));
+        if n > 1 && !self.met.iter().any(|m| m.0 == name) {
+            self.met.push((name, n));
         }
-        let p = self.cands[name][i];
+        let p = self.cands[&name][i];
         // (Defined further down the use's own file: not yet, unless an
         // earlier definition there or elsewhere may be meant.)
         if let Some((file, line)) = self.site.filter(|s| p.file == s.0 && p.line > s.1) {
-            return self.cands[name].iter().copied().find(|q| q.file != file || q.line <= line);
+            return self.cands[&name].iter().copied().find(|q| q.file != file || q.line <= line);
         }
         Some(p)
     }
@@ -682,7 +699,7 @@ impl<'a> Engine<'a> {
                 out.push(t);
                 continue;
             }
-            let Some(m) = self.pick(&t.text) else {
+            let Some(m) = self.pick(t.text) else {
                 out.push(t);
                 continue;
             };
@@ -818,9 +835,12 @@ impl<'a> Engine<'a> {
     /// Every distinct expansion of `toks`, with the choices that gave it.
     /// Names in `pinned` keep the definition chosen there. Stops once a few
     /// expansions in a row hold nothing `novel`.
-    fn variants(&mut self, toks: &[T], pinned: &Choice, mut novel: impl FnMut(&[T]) -> bool) -> Vec<(Vec<T>, Choice)> {
+    /// (`keep`: return them; else only `novel` sees them.)
+    fn variants(&mut self, toks: &[T], pinned: &Choice, keep: bool, mut novel: impl FnMut(&[T]) -> bool) -> Vec<(Vec<T>, Choice)> {
         let mut results: Vec<(Vec<T>, Choice)> = Vec::new();
-        let mut free: Vec<(Box<str>, usize)> = Vec::new();
+        // The expansions read so far, by a hash of their texts.
+        let mut read: FxHashSet<u64> = FxHashSet::default();
+        let mut free: Vec<(Text, usize)> = Vec::new();
         // Every definition of every name met is read once before any two
         // are read together: one name, one other definition, the rest as
         // first read. (Else the outermost name, which turns slowest, had a
@@ -828,7 +848,7 @@ impl<'a> Engine<'a> {
         // five.)
         // (A name met only under another choice, as `DECLARE_EVENT_CLASS`
         // is only under `trace_events.h`'s `TRACE_EVENT`, is read under it.)
-        let mut singles: std::collections::VecDeque<(Box<str>, usize, Choice)> = std::collections::VecDeque::new();
+        let mut singles: std::collections::VecDeque<(Text, usize, Choice)> = std::collections::VecDeque::new();
         let mut combining = false;
         let mut choice = pinned.clone();
         let mut stale = 0;
@@ -852,20 +872,29 @@ impl<'a> Engine<'a> {
             let under = self.choice.clone();
             for m in self.met.drain(..) {
                 if !pinned.contains_key(&m.0) && !free.iter().any(|f| f.0 == m.0) {
-                    singles.extend((1..m.1).map(|i| (m.0.clone(), i, under.clone())));
+                    singles.extend((1..m.1).map(|i| (m.0, i, under.clone())));
                     free.push(m);
                 }
             }
-            if !results.iter().any(|r| r.0.len() == out.len() && r.0.iter().zip(&out).all(|(a, b)| a.text == b.text)) {
+            let digest = {
+                use std::hash::{Hash, Hasher};
+                let mut h = rustc_hash::FxHasher::default();
+                out.len().hash(&mut h);
+                out.iter().for_each(|t| t.text.hash(&mut h));
+                h.finish()
+            };
+            if read.insert(digest) {
                 let t = std::time::Instant::now();
                 let is_novel = novel(&out);
                 spend(1, t);
                 if is_novel {
                     stale = 0;
                 }
-                results.push((out, self.choice.clone()));
+                if keep {
+                    results.push((out, self.choice.clone()));
+                }
             }
-            if results.len() >= self.max_variants {
+            if read.len() >= self.max_variants {
                 break;
             }
             if !combining {
@@ -887,7 +916,7 @@ impl<'a> Engine<'a> {
                 k -= 1;
                 let c = choice.get(&free[k].0).copied().unwrap_or(0) + 1;
                 if c < free[k].1 {
-                    choice.insert(free[k].0.clone(), c);
+                    choice.insert(free[k].0, c);
                     for f in &free[k + 1..] {
                         choice.remove(&f.0);
                     }
@@ -918,14 +947,38 @@ struct Found {
 
 impl Found {
     /// Add this expansion's names to `known`; was any of them new?
-    fn novel(self, known: &mut FxHashSet<String>) -> bool {
-        let names = self.single.into_iter().chain(self.decls.into_iter().map(|d| d.0)).chain(self.refs.into_iter().map(|r| r.0)).chain(self.bases.into_iter().map(|b| b.0 + ":" + &b.1)).chain(self.result_calls.into_iter().map(|c| c + "()"));
-        // (Every one of them inserted: no stopping at the first new one.)
+    fn novel_in(&self, known: &mut FxHashSet<String>) -> bool {
         let mut new = false;
-        for n in names {
-            new |= known.insert(n);
-        }
+        let mut see = |n: &str| {
+            if !known.contains(n) {
+                known.insert(n.to_string());
+                new = true;
+            }
+        };
+        self.single.iter().for_each(|n| see(n));
+        self.decls.iter().for_each(|d| see(&d.0));
+        self.refs.iter().for_each(|r| see(&r.0));
+        self.bases.iter().for_each(|b| see(&format!("{}:{}", b.0, b.1)));
+        self.result_calls.iter().for_each(|c| see(&format!("{c}()")));
         new
+    }
+
+    /// What another expansion of the same use found besides, once each.
+    fn merge(&mut self, other: Found) {
+        fn add<X: PartialEq>(into: &mut Vec<X>, more: Vec<X>) {
+            for x in more {
+                if !into.contains(&x) {
+                    into.push(x);
+                }
+            }
+        }
+        if self.single.is_none() {
+            self.single = other.single;
+        }
+        add(&mut self.decls, other.decls);
+        add(&mut self.refs, other.refs);
+        add(&mut self.bases, other.bases);
+        add(&mut self.result_calls, other.result_calls);
     }
 
     fn is_empty(&self) -> bool {
@@ -1405,9 +1458,9 @@ struct Made {
     /// taken from that one only.
     first: bool,
     found: Found,
-    /// An initialized object the expansion declares: its type's name and
-    /// the names in the initializer.
-    stored: Option<(String, Vec<(Place, String)>)>,
+    /// The initialized objects the expansions declare: each its type's
+    /// name and the names in the initializer.
+    stored: Vec<(String, Vec<(Place, String)>)>,
 }
 
 /// Where an expansion holds: which translation unit (as an index into the
@@ -1463,7 +1516,7 @@ fn expand_file(
     let mut names = Names { ids: f.shared_names().enumerate().filter(|&(_, id)| id != NONE).map(|(i, id)| (id, i as u32)).collect() };
     let (n_defs, n_refs) = (f.defs.len(), f.refs.len());
     let live: Vec<&Site> =
-        f.sites.iter().filter(|s| engines.iter_mut().any(|e| e.hides(f.name(s.name as usize)))).collect();
+        f.sites.iter().filter(|s| engines.iter_mut().any(|e| e.hides(Text::of(f.name(s.name as usize))))).collect();
 
     spend(2, t_setup);
     // 1. Definitions written under a macro's name: one per expansion.
@@ -1478,8 +1531,8 @@ fn expand_file(
                 add_name(&mut named, macro_name, (ei, Choice::default()));
             }
             let mut known = FxHashSet::default();
-            let novel = |exp: &[T]| recognise(exp, s, macro_name, f.cpp()).novel(&mut known);
-            for (exp, choice) in eng.variants(&toks, &Choice::default(), novel) {
+            let novel = |exp: &[T]| recognise(exp, s, macro_name, f.cpp()).novel_in(&mut known);
+            for (exp, choice) in eng.variants(&toks, &Choice::default(), true, novel) {
                 if let Some(n) = recognise(&exp, s, macro_name, f.cpp()).def_name() {
                     add_name(&mut named, n, (ei, choice));
                 }
@@ -1541,10 +1594,13 @@ fn expand_file(
                 for (ei, pinned) in contexts {
                     engines[*ei].site = Some((fi as u32, s.line));
                     let maybe = engines[*ei].maybe_undefined(macro_name);
+                    // Each expansion read once, as it is made; what they
+                    // find together kept once.
                     let mut known = FxHashSet::default();
-                    let novel = |exp: &[T]| recognise(exp, s, macro_name, f.cpp()).novel(&mut known);
-                    for (exp, _) in engines[*ei].variants(&toks, pinned, novel) {
-                        let mut found = recognise(&exp, s, macro_name, f.cpp());
+                    let mut together = Made { line: s.line, scope, maybe, first: i == 0, found: Found::default(), stored: Vec::new() };
+                    let novel = |exp: &[T]| {
+                        let mut found = recognise(exp, s, macro_name, f.cpp());
+                        let new = found.novel_in(&mut known);
                         // A use that names a definition: what else it makes,
                         // and what that calls; not its own name (a call of
                         // itself, from its own body).
@@ -1553,14 +1609,19 @@ fn expand_file(
                             found.refs.retain(|r| r.2.is_some());
                         }
                         // A macro that declares a whole initialized object.
-                        let stored = declared_initializer(&exp)
+                        let stored = declared_initializer(exp)
                             .filter(|_| s.flags & site::TOP != 0)
                             .map(|(type_name, array, at)| (type_name, init_names(&exp[at..], array)));
-                        if found.is_empty() && stored.is_none() {
-                            continue;
+                        if !found.is_empty() || stored.is_some() {
+                            together.found.merge(found);
+                            together.stored.extend(stored);
                         }
+                        new
+                    };
+                    engines[*ei].variants(&toks, pinned, false, novel);
+                    if !together.found.is_empty() || !together.stored.is_empty() {
                         fruitful = true;
-                        made.push(Made { line: s.line, scope, maybe, first: i == 0, found, stored });
+                        made.push(together);
                     }
                 }
             }
@@ -1634,7 +1695,7 @@ fn expand_file(
                 out.refs.push(Ref { name, line: m.line, scope, kind });
             }
         }
-        if let Some((type_name, stored)) = m.stored {
+        for (type_name, stored) in m.stored {
             let type_name = names.id(&mut out, &type_name);
             for (place, func) in stored {
                 let func = names.id(&mut out, &func);
@@ -1669,7 +1730,7 @@ fn expand_file(
                 let novel = |exp: &[T]| {
                     init_names(exp, init.array).into_iter().fold(false, |new, (place, name)| known.insert((place, name, unit)) || new)
                 };
-                eng.variants(toks, &Choice::default(), novel);
+                eng.variants(toks, &Choice::default(), false, novel);
             }
             eng.max_variants = if table.thorough { MAX_VARIANTS_READ } else { MAX_VARIANTS };
         };
@@ -2120,7 +2181,7 @@ mod tests {
             ("SELF", "SELF + 1"),
             ("CAT", "CAT"),
         ] {
-            let v = eng.variants(&tokenize(src.as_bytes(), Origin::Site), &Choice::default(), |_| true);
+            let v = eng.variants(&tokenize(src.as_bytes(), Origin::Site), &Choice::default(), true, |_| true);
             assert_eq!(texts(&v[0].0), want, "{src}");
         }
     }
@@ -2146,7 +2207,7 @@ mod tests {
         let made = |table: &Table| {
             let mut eng = Engine::new(table, vec![true; 6]);
             // (Novel: what has `made_` in it.)
-            let v = eng.variants(&tokenize(b"STAGE (x)", Origin::Site), &Choice::default(), |t| t.iter().any(|t| t.text.starts_with("made_")));
+            let v = eng.variants(&tokenize(b"STAGE (x)", Origin::Site), &Choice::default(), true, |t| t.iter().any(|t| t.text.starts_with("made_")));
             v.iter().any(|(t, _)| texts_of(t).contains("made_x"))
         };
         assert!(!made(&table));
@@ -2189,7 +2250,7 @@ mod tests {
         }
         let table = Table::new(&files, by_name, parsed);
         let mut eng = Engine::new(&table, vec![true, true]);
-        let v = eng.variants(&tokenize(b"OUTER (sched)", Origin::Site), &Choice::default(), |_| true);
+        let v = eng.variants(&tokenize(b"OUTER (sched)", Origin::Site), &Choice::default(), true, |_| true);
         let all: Vec<String> = v.iter().map(|(t, _)| texts(t)).collect();
         // Never `events.h`'s OUTER with `perf.h`'s INNER.
         assert!(all.contains(&"do_sched raw_sched".to_string()), "{all:?}");
