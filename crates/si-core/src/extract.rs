@@ -1496,7 +1496,7 @@ impl<'a> Walk<'a> {
                         let text = String::from_utf8_lossy(&self.orig[m.name.end as usize..m.end as usize]);
                         let text = self.out.push_text(&text);
                         let guard = if m.guard.is_empty() { NONE } else { self.out.push_text(&m.guard) };
-                        self.out.macros.push(MacroBody { name, text, function_like: m.name.call, guard, conditional: m.conditional, fallback: m.fallback });
+                        self.out.macros.push(MacroBody { name, text, function_like: m.name.call, guard, conditional: m.conditional, fallback: m.fallback, line: m.name.line });
                     }
                 }
                 Event::Site(s) => {

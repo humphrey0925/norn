@@ -1236,6 +1236,20 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     // Where none of a header's compilations reads the callee's file, what
     // every compilation that does compiles: per (file, stretch of lines).
     let everywhere: std::sync::Mutex<FxHashMap<(u32, u32), crate::cond::Tri>> = Default::default();
+    // The macros whose body uses their own name: wrappers of the function
+    // of that name (`#define class_mutex_constructor(_T)
+    // WITH_LOCK_GUARD_1_ATTRS(...)`, which calls it).
+    let wrappers: FxHashSet<u32> = files
+        .iter()
+        .enumerate()
+        .flat_map(|(fi, f)| {
+            let base = g.files[fi].sym_start;
+            f.refs
+                .iter()
+                .filter(move |r| f.defs.get(r.scope as usize).is_some_and(|d| d.kind == kind::MACRO && d.name == r.name))
+                .map(move |r| base + r.scope)
+        })
+        .collect();
     let who = Readers::new(readings);
     let all: Vec<u64> = vec![u64::MAX; readings.units.len().div_ceil(64)];
     let (unit_of, header_of, path_of) = if readings.is_empty() {
@@ -1767,7 +1781,11 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     let first = (syms[tmp[0] as usize].file, cpp.class(tmp[0]));
                     tmp.iter().any(|&c| (syms[c as usize].file, cpp.class(c)) != first)
                 } else {
-                    tmp.len() > 1
+                    // (A macro that wraps the function of its name is the
+                    // way to it, not another reading of the call.)
+                    let function = |c: &u32| syms[*c as usize].kind == kind::FUNCTION;
+                    let wraps = tmp.iter().any(function);
+                    tmp.iter().filter(|c| !(wraps && wrappers.contains(c))).count() > 1
                 };
                 let ambiguous = several || maybe || guessed || tmp.iter().any(optional);
                 counts[ambiguous as usize] += 1;
@@ -2386,6 +2404,54 @@ struct writer w = { .run = do_write };
         let calls: Vec<bool> = g.find("trace_open").iter().flat_map(|&s| g.refs_from(s)).filter(|e| g.sym_name(e.other) == "probe").map(|e| !e.ambiguous()).collect();
         assert_eq!(calls, [true]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The graph of these files as `norn index` makes it: prescanned, so
+    /// that macros are expanded.
+    fn indexed(files: &[(&str, &str)]) -> Graph {
+        let dir = std::env::temp_dir().join(format!("si-link-indexed-{}-{}", std::process::id(), files[0].0.replace(['/', '.'], "_")));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (p, src) in files {
+            std::fs::create_dir_all(dir.join(p).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(p), src).unwrap();
+        }
+        let full: Vec<std::path::PathBuf> = files.iter().map(|(p, _)| dir.join(p)).collect();
+        let sets = crate::prescan(&full);
+        let g = link(&crate::extract_all(&dir, &full, &sets)).0;
+        let _ = std::fs::remove_dir_all(&dir);
+        g
+    }
+
+    #[test]
+    fn a_macro_defined_further_down_is_not_there_yet() {
+        // `mutex.h` makes `class_mutex_constructor`, then a macro of that
+        // name that wraps it (the kernel's guards).
+        let g = indexed(&[
+            ("cleanup.h", "#define __GUARD(n, t) static inline int class_##n##_constructor (t *l) { return lock_it (l); }
+#define GUARD(n, t) __GUARD(n, t)
+"),
+            ("mutex.h", "#include \"cleanup.h\"
+int lock_it (int *l);
+GUARD(mutex, int)
+#define class_mutex_constructor(l) class_mutex_constructor (l), check ()
+"),
+            ("a.c", "#include \"mutex.h\"
+int check (void) { return 0; }
+void f (int *m) { class_mutex_constructor (m); }
+"),
+        ]);
+        let defs: Vec<bool> = g.find("class_mutex_constructor").iter().filter(|&&s| g.syms[s as usize].kind == kind::FUNCTION).map(|&s| g.syms[s as usize].flags & flag::DECL == 0).collect();
+        assert_eq!(defs, [true]);
+        // And the call through the wrapper reaches it, for certain.
+        let calls: Vec<(String, bool)> = g
+            .find("f")
+            .iter()
+            .flat_map(|&s| g.refs_from(s))
+            .filter(|e| g.sym_name(e.other) == "class_mutex_constructor")
+            .map(|e| (kind::name(g.syms[e.other as usize].kind).to_string(), !e.ambiguous()))
+            .collect();
+        assert!(calls.contains(&("function".to_string(), true)), "{calls:?}");
+        assert!(calls.iter().all(|c| c.1), "{calls:?}");
     }
 
     #[test]

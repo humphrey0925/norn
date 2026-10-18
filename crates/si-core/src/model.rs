@@ -106,6 +106,8 @@ pub struct MacroBody {
     pub conditional: bool,
     /// Defined under `#ifndef` of its own name.
     pub fallback: bool,
+    /// The line of its `#define`.
+    pub line: u32,
 }
 
 /// A use of an expanding macro, to be expanded at link time, when the
