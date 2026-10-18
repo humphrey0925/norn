@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.24.0
 
 **C++ and the Linux kernel more accurate**
 
@@ -24,7 +24,9 @@
 - A macro defined further down the file a use is in is not there yet at the use (the kernel's `mutex.h` makes `class_mutex_constructor`, then a macro of that name): the functions its guards make were read as declarations, and every `guard(mutex)` call missed.
 - A call through a macro that wraps the function of its own name (`#define error(...) (error(__VA_ARGS__), const_error())`, or the kernel's guard constructors, whose bodies come back to the name through another macro) reaches that function for certain. A macro that does without the function (`#define htab_size(h) ((h)->size)`) is still another reading.
 - Where every compilation was read, every definition of a macro met is expanded once, and a name first met under another choice of definition is read under it (the kernel's `TRACE_EVENT`, then each stage of `DECLARE_EVENT_CLASS`).
-- On the Linux kernel (x86_64 defconfig, against clang), with the build's configuration in the tree: calls found and certain 69.9% → 95.6%, all calls found 90.3% → 98.4%, definitions found 92.8% → 99.7%, precision of certain calls 98.7% → 99.2%; indexing takes a little longer (72 s → 75 s on the machine measured, back to back) and as much memory (5.2 GB at most): each expansion is recognised once, what a use's expansions find is kept once, and what was read already is known by a hash. Without a configuration: certain 59.7% → 64.2%. git's certain calls 99.4% → 99.6%. Without a configuration, little changes (certain 59.7% → 59.9%). Redis, git, binutils, STM32F4 HAL and nrfx unchanged.
+- On the Linux kernel (x86_64 defconfig, against clang), with the build's configuration in the tree: calls found and certain 69.9% → 95.6%, all calls found 90.3% → 98.4%, definitions found 92.8% → 99.7%, precision of certain calls 98.7% → 99.2%. Without a configuration: certain 59.7% → 64.2%, though their precision 98.5% → 98.1%.
+- Indexing the kernel with its configuration takes about 75 s and 5.2 GB at most on the machine measured: each expansion is recognised once, what a use's expansions find is kept once, and what was read already is known by a hash.
+- git's certain calls 99.4% → 99.6%; Redis, binutils, STM32F4 HAL and nrfx unchanged.
 
 ## 0.23.2
 

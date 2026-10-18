@@ -2,7 +2,7 @@
   "name": "norn-c",
   "displayName": "Norn — Code Navigation & Symbol Index",
   "description": "Norn: Source-Insight-style symbol search, context and relation views for C, from an index that follows macros and function pointers.",
-  "version": "0.23.2",
+  "version": "0.24.0",
   "publisher": "humphrey0925",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
