@@ -21,7 +21,8 @@
 - A call inside a function a macro makes is there whenever the function is: that the macro may not be defined (the kernel's `TRACE_EVENT`, read again and again under other definitions) no longer makes the call uncertain.
 - Macros of folders the build does not compile are not seen from those it does (`READ_ONCE` from `samples/bpf`).
 - In a macro's body, a name its own file defined just before it means that definition: the kernel's `trace_events.h` redefines its macros stage after stage, and its `do_trace_event_raw_event_*` functions were never made.
-- On the Linux kernel (x86_64 defconfig, against clang), with the build's configuration in the tree: calls found and certain 69.9% → 89.1%, all calls found 90.3% → 92.5%, precision of certain calls 98.7% → 99.3%; indexing takes about a quarter longer (90 s → 113 s on the machine measured). git's certain calls 99.4% → 99.6%. Without a configuration, little changes (certain 59.7% → 59.9%). Redis, git, binutils, STM32F4 HAL and nrfx unchanged.
+- Where every compilation was read, every definition of a macro met is expanded once, and a name first met under another choice of definition is read under it (the kernel's `TRACE_EVENT`, then each stage of `DECLARE_EVENT_CLASS`).
+- On the Linux kernel (x86_64 defconfig, against clang), with the build's configuration in the tree: calls found and certain 69.9% → 94.5%, all calls found 90.3% → 97.9%, definitions found 92.8% → 99.6%, precision of certain calls 98.7% → 99.2%; indexing takes longer (90 s → about 145 s on the machine measured) and more memory (5.0 → 6.9 GB at most). Without a configuration: certain 59.7% → 64.2%. git's certain calls 99.4% → 99.6%. Without a configuration, little changes (certain 59.7% → 59.9%). Redis, git, binutils, STM32F4 HAL and nrfx unchanged.
 
 ## 0.23.2
 

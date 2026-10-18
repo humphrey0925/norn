@@ -1060,7 +1060,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     let (includes, sure_includes) = include_edges(files, &options.include_aliases, &options.not_built, &mut stats);
     stats.include_ms = ms(t);
     let t = Instant::now();
-    (stats.sites, stats.expanded_defs, stats.expanded_refs) = crate::expand::expand(files, &includes, &sure_includes, &options.not_built, cache);
+    (stats.sites, stats.expanded_defs, stats.expanded_refs) = crate::expand::expand(files, &includes, &sure_includes, &options.not_built, !options.readings.is_empty(), cache);
     stats.expand_ms = ms(t);
     crate::mem_mark("expanded");
     crate::trim_memory();

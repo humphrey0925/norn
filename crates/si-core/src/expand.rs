@@ -24,8 +24,10 @@ fn spend(i: usize, since: std::time::Instant) {
     SPENT[i].fetch_add(since.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Distinct expansions kept for one use.
+/// Distinct expansions kept for one use; where every compilation was read
+/// (see [`Table::thorough`]), more.
 const MAX_VARIANTS: usize = 24;
+const MAX_VARIANTS_READ: usize = 40;
 /// Definitions of one name tried at one use.
 const MAX_CANDIDATES: usize = 16;
 /// Macro invocations and tokens allowed in one expansion.
@@ -423,6 +425,12 @@ struct Table<'a> {
     files: &'a [FileFacts],
     /// Per file, whether it is in a folder the build does not compile.
     outside: Vec<bool>,
+    /// Whether every compilation of the tree was read (`units`): what each
+    /// file can see is known, and every definition of a name met is worth
+    /// reading once (the kernel's `trace_events.h` stages, most of which
+    /// make nothing new for a given use). Else the many a file may see are
+    /// tried only while they bring something.
+    thorough: bool,
     by_name: FxHashMap<&'a str, Vec<(u32, u32)>>,
     /// The same definitions in the order of their text, each with a number
     /// that definitions of the same text (spacing aside) share: sorted and
@@ -485,7 +493,7 @@ impl<'a> Table<'a> {
                 (name, out)
             })
             .collect();
-        Table { files, outside: vec![false; files.len()], by_name, by_text, parsed }
+        Table { files, outside: vec![false; files.len()], thorough: false, by_name, by_text, parsed }
     }
 }
 
@@ -502,7 +510,7 @@ impl<'a> Engine<'a> {
             steps: 0,
             hiding: FxHashMap::default(),
             merged: None,
-            max_variants: MAX_VARIANTS,
+            max_variants: if table.thorough { MAX_VARIANTS_READ } else { MAX_VARIANTS },
             sure: Vec::new(),
         }
     }
@@ -807,7 +815,9 @@ impl<'a> Engine<'a> {
         // first read. (Else the outermost name, which turns slowest, had a
         // definition never read: `DEFINE_EVENT`'s tracepoint one among
         // five.)
-        let mut singles: std::collections::VecDeque<(Box<str>, usize)> = std::collections::VecDeque::new();
+        // (A name met only under another choice, as `DECLARE_EVENT_CLASS`
+        // is only under `trace_events.h`'s `TRACE_EVENT`, is read under it.)
+        let mut singles: std::collections::VecDeque<(Box<str>, usize, Choice)> = std::collections::VecDeque::new();
         let mut combining = false;
         let mut choice = pinned.clone();
         let mut stale = 0;
@@ -815,7 +825,9 @@ impl<'a> Engine<'a> {
             if stale >= BLIND_RUNS {
                 break;
             }
-            stale += 1;
+            // (Where thorough, every definition is read once whatever it
+            // brings: only readings of several together give up when blind.)
+            stale += (combining || !self.table.thorough) as usize;
             self.choice = choice.clone();
             self.met.clear();
             self.active.clear();
@@ -826,9 +838,10 @@ impl<'a> Engine<'a> {
             spend(0, t);
             SPENT[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             SPENT[5].fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let under = self.choice.clone();
             for m in self.met.drain(..) {
                 if !pinned.contains_key(&m.0) && !free.iter().any(|f| f.0 == m.0) {
-                    singles.extend((1..m.1).map(|i| (m.0.clone(), i)));
+                    singles.extend((1..m.1).map(|i| (m.0.clone(), i, under.clone())));
                     free.push(m);
                 }
             }
@@ -845,8 +858,8 @@ impl<'a> Engine<'a> {
                 break;
             }
             if !combining {
-                if let Some((name, i)) = singles.pop_front() {
-                    choice = pinned.clone();
+                if let Some((name, i, under)) = singles.pop_front() {
+                    choice = under;
                     choice.insert(name, i);
                     continue;
                 }
@@ -1646,7 +1659,7 @@ fn expand_file(
                 };
                 eng.variants(toks, &Choice::default(), novel);
             }
-            eng.max_variants = MAX_VARIANTS;
+            eng.max_variants = if table.thorough { MAX_VARIANTS_READ } else { MAX_VARIANTS };
         };
         if units.len() <= MAX_UNITS {
             for (eng, &unit) in engines.iter_mut().zip(&units) {
@@ -1915,14 +1928,15 @@ fn environment(files: &[FileFacts], includes: &[Vec<u32>]) -> u64 {
 /// Expand the macro uses recorded in `files` into `cache.expanded`: a
 /// replacement for each file that had any. Returns (uses, definitions added,
 /// references added).
-pub fn expand(files: &[FileFacts], includes: &[Vec<u32>], sure_includes: &[Vec<u32>], not_built: &[String], cache: &mut Cache) -> (u64, u64, u64) {
+pub fn expand(files: &[FileFacts], includes: &[Vec<u32>], sure_includes: &[Vec<u32>], not_built: &[String], thorough: bool, cache: &mut Cache) -> (u64, u64, u64) {
     // Dropped last, after the macro table and the engines below.
     let _holding = Holding::new();
     let sites: u64 = files.iter().map(|f| (f.sites.len() + f.inits.len()) as u64).sum();
     let environment = environment(files, includes)
         ^ environment(&[], sure_includes).rotate_left(17)
         ^ sure_digest(sure_includes)
-        ^ not_built.iter().fold(0, |acc, d| acc ^ xxhash_rust::xxh3::xxh3_64(d.as_bytes()));
+        ^ not_built.iter().fold(0, |acc, d| acc ^ xxhash_rust::xxh3::xxh3_64(d.as_bytes()))
+        ^ (thorough as u64) << 63;
     if cache.environment != environment || cache.hashes.len() != files.len() {
         *cache = Cache {
             environment,
@@ -1960,6 +1974,7 @@ pub fn expand(files: &[FileFacts], includes: &[Vec<u32>], sure_includes: &[Vec<u
             .collect();
         let mut table = Table::new(files, by_name, parsed);
         table.outside = files.iter().map(|f| crate::link::outside(&f.path, not_built)).collect();
+        table.thorough = thorough;
         let mut rev: Vec<Vec<u32>> = vec![Vec::new(); files.len()];
         for (from, tos) in includes.iter().enumerate() {
             for &to in tos {
@@ -2095,6 +2110,39 @@ mod tests {
             let v = eng.variants(&tokenize(src.as_bytes(), Origin::Site), &Choice::default(), |_| true);
             assert_eq!(texts(&v[0].0), want, "{src}");
         }
+    }
+
+    #[test]
+    fn where_every_compilation_was_read_every_definition_is_read_once() {
+        // Six definitions of STAGE, one file each; only the last makes
+        // something the others do not.
+        let texts = ["(n) n", "(n) n n", "(n) (n)", "(n) n ;", "(n) { n }", "(n) ~ made_ ## n"];
+        let files: Vec<FileFacts> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let mut f = FileFacts::new(format!("s{i}.h"));
+                let (name, text) = (f.push_name("STAGE"), f.push_text(text));
+                f.macros.push(crate::model::MacroBody { name, text, function_like: true, guard: NONE, conditional: false, fallback: false });
+                f
+            })
+            .collect();
+        let parsed: Vec<Vec<Parsed>> = files.iter().enumerate().map(|(fi, f)| vec![Parsed { file: fi as u32, ..parse(f.name(f.macros[0].text as usize), true, "") }]).collect();
+        let by_name: FxHashMap<&str, Vec<(u32, u32)>> = [("STAGE", (0..files.len() as u32).map(|f| (f, 0)).collect())].into_iter().collect();
+        let mut table = Table::new(&files, by_name, parsed);
+        let made = |table: &Table| {
+            let mut eng = Engine::new(table, vec![true; 6]);
+            // (Novel: what has `made_` in it.)
+            let v = eng.variants(&tokenize(b"STAGE (x)", Origin::Site), &Choice::default(), |t| t.iter().any(|t| t.text.starts_with("made_")));
+            v.iter().any(|(t, _)| texts_of(t).contains("made_x"))
+        };
+        assert!(!made(&table));
+        table.thorough = true;
+        assert!(made(&table));
+    }
+
+    fn texts_of(t: &[T]) -> String {
+        t.iter().map(|t| &*t.text).collect::<Vec<_>>().join(" ")
     }
 
     #[test]
