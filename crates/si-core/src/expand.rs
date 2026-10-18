@@ -869,7 +869,7 @@ impl<'a> Engine<'a> {
             let under = self.choice.clone();
             for m in self.met.drain(..) {
                 if !pinned.contains_key(&m.0) && !free.iter().any(|f| f.0 == m.0) {
-                    singles.extend((1..m.1).map(|i| (m.0.clone(), i, under.clone())));
+                    singles.extend((1..m.1).map(|i| (m.0, i, under.clone())));
                     free.push(m);
                 }
             }
@@ -904,7 +904,7 @@ impl<'a> Engine<'a> {
                 k -= 1;
                 let c = choice.get(&free[k].0).copied().unwrap_or(0) + 1;
                 if c < free[k].1 {
-                    choice.insert(free[k].0.clone(), c);
+                    choice.insert(free[k].0, c);
                     for f in &free[k + 1..] {
                         choice.remove(&f.0);
                     }
