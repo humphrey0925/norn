@@ -105,6 +105,32 @@ impl Units {
         Units::Many(bits)
     }
 
+    /// These, numbered among `n`, sorted.
+    fn from_list(n: usize, list: Vec<u32>) -> Units {
+        if list.len() < 64 {
+            return Units::Few(list);
+        }
+        let mut bits = vec![0u64; n.div_ceil(64)];
+        for u in list {
+            bits[u as usize / 64] |= 1 << (u % 64);
+        }
+        Units::Many(bits)
+    }
+
+    /// As bits, numbered among `n`.
+    fn bits(&self, n: usize) -> Vec<u64> {
+        match self {
+            Units::Many(bits) => bits.clone(),
+            Units::Few(few) => {
+                let mut bits = vec![0u64; n.div_ceil(64)];
+                for &u in few {
+                    bits[u as usize / 64] |= 1 << (u % 64);
+                }
+                bits
+            }
+        }
+    }
+
     /// Whether any of them is among `among` (as bits).
     fn meets(&self, among: &[u64]) -> bool {
         match self {
@@ -119,24 +145,56 @@ impl Units {
 struct Readers<'a> {
     readings: &'a crate::units::Readings,
     /// Per path: those reading it, and those reading it for certain.
-    paths: std::sync::Mutex<FxHashMap<u32, std::sync::Arc<(Units, Units)>>>,
+    /// (Made at once, turning each compilation's list of what it reads
+    /// over: asking every compilation, file by file, took minutes. Made
+    /// before the files are resolved in parallel: made inside, on first
+    /// asking, the threads waiting for it would have been those it needs.)
+    paths: Vec<(Units, Units)>,
     /// Per header: per way, those reading it that way.
     ways: std::sync::Mutex<FxHashMap<u32, std::sync::Arc<Vec<Units>>>>,
 }
 
 impl<'a> Readers<'a> {
     fn new(readings: &'a crate::units::Readings) -> Readers<'a> {
-        Readers { readings, paths: Default::default(), ways: Default::default() }
+        Readers { readings, paths: Readers::turned_over(readings), ways: Default::default() }
     }
 
-    fn path(&self, p: u32) -> std::sync::Arc<(Units, Units)> {
-        if let Some(r) = self.paths.lock().unwrap().get(&p) {
-            return r.clone();
+    fn path(&self, p: u32) -> &(Units, Units) {
+        &self.paths[p as usize]
+    }
+
+    fn turned_over(r: &crate::units::Readings) -> Vec<(Units, Units)> {
+        {
+            let (n, m) = (r.units.len(), r.paths.len());
+            let mut reading: Vec<Vec<u32>> = vec![Vec::new(); m];
+            for (u, bits) in r.reads.iter().enumerate() {
+                for (i, &w) in bits.iter().enumerate() {
+                    let mut w = w;
+                    while w != 0 {
+                        if let Some(list) = reading.get_mut(i * 64 + w.trailing_zeros() as usize) {
+                            list.push(u as u32);
+                        }
+                        w &= w - 1;
+                    }
+                }
+            }
+            let mut maybe: Vec<Vec<u32>> = vec![Vec::new(); m];
+            for (u, paths) in r.maybe.iter().enumerate() {
+                for &p in paths.iter() {
+                    if let Some(list) = maybe.get_mut(p as usize) {
+                        list.push(u as u32);
+                    }
+                }
+            }
+            reading
+                .into_par_iter()
+                .zip(maybe)
+                .map(|(all, maybe)| {
+                    let sure = all.iter().copied().filter(|u| maybe.binary_search(u).is_err()).collect();
+                    (Units::from_list(n, all), Units::from_list(n, sure))
+                })
+                .collect()
         }
-        let n = self.readings.units.len();
-        let r = std::sync::Arc::new((Units::of(n, |u| self.readings.reads(u, p)), Units::of(n, |u| self.readings.reads_surely(u, p))));
-        self.paths.lock().unwrap().insert(p, r.clone());
-        r
     }
 
     fn ways(&self, h: u32) -> std::sync::Arc<Vec<Units>> {
@@ -1731,12 +1789,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     }
                     let at = path_of.get(fi).copied().unwrap_or(NONE);
                     let among = reader_bits.get_or_init(|| {
-                        let mut bits = vec![0u64; readings.units.len().div_ceil(64)];
-                        let list = readers.get_or_init(|| if at == NONE { Vec::new() } else { (0..readings.units.len() as u32).filter(|&u| readings.reads(u, at)).collect() });
-                        for &u in list {
-                            bits[u as usize / 64] |= 1 << (u % 64);
-                        }
-                        bits
+                        if at == NONE { vec![0u64; readings.units.len().div_ceil(64)] } else { who.path(at).0.bits(readings.units.len()) }
                     });
                     // (A compilation that does not read the callee's file
                     // has no say: what it calls is not that.)
@@ -1808,7 +1861,12 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 if ambiguous && edge_why.as_deref().is_some_and(|w| w.split(',').any(|w| g.name(remap[fi][r.name as usize]) == w)) {
                     let at = path_of.get(fi).and_then(|&p| readings.paths.get(p as usize)).map_or("?", |p| p.as_str());
                     let c = tmp[0];
-                    let n_readers = readers.get().map_or(0, |r| r.len());
+                    // (Here worked out only to say: the link asks the turned-over table.)
+                    let readers = readers.get_or_init(|| {
+                        let p = path_of.get(fi).copied().unwrap_or(NONE);
+                        if p == NONE { Vec::new() } else { (0..readings.units.len() as u32).filter(|&u| readings.reads(u, p)).collect() }
+                    });
+                    let n_readers = readers.len();
                     eprintln!(
                         "edgewhy   {at}:{}: {} {} target(s) {:?}, maybe {maybe}, guessed {guessed}, optional {}, conditional {}, compiled {:?}, in its unit {}, readers {n_readers}",
                         r.line,
@@ -1839,7 +1897,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                         };
                         let mut n = [0u32; 4];
                         let mut odd: Vec<&str> = Vec::new();
-                        for &u in readers.get().map_or(&[][..], |r| &r[..]) {
+                        for &u in readers {
                             let k = match say(u) { Some(Tri::True) => 0, Some(Tri::False) => 1, Some(Tri::Unknown) => 2, None => 3 };
                             n[k] += 1;
                             if (k == 1 || k == 2) && odd.len() < 4 {
