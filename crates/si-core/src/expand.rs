@@ -835,8 +835,11 @@ impl<'a> Engine<'a> {
     /// Every distinct expansion of `toks`, with the choices that gave it.
     /// Names in `pinned` keep the definition chosen there. Stops once a few
     /// expansions in a row hold nothing `novel`.
-    fn variants(&mut self, toks: &[T], pinned: &Choice, mut novel: impl FnMut(&[T]) -> bool) -> Vec<(Vec<T>, Choice)> {
+    /// (`keep`: return them; else only `novel` sees them.)
+    fn variants(&mut self, toks: &[T], pinned: &Choice, keep: bool, mut novel: impl FnMut(&[T]) -> bool) -> Vec<(Vec<T>, Choice)> {
         let mut results: Vec<(Vec<T>, Choice)> = Vec::new();
+        // The expansions read so far, by a hash of their texts.
+        let mut read: FxHashSet<u64> = FxHashSet::default();
         let mut free: Vec<(Text, usize)> = Vec::new();
         // Every definition of every name met is read once before any two
         // are read together: one name, one other definition, the rest as
@@ -873,16 +876,25 @@ impl<'a> Engine<'a> {
                     free.push(m);
                 }
             }
-            if !results.iter().any(|r| r.0.len() == out.len() && r.0.iter().zip(&out).all(|(a, b)| a.text == b.text)) {
+            let digest = {
+                use std::hash::{Hash, Hasher};
+                let mut h = rustc_hash::FxHasher::default();
+                out.len().hash(&mut h);
+                out.iter().for_each(|t| t.text.hash(&mut h));
+                h.finish()
+            };
+            if read.insert(digest) {
                 let t = std::time::Instant::now();
                 let is_novel = novel(&out);
                 spend(1, t);
                 if is_novel {
                     stale = 0;
                 }
-                results.push((out, self.choice.clone()));
+                if keep {
+                    results.push((out, self.choice.clone()));
+                }
             }
-            if results.len() >= self.max_variants {
+            if read.len() >= self.max_variants {
                 break;
             }
             if !combining {
@@ -1520,7 +1532,7 @@ fn expand_file(
             }
             let mut known = FxHashSet::default();
             let novel = |exp: &[T]| recognise(exp, s, macro_name, f.cpp()).novel_in(&mut known);
-            for (exp, choice) in eng.variants(&toks, &Choice::default(), novel) {
+            for (exp, choice) in eng.variants(&toks, &Choice::default(), true, novel) {
                 if let Some(n) = recognise(&exp, s, macro_name, f.cpp()).def_name() {
                     add_name(&mut named, n, (ei, choice));
                 }
@@ -1606,7 +1618,7 @@ fn expand_file(
                         }
                         new
                     };
-                    engines[*ei].variants(&toks, pinned, novel);
+                    engines[*ei].variants(&toks, pinned, false, novel);
                     if !together.found.is_empty() || !together.stored.is_empty() {
                         fruitful = true;
                         made.push(together);
@@ -1718,7 +1730,7 @@ fn expand_file(
                 let novel = |exp: &[T]| {
                     init_names(exp, init.array).into_iter().fold(false, |new, (place, name)| known.insert((place, name, unit)) || new)
                 };
-                eng.variants(toks, &Choice::default(), novel);
+                eng.variants(toks, &Choice::default(), false, novel);
             }
             eng.max_variants = if table.thorough { MAX_VARIANTS_READ } else { MAX_VARIANTS };
         };
@@ -2169,7 +2181,7 @@ mod tests {
             ("SELF", "SELF + 1"),
             ("CAT", "CAT"),
         ] {
-            let v = eng.variants(&tokenize(src.as_bytes(), Origin::Site), &Choice::default(), |_| true);
+            let v = eng.variants(&tokenize(src.as_bytes(), Origin::Site), &Choice::default(), true, |_| true);
             assert_eq!(texts(&v[0].0), want, "{src}");
         }
     }
@@ -2195,7 +2207,7 @@ mod tests {
         let made = |table: &Table| {
             let mut eng = Engine::new(table, vec![true; 6]);
             // (Novel: what has `made_` in it.)
-            let v = eng.variants(&tokenize(b"STAGE (x)", Origin::Site), &Choice::default(), |t| t.iter().any(|t| t.text.starts_with("made_")));
+            let v = eng.variants(&tokenize(b"STAGE (x)", Origin::Site), &Choice::default(), true, |t| t.iter().any(|t| t.text.starts_with("made_")));
             v.iter().any(|(t, _)| texts_of(t).contains("made_x"))
         };
         assert!(!made(&table));
@@ -2238,7 +2250,7 @@ mod tests {
         }
         let table = Table::new(&files, by_name, parsed);
         let mut eng = Engine::new(&table, vec![true, true]);
-        let v = eng.variants(&tokenize(b"OUTER (sched)", Origin::Site), &Choice::default(), |_| true);
+        let v = eng.variants(&tokenize(b"OUTER (sched)", Origin::Site), &Choice::default(), true, |_| true);
         let all: Vec<String> = v.iter().map(|(t, _)| texts(t)).collect();
         // Never `events.h`'s OUTER with `perf.h`'s INNER.
         assert!(all.contains(&"do_sched raw_sched".to_string()), "{all:?}");
