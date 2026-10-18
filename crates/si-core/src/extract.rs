@@ -1420,7 +1420,8 @@ impl<'a> Walk<'a> {
             match ev {
                 Event::Macro(m) => {
                     let name = self.intern(self.tok_text(&m.name));
-                    self.out.defs.push(Def { name, line: m.name.line, end_line: m.end_line, kind: kind::MACRO, flags: if m.conditional { flag::CONDITIONAL } else { 0 } });
+                    let flags = if m.conditional { flag::CONDITIONAL } else { 0 } | if m.name.call { flag::CALLABLE } else { 0 };
+                    self.out.defs.push(Def { name, line: m.name.line, end_line: m.end_line, kind: kind::MACRO, flags });
                     let scope = (self.out.defs.len() - 1) as u32;
                     for t in &m.refs {
                         self.push_tok_ref(t, scope);

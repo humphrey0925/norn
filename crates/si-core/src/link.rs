@@ -1239,6 +1239,12 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     // The macros whose body uses their own name: wrappers of the function
     // of that name (`#define class_mutex_constructor(_T)
     // WITH_LOCK_GUARD_1_ATTRS(...)`, which calls it).
+    // So, likely, are those with parameters, there in every configuration,
+    // whose body calls another macro: the name may come back expanded, as
+    // it does there. (Not one whose body only does without the function,
+    // `#define htab_size(h) ((h)->size)`.)
+    let macro_names: FxHashSet<&str> = files.iter().flat_map(|f| f.defs.iter().filter(|d| d.kind == kind::MACRO).map(move |d| f.name(d.name as usize))).collect();
+    let macro_names = &macro_names;
     let wrappers: FxHashSet<u32> = files
         .iter()
         .enumerate()
@@ -1246,7 +1252,15 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
             let base = g.files[fi].sym_start;
             f.refs
                 .iter()
-                .filter(move |r| f.defs.get(r.scope as usize).is_some_and(|d| d.kind == kind::MACRO && d.name == r.name))
+                .filter(move |r| {
+                    f.defs.get(r.scope as usize).is_some_and(|d| {
+                        d.kind == kind::MACRO
+                            && (d.name == r.name
+                                || d.flags & (flag::CONDITIONAL | flag::CALLABLE) == flag::CALLABLE
+                                    && r.kind & !refkind::MAYBE == refkind::CALL
+                                    && macro_names.contains(f.name(r.name as usize)))
+                    })
+                })
                 .map(move |r| base + r.scope)
         })
         .collect();
@@ -2433,7 +2447,8 @@ struct writer w = { .run = do_write };
             ("mutex.h", "#include \"cleanup.h\"
 int lock_it (int *l);
 GUARD(mutex, int)
-#define class_mutex_constructor(l) class_mutex_constructor (l), check ()
+#define WITH(n, l) class_##n##_constructor (l), check ()
+#define class_mutex_constructor(l) WITH(mutex, l)
 "),
             ("a.c", "#include \"mutex.h\"
 int check (void) { return 0; }
@@ -2452,6 +2467,22 @@ void f (int *m) { class_mutex_constructor (m); }
             .collect();
         assert!(calls.contains(&("function".to_string(), true)), "{calls:?}");
         assert!(calls.iter().all(|c| c.1), "{calls:?}");
+    }
+
+    #[test]
+    fn a_macro_that_does_without_the_function_of_its_name_is_another_reading() {
+        // libiberty's `htab_size`: the macro reads the member; the function,
+        // defined as `(htab_size)`, is for those who take its address.
+        let g = indexed(&[(
+            "hashtab.c",
+            "struct t { int size; };
+#define htab_size(h) ((h)->size)
+int (htab_size) (struct t *h) { return htab_size (h); }
+int f (struct t *h) { return htab_size (h); }
+",
+        )]);
+        let sure: Vec<bool> = g.find("f").iter().flat_map(|&s| g.refs_from(s)).filter(|e| g.sym_name(e.other) == "htab_size").map(|e| !e.ambiguous()).collect();
+        assert!(!sure.is_empty() && sure.iter().all(|s| !s), "{sure:?}");
     }
 
     #[test]

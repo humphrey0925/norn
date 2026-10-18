@@ -45,8 +45,8 @@ pub mod flag {
     pub const DECL: u8 = 2;
     /// Defined in a header file.
     pub const HEADER: u8 = 4;
-    /// A typedef of a function or function pointer type, or a member that
-    /// can hold a function.
+    /// A typedef of a function or function pointer type, a member that
+    /// can hold a function, or a macro with parameters.
     pub const CALLABLE: u8 = 8;
     /// A macro defined under an `#if`: it may not be defined at all.
     pub const CONDITIONAL: u8 = 16;
