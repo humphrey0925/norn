@@ -379,10 +379,11 @@ struct Parsed {
     conditional: bool,
     /// Defined under `#ifndef` of its own name.
     fallback: bool,
-    /// The file it is defined in, and which of its definitions it is
-    /// (they are in the order of the file).
+    /// The file it is defined in, which of its definitions it is (they
+    /// are in the order of the file), and the line.
     file: u32,
     at: u32,
+    line: u32,
     /// For each body token, the parameter it names, or `NONE`.
     param_at: Vec<u32>,
 }
@@ -418,7 +419,7 @@ fn parse(text: &str, function_like: bool, guard: &str) -> Parsed {
     let param_at =
         toks.iter().map(|t| params.iter().position(|p| t.k == K::Ident && *p == t.text).map_or(NONE, |i| i as u32)).collect();
     let hides = hides(&toks, |t| params.contains(&t.text));
-    Parsed { params, variadic, function_like, body: toks, hides, guards, conditional: false, fallback: false, file: 0, at: 0, param_at }
+    Parsed { params, variadic, function_like, body: toks, hides, guards, conditional: false, fallback: false, file: 0, at: 0, line: 0, param_at }
 }
 
 struct Table<'a> {
@@ -462,6 +463,9 @@ struct Engine<'a> {
     active: Vec<Text>,
     /// The definitions those are expanded by, in the same order.
     active_defs: Vec<&'a Parsed>,
+    /// The use being expanded: its file and line. A definition its own
+    /// file makes after that line is not there yet.
+    site: Option<(u32, u32)>,
     steps: u32,
     hiding: FxHashMap<Box<str>, bool>,
     /// Set when the engine stands for all the translation units of this
@@ -507,6 +511,7 @@ impl<'a> Engine<'a> {
             met: Vec::new(),
             active: Vec::new(),
             active_defs: Vec::new(),
+            site: None,
             steps: 0,
             hiding: FxHashMap::default(),
             merged: None,
@@ -647,7 +652,13 @@ impl<'a> Engine<'a> {
         if n > 1 && !self.met.iter().any(|m| &*m.0 == name) {
             self.met.push((name.into(), n));
         }
-        Some(self.cands[name][i])
+        let p = self.cands[name][i];
+        // (Defined further down the use's own file: not yet, unless an
+        // earlier definition there or elsewhere may be meant.)
+        if let Some((file, line)) = self.site.filter(|s| p.file == s.0 && p.line > s.1) {
+            return self.cands[name].iter().copied().find(|q| q.file != file || q.line <= line);
+        }
+        Some(p)
     }
 
     fn expand(&mut self, input: Vec<T>) -> Vec<T> {
@@ -1528,6 +1539,7 @@ fn expand_file(
             };
             for (i, (scope, contexts)) in scopes.into_iter().enumerate() {
                 for (ei, pinned) in contexts {
+                    engines[*ei].site = Some((fi as u32, s.line));
                     let maybe = engines[*ei].maybe_undefined(macro_name);
                     let mut known = FxHashSet::default();
                     let novel = |exp: &[T]| recognise(exp, s, macro_name, f.cpp()).novel(&mut known);
@@ -1967,6 +1979,7 @@ pub fn expand(files: &[FileFacts], includes: &[Vec<u32>], sure_includes: &[Vec<u
                     fallback: m.fallback,
                     file: fi as u32,
                     at: i as u32,
+                    line: m.line,
                     ..parse(f.name(m.text as usize), m.function_like, guard_text(f, m))
                 };
                 f.macros.iter().enumerate().map(one).collect()
@@ -2087,7 +2100,7 @@ mod tests {
         let mut f = FileFacts::new("a.c".into());
         for (name, text, function_like) in macros {
             let (name, text) = (f.push_name(name), f.push_text(text));
-            f.macros.push(crate::model::MacroBody { name, text, function_like, guard: NONE, conditional: false, fallback: false });
+            f.macros.push(crate::model::MacroBody { name, text, function_like, guard: NONE, conditional: false, fallback: false, line: 0 });
         }
         let files = [f];
         let parsed = vec![files[0].macros.iter().map(|m| parse(files[0].name(m.text as usize), m.function_like, "")).collect()];
@@ -2123,7 +2136,7 @@ mod tests {
             .map(|(i, text)| {
                 let mut f = FileFacts::new(format!("s{i}.h"));
                 let (name, text) = (f.push_name("STAGE"), f.push_text(text));
-                f.macros.push(crate::model::MacroBody { name, text, function_like: true, guard: NONE, conditional: false, fallback: false });
+                f.macros.push(crate::model::MacroBody { name, text, function_like: true, guard: NONE, conditional: false, fallback: false, line: 0 });
                 f
             })
             .collect();
@@ -2158,7 +2171,7 @@ mod tests {
                 let mut f = FileFacts::new((*path).into());
                 for (name, text) in macros.iter() {
                     let (name, text) = (f.push_name(name), f.push_text(text));
-                    f.macros.push(crate::model::MacroBody { name, text, function_like: true, guard: NONE, conditional: false, fallback: false });
+                    f.macros.push(crate::model::MacroBody { name, text, function_like: true, guard: NONE, conditional: false, fallback: false, line: 0 });
                 }
                 f
             })

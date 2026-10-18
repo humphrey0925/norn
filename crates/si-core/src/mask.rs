@@ -579,6 +579,17 @@ pub struct MacroSets {
     /// The macros some rival does not see: name -> the files defining it.
     #[serde(default)]
     rival_defined: FxHashMap<Vec<u8>, Vec<u32>>,
+    /// The macros defined only in folders the build does not compile
+    /// (`notBuilt`: m68k's `#define clear_bit_unlock clear_bit`), and per
+    /// file (as `ids`), whether it is in one, and whether it may read
+    /// anything (an `#include` of nothing here). Those it compiles see
+    /// none of them.
+    #[serde(default)]
+    apart: FxHashSet<Vec<u8>>,
+    #[serde(default)]
+    outside: Vec<bool>,
+    #[serde(default)]
+    open: Vec<bool>,
     /// What the build is known to define: branches it never compiles are
     /// skipped (see `cond`). (Not saved: made anew from the settings.)
     #[serde(skip)]
@@ -740,13 +751,13 @@ impl MacroSets {
     /// define it and those that read them. A test program's
     /// `#define kfree(p) free(p)` (in `tools/`) is no attribute or
     /// expansion of the kernel's `kfree`.
-    pub fn of_files(per_file: &[Vec<Define>], paths: &[String]) -> MacroSets {
+    pub fn of_files(per_file: &[Vec<Define>], paths: &[String], not_built: &[String]) -> MacroSets {
         let mut sets = MacroSets::of_defines(per_file.iter().flatten());
-        sets.scope(per_file, paths);
+        sets.scope(per_file, paths, not_built);
         sets
     }
 
-    pub(crate) fn scope(&mut self, per_file: &[Vec<Define>], paths: &[String]) {
+    pub(crate) fn scope(&mut self, per_file: &[Vec<Define>], paths: &[String], not_built: &[String]) {
         use rayon::prelude::*;
         let n = paths.len();
         // Who reads whom, as the link will find it: each file's `#include`s
@@ -888,6 +899,12 @@ impl MacroSets {
             }
             self.rivals = rivals;
         }
+        let outside: Vec<bool> = paths.iter().map(|p| crate::link::outside(p, not_built)).collect();
+        let apart: FxHashSet<Vec<u8>> = if outside.iter().any(|&o| o) {
+            defined_in.iter().filter(|(_, at)| at.iter().all(|d| outside[d.0 as usize])).map(|(name, _)| name.to_vec()).collect()
+        } else {
+            FxHashSet::default()
+        };
         for (name, at) in defined_in {
             // Seen everywhere if one of its definitions is.
             if at.iter().all(|d| reach[d].is_some()) {
@@ -899,7 +916,16 @@ impl MacroSets {
         if std::env::var_os("SI_SCOPE_PROFILE").is_some() {
             eprintln!("scope     {} macros seen by few files, {} definitions, {} entries", self.scoped.len(), self.reach.len(), self.reach.values().map(Vec::len).sum::<usize>());
         }
-        if !self.scoped.is_empty() || !self.rival_defined.is_empty() {
+        self.apart = apart;
+        if !self.apart.is_empty() {
+            // Every file numbered, those who may read anything marked so.
+            self.ids = paths.iter().enumerate().map(|(i, p)| (p.clone(), i as u32)).collect();
+            self.open = vec![false; paths.len()];
+            for &f in &open {
+                self.open[f as usize] = true;
+            }
+            self.outside = outside;
+        } else if !self.scoped.is_empty() || !self.rival_defined.is_empty() {
             // Those who may read anything are not numbered: they see all.
             let open: FxHashSet<u32> = open.into_iter().collect();
             self.ids = paths.iter().enumerate().filter(|(i, _)| !open.contains(&(*i as u32))).map(|(i, p)| (p.clone(), i as u32)).collect();
@@ -913,6 +939,12 @@ impl MacroSets {
 
     /// Can the file numbered `file` see a definition of `name`?
     pub fn visible(&self, name: &[u8], file: u32) -> bool {
+        if self.apart.contains(name) && !self.outside.get(file as usize).copied().unwrap_or(false) {
+            return false;
+        }
+        if self.open.get(file as usize).copied().unwrap_or(false) {
+            return true;
+        }
         // Defined only in its rivals.
         if let (Some(at), Some(rivals)) = (self.rival_defined.get(name), self.rivals.get(&file)) {
             if at.iter().all(|f| rivals.contains(f)) {
