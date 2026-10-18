@@ -130,8 +130,15 @@ impl Ways {
 /// More directive steps than this in all, and the tree is left alone:
 /// the kernel, where an include of `<asm/...>` may mean any of twenty
 /// architectures' and each compilation reads them all, takes three
-/// thousand million, to decide three conditions in a thousand.
-const MOST_STEPS: u64 = 200_000_000;
+/// thousand million. Told its architecture (Linux's configuration says,
+/// the others are `notBuilt`), it takes under five hundred million, in
+/// about fifteen seconds.
+const MOST_STEPS: u64 = 600_000_000;
+/// `MOST_STEPS`, or `SI_MOST_STEPS` (for measuring what more would cost).
+fn most_steps() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("SI_MOST_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(MOST_STEPS))
+}
 /// More than this in one compilation, and that one is: what it reads
 /// then has no verdicts. (Not knowing which of several files an include
 /// means, every one is read, and that can multiply without end.)
@@ -492,7 +499,7 @@ impl Unit<'_> {
     fn read(&mut self, file: u32, maybe: bool, depth: u32) {
         let w = self.w;
         let steps = &w.steps[file as usize];
-        if w.spent.fetch_add(steps.len() as u64, Relaxed) > MOST_STEPS {
+        if w.spent.fetch_add(steps.len() as u64, Relaxed) > most_steps() {
             w.stop.store(true, Relaxed);
         }
         self.spent += steps.len() as u64 + 1;

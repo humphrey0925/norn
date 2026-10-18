@@ -1154,6 +1154,9 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
             _ => Tri::Unknown,
         })
     }
+    // Where none of a header's compilations reads the callee's file, what
+    // every compilation that does compiles: per (file, stretch of lines).
+    let everywhere: std::sync::Mutex<FxHashMap<(u32, u32), crate::cond::Tri>> = Default::default();
     let (unit_of, header_of, path_of) = if readings.is_empty() {
         (Vec::new(), Vec::new(), Vec::new())
     } else {
@@ -1207,9 +1210,9 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
             let (mut pick, mut lineage, mut overrides, mut descendants) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             // In a header: the compilations that read it (worked out when first needed).
             let readers: std::cell::OnceCell<Vec<u32>> = std::cell::OnceCell::new();
-            // (And, where none of them reads the callee's file, what every
-            // compilation that does compiles: per (file, line).)
-            let anywhere: std::cell::RefCell<FxHashMap<(u32, u32), crate::cond::Tri>> = Default::default();
+            // What they compile of a callee's file, per (file, stretch of
+            // lines between its directives): asked once, not once a call.
+            let known: std::cell::RefCell<FxHashMap<(u32, u32), crate::cond::Tri>> = Default::default();
             let constructs: FxHashSet<u32> = f.cxx().constructs.iter().copied().collect();
             let operands: FxHashMap<u32, (u32, u32, bool)> = f.cxx().operators.iter().map(|&(r, l, rr, binary)| (r, (l, rr, binary))).collect();
             let args_of: FxHashMap<u32, u8> = f.cxx().args.iter().copied().collect();
@@ -1610,14 +1613,29 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     if unit != NONE {
                         return in_unit(unit).unwrap_or(Tri::Unknown);
                     }
+                    // (Here every compilation reading the callee's file reads
+                    // it one way per stretch: one answer for all of it.)
+                    let stretch = if h != NONE { readings.files[h as usize].1.partition_point(|&l| l < s.line) as u32 } else { u32::MAX - (s.flags & flag::CONDITIONAL != 0) as u32 };
+                    if let Some(&t) = known.borrow().get(&(s.file, stretch)) {
+                        return t;
+                    }
                     let at = path_of.get(fi).copied().unwrap_or(NONE);
                     let readers = readers.get_or_init(|| if at == NONE { Vec::new() } else { (0..readings.units.len() as u32).filter(|&u| readings.reads(u, at)).collect() });
                     // (A compilation that does not read the callee's file
                     // has no say: what it calls is not that.)
-                    if let Some(t) = agree(readers.iter().filter_map(|&u| in_unit(u))) {
-                        return t;
-                    }
-                    *anywhere.borrow_mut().entry((s.file, s.line)).or_insert_with(|| agree((0..readings.units.len() as u32).filter_map(in_unit)).unwrap_or(Tri::Unknown))
+                    // (What every compilation compiles of it is the same
+                    // from any file: worked out once for them all.)
+                    let t = agree(readers.iter().filter_map(|&u| in_unit(u))).unwrap_or_else(|| {
+                        let key = (s.file, stretch);
+                        if let Some(&t) = everywhere.lock().unwrap().get(&key) {
+                            return t;
+                        }
+                        let t = agree((0..readings.units.len() as u32).filter_map(in_unit)).unwrap_or(Tri::Unknown);
+                        everywhere.lock().unwrap().insert(key, t);
+                        t
+                    });
+                    known.borrow_mut().insert((s.file, stretch), t);
+                    t
                 };
                 if !header_of.is_empty() && tmp.iter().any(|&c| compiled(c) == crate::cond::Tri::False) && tmp.iter().any(|&c| compiled(c) != crate::cond::Tri::False) {
                     tmp.retain(|&c| compiled(c) != crate::cond::Tri::False);
