@@ -86,6 +86,101 @@ fn join(dir: &str, rel: &str) -> String {
     parts.join("/")
 }
 
+/// Some of the compilations: a few by number, or many as bits.
+enum Units {
+    Few(Vec<u32>),
+    Many(Vec<u64>),
+}
+
+impl Units {
+    fn of(n: usize, mut has: impl FnMut(u32) -> bool) -> Units {
+        let few: Vec<u32> = (0..n as u32).filter(|&u| has(u)).collect();
+        if few.len() < 64 {
+            return Units::Few(few);
+        }
+        let mut bits = vec![0u64; n.div_ceil(64)];
+        for u in few {
+            bits[u as usize / 64] |= 1 << (u % 64);
+        }
+        Units::Many(bits)
+    }
+
+    /// Whether any of them is among `among` (as bits).
+    fn meets(&self, among: &[u64]) -> bool {
+        match self {
+            Units::Few(few) => few.iter().any(|&u| among.get(u as usize / 64).is_some_and(|w| w & (1 << (u % 64)) != 0)),
+            Units::Many(bits) => bits.iter().zip(among).any(|(a, b)| a & b != 0),
+        }
+    }
+}
+
+/// Which compilations read each file, and each way of reading a header
+/// read more than one way: worked out when first asked, for the link.
+struct Readers<'a> {
+    readings: &'a crate::units::Readings,
+    /// Per path: those reading it, and those reading it for certain.
+    paths: std::sync::Mutex<FxHashMap<u32, std::sync::Arc<(Units, Units)>>>,
+    /// Per header: per way, those reading it that way.
+    ways: std::sync::Mutex<FxHashMap<u32, std::sync::Arc<Vec<Units>>>>,
+}
+
+impl<'a> Readers<'a> {
+    fn new(readings: &'a crate::units::Readings) -> Readers<'a> {
+        Readers { readings, paths: Default::default(), ways: Default::default() }
+    }
+
+    fn path(&self, p: u32) -> std::sync::Arc<(Units, Units)> {
+        if let Some(r) = self.paths.lock().unwrap().get(&p) {
+            return r.clone();
+        }
+        let n = self.readings.units.len();
+        let r = std::sync::Arc::new((Units::of(n, |u| self.readings.reads(u, p)), Units::of(n, |u| self.readings.reads_surely(u, p))));
+        self.paths.lock().unwrap().insert(p, r.clone());
+        r
+    }
+
+    fn ways(&self, h: u32) -> std::sync::Arc<Vec<Units>> {
+        if let Some(r) = self.ways.lock().unwrap().get(&h) {
+            return r.clone();
+        }
+        let n = self.readings.units.len();
+        let way = |u: u32| self.readings.units[u as usize].1.binary_search_by_key(&h, |w| w.0).ok().map(|i| self.readings.units[u as usize].1[i].1);
+        let r = std::sync::Arc::new((0..self.readings.ways[h as usize].len() as u32).map(|w| Units::of(n, |u| way(u) == Some(w))).collect::<Vec<Units>>());
+        self.ways.lock().unwrap().insert(h, r.clone());
+        r
+    }
+
+    /// What the compilations among `among` (as bits) that read `file`
+    /// compile of it (`h`: its number as a header read more than one
+    /// way, with the stretch of lines; else `p`, its path, and whether
+    /// the definition is under an `#if`); `None` if none reads it. They
+    /// say yes where some say yes and none no (one that does not know may
+    /// just not read the line), no where all say no.
+    fn compile(&self, among: &[u64], h: u32, stretch: u32, p: u32, conditional: bool) -> Option<crate::cond::Tri> {
+        use crate::cond::Tri;
+        if h != NONE {
+            let ways = self.ways(h);
+            let mut n = [false; 3];
+            for (w, units) in ways.iter().enumerate() {
+                if units.meets(among) {
+                    n[match self.readings.ways[h as usize][w].get(stretch as usize) { Some(1) => 0, Some(0) => 1, _ => 2 }] = true;
+                }
+            }
+            return Some(match n {
+                [false, false, false] => return None,
+                [true, false, _] => Tri::True,
+                [false, true, false] => Tri::False,
+                _ => Tri::Unknown,
+            });
+        }
+        let r = self.path(p);
+        if !r.0.meets(among) {
+            return None;
+        }
+        Some(if !conditional && r.1.meets(among) { Tri::True } else { Tri::Unknown })
+    }
+}
+
 /// Whether `path` is in one of `folders` (each `a/b/`).
 pub(crate) fn outside(path: &str, folders: &[String]) -> bool {
     folders.iter().any(|f| path.starts_with(f.as_str()))
@@ -1138,25 +1233,11 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         let set: FxHashSet<&str> = readings.unread.iter().map(String::as_str).collect();
         files.iter().map(|f| set.contains(f.path.as_str()) || outside(&f.path, &options.not_built)).collect()
     };
-    // What they say together: yes where some say yes and none no (one
-    // that does not know may just not read the file), no where all say
-    // no; none: nothing.
-    fn agree(all: impl Iterator<Item = crate::cond::Tri>) -> Option<crate::cond::Tri> {
-        use crate::cond::Tri;
-        let mut n = [0usize; 3];
-        for t in all {
-            n[match t { Tri::True => 0, Tri::False => 1, Tri::Unknown => 2 }] += 1;
-        }
-        Some(match n {
-            [0, 0, 0] => return None,
-            [_, 0, _] if n[0] > 0 => Tri::True,
-            [0, _, 0] => Tri::False,
-            _ => Tri::Unknown,
-        })
-    }
     // Where none of a header's compilations reads the callee's file, what
     // every compilation that does compiles: per (file, stretch of lines).
     let everywhere: std::sync::Mutex<FxHashMap<(u32, u32), crate::cond::Tri>> = Default::default();
+    let who = Readers::new(readings);
+    let all: Vec<u64> = vec![u64::MAX; readings.units.len().div_ceil(64)];
     let (unit_of, header_of, path_of) = if readings.is_empty() {
         (Vec::new(), Vec::new(), Vec::new())
     } else {
@@ -1210,6 +1291,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
             let (mut pick, mut lineage, mut overrides, mut descendants) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             // In a header: the compilations that read it (worked out when first needed).
             let readers: std::cell::OnceCell<Vec<u32>> = std::cell::OnceCell::new();
+            let reader_bits: std::cell::OnceCell<Vec<u64>> = std::cell::OnceCell::new();
             // What they compile of a callee's file, per (file, stretch of
             // lines between its directives): asked once, not once a call.
             let known: std::cell::RefCell<FxHashMap<(u32, u32), crate::cond::Tri>> = Default::default();
@@ -1620,17 +1702,25 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                         return t;
                     }
                     let at = path_of.get(fi).copied().unwrap_or(NONE);
-                    let readers = readers.get_or_init(|| if at == NONE { Vec::new() } else { (0..readings.units.len() as u32).filter(|&u| readings.reads(u, at)).collect() });
+                    let among = reader_bits.get_or_init(|| {
+                        let mut bits = vec![0u64; readings.units.len().div_ceil(64)];
+                        let list = readers.get_or_init(|| if at == NONE { Vec::new() } else { (0..readings.units.len() as u32).filter(|&u| readings.reads(u, at)).collect() });
+                        for &u in list {
+                            bits[u as usize / 64] |= 1 << (u % 64);
+                        }
+                        bits
+                    });
                     // (A compilation that does not read the callee's file
                     // has no say: what it calls is not that.)
                     // (What every compilation compiles of it is the same
                     // from any file: worked out once for them all.)
-                    let t = agree(readers.iter().filter_map(|&u| in_unit(u))).unwrap_or_else(|| {
+                    let conditional = s.flags & flag::CONDITIONAL != 0;
+                    let t = who.compile(among, h, stretch, p, conditional).unwrap_or_else(|| {
                         let key = (s.file, stretch);
                         if let Some(&t) = everywhere.lock().unwrap().get(&key) {
                             return t;
                         }
-                        let t = agree((0..readings.units.len() as u32).filter_map(in_unit)).unwrap_or(Tri::Unknown);
+                        let t = who.compile(&all, h, stretch, p, conditional).unwrap_or(Tri::Unknown);
                         everywhere.lock().unwrap().insert(key, t);
                         t
                     });

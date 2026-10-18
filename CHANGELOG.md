@@ -17,7 +17,8 @@
 - With it, what Kbuild and the compiler it names define for C: `__KERNEL__`, the compiler's own macros (`__clang__` and its version, or `__GNUC__`), the architecture's (`__x86_64__`); `__ASSEMBLY__` and `__CHECKER__` not defined.
 - `__ASSEMBLER__` is never defined in C: the many headers inside `#ifndef __ASSEMBLER__` are no longer undecided.
 - A macro defined in a source file is not taken as a meaning of a name in another source file that does not include it (`kfree` from `lib/decompress_unxz.c`).
-- On the Linux kernel (x86_64 defconfig, against clang), with the build's configuration in the tree: calls found and certain 69.9% → 78.4%, all calls found 90.3% → 91.5%, precision of certain calls 98.7% → 99.4%. Without a configuration, little changes (certain 59.7% → 59.9%). Redis, git, binutils, STM32F4 HAL and nrfx unchanged.
+- Told its architecture, the kernel's compilations are each read through (they were too many to read before), and what they compile of a file is asked once per file, not once per call.
+- On the Linux kernel (x86_64 defconfig, against clang), with the build's configuration in the tree: calls found and certain 69.9% → 82.2%, all calls found 90.3% → 91.9%, precision of certain calls 98.7% → 99.3%; indexing takes about a quarter longer (90 s → 113 s on the machine measured). Without a configuration, little changes (certain 59.7% → 59.9%). Redis, git, binutils, STM32F4 HAL and nrfx unchanged.
 
 ## 0.23.2
 
