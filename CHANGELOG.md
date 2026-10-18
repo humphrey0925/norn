@@ -18,7 +18,9 @@
 - `__ASSEMBLER__` is never defined in C: the many headers inside `#ifndef __ASSEMBLER__` are no longer undecided.
 - A macro defined in a source file is not taken as a meaning of a name in another source file that does not include it (`kfree` from `lib/decompress_unxz.c`).
 - Told its architecture, the kernel's compilations are each read through (they were too many to read before), and what they compile of a file is asked once per file, not once per call.
-- On the Linux kernel (x86_64 defconfig, against clang), with the build's configuration in the tree: calls found and certain 69.9% → 82.2%, all calls found 90.3% → 91.9%, precision of certain calls 98.7% → 99.3%; indexing takes about a quarter longer (90 s → 113 s on the machine measured). Without a configuration, little changes (certain 59.7% → 59.9%). Redis, git, binutils, STM32F4 HAL and nrfx unchanged.
+- A call inside a function a macro makes is there whenever the function is: that the macro may not be defined (the kernel's `TRACE_EVENT`, read again and again under other definitions) no longer makes the call uncertain.
+- Macros of folders the build does not compile are not seen from those it does (`READ_ONCE` from `samples/bpf`).
+- On the Linux kernel (x86_64 defconfig, against clang), with the build's configuration in the tree: calls found and certain 69.9% → 88.7%, all calls found 90.3% → 92.1%, precision of certain calls 98.7% → 99.3%; indexing takes about a quarter longer (90 s → 113 s on the machine measured). git's certain calls 99.4% → 99.6%. Without a configuration, little changes (certain 59.7% → 59.9%). Redis, git, binutils, STM32F4 HAL and nrfx unchanged.
 
 ## 0.23.2
 

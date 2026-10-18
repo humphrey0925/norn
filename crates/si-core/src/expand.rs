@@ -419,6 +419,8 @@ fn parse(text: &str, function_like: bool, guard: &str) -> Parsed {
 
 struct Table<'a> {
     files: &'a [FileFacts],
+    /// Per file, whether it is in a folder the build does not compile.
+    outside: Vec<bool>,
     by_name: FxHashMap<&'a str, Vec<(u32, u32)>>,
     /// The same definitions in the order of their text, each with a number
     /// that definitions of the same text (spacing aside) share: sorted and
@@ -479,7 +481,7 @@ impl<'a> Table<'a> {
                 (name, out)
             })
             .collect();
-        Table { files, by_name, by_text, parsed }
+        Table { files, outside: vec![false; files.len()], by_name, by_text, parsed }
     }
 }
 
@@ -1387,13 +1389,25 @@ fn expand_file(
     // One engine per translation unit the file is in, so that what one macro
     // expands to agrees with what the others do there. A header in too many
     // gets a single engine that sees them all at once.
-    let units = roots(fi as u32, table.files, rev);
+    let mut units = roots(fi as u32, table.files, rev);
+    // A file the build compiles is read by the compilations it makes, and
+    // sees nothing of folders it does not compile (another program's).
+    let built = !table.outside[fi];
+    if built && units.iter().any(|&r| !table.outside[r as usize]) {
+        units.retain(|&r| !table.outside[r as usize]);
+    }
+    let seen = |mut v: Vec<bool>| {
+        if built {
+            v.iter_mut().zip(&table.outside).filter(|(_, &o)| o).for_each(|(v, _)| *v = false);
+        }
+        v
+    };
     let make_engines = || -> Vec<Engine> {
         if units.len() <= MAX_UNITS {
-            units.iter().map(|&r| Engine { sure: closure(r, sure_fwd), ..Engine::new(table, closure(r, fwd)) }).collect()
+            units.iter().map(|&r| Engine { sure: closure(r, sure_fwd), ..Engine::new(table, seen(closure(r, fwd))) }).collect()
         } else {
             // (What it reads for certain: what it includes so, itself.)
-            vec![Engine { merged: Some(fi as u32), sure: closure(fi as u32, sure_fwd), ..Engine::new(table, visible(fi as u32, fwd, rev)) }]
+            vec![Engine { merged: Some(fi as u32), sure: closure(fi as u32, sure_fwd), ..Engine::new(table, seen(visible(fi as u32, fwd, rev))) }]
         }
     };
     let t_setup = std::time::Instant::now();
@@ -1562,11 +1576,12 @@ fn expand_file(
         }
         for (n, kind, owner) in m.found.refs {
             let name = names.id(&mut out, &n);
-            // Inside a function the expansion defines, that function is the scope.
-            let scope = owner
-                .and_then(|o| made_here.get(&(names.id(&mut out, &o), m.line)).copied())
-                .unwrap_or(m.scope);
-            let kind = kind | if m.maybe { refkind::MAYBE } else { 0 };
+            // Inside a function the expansion defines, that function is the
+            // scope; and the call is there whenever the function is: that
+            // the macro may not be defined says only that neither may be.
+            let made = owner.and_then(|o| made_here.get(&(names.id(&mut out, &o), m.line)).copied());
+            let scope = made.unwrap_or(m.scope);
+            let kind = kind | if m.maybe && made.is_none() { refkind::MAYBE } else { 0 };
             if seen_refs.insert((name, m.line, scope, kind)) {
                 out.refs.push(Ref { name, line: m.line, scope, kind });
             }
@@ -1618,7 +1633,7 @@ fn expand_file(
             // What is stored where differs in every unit and all of it
             // counts, so here each unit is worth its own engine.
             for &unit in units.iter().take(MAX_INIT_UNITS) {
-                read(&mut Engine::new(table, closure(unit, fwd)), unit);
+                read(&mut Engine::new(table, seen(closure(unit, fwd))), unit);
             }
         }
         for (place, func, unit) in known {
@@ -1877,11 +1892,14 @@ fn environment(files: &[FileFacts], includes: &[Vec<u32>]) -> u64 {
 /// Expand the macro uses recorded in `files` into `cache.expanded`: a
 /// replacement for each file that had any. Returns (uses, definitions added,
 /// references added).
-pub fn expand(files: &[FileFacts], includes: &[Vec<u32>], sure_includes: &[Vec<u32>], cache: &mut Cache) -> (u64, u64, u64) {
+pub fn expand(files: &[FileFacts], includes: &[Vec<u32>], sure_includes: &[Vec<u32>], not_built: &[String], cache: &mut Cache) -> (u64, u64, u64) {
     // Dropped last, after the macro table and the engines below.
     let _holding = Holding::new();
     let sites: u64 = files.iter().map(|f| (f.sites.len() + f.inits.len()) as u64).sum();
-    let environment = environment(files, includes) ^ environment(&[], sure_includes).rotate_left(17) ^ sure_digest(sure_includes);
+    let environment = environment(files, includes)
+        ^ environment(&[], sure_includes).rotate_left(17)
+        ^ sure_digest(sure_includes)
+        ^ not_built.iter().fold(0, |acc, d| acc ^ xxhash_rust::xxh3::xxh3_64(d.as_bytes()));
     if cache.environment != environment || cache.hashes.len() != files.len() {
         *cache = Cache {
             environment,
@@ -1916,7 +1934,8 @@ pub fn expand(files: &[FileFacts], includes: &[Vec<u32>], sure_includes: &[Vec<u
                 f.macros.iter().map(one).collect()
             })
             .collect();
-        let table = Table::new(files, by_name, parsed);
+        let mut table = Table::new(files, by_name, parsed);
+        table.outside = files.iter().map(|f| crate::link::outside(&f.path, not_built)).collect();
         let mut rev: Vec<Vec<u32>> = vec![Vec::new(); files.len()];
         for (from, tos) in includes.iter().enumerate() {
             for &to in tos {

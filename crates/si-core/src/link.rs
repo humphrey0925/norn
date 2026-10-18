@@ -1060,7 +1060,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     let (includes, sure_includes) = include_edges(files, &options.include_aliases, &options.not_built, &mut stats);
     stats.include_ms = ms(t);
     let t = Instant::now();
-    (stats.sites, stats.expanded_defs, stats.expanded_refs) = crate::expand::expand(files, &includes, &sure_includes, cache);
+    (stats.sites, stats.expanded_defs, stats.expanded_refs) = crate::expand::expand(files, &includes, &sure_includes, &options.not_built, cache);
     stats.expand_ms = ms(t);
     crate::mem_mark("expanded");
     crate::trim_memory();
@@ -1771,15 +1771,16 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 };
                 let ambiguous = several || maybe || guessed || tmp.iter().any(optional);
                 counts[ambiguous as usize] += 1;
-                // `SI_EDGE_WHY=<name>`: why each call of that name that is
+                // `SI_EDGE_WHY=<name>[,<name>...]`: why each call of those names that is
                 // not certain is not.
-                if ambiguous && edge_why.as_deref().is_some_and(|w| g.name(remap[fi][r.name as usize]) == w) {
+                if ambiguous && edge_why.as_deref().is_some_and(|w| w.split(',').any(|w| g.name(remap[fi][r.name as usize]) == w)) {
                     let at = path_of.get(fi).and_then(|&p| readings.paths.get(p as usize)).map_or("?", |p| p.as_str());
                     let c = tmp[0];
                     let n_readers = readers.get().map_or(0, |r| r.len());
                     eprintln!(
-                        "edgewhy   {at}:{}: {} target(s) {:?}, maybe {maybe}, guessed {guessed}, optional {}, conditional {}, compiled {:?}, in its unit {}, readers {n_readers}",
+                        "edgewhy   {at}:{}: {} {} target(s) {:?}, maybe {maybe}, guessed {guessed}, optional {}, conditional {}, compiled {:?}, in its unit {}, readers {n_readers}",
                         r.line,
+                        g.name(remap[fi][r.name as usize]),
                         tmp.len(),
                         tmp.iter().map(|&t| format!("{}{}", files[syms[t as usize].file as usize].path, if optional(&t) { " (optional)" } else { "" })).collect::<Vec<_>>(),
                         tmp.iter().any(optional),
@@ -2362,6 +2363,29 @@ struct writer w = { .run = do_write };
         ]);
         assert_eq!(targets(&g, "f", "helper"), ["gas/impl.c"]);
         assert!(targets(&g, "g", "helper").is_empty());
+    }
+
+    #[test]
+    fn a_call_in_a_function_a_macro_may_make_is_there_whenever_the_function_is() {
+        let files = [
+            ("trace.h", "#ifdef TRACING\n#define DECLARE(n) static inline void trace_##n (void) { probe (); }\n#else\n#define DECLARE(n)\n#endif\nDECLARE(open)\n"),
+            ("probe.c", "void probe (void) { }\n"),
+            ("a.c", "#include \"trace.h\"\nvoid f (void) { trace_open (); }\n"),
+        ];
+        let paths: Vec<std::path::PathBuf> = files.iter().map(|(p, _)| p.into()).collect();
+        let dir = std::env::temp_dir().join(format!("si-link-made-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (p, src) in &files {
+            std::fs::create_dir_all(dir.join(p).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(p), src).unwrap();
+        }
+        let full: Vec<std::path::PathBuf> = paths.iter().map(|p| dir.join(p)).collect();
+        let sets = crate::prescan(&full);
+        let facts = crate::extract_all(&dir, &full, &sets);
+        let g = link(&facts).0;
+        let calls: Vec<bool> = g.find("trace_open").iter().flat_map(|&s| g.refs_from(s)).filter(|e| g.sym_name(e.other) == "probe").map(|e| !e.ambiguous()).collect();
+        assert_eq!(calls, [true]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
