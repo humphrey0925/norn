@@ -5,6 +5,7 @@ pub mod cond;
 pub mod expand;
 pub mod extract;
 pub mod graph;
+pub mod kbuild;
 pub mod link;
 pub mod mask;
 pub mod model;

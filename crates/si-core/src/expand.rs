@@ -440,8 +440,11 @@ fn parse(text: &str, function_like: bool, guard: &str) -> Parsed {
 
 struct Table<'a> {
     files: &'a [FileFacts],
-    /// Per file, whether it is in a folder the build does not compile.
+    /// Per file, whether the build does not compile it, and whether it is
+    /// in a folder the build does not compile (another program's; not a
+    /// file of this one the configuration leaves out).
     outside: Vec<bool>,
+    apart: Vec<bool>,
     /// Whether every compilation of the tree was read (`units`): what each
     /// file can see is known, and every definition of a name met is worth
     /// reading once (the kernel's `trace_events.h` stages, most of which
@@ -524,7 +527,7 @@ impl<'a> Table<'a> {
                 (name, out)
             })
             .collect();
-        Table { files, outside: vec![false; files.len()], thorough: false, readings: None, unit_of: Vec::new(), header_of: Vec::new(), by_name, by_text, parsed }
+        Table { files, outside: vec![false; files.len()], apart: vec![false; files.len()], thorough: false, readings: None, unit_of: Vec::new(), header_of: Vec::new(), by_name, by_text, parsed }
     }
 }
 
@@ -1515,14 +1518,16 @@ fn expand_file(
     // gets a single engine that sees them all at once.
     let mut units = roots(fi as u32, table.files, rev);
     // A file the build compiles is read by the compilations it makes, and
-    // sees nothing of folders it does not compile (another program's).
-    let built = !table.outside[fi];
-    if built && units.iter().any(|&r| !table.outside[r as usize]) {
+    // sees nothing of folders it does not compile (another program's). So
+    // does one of this program the configuration leaves out (a driver
+    // Kbuild does not build): it is the program's all the same.
+    let built = !table.apart[fi];
+    if !table.outside[fi] && units.iter().any(|&r| !table.outside[r as usize]) {
         units.retain(|&r| !table.outside[r as usize]);
     }
     let seen = |mut v: Vec<bool>| {
         if built {
-            v.iter_mut().zip(&table.outside).filter(|(_, &o)| o).for_each(|(v, _)| *v = false);
+            v.iter_mut().zip(&table.apart).filter(|(_, &o)| o).for_each(|(v, _)| *v = false);
         }
         v
     };
@@ -2088,6 +2093,8 @@ pub fn expand(
             .collect();
         let mut table = Table::new(files, by_name, parsed);
         table.outside = files.iter().map(|f| crate::link::outside(&f.path, not_built)).collect();
+        let folders: Vec<String> = not_built.iter().filter(|f| f.ends_with('/')).cloned().collect();
+        table.apart = files.iter().map(|f| crate::link::outside(&f.path, &folders)).collect();
         table.thorough = thorough;
         if thorough {
             let numbered = |list: Vec<&str>| -> Vec<u32> {

@@ -101,6 +101,12 @@ pub struct Settings {
     /// `IS_ENABLED`).
     #[serde(default, rename = "includeFirst", skip_serializing_if = "Vec::is_empty")]
     pub include_first: Vec<String>,
+    /// The tree's Kbuild makefiles say which files and folders the
+    /// configuration builds: those they do not are not built (as
+    /// `notBuilt`), worked out from the makefiles when the settings are
+    /// read.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub kbuild: bool,
 }
 
 impl Settings {
@@ -293,9 +299,12 @@ fn kconfig(root: &Path) -> Vec<(String, Settings)> {
             .or_else(|| string("CONFIG_SYS_ARCH"));
         let mut not_built = Vec::new();
         let mut include_first = Vec::new();
+        // (Known: then its makefiles say what it builds.)
+        let mut arch_known = false;
         let mut defines = std::collections::BTreeMap::new();
         let mut undefines = Vec::new();
         if let Some(arch) = arch.filter(|a| !a.is_empty() && root.join("arch").join(a).is_dir()) {
+            arch_known = true;
             // What Kbuild and the compiler it names define for C.
             let on = |name: &str| value(name).is_some_and(|v| v == "1" || v == "y");
             let version = |name: &str| value(name).and_then(|v| v.parse::<u32>().ok()).filter(|&v| v > 0);
@@ -361,7 +370,7 @@ fn kconfig(root: &Path) -> Vec<(String, Settings)> {
                 }
             }
         }
-        out.push((name, Settings { condition_files: vec![file], assume_undefined: vec!["CONFIG_".into()], not_built, include_first, defines, undefines, ..Settings::default() }));
+        out.push((name, Settings { condition_files: vec![file], assume_undefined: vec!["CONFIG_".into()], not_built, include_first, kbuild: arch_known, defines, undefines, ..Settings::default() }));
     }
     out
 }
@@ -1128,13 +1137,30 @@ impl Conditions {
         c.assume_all = settings.assume_undefined.iter().any(|p| p == "*");
         c.no_source = settings.source_defines == Some(false);
         c.undecided_off = settings.undecided.as_deref() == Some("off");
+        // (A folder as `a/b/`, a file as it is.)
         c.not_built = settings
             .not_built
             .iter()
             .map(|d| d.replace('\\', "/").trim_matches('/').to_string())
             .filter(|d| !d.is_empty() && d != ".")
-            .map(|d| d + "/")
+            .map(|d| if root.join(&d).is_file() { d } else { d + "/" })
             .collect();
+        if settings.kbuild {
+            // What make has for `$(CONFIG_X)`: `y`, `m`, the value, or
+            // nothing.
+            let defined = c.defined.clone();
+            let value = |name: &str| -> Option<String> {
+                name.starts_with("CONFIG_").then(|| match defined.get(name.as_bytes()) {
+                    Some(v) if v == b"1" => "y".to_string(),
+                    Some(v) => String::from_utf8_lossy(v).trim_matches('"').to_string(),
+                    None if defined.contains_key(format!("{name}_MODULE").as_bytes()) => "m".to_string(),
+                    None => String::new(),
+                })
+            };
+            c.not_built.extend(crate::kbuild::not_built(root, &value));
+        }
+        c.not_built.sort();
+        c.not_built.dedup();
         c.include_first = settings.include_first.iter().map(|f| f.replace('\\', "/").trim_start_matches("./").to_string()).collect();
         c
     }
@@ -2240,13 +2266,32 @@ CONFIG_SYS_ARCH=\"sandbox\"
 CONFIG_SYS_BOARD=\"sandbox\"
 CONFIG_LOG=y
 ").unwrap();
+        // Its makefiles: `tiny-printf.o` is SPL's, not built here.
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/Makefile"), "ifeq ($(CONFIG_XPL_BUILD),y)
+obj-y += tiny-printf.o
+else
+obj-y += vsprintf.o
+endif
+").unwrap();
+        for f in ["lib/tiny-printf.c", "lib/vsprintf.c"] {
+            std::fs::write(dir.join(f), "").unwrap();
+        }
         let p = Project::load(&dir);
         let settings = p.current();
         assert_eq!(settings.not_built, ["arch/arm", "tools", "board/ti"]);
         assert_eq!(settings.include_first, ["include/linux/kconfig.h"]);
+        assert!(settings.kbuild);
         let c = Conditions::from_settings(&settings, &dir);
         assert_eq!((c.defined(b"__UBOOT__"), c.defined(b"__KERNEL__"), c.eval(b"CONFIG_IS_ENABLED(LOG)")), (Tri::True, Tri::True, Tri::True));
         assert_eq!(c.include_first(), ["include/linux/kconfig.h"]);
+        // A folder ends in `/`, a file does not; sorted, for looking up.
+        assert_eq!(c.not_built(), ["arch/arm/", "board/ti/", "lib/tiny-printf.c", "tools/"]);
+        let many: Vec<String> = (0..40).map(|i| format!("drivers/d{i:02}.c")).chain(c.not_built().iter().cloned()).collect();
+        let mut many = many;
+        many.sort();
+        let out = |p: &str| crate::link::outside(p, &many);
+        assert_eq!([out("lib/tiny-printf.c"), out("lib/tiny-printf.cc"), out("lib/vsprintf.c"), out("board/ti/am335x/b.c"), out("drivers/d07.c")], [true, false, false, true, true]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

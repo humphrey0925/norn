@@ -920,10 +920,12 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
     }
     // What a compilation starts from: a file that is not a header, or a
     // header nothing here includes (it is somebody's, out of sight).
-    // (Not those in folders the build does not compile.)
+    // (Not those in folders the build does not compile. A file of this
+    // program the configuration leaves out is read as it would be.)
+    let folders: Vec<String> = conditions.not_built().iter().filter(|f| f.ends_with('/')).cloned().collect();
     let roots: Vec<u32> = (0..n as u32)
         .filter(|&i| !crate::is_header(&paths[i as usize]) || !included[i as usize])
-        .filter(|&i| !crate::link::outside(&paths[i as usize], conditions.not_built()))
+        .filter(|&i| !crate::link::outside(&paths[i as usize], &folders))
         .collect();
     // What every compilation reads before its own file (the build's
     // `-include`).
