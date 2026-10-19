@@ -96,6 +96,11 @@ pub struct Settings {
     /// what is elsewhere.
     #[serde(default, rename = "notBuilt", skip_serializing_if = "Vec::is_empty")]
     pub not_built: Vec<String>,
+    /// Headers every compilation reads before its own file, as the build's
+    /// `-include` has it (Kbuild's `include/linux/kconfig.h`, which makes
+    /// `IS_ENABLED`).
+    #[serde(default, rename = "includeFirst", skip_serializing_if = "Vec::is_empty")]
+    pub include_first: Vec<String>,
 }
 
 impl Settings {
@@ -265,32 +270,41 @@ fn kconfig(root: &Path) -> Vec<(String, Settings)> {
         };
         let Some(file) = [at("include/generated/autoconf.h"), at(".config")].into_iter().find(|f| generated(f)) else { continue };
         let name = if dir.is_empty() { "Kconfig".to_string() } else { format!("Kconfig ({dir})") };
+        let text = std::fs::read(root.join(&file)).map(|t| String::from_utf8_lossy(&t).into_owned()).unwrap_or_default();
+        let value = |name: &str| {
+            text.lines().find_map(|l| {
+                let l = l.trim();
+                let rest = l.strip_prefix("#define ").map(|r| r.trim_start()).unwrap_or(l);
+                let rest = rest.strip_prefix(name)?;
+                let v = rest.strip_prefix('=').unwrap_or(rest).trim();
+                (!v.is_empty() && rest.starts_with([' ', '\t', '='])).then(|| v.to_string())
+            })
+        };
+        // A string's value, without its quotes.
+        let string = |name: &str| value(name).map(|v| v.trim_matches('"').to_string()).filter(|v| !v.is_empty());
         // Linux's says which architecture it is for ("Linux/x86 6.12.0
-        // Kernel Configuration"): the others' folders, and the programs
-        // of `tools/` and `scripts/` that the host runs, are not built.
-        let arch = std::fs::read(root.join(&file)).ok().and_then(|text| {
-            let head = String::from_utf8_lossy(&text[..text.len().min(512)]).into_owned();
-            let at = head.find("Linux/")? + "Linux/".len();
-            Some(head[at..].split(|c: char| c.is_whitespace()).next()?.to_string())
-        });
+        // Kernel Configuration"), U-Boot's in `CONFIG_SYS_ARCH`: the others'
+        // folders, and the programs of `tools/` and `scripts/` that the
+        // host runs, are not built.
+        let head = &text[..text.len().min(512)];
+        let arch = head
+            .find("Linux/")
+            .and_then(|at| Some(head[at + "Linux/".len()..].split(|c: char| c.is_whitespace()).next()?.to_string()))
+            .or_else(|| string("CONFIG_SYS_ARCH"));
         let mut not_built = Vec::new();
+        let mut include_first = Vec::new();
         let mut defines = std::collections::BTreeMap::new();
         let mut undefines = Vec::new();
         if let Some(arch) = arch.filter(|a| !a.is_empty() && root.join("arch").join(a).is_dir()) {
             // What Kbuild and the compiler it names define for C.
-            let text = std::fs::read(root.join(&file)).map(|t| String::from_utf8_lossy(&t).into_owned()).unwrap_or_default();
-            let value = |name: &str| {
-                text.lines().find_map(|l| {
-                    let l = l.trim();
-                    let rest = l.strip_prefix("#define ").map(|r| r.trim_start()).unwrap_or(l);
-                    let rest = rest.strip_prefix(name)?;
-                    let v = rest.strip_prefix('=').unwrap_or(rest).trim();
-                    (!v.is_empty() && rest.starts_with([' ', '\t', '='])).then(|| v.to_string())
-                })
-            };
             let on = |name: &str| value(name).is_some_and(|v| v == "1" || v == "y");
             let version = |name: &str| value(name).and_then(|v| v.parse::<u32>().ok()).filter(|&v| v > 0);
             defines.insert("__KERNEL__".to_string(), "1".to_string());
+            // (`-include include/linux/kconfig.h`, on every command.)
+            include_first.extend(["include/linux/kconfig.h"].iter().filter(|f| root.join(f).is_file()).map(|f| f.to_string()));
+            if string("CONFIG_SYS_ARCH").is_some() {
+                defines.insert("__UBOOT__".to_string(), "1".to_string());
+            }
             undefines.extend(["__ASSEMBLY__", "__CHECKER__", "__GENKSYMS__"].map(String::from));
             if on("CONFIG_CC_IS_CLANG") {
                 let v = version("CONFIG_CLANG_VERSION").unwrap_or(0);
@@ -320,8 +334,34 @@ fn kconfig(root: &Path) -> Vec<(String, Settings)> {
             others.sort();
             not_built.extend(others);
             not_built.extend(["tools", "scripts"].iter().filter(|d| root.join(d).is_dir()).map(|d| d.to_string()));
+            // U-Boot's board, `board/<vendor>/<board>` or `board/<board>`:
+            // the others' are not built.
+            if let Some(board) = string("CONFIG_SYS_BOARD") {
+                let vendor = string("CONFIG_SYS_VENDOR");
+                let (keep, inside) = match &vendor {
+                    Some(v) => (v.as_str(), Some(board.as_str())),
+                    None => (board.as_str(), None),
+                };
+                let folders = |dir: &Path| -> Vec<String> {
+                    let mut names: Vec<String> = std::fs::read_dir(dir)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                        .collect();
+                    names.sort();
+                    names
+                };
+                if root.join("board").join(keep).is_dir() {
+                    not_built.extend(folders(&root.join("board")).into_iter().filter(|b| b != keep).map(|b| format!("board/{b}")));
+                    if let Some(inside) = inside.filter(|b| root.join("board").join(keep).join(b).is_dir()) {
+                        not_built.extend(folders(&root.join("board").join(keep)).into_iter().filter(|b| b != inside).map(|b| format!("board/{keep}/{b}")));
+                    }
+                }
+            }
         }
-        out.push((name, Settings { condition_files: vec![file], assume_undefined: vec!["CONFIG_".into()], not_built, defines, undefines, ..Settings::default() }));
+        out.push((name, Settings { condition_files: vec![file], assume_undefined: vec!["CONFIG_".into()], not_built, include_first, defines, undefines, ..Settings::default() }));
     }
     out
 }
@@ -750,6 +790,8 @@ pub struct Conditions {
     undecided_off: bool,
     /// Folders the build does not compile (`notBuilt`), as `a/b/`.
     not_built: Vec<String>,
+    /// Headers read before every compilation's own file (`includeFirst`).
+    include_first: Vec<String>,
 }
 
 /// The macros whose value the sources settle, and in which files each is
@@ -1093,7 +1135,13 @@ impl Conditions {
             .filter(|d| !d.is_empty() && d != ".")
             .map(|d| d + "/")
             .collect();
+        c.include_first = settings.include_first.iter().map(|f| f.replace('\\', "/").trim_start_matches("./").to_string()).collect();
         c
+    }
+
+    /// The headers every compilation reads first, by path.
+    pub fn include_first(&self) -> &[String] {
+        &self.include_first
     }
 
     /// The folders the build does not compile, each as `a/b/`.
@@ -1206,7 +1254,7 @@ impl Conditions {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.defined.is_empty() && self.undefined.is_empty() && self.assume_undefined.is_empty() && !self.assume_all && !self.assume_built && !self.undecided_off && self.not_built.is_empty()
+        self.defined.is_empty() && self.undefined.is_empty() && self.assume_undefined.is_empty() && !self.assume_all && !self.assume_built && !self.undecided_off && self.not_built.is_empty() && self.include_first.is_empty()
     }
 
     /// Do these conditions assume anything about names they do not list?
@@ -1275,7 +1323,8 @@ impl Conditions {
         let s = self.in_source.iter().fold(0, |acc, k| acc ^ h(k, 14));
         let c = self.source.as_ref().map_or(0, |s| s.digest()) ^ self.no_source as u64 ^ (self.undecided_off as u64) << 1;
         let b = self.not_built.iter().fold(0, |acc, k| acc ^ h(k.as_bytes(), 15));
-        d ^ u ^ a ^ s ^ c ^ b
+        let f = self.include_first.iter().enumerate().fold(0, |acc, (i, k)| acc ^ h(k.as_bytes(), 16 + i as u64));
+        d ^ u ^ a ^ s ^ c ^ b ^ f
     }
 
     pub fn defined(&self, name: &[u8]) -> Tri {
@@ -1781,9 +1830,12 @@ impl Parser<'_> {
                     return None;
                 }
                 if let Some((params, body)) = self.c.text(name).flatten().and_then(function_parts) {
-                    return self.expand(&params, body, &args);
+                    if let Some(v) = self.expand(&params, body, &args) {
+                        return Some(v);
+                    }
                 }
-                // The kernel's own.
+                // The kernel's own, and U-Boot's, which paste: what they
+                // come to.
                 let arg = match &args[..] {
                     [one] if one.len() == 1 => match self.toks[one.start] {
                         Tok::Ident(a) => Some(a),
@@ -1792,6 +1844,19 @@ impl Parser<'_> {
                     _ => None,
                 };
                 let arg = arg?;
+                if name == b"CONFIG_IS_ENABLED" {
+                    // `CONFIG_<prefix>X`, the prefix that of the image being
+                    // built: `SPL_` for SPL's, and so on; none for U-Boot's.
+                    let mut prefix: Option<&[u8]> = Some(b"");
+                    for (build, p) in [(&b"CONFIG_TPL_BUILD"[..], &b"TPL_"[..]), (b"CONFIG_VPL_BUILD", b"VPL_"), (b"CONFIG_SPL_BUILD", b"SPL_")] {
+                        match self.c.defined(build) {
+                            Tri::True if prefix == Some(b"") => prefix = Some(p),
+                            Tri::False => {}
+                            _ => prefix = None,
+                        }
+                    }
+                    return as_value(prefix.map_or(Tri::Unknown, |p| self.c.defined(&[b"CONFIG_", p, arg].concat())));
+                }
                 let module = [arg, b"_MODULE"].concat();
                 let (builtin, as_module) = (self.c.defined(arg), self.c.defined(&module));
                 as_value(match name {
@@ -2158,6 +2223,34 @@ CONFIG_CLANG_VERSION=180103
     }
 
     #[test]
+    fn u_boot_s_configuration_names_its_architecture_and_board() {
+        let dir = std::env::temp_dir().join(format!("si-cond-uboot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for d in ["arch/sandbox", "arch/arm", "board/sandbox", "board/ti/am335x", "include/linux", "tools"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(dir.join("include/linux/kconfig.h"), "#define IS_ENABLED(option) config_enabled(option, 0)
+").unwrap();
+        std::fs::write(dir.join(".config"), "#
+# Automatically generated file; DO NOT EDIT.
+# U-Boot 2026.10 Configuration
+#
+CONFIG_SANDBOX=y
+CONFIG_SYS_ARCH=\"sandbox\"
+CONFIG_SYS_BOARD=\"sandbox\"
+CONFIG_LOG=y
+").unwrap();
+        let p = Project::load(&dir);
+        let settings = p.current();
+        assert_eq!(settings.not_built, ["arch/arm", "tools", "board/ti"]);
+        assert_eq!(settings.include_first, ["include/linux/kconfig.h"]);
+        let c = Conditions::from_settings(&settings, &dir);
+        assert_eq!((c.defined(b"__UBOOT__"), c.defined(b"__KERNEL__"), c.eval(b"CONFIG_IS_ENABLED(LOG)")), (Tri::True, Tri::True, Tri::True));
+        assert_eq!(c.include_first(), ["include/linux/kconfig.h"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn what_the_sources_define_is_known_where_it_can_be() {
         let files = ["a.c".to_string(), "b.c".to_string(), "cfg.h".to_string()];
         let mut source = Source::new(&files);
@@ -2234,6 +2327,9 @@ CONFIG_CLANG_VERSION=180103
             ("IS_ENABLED(CONFIG_NET)", Tri::True),
             ("IS_BUILTIN(CONFIG_NET)", Tri::False),
             ("IS_ENABLED(CONFIG_DEBUG)", Tri::False),
+            // U-Boot's, for U-Boot's image itself (not SPL's).
+            ("CONFIG_IS_ENABLED(SMP)", Tri::True),
+            ("CONFIG_IS_ENABLED(DEBUG)", Tri::False),
             ("SOME_MACRO(1, 2) && 0", Tri::False),
             ("SOME_MACRO(1, 2) || 0", Tri::Unknown),
             ("0", Tri::False),
