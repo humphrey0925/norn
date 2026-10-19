@@ -925,6 +925,9 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         .filter(|&i| !crate::is_header(&paths[i as usize]) || !included[i as usize])
         .filter(|&i| !crate::link::outside(&paths[i as usize], conditions.not_built()))
         .collect();
+    // What every compilation reads before its own file (the build's
+    // `-include`).
+    let read_first: Vec<u32> = conditions.include_first().iter().filter_map(|f| paths.iter().position(|p| p == f)).map(|i| i as u32).collect();
     let sizes: Vec<usize> = steps.iter().map(Vec::len).collect();
     let seen = || sizes.iter().map(|&n| (0..n).map(|_| AtomicU8::new(0)).collect()).collect();
     let mut slots = 0;
@@ -1057,6 +1060,10 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
                     files: Some(FxHashMap::default()),
                     unknown_why: FxHashMap::default(),
                 };
+                for &f in read_first.iter().filter(|&&f| f != root) {
+                    unit.read.insert(f, true);
+                    unit.read(f, false, 0);
+                }
                 unit.read.insert(root, true);
                 unit.read(root, false, 0);
                 if let Some(p) = unit.prof {
@@ -1404,6 +1411,24 @@ int both;
         let at = |p: &str, line: u32| readings.compiled(unit(p), 0, line);
         assert_eq!([at("good.c", 2), at("good.c", 4), at("good.c", 6)], [Tri::True, Tri::False, Tri::True]);
         assert_eq!([at("spoil.c", 2), at("spoil.c", 4), at("spoil.c", 6)], [Tri::False, Tri::True, Tri::True]);
+    }
+
+    #[test]
+    fn a_header_the_build_includes_first_is_read_before_the_file() {
+        // Kbuild's `-include include/linux/kconfig.h`: no file includes it,
+        // every compilation has read it before its first line.
+        let files = [
+            ("include/linux/kconfig.h", "#define ON 1
+"),
+            ("a.c", "#if ON
+int a;
+#endif
+"),
+        ];
+        let settings = crate::cond::Settings { include_first: vec!["include/linux/kconfig.h".into()], ..Default::default() };
+        let first = crate::cond::Conditions::from_settings(&settings, std::path::Path::new("."));
+        assert_eq!(told(&files)[1], [one("#if ON", false)]);
+        assert_eq!(told_under(&files, &first)[1], [one("#if ON", true)]);
     }
 
     #[test]

@@ -310,11 +310,15 @@ folders down:
 Each build configuration in a project file (Debug, Release, each target)
 becomes a set of conditions; the first is in force. For Kconfig, every
 `CONFIG_` name the configuration does not set is taken as not set, as Kbuild
-does; for Linux, the configuration's architecture is the one built: the other
-architectures' folders, `tools/` and `scripts/` are still indexed, but where a
-name could mean something there or something the build compiles, it means the
-latter. Any project can say the same of its own folders with `"notBuilt":
-["vendor/other-board"]` in `.norn/config.json`.
+does; for Linux and U-Boot, the configuration's architecture is the one built
+(and for U-Boot its board): the other architectures' and boards' folders,
+`tools/` and `scripts/` are still indexed, but where a name could mean something
+there or something the build compiles, it means the latter. Any project can say
+the same of its own folders with `"notBuilt": ["vendor/other-board"]` in
+`.norn/config.json`. Kbuild also reads `include/linux/kconfig.h` before every
+file (`-include`), which makes `IS_ENABLED` and `CONFIG_IS_ENABLED`; Norn does
+the same, and any project can name such headers with `"includeFirst":
+["config/prefix.h"]`.
 
 With no build configuration at all, Norn still works out what it can: what the
 sources themselves define holds; a branch it cannot decide is kept both ways,
