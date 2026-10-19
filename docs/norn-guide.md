@@ -318,7 +318,12 @@ the same of its own folders with `"notBuilt": ["vendor/other-board"]` in
 `.norn/config.json`. Kbuild also reads `include/linux/kconfig.h` before every
 file (`-include`), which makes `IS_ENABLED` and `CONFIG_IS_ENABLED`; Norn does
 the same, and any project can name such headers with `"includeFirst":
-["config/prefix.h"]`.
+["config/prefix.h"]`. The makefiles say which source files the configuration
+builds (`obj-$(CONFIG_X) += foo.o`, `ifdef`, `ifeq` and the like): a file or
+folder they list only where it is not built is taken as not built, as
+`"notBuilt"` would have it (U-Boot's `tiny-printf.c` beside `vsprintf.c`).
+What they do not name, or name in a way Norn does not work out, is left alone,
+and so are headers.
 
 With no build configuration at all, Norn still works out what it can: what the
 sources themselves define holds; a branch it cannot decide is kept both ways,

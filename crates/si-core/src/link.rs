@@ -241,7 +241,14 @@ impl<'a> Readers<'a> {
 
 /// Whether `path` is in one of `folders` (each `a/b/`).
 pub(crate) fn outside(path: &str, folders: &[String]) -> bool {
-    folders.iter().any(|f| path.starts_with(f.as_str()))
+    // A folder as `a/b/`, a file as it is. (Many, sorted, as the
+    // conditions keep them: the file and each folder it is in looked up.)
+    let one = |f: &String| if f.ends_with('/') { path.starts_with(f.as_str()) } else { path == f };
+    if folders.len() <= 16 {
+        return folders.iter().any(one);
+    }
+    let has = |p: &str| folders.binary_search_by(|f| f.as_str().cmp(p)).is_ok();
+    has(path) || path.match_indices('/').any(|(i, _)| has(&path[..=i]))
 }
 
 /// For each file, the files it includes directly. Without the build's `-I`
@@ -1291,6 +1298,14 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         let set: FxHashSet<&str> = readings.unread.iter().map(String::as_str).collect();
         files.iter().map(|f| set.contains(f.path.as_str()) || outside(&f.path, &options.not_built)).collect()
     };
+    // Of those, the files of another program (in a folder the build does not
+    // compile): what they call is not what the build's files call. (A file of
+    // this program the configuration leaves out calls what it would.)
+    let apart: Vec<bool> = {
+        let set: FxHashSet<&str> = readings.unread.iter().map(String::as_str).collect();
+        let folders: Vec<String> = options.not_built.iter().filter(|f| f.ends_with('/')).cloned().collect();
+        files.iter().map(|f| set.contains(f.path.as_str()) || outside(&f.path, &folders)).collect()
+    };
     // Where none of a header's compilations reads the callee's file, what
     // every compilation that does compiles: per (file, stretch of lines).
     let everywhere: std::sync::Mutex<FxHashMap<(u32, u32), crate::cond::Tri>> = Default::default();
@@ -1715,8 +1730,15 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     tmp.retain(is_def);
                 }
                 let built = |c: &u32| !unread.get(syms[*c as usize].file as usize).copied().unwrap_or(false);
-                if !unread.get(fi).copied().unwrap_or(false) && tmp.iter().any(built) {
-                    tmp.retain(built);
+                if !apart.get(fi).copied().unwrap_or(false) {
+                    // (None built, as x86-64's `memcpy`, written in assembly:
+                    // this program's before another's.)
+                    let own = |c: &u32| !apart.get(syms[*c as usize].file as usize).copied().unwrap_or(false);
+                    if tmp.iter().any(built) {
+                        tmp.retain(built);
+                    } else if tmp.iter().any(own) {
+                        tmp.retain(own);
+                    }
                 }
                 // A macro, or a function defined in a header, is there only
                 // where its file is read: in a source file, not one its own
