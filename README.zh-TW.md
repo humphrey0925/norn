@@ -10,6 +10,8 @@
 </p>
 
 <p align="center">
+  <a href="https://marketplace.visualstudio.com/items?itemName=humphrey0925.norn-c"><img src="https://img.shields.io/badge/VS%20Marketplace-install-007ACC" alt="Visual Studio Marketplace"></a>
+  <a href="https://open-vsx.org/extension/humphrey0925/norn-c"><img src="https://img.shields.io/open-vsx/v/humphrey0925/norn-c?label=Open%20VSX" alt="Open VSX"></a>
   <a href="https://github.com/humphrey0925/norn/actions/workflows/ci.yml"><img src="https://github.com/humphrey0925/norn/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
   <img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS-informational.svg" alt="Windows | Linux | macOS">
@@ -24,6 +26,12 @@
   <a href="docs/norn-guide.zh-TW.md">使用指南</a> ·
   <a href="docs/cli.zh-TW.md">命令列</a> ·
   <a href="README.md">English</a>
+</p>
+
+<p align="center">
+  <b>安裝：</b><a href="https://marketplace.visualstudio.com/items?itemName=humphrey0925.norn-c">Visual Studio Marketplace</a> ·
+  <a href="https://open-vsx.org/extension/humphrey0925/norn-c">Open VSX</a>（VSCodium、Cursor、Windsurf） ·
+  <a href="https://github.com/humphrey0925/norn/releases">.vsix 與 <code>norn</code> 指令</a>
 </p>
 
 <p align="center">
@@ -115,8 +123,10 @@ configuration provider，而不是和它重複。完整功能列表見[擴充套
 
 ## 開始使用
 
-1. 從 Visual Studio Marketplace 或 Open VSX 安裝 **Norn — Code Navigation & Symbol Index**，
-   或從 [releases](https://github.com/humphrey0925/norn/releases) 下載 `.vsix`。
+1. 安裝 **Norn — Code Navigation & Symbol Index**：從 [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=humphrey0925.norn-c)，
+   或給 VSCodium、Cursor 等編輯器用的 [Open VSX](https://open-vsx.org/extension/humphrey0925/norn-c)，
+   或從 [releases](https://github.com/humphrey0925/norn/releases) 下載 `.vsix`。用指令安裝：
+   `code --install-extension humphrey0925.norn-c`。
 2. 開啟一個有 C 原始碼的資料夾。
 
 這樣就好了。擴充套件已內含 Windows、Linux、macOS（x64 與 Arm64）的伺服器。每個檢視和設定的

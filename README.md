@@ -10,6 +10,8 @@
 </p>
 
 <p align="center">
+  <a href="https://marketplace.visualstudio.com/items?itemName=humphrey0925.norn-c"><img src="https://img.shields.io/badge/VS%20Marketplace-install-007ACC" alt="Visual Studio Marketplace"></a>
+  <a href="https://open-vsx.org/extension/humphrey0925/norn-c"><img src="https://img.shields.io/open-vsx/v/humphrey0925/norn-c?label=Open%20VSX" alt="Open VSX"></a>
   <a href="https://github.com/humphrey0925/norn/actions/workflows/ci.yml"><img src="https://github.com/humphrey0925/norn/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
   <img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS-informational.svg" alt="Windows | Linux | macOS">
@@ -24,6 +26,12 @@
   <a href="docs/norn-guide.md">User guide</a> ·
   <a href="docs/cli.md">Command line</a> ·
   <a href="README.zh-TW.md">繁體中文</a>
+</p>
+
+<p align="center">
+  <b>Install:</b> <a href="https://marketplace.visualstudio.com/items?itemName=humphrey0925.norn-c">Visual Studio Marketplace</a> ·
+  <a href="https://open-vsx.org/extension/humphrey0925/norn-c">Open VSX</a> (VSCodium, Cursor, Windsurf) ·
+  <a href="https://github.com/humphrey0925/norn/releases">.vsix and the <code>norn</code> command</a>
 </p>
 
 <p align="center">
@@ -125,9 +133,12 @@ provider instead of competing with it. The full list is on the
 
 ## Getting started
 
-1. Install **Norn — Code Navigation & Symbol Index** from the Visual Studio
-   Marketplace or Open VSX, or a `.vsix` from the
-   [releases](https://github.com/humphrey0925/norn/releases).
+1. Install **Norn — Code Navigation & Symbol Index**: from the
+   [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=humphrey0925.norn-c), from
+   [Open VSX](https://open-vsx.org/extension/humphrey0925/norn-c) for VSCodium, Cursor and the
+   other editors that use it, or a `.vsix` from the
+   [releases](https://github.com/humphrey0925/norn/releases). From the command
+   line: `code --install-extension humphrey0925.norn-c`.
 2. Open a folder with C sources.
 
 That is all. The server is included for Windows, Linux and macOS, on x64 and
