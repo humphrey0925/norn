@@ -1049,6 +1049,8 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
     let init = s.flags & site::INIT != 0;
     let (mut paren, mut brace) = (0i32, 0i32);
     let mut storage = 0u8;
+    // In a `typedef`: what it names is a type, whatever follows.
+    let mut typedef = false;
     // The function whose body, written in the expansion, is being read.
     let mut owner: Option<String> = None;
     for i in 0..n {
@@ -1064,7 +1066,7 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
                         owner = None;
                     }
                 }
-                ";" if paren == 0 && brace == 0 => storage = 0,
+                ";" if paren == 0 && brace == 0 => (storage, typedef) = (0, false),
                 _ => {}
             }
             continue;
@@ -1075,6 +1077,7 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
         match &*t.text {
             "static" => storage |= flag::STATIC,
             "extern" => storage |= flag::DECL,
+            "typedef" if paren == 0 && brace == 0 => typedef = true,
             _ => {}
         }
         // C++: `class Name : public Base {`, what it derives from.
@@ -1201,7 +1204,9 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
             continue;
         }
         if !in_fn && paren == 0 && brace == 0 && prev.is_some_and(decl_prev) {
-            if next_is("(") {
+            // (`typedef u64 (*btf_name) (...)`, of the kernel's `BPF_CALL_x`:
+            // no function `u64`.)
+            if next_is("(") && !typedef {
                 let mut depth = 0;
                 let close = toks[i + 1..].iter().position(|x| {
                     depth += x.is("(") as i32 - x.is(")") as i32;
@@ -2189,6 +2194,16 @@ mod tests {
         ] {
             assert!(decls(src).is_empty(), "{src}: {:?}", decls(src));
         }
+    }
+
+    #[test]
+    fn a_typedef_declares_no_function() {
+        // The kernel's `BPF_CALL_x`: a function pointer type, then the
+        // function.
+        let s = Site { name: 0, args: NONE, line: 1, scope: 0, def: NONE, flags: 0 };
+        let found = recognise(&tokenize(b"typedef u64 (*btf_f) (u32 a); u64 f (u64 a);", Origin::Body), &s, "M", false);
+        let functions: Vec<&str> = found.decls.iter().filter(|d| d.1 == kind::FUNCTION).map(|d| d.0.as_str()).collect();
+        assert_eq!(functions, ["f"]);
     }
 
     #[test]
