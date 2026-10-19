@@ -80,6 +80,25 @@ impl Readings {
         self.files.is_empty() && self.units.is_empty()
     }
 
+    /// What the ways come to, for knowing when expansions made with them
+    /// are stale.
+    pub fn digest(&self) -> u64 {
+        let mut h = xxhash_rust::xxh3::Xxh3::new();
+        for (path, lines) in &self.files {
+            h.update(path.as_bytes());
+            lines.iter().for_each(|l| h.update(&l.to_le_bytes()));
+        }
+        for ways in &self.ways {
+            h.update(&(ways.len() as u32).to_le_bytes());
+            ways.iter().for_each(|w| h.update(w));
+        }
+        for (path, ways) in &self.units {
+            h.update(path.as_bytes());
+            ways.iter().for_each(|w| h.update(&[w.0.to_le_bytes(), w.1.to_le_bytes()].concat()));
+        }
+        h.digest()
+    }
+
     /// Whether compilation `unit` reads the file `path` (numbered as in `paths`).
     pub fn reads(&self, unit: u32, path: u32) -> bool {
         self.reads.get(unit as usize).and_then(|b| b.get(path as usize / 64)).is_some_and(|w| w & (1 << (path % 64)) != 0)
@@ -1385,6 +1404,33 @@ int both;
         let at = |p: &str, line: u32| readings.compiled(unit(p), 0, line);
         assert_eq!([at("good.c", 2), at("good.c", 4), at("good.c", 6)], [Tri::True, Tri::False, Tri::True]);
         assert_eq!([at("spoil.c", 2), at("spoil.c", 4), at("spoil.c", 6)], [Tri::False, Tri::True, Tri::True]);
+    }
+
+    #[test]
+    fn a_header_is_read_as_things_stood_where_it_was_included() {
+        // FreeRTOS's `tasks.c`: `mpu_wrappers.h` renames nothing there,
+        // whatever is undefined after.
+        let files = [
+            ("tasks.c", "#define FROM_API
+#include \"w.h\"
+#undef FROM_API
+"),
+            ("app.c", "#include \"w.h\"
+"),
+            ("w.h", "#ifndef W_H
+#define W_H
+#ifndef FROM_API
+#define make_task MPU_make_task
+#endif
+#endif
+"),
+        ];
+        let paths: Vec<String> = files.iter().map(|f| f.0.to_string()).collect();
+        let scripts: Vec<Script> = files.iter().map(|f| crate::mask::script(f.1.as_bytes())).collect();
+        let (_, readings) = read_tree(&paths, &scripts, &Conditions::default()).unwrap();
+        let unit = |p: &str| readings.units.iter().position(|u| u.0 == p).unwrap() as u32;
+        let h = readings.files.iter().position(|f| f.0 == "w.h").unwrap() as u32;
+        assert_eq!([readings.compiled(unit("tasks.c"), h, 4), readings.compiled(unit("app.c"), h, 4)], [Tri::False, Tri::True]);
     }
 
     #[test]

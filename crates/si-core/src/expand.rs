@@ -448,6 +448,14 @@ struct Table<'a> {
     /// make nothing new for a given use). Else the many a file may see are
     /// tried only while they bring something.
     thorough: bool,
+    /// How each compilation reads the headers read differently, and per
+    /// file the compilation it starts and the header it is there (or
+    /// `NONE`): a definition on a line a compilation does not compile is
+    /// not there for it (`mpu_wrappers.h`'s renames, under `#ifndef` of what
+    /// `tasks.c` defines before including it).
+    readings: Option<&'a crate::units::Readings>,
+    unit_of: Vec<u32>,
+    header_of: Vec<u32>,
     by_name: FxHashMap<&'a str, Vec<(u32, u32)>>,
     /// The same definitions in the order of their text, each with a number
     /// that definitions of the same text (spacing aside) share: sorted and
@@ -492,6 +500,9 @@ struct Engine<'a> {
     /// Files this unit reads whatever the configuration (no `#include`
     /// under an `#if` on the way). Empty: all of them.
     sure: Vec<bool>,
+    /// The compilation it stands for, as the readings number them, or
+    /// `NONE`.
+    unit: u32,
 }
 
 impl<'a> Table<'a> {
@@ -513,7 +524,7 @@ impl<'a> Table<'a> {
                 (name, out)
             })
             .collect();
-        Table { files, outside: vec![false; files.len()], thorough: false, by_name, by_text, parsed }
+        Table { files, outside: vec![false; files.len()], thorough: false, readings: None, unit_of: Vec::new(), header_of: Vec::new(), by_name, by_text, parsed }
     }
 }
 
@@ -533,7 +544,15 @@ impl<'a> Engine<'a> {
             merged: None,
             max_variants: if table.thorough { MAX_VARIANTS_READ } else { MAX_VARIANTS },
             sure: Vec::new(),
+            unit: NONE,
         }
+    }
+
+    /// Is the line of this definition compiled where it is read? Not when
+    /// this compilation reads its header in a way that switches it off.
+    fn there(&self, p: &Parsed) -> bool {
+        let (Some(r), Some(&h)) = (self.table.readings, self.table.header_of.get(p.file as usize)) else { return true };
+        self.unit == NONE || h == NONE || r.compiled(self.unit, h, p.line) != crate::cond::Tri::False
     }
 
     /// Is there a translation unit here in which `name` is no macro?
@@ -590,7 +609,7 @@ impl<'a> Engine<'a> {
                 }
             }
             seen.truncate(MAX_CANDIDATES);
-            let mut list: Vec<&'a Parsed> = seen.iter().map(|&(f, i, _)| &self.table.parsed[f as usize][i as usize]).collect();
+            let mut list: Vec<&'a Parsed> = seen.iter().map(|&(f, i, _)| &self.table.parsed[f as usize][i as usize]).filter(|p| self.there(p)).collect();
             // `#ifndef X` / `#define X default` gives way to another
             // definition that is there for certain; one that may not be (the
             // tracepoint headers' `TRACE_EVENT`, read again under
@@ -1504,7 +1523,14 @@ fn expand_file(
     };
     let make_engines = || -> Vec<Engine> {
         if units.len() <= MAX_UNITS {
-            units.iter().map(|&r| Engine { sure: closure(r, sure_fwd), ..Engine::new(table, seen(closure(r, fwd))) }).collect()
+            units
+                .iter()
+                .map(|&r| Engine {
+                    sure: closure(r, sure_fwd),
+                    unit: table.unit_of.get(r as usize).copied().unwrap_or(NONE),
+                    ..Engine::new(table, seen(closure(r, fwd)))
+                })
+                .collect()
         } else {
             // (What it reads for certain: what it includes so, itself.)
             vec![Engine { merged: Some(fi as u32), sure: closure(fi as u32, sure_fwd), ..Engine::new(table, seen(visible(fi as u32, fwd, rev))) }]
@@ -2001,7 +2027,15 @@ fn environment(files: &[FileFacts], includes: &[Vec<u32>]) -> u64 {
 /// Expand the macro uses recorded in `files` into `cache.expanded`: a
 /// replacement for each file that had any. Returns (uses, definitions added,
 /// references added).
-pub fn expand(files: &[FileFacts], includes: &[Vec<u32>], sure_includes: &[Vec<u32>], not_built: &[String], thorough: bool, cache: &mut Cache) -> (u64, u64, u64) {
+pub fn expand(
+    files: &[FileFacts],
+    includes: &[Vec<u32>],
+    sure_includes: &[Vec<u32>],
+    not_built: &[String],
+    readings: &crate::units::Readings,
+    cache: &mut Cache,
+) -> (u64, u64, u64) {
+    let thorough = !readings.is_empty();
     // Dropped last, after the macro table and the engines below.
     let _holding = Holding::new();
     let sites: u64 = files.iter().map(|f| (f.sites.len() + f.inits.len()) as u64).sum();
@@ -2009,7 +2043,8 @@ pub fn expand(files: &[FileFacts], includes: &[Vec<u32>], sure_includes: &[Vec<u
         ^ environment(&[], sure_includes).rotate_left(17)
         ^ sure_digest(sure_includes)
         ^ not_built.iter().fold(0, |acc, d| acc ^ xxhash_rust::xxh3::xxh3_64(d.as_bytes()))
-        ^ (thorough as u64) << 63;
+        ^ (thorough as u64) << 63
+        ^ readings.digest();
     if cache.environment != environment || cache.hashes.len() != files.len() {
         *cache = Cache {
             environment,
@@ -2049,6 +2084,15 @@ pub fn expand(files: &[FileFacts], includes: &[Vec<u32>], sure_includes: &[Vec<u
         let mut table = Table::new(files, by_name, parsed);
         table.outside = files.iter().map(|f| crate::link::outside(&f.path, not_built)).collect();
         table.thorough = thorough;
+        if thorough {
+            let numbered = |list: Vec<&str>| -> Vec<u32> {
+                let at: FxHashMap<&str, u32> = list.into_iter().enumerate().map(|(i, p)| (p, i as u32)).collect();
+                files.iter().map(|f| at.get(f.path.as_str()).copied().unwrap_or(NONE)).collect()
+            };
+            table.unit_of = numbered(readings.units.iter().map(|u| u.0.as_str()).collect());
+            table.header_of = numbered(readings.files.iter().map(|f| f.0.as_str()).collect());
+            table.readings = Some(readings);
+        }
         let mut rev: Vec<Vec<u32>> = vec![Vec::new(); files.len()];
         for (from, tos) in includes.iter().enumerate() {
             for &to in tos {

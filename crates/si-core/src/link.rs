@@ -1118,7 +1118,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     let (includes, sure_includes) = include_edges(files, &options.include_aliases, &options.not_built, &mut stats);
     stats.include_ms = ms(t);
     let t = Instant::now();
-    (stats.sites, stats.expanded_defs, stats.expanded_refs) = crate::expand::expand(files, &includes, &sure_includes, &options.not_built, !options.readings.is_empty(), cache);
+    (stats.sites, stats.expanded_defs, stats.expanded_refs) = crate::expand::expand(files, &includes, &sure_includes, &options.not_built, &options.readings, cache);
     stats.expand_ms = ms(t);
     crate::mem_mark("expanded");
     crate::trim_memory();
@@ -2559,6 +2559,45 @@ static inline void clear_bit_unlock (long n) { }
         assert!(defined(vec![])[1]);
         assert_eq!(defined(vec!["arch/m68k".into()]), [true, false]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rename_a_file_switches_off_before_including_it_renames_nothing_there() {
+        // FreeRTOS's `tasks.c` defines `MPU_WRAPPERS_INCLUDED_FROM_API_FILE`
+        // before including `mpu_wrappers.h` (and undefines it after): its
+        // `xTaskCreate` is `xTaskCreate`, not `MPU_xTaskCreate`.
+        let dir = std::env::temp_dir().join(format!("si-link-api-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let files = [
+            ("w.h", "#ifndef W_H
+#define W_H
+#ifndef FROM_API
+#define make_task MPU_make_task
+#endif
+int make_task (int);
+#endif
+"),
+            ("tasks.c", "#define FROM_API
+#include \"w.h\"
+#undef FROM_API
+int make_task (int x) { return x; }
+"),
+            ("app.c", "#include \"w.h\"
+int main (void) { return make_task (1); }
+"),
+        ];
+        for (p, src) in &files {
+            std::fs::create_dir_all(dir.join(p).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(p), src).unwrap();
+        }
+        let full: Vec<std::path::PathBuf> = files.iter().map(|(p, _)| dir.join(p)).collect();
+        let mut conditions = crate::conditions_of(&dir, &full);
+        let sets = crate::prescan_under(&dir, &full, &mut conditions);
+        let facts = crate::extract_all(&dir, &full, &sets);
+        let g = link_with(&facts, &Options { readings: crate::readings_of(&conditions), ..Default::default() }).0;
+        let _ = std::fs::remove_dir_all(&dir);
+        let defined = |n: &str| g.find(n).iter().any(|&s| g.syms[s as usize].kind == kind::FUNCTION && g.syms[s as usize].flags & flag::DECL == 0);
+        assert_eq!([defined("make_task"), defined("MPU_make_task")], [true, false]);
     }
 
     #[test]

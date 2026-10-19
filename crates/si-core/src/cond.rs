@@ -854,7 +854,9 @@ impl Source {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.names.is_empty() && self.verdicts.iter().all(Vec::is_empty)
+        // (Readings alone are something: a header two compilations read
+        // differently, by what one defines before including it.)
+        self.names.is_empty() && self.verdicts.iter().all(Vec::is_empty) && self.readings.is_empty()
     }
 
     /// What differs from `other`: the names whose values do, and per file
