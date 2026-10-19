@@ -11,7 +11,7 @@ use std::time::Instant;
 /// Structs that may share a member name before a use of the name is left
 /// unresolved.
 const MAX_MEMBER_CANDIDATES: usize = 8;
-const MAX_CANDIDATES: usize = 32;
+const MAX_CANDIDATES: usize = 128;
 
 #[derive(Clone, Debug, Default)]
 pub struct LinkStats {
@@ -2618,6 +2618,21 @@ int main (void) { return make_task (1); }
         ]);
         let called: Vec<&str> = g.find("f").iter().flat_map(|&s| g.refs_from(s)).map(|e| g.sym_name(e.other)).collect();
         assert!(!called.contains(&"_Pragma"), "{called:?}");
+    }
+
+    #[test]
+    fn every_port_s_definition_is_a_reading() {
+        // FreeRTOS: `vPortEnterCritical` in each of 86 ports; the one the
+        // build compiles is among them, whichever it is.
+        let ports: Vec<(String, String)> = (0..40).map(|i| (format!("port{i:02}/port.c"), "void enter (void) { }
+".to_string())).collect();
+        let mut files: Vec<(&str, &str)> = ports.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+        files.insert(0, ("tasks.c", "void enter (void);
+void f (void) { enter (); }
+"));
+        let g = indexed(&files);
+        let called = g.find("f").iter().flat_map(|&s| g.refs_from(s)).filter(|e| g.sym_name(e.other) == "enter").count();
+        assert_eq!(called, 40);
     }
 
     #[test]
