@@ -1556,6 +1556,12 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 }
                 let (kind, maybe) = (r.kind & !refkind::MAYBE, r.kind & refkind::MAYBE != 0);
                 let cands = g.syms_named(remap[fi][r.name as usize]);
+                // `_Pragma ("...")`, `__asm__ __volatile__ (...)`: no call,
+                // whatever a parse in a macro's body took for a function.
+                if !cands.is_empty() && crate::mask::is_keyword(g.name(remap[fi][r.name as usize]).as_bytes()) {
+                    counts[2] += 1;
+                    continue;
+                }
                 // A member name can only mean a member, and nothing else can.
                 let member = matches!(kind, refkind::MEMBER | refkind::ICALL);
                 let through = kind == refkind::ICALL;
@@ -2598,6 +2604,20 @@ int main (void) { return make_task (1); }
         let _ = std::fs::remove_dir_all(&dir);
         let defined = |n: &str| g.find(n).iter().any(|&s| g.syms[s as usize].kind == kind::FUNCTION && g.syms[s as usize].flags & flag::DECL == 0);
         assert_eq!([defined("make_task"), defined("MPU_make_task")], [true, false]);
+    }
+
+    #[test]
+    fn a_pragma_is_no_call() {
+        // A parse in a macro's body took `_Pragma ("...")` for a function
+        // (the kernel's HID BPF programs); its uses are no calls of it.
+        let g = indexed(&[
+            ("p.c", "int _Pragma (const char *s) { return 0; }
+"),
+            ("a.c", "void f (void) { _Pragma (\"GCC diagnostic push\"); }
+"),
+        ]);
+        let called: Vec<&str> = g.find("f").iter().flat_map(|&s| g.refs_from(s)).map(|e| g.sym_name(e.other)).collect();
+        assert!(!called.contains(&"_Pragma"), "{called:?}");
     }
 
     #[test]

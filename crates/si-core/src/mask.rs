@@ -1053,6 +1053,9 @@ pub(crate) fn is_keyword(s: &[u8]) -> bool {
             | b"_Bool" | b"bool" | b"true" | b"false" | b"typeof" | b"__typeof__" | b"__extension__" | b"__attribute__"
             | b"__attribute" | b"__inline" | b"__inline__" | b"__asm__" | b"asm" | b"__restrict" | b"_Noreturn"
             | b"_Static_assert" | b"__builtin_va_arg" | b"__func__" | b"__FILE__" | b"__LINE__"
+            | b"_Pragma" | b"__volatile__" | b"__volatile" | b"__asm" | b"__const" | b"__const__" | b"__signed__"
+            | b"__typeof" | b"_Alignof" | b"__alignof__" | b"_Alignas" | b"_Generic" | b"_Atomic" | b"_Thread_local"
+            | b"__thread"
     )
 }
 
