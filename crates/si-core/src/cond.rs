@@ -893,6 +893,15 @@ impl Source {
         &self.readings
     }
 
+    /// Whether what this says of the file `path` depends on its text as it
+    /// was read: conditions decided in it, or how compilations read it (a
+    /// header read more than one way, or the file a compilation starts from).
+    pub fn tells(&self, path: &str) -> bool {
+        self.file(path).is_some_and(|f| self.verdicts.get(f as usize).is_some_and(|v| !v.is_empty()))
+            || self.readings.files.iter().any(|(p, _)| p == path)
+            || self.readings.units.iter().any(|(p, _)| p == path)
+    }
+
     /// How many conditions are decided that way.
     pub fn decided(&self) -> usize {
         self.verdicts.iter().map(Vec::len).sum()
