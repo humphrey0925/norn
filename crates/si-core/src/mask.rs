@@ -381,6 +381,56 @@ pub struct Script {
     /// The line each `#if`, `#elif`, `#else` and `#endif` of `ops` is on,
     /// in order.
     pub lines: Vec<u32>,
+    /// The line each `#include` of `ops` is on, in order.
+    pub include_lines: Vec<u32>,
+}
+
+/// What a file's directives are, apart from where they are, and where its
+/// conditional ones are: what the sources settle of a file holds of
+/// another text of it with the same shape, moved to where they now are.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Skeleton {
+    /// A digest of the directives (`Script::ops`), without their places.
+    pub shape: u64,
+    /// Where each `#if` and `#elif` starts, in order.
+    pub ats: Vec<u32>,
+    /// The line of each `#if`, `#elif`, `#else` and `#endif`, in order.
+    pub lines: Vec<u32>,
+    /// The line of each `#include`, in order.
+    pub include_lines: Vec<u32>,
+}
+
+impl Script {
+    pub fn skeleton(&self) -> Skeleton {
+        let mut h = xxhash_rust::xxh3::Xxh3::new();
+        let mut bytes = |tag: u8, parts: &[&[u8]]| {
+            h.update(&[tag]);
+            for p in parts {
+                h.update(&(p.len() as u32).to_le_bytes());
+                h.update(p);
+            }
+        };
+        bytes(self.once as u8, &[]);
+        let mut ats = Vec::new();
+        for op in &self.ops {
+            match op {
+                Op::If { at, kind, expr } => {
+                    ats.push(*at);
+                    bytes(1, &[&[*kind], expr]);
+                }
+                Op::Elif { at, kind, expr } => {
+                    ats.push(*at);
+                    bytes(2, &[&[*kind], expr]);
+                }
+                Op::Else => bytes(3, &[]),
+                Op::Endif => bytes(4, &[]),
+                Op::Define { name, value } => bytes(5, &[name, value]),
+                Op::Undef { name } => bytes(6, &[name]),
+                Op::Include { name, quoted } => bytes(7, &[name, &[*quoted as u8]]),
+            }
+        }
+        Skeleton { shape: h.digest(), ats, lines: self.lines.clone(), include_lines: self.include_lines.clone() }
+    }
 }
 
 /// The name of a file's include guard, when it starts with one: `#ifndef G`
@@ -504,6 +554,9 @@ pub fn script(src: &[u8]) -> Script {
                 }
                 if matches!(out.ops[ops..], [Op::If { .. } | Op::Elif { .. } | Op::Else | Op::Endif]) {
                     out.lines.push(line);
+                }
+                if matches!(out.ops[ops..], [Op::Include { .. }]) {
+                    out.include_lines.push(line);
                 }
                 line_start = false;
             }
@@ -960,6 +1013,16 @@ impl MacroSets {
     pub fn with_conditions(mut self, conditions: Conditions) -> MacroSets {
         self.conditions = conditions;
         self
+    }
+
+    /// The conditions, taken out (to change them, and give them back with
+    /// `set_conditions`).
+    pub fn take_conditions(&mut self) -> Conditions {
+        std::mem::take(&mut self.conditions)
+    }
+
+    pub fn set_conditions(&mut self, conditions: Conditions) {
+        self.conditions = conditions;
     }
 
     pub fn conditions(&self) -> &Conditions {

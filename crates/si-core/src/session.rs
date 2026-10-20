@@ -649,6 +649,20 @@ impl Session {
 
     /// Bring the index up to date with what is on disk at `paths` (absolute,
     /// or relative to the root): files edited, created or deleted.
+    /// Move what the sources say of the file `rel` to where its directives
+    /// are now (`Source::moved`).
+    fn moved(&mut self, rel: &str, old: &mask::Skeleton, new: &mask::Skeleton) {
+        // (Changed where it stands: the macro sets' copy and the options'
+        // readings let go of it first, not to copy it all.)
+        drop(self.sets.take_conditions());
+        self.options.readings = Default::default();
+        if let Some(source) = self.conditions.source_mut() {
+            source.moved(rel, old, new);
+        }
+        self.sets.set_conditions(self.conditions.clone());
+        self.options.readings = crate::readings_of(&self.conditions);
+    }
+
     pub fn update(&mut self, paths: &[PathBuf]) -> Update {
         self.update_listed(paths, None)
     }
@@ -659,14 +673,20 @@ impl Session {
     fn update_listed(&mut self, paths: &[PathBuf], listed: Option<&FxHashSet<PathBuf>>) -> Update {
         let mut up = Update::default();
         let t = Instant::now();
+        let mark = |what: &str| {
+            if std::env::var_os("SI_UPDATE_PROFILE").is_some() {
+                eprintln!("update    {what}: {:.0} ms", ms(t));
+            }
+        };
         let mut touched: FxHashSet<PathBuf> = FxHashSet::default();
         // Most edits leave every `#define` as it was, and the macro sets with them.
         let mut defines_changed = false;
         // What the sources settle of a file's `#if`s, and of how each
-        // compilation reads it, holds of its text as it was (by where each
-        // directive is): an edited file the source tells of is settled again.
+        // compilation reads it, holds of its directives as they were: an
+        // edited file whose directives changed is settled again, with every
+        // other. One whose directives only moved (lines put in or taken out
+        // above them) has what is said of it moved with them.
         let mut told_changed = false;
-        let told = |path: &Path, root: &Path, c: &Conditions| c.source().is_some_and(|s| s.tells(&crate::rel_path(root, path)));
         for p in paths {
             let path = if p.is_absolute() { p.clone() } else { self.root.join(p) };
             // (A file of another kind is in the index when a source includes it.)
@@ -689,10 +709,31 @@ impl Session {
                         }
                         continue;
                     }
-                    let defines = Packed::of(&mask::defines(&src, &self.conditions));
-                    defines_changed |= defines != self.defines[i];
-                    told_changed |= told(&path, &self.root, &self.conditions);
-                    self.defines[i] = defines;
+                    let rel = crate::rel_path(&self.root, &path);
+                    let skeleton = mask::script(&src).skeleton();
+                    let shaped = self.conditions.uses_source() && !self.facts[i].path.is_empty() && self.facts[i].skeleton.shape == skeleton.shape;
+                    // Only moved: what the sources say of it moves with its
+                    // directives, first, its definitions being read with it.
+                    if shaped && self.facts[i].skeleton != skeleton {
+                        let old = self.facts[i].skeleton.clone();
+                        self.moved(&rel, &old, &skeleton);
+                    }
+                    // As `settle` has them: of this file, by its path.
+                    let defines = mask::defines_of(&src, &self.conditions, Some(&rel));
+                    let was = self.defines[i].get();
+                    // The same but for where: an include's line, and the
+                    // #if it is in (by where that starts) as the how-manyth.
+                    let unlined = |d: &[Define]| {
+                        let mut starts = Vec::new();
+                        let mut group = |start: u64| starts.iter().position(|&s| s == start).unwrap_or_else(|| (starts.push(start), starts.len() - 1).1) as u64 + 1;
+                        d.iter().map(|d| Define { line: 0, branch: if d.branch == 0 { 0 } else { group(d.branch >> 16) << 16 | d.branch & 0xffff }, ..d.clone() }).collect::<Vec<_>>()
+                    };
+                    if unlined(&defines) != unlined(&was) {
+                        defines_changed = true;
+                    } else if self.conditions.uses_source() && !shaped {
+                        told_changed = true;
+                    }
+                    self.defines[i] = Packed::of(&defines);
                     up.changed += 1;
                 }
                 (Ok(i), false) => {
@@ -709,7 +750,7 @@ impl Session {
                 }
                 (Err(i), true) => {
                     self.files.insert(i, path.clone());
-                    self.defines.insert(i, Packed::of(&mask::defines(&std::fs::read(&path).unwrap_or_default(), &self.conditions)));
+                    self.defines.insert(i, Packed::of(&mask::defines_of(&std::fs::read(&path).unwrap_or_default(), &self.conditions, Some(&crate::rel_path(&self.root, &path)))));
                     self.facts.insert(i, FileFacts::new(String::new()));
                     self.stamps.insert(i, (0, 0));
                     defines_changed = true;
@@ -721,15 +762,17 @@ impl Session {
             }
         }
 
+        mark(&format!("files read (definitions changed {defines_changed}, directives changed {told_changed})"));
         // New conditions: which `#define`s count has to be seen again, and
         // every file read under them.
         let all_stale = std::mem::take(&mut self.all_stale);
+        let settling = all_stale || (defines_changed || told_changed) && self.conditions.uses_source();
         // What the sources settle about macros may have changed with the
         // definitions (an edit to a configuration header reaches every
         // file that includes it): the files told something else now are
         // read again.
         let mut retold: FxHashSet<PathBuf> = FxHashSet::default();
-        if all_stale || (defines_changed || told_changed) && self.conditions.uses_source() {
+        if settling {
             let before = self.conditions.source().cloned();
             self.defines = Packed::all(crate::settle(&self.root, &self.files, &mut self.conditions));
             defines_changed = true;
@@ -748,6 +791,7 @@ impl Session {
                     .collect();
             }
         }
+        mark("settled");
         // Did any macro change character? Then whoever mentions it is stale.
         let mut reclassified = FxHashSet::default();
         if defines_changed {
@@ -758,6 +802,7 @@ impl Session {
             self.sets = sets;
         }
         up.macros_reclassified = reclassified.len();
+        mark("macro sets");
         let stale: Vec<usize> = (0..self.files.len())
             .into_par_iter()
             .filter(|&i| {
@@ -773,6 +818,7 @@ impl Session {
         let fresh: Vec<FileFacts> =
             stale.par_iter().map_init(Extractor::new, |ex, &i| crate::extract_file(ex, root, &files[i], sets)).collect();
         up.extracted = fresh.len();
+        mark("extracted");
         for (&i, mut f) in stale.iter().zip(fresh) {
             // Read again, perhaps under other conditions with the very
             // same text: what the link kept of the file no longer holds.
@@ -797,6 +843,7 @@ impl Session {
             }
         }
         up.extract_ms = ms(t);
+        mark("saved");
 
         let t = Instant::now();
         // The graph that was goes first: nobody can ask it anything while
@@ -1227,6 +1274,44 @@ int slow (void) { return 0; }
         d.write("src/a.c", "#if (WITH_LOG)\nvoid log_line(void) {}\n#endif\nvoid run(void) {}\n");
         s.update(&[PathBuf::from("src/a.c")]);
         assert_eq!(inactive(&s), Some(vec![(2, 2)]));
+    }
+
+    #[test]
+    fn an_edit_that_only_moves_directives_is_indexed_as_from_nothing() {
+        let d = Dir::new("moved");
+        d.write("config.h", "#ifndef CONFIG_H\n#define CONFIG_H\n#define USE_NET 1\n#define USE_USB 0\n#endif\n");
+        d.write("net.h", "#if USE_NET\nint net_init (void);\n#endif\n");
+        let text = |above: &str, between: &str| {
+            format!("{above}#include \"config.h\"\n#include \"net.h\"\n#if USE_NET\nint net_up (void) {{ return net_init (); }}\n#else\nint net_down (void) {{ return 0; }}\n#endif\n{between}#if USE_USB\nint usb_init (void) {{ return 1; }}\n#endif\nint run (void) {{ return net_up (); }}\n")
+        };
+        d.write("a.c", &text("", ""));
+        d.write("b.c", "#define USE_NET 0\n#include \"net.h\"\nint quiet (void) { return 0; }\n");
+        let cache = d.0.join("cache-outside-scan");
+        let (mut s, _) = Session::open_cached(&d.0, Options::default(), cache.clone());
+        let same = |s: &Session| {
+            let fresh = Session::open(&d.0, Options::default());
+            assert_eq!(shape(s), shape(&fresh));
+            assert_eq!(s.conditions(), fresh.conditions());
+            for f in ["a.c", "b.c", "net.h"] {
+                let of = |s: &Session| s.facts_of(f).map(|x| (x.inactive.clone(), x.undecided.iter().map(|u| (u.0, u.1, u.2)).collect::<Vec<_>>()));
+                assert_eq!(of(s), of(&fresh), "{f}");
+            }
+        };
+        same(&s);
+        // (The sources decide the #ifs of a.c: what is said of them moves.)
+        assert!(s.conditions().source().is_some_and(|x| x.decided() >= 2));
+        // Lines put in above the includes, and between the #ifs.
+        d.write("a.c", &text("/* one */\n/* two */\n\n", "int more (void) { return 2; }\n\n"));
+        let up = s.update(&[d.0.join("a.c")]);
+        assert_eq!(up.extracted, 1);
+        same(&s);
+        // And taken out again, from the save.
+        while s.save_some(usize::MAX) {}
+        drop(s);
+        d.write("a.c", &text("", "\n"));
+        let (s, up) = Session::open_cached(&d.0, Options::default(), cache);
+        assert_eq!((up.loaded, up.extracted), (4, 1));
+        same(&s);
     }
 
     #[test]

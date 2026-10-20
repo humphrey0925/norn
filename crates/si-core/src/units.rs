@@ -1283,11 +1283,16 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
     };
     let mut number = vec![u32::MAX; n];
     let ways = ways.into_inner().unwrap();
+    // A header's ways are numbered as the compilations met them, which the
+    // threads decide: in order of what they are instead, the same each time
+    // (what was expanded with them is kept while they are).
+    let mut renumber: FxHashMap<u32, FxHashMap<u32, u32>> = FxHashMap::default();
     for f in (0..n).filter(|&f| split[f]) {
         number[f] = readings.files.len() as u32;
         readings.files.push((paths[f].clone(), scripts[f].lines.clone()));
         let mut of: Vec<(&Box<[u8]>, &u32)> = ways.by_file.get(&(f as u32)).into_iter().flatten().collect();
-        of.sort_unstable_by_key(|w| *w.1);
+        of.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        renumber.insert(f as u32, of.iter().enumerate().map(|(i, w)| (*w.1, i as u32)).collect());
         readings.ways.push(of.into_iter().map(|w| w.0.clone()).collect());
     }
     let mut read_as = read_as.into_inner().unwrap();
@@ -1296,7 +1301,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         if unread[root as usize] {
             continue;
         }
-        let read: Vec<(u32, u32)> = read.iter().filter(|r| split[r.0 as usize]).map(|&(f, way)| (number[f as usize], way)).collect();
+        let read: Vec<(u32, u32)> = read.iter().filter(|r| split[r.0 as usize]).map(|&(f, way)| (number[f as usize], renumber[&f].get(&way).copied().unwrap_or(way))).collect();
         readings.units.push((paths[root as usize].clone(), read));
         readings.generated.push(generated);
         let mut bits = vec![0u64; n.div_ceil(64)];
