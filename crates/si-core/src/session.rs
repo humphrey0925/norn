@@ -662,6 +662,11 @@ impl Session {
         let mut touched: FxHashSet<PathBuf> = FxHashSet::default();
         // Most edits leave every `#define` as it was, and the macro sets with them.
         let mut defines_changed = false;
+        // What the sources settle of a file's `#if`s, and of how each
+        // compilation reads it, holds of its text as it was (by where each
+        // directive is): an edited file the source tells of is settled again.
+        let mut told_changed = false;
+        let told = |path: &Path, root: &Path, c: &Conditions| c.source().is_some_and(|s| s.tells(&crate::rel_path(root, path)));
         for p in paths {
             let path = if p.is_absolute() { p.clone() } else { self.root.join(p) };
             // (A file of another kind is in the index when a source includes it.)
@@ -686,6 +691,7 @@ impl Session {
                     }
                     let defines = Packed::of(&mask::defines(&src, &self.conditions));
                     defines_changed |= defines != self.defines[i];
+                    told_changed |= told(&path, &self.root, &self.conditions);
                     self.defines[i] = defines;
                     up.changed += 1;
                 }
@@ -723,7 +729,7 @@ impl Session {
         // file that includes it): the files told something else now are
         // read again.
         let mut retold: FxHashSet<PathBuf> = FxHashSet::default();
-        if all_stale || defines_changed && self.conditions.uses_source() {
+        if all_stale || (defines_changed || told_changed) && self.conditions.uses_source() {
             let before = self.conditions.source().cloned();
             self.defines = Packed::all(crate::settle(&self.root, &self.files, &mut self.conditions));
             defines_changed = true;
@@ -1185,6 +1191,42 @@ int slow (void) { return 0; }
         Settings::default().save(&d.0).unwrap();
         let (s, up) = open(&d);
         assert_eq!((up.loaded, functions(&s, "net_init"), functions(&s, "net_stub")), (0, 1, 1));
+    }
+
+    #[test]
+    fn a_file_read_again_after_a_start_from_the_save_is_read_under_the_set_in_force() {
+        let d = Dir::new("second-set");
+        let set = |name: &str, value: u32| {
+            format!(
+                "<configuration name=\"{name}\"><folderInfo><toolChain id=\"com.arm.toolchain.ac5.exe.{name}\" name=\"ARM Compiler 5\" superClass=\"com.arm.toolchain.ac5.exe\"><tool name=\"ARM C Compiler 5\"><option valueType=\"definedSymbols\"><listOptionValue value=\"WITH_LOG={value}\"/></option></tool></toolChain></folderInfo></configuration>"
+            )
+        };
+        d.write(".cproject", &format!("<cproject>{}{}</cproject>", set("Debug", 1), set("Release", 0)));
+        d.write("src/a.c", "#if (!WITH_LOG)\nvoid quiet(void) {}\n#endif\nvoid run(void) {}\n");
+        let cache = d.0.join("cache-outside-scan");
+        let open = |d: &Dir| Session::open_cached(&d.0, Options::default(), cache.clone());
+        let inactive = |s: &Session| s.facts_of("src/a.c").map(|f| f.inactive.clone());
+
+        // The first set found is in force; the second is chosen.
+        let (mut s, _) = open(&d);
+        assert_eq!(inactive(&s), Some(vec![(2, 2)]));
+        let mut project = crate::cond::Project::load(&d.0);
+        project.active = Some("Release".into());
+        s.set_condition_project(&project).unwrap();
+        assert_eq!(inactive(&s), Some(vec![]));
+        while s.save_some(usize::MAX) {}
+        drop(s);
+
+        // Edited while nothing ran: read again under the second set.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        d.write("src/a.c", "#if (WITH_LOG)\nvoid log_line(void) {}\n#endif\n");
+        let (mut s, up) = open(&d);
+        assert_eq!((up.loaded, up.extracted), (1, 1));
+        assert_eq!(inactive(&s), Some(vec![(2, 2)]));
+        // And so after an edit while it runs.
+        d.write("src/a.c", "#if (WITH_LOG)\nvoid log_line(void) {}\n#endif\nvoid run(void) {}\n");
+        s.update(&[PathBuf::from("src/a.c")]);
+        assert_eq!(inactive(&s), Some(vec![(2, 2)]));
     }
 
     #[test]
