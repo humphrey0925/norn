@@ -236,6 +236,9 @@ pub struct Ref {
 pub struct FileFacts {
     pub path: String,
     pub hash: u64,
+    /// The file's directives and where its conditional ones are, for
+    /// knowing an edit that only moved them (`Session::update`).
+    pub skeleton: crate::mask::Skeleton,
     pub bytes: u32,
     pub has_error: bool,
     pub indirect_calls: u32,

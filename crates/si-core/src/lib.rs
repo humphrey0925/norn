@@ -381,6 +381,8 @@ pub fn extract_file_reusing(ex: &mut extract::Extractor, root: &Path, path: &Pat
         }
         None => ex.extract(&rel, &src, transparent),
     };
+    let mut facts = facts;
+    facts.skeleton = mask::script(&src).skeleton();
     progress::tick();
     facts
 }

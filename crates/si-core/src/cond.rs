@@ -893,13 +893,38 @@ impl Source {
         &self.readings
     }
 
-    /// Whether what this says of the file `path` depends on its text as it
-    /// was read: conditions decided in it, or how compilations read it (a
-    /// header read more than one way, or the file a compilation starts from).
-    pub fn tells(&self, path: &str) -> bool {
-        self.file(path).is_some_and(|f| self.verdicts.get(f as usize).is_some_and(|v| !v.is_empty()))
-            || self.readings.files.iter().any(|(p, _)| p == path)
-            || self.readings.units.iter().any(|(p, _)| p == path)
+    /// What this says of the file `path`, moved to where its directives are
+    /// in a new text of the same shape: its conditions decided (by where
+    /// each `#if` starts), the lines of its `#if`s where it is a header read
+    /// more than one way or the file a compilation starts from, and the
+    /// lines of its includes.
+    pub fn moved(&mut self, path: &str, old: &crate::mask::Skeleton, new: &crate::mask::Skeleton) {
+        let Some(f) = self.file(path) else { return };
+        let to = |from: &[u32], to: &[u32], x: u32| from.binary_search(&x).ok().and_then(|i| to.get(i).copied());
+        if self.verdicts.get(f as usize).is_some_and(|v| !v.is_empty()) {
+            let verdicts = std::sync::Arc::make_mut(&mut self.verdicts);
+            let mut moved: Vec<(u32, bool)> = verdicts[f as usize].iter().filter_map(|&(at, holds)| Some((to(&old.ats, &new.ats, at)?, holds))).collect();
+            moved.sort_unstable();
+            verdicts[f as usize] = moved;
+        }
+        for (line, _) in &mut self.includes[f as usize] {
+            *line = to(&old.include_lines, &new.include_lines, *line).unwrap_or(*line);
+        }
+        let header = self.readings.files.iter().position(|(p, _)| p == path);
+        let unit = self.readings.units.iter().position(|(p, _)| p == path);
+        if header.is_some() || unit.is_some() {
+            let readings = std::sync::Arc::make_mut(&mut self.readings);
+            if let Some(h) = header {
+                readings.files[h].1 = new.lines.clone();
+            }
+            if let Some(u) = unit.filter(|&u| u < readings.under.len()) {
+                for ways in readings.under[u].iter_mut().flatten() {
+                    for way in ways.iter_mut() {
+                        way.iter_mut().for_each(|l| *l = to(&old.lines, &new.lines, *l).unwrap_or(*l));
+                    }
+                }
+            }
+        }
     }
 
     /// How many conditions are decided that way.
@@ -1348,6 +1373,12 @@ impl Conditions {
 
     pub fn set_source(&mut self, source: Option<std::sync::Arc<Source>>) {
         self.source = source;
+    }
+
+    /// The source, to change where it stands (copied only when it is
+    /// shared).
+    pub fn source_mut(&mut self) -> Option<&mut Source> {
+        self.source.as_mut().map(std::sync::Arc::make_mut)
     }
 
     /// The same conditions, with nothing taken from the sources.
