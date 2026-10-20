@@ -132,6 +132,15 @@ impl Settings {
 /// What a set is called when nobody named it.
 pub const DEFAULT: &str = "Default";
 
+static FOLLOW_FOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether a project that has no sets of its own follows the first build
+/// configuration found in the tree (the default), or is indexed with no
+/// conditions at all. Sets written in `.norn/config.json` hold either way.
+pub fn follow_found(on: bool) {
+    FOLLOW_FOUND.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Every set of conditions the project has, and which is in force.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
@@ -177,6 +186,9 @@ impl Project {
     pub fn load_told(root: &Path) -> (Project, bool) {
         let path = crate::scope::Scope::config_path(root);
         let found = || {
+            if !FOLLOW_FOUND.load(std::sync::atomic::Ordering::Relaxed) {
+                return (Project::default(), false);
+            }
             let found = Project::found(root);
             let any = !found.configurations.is_empty();
             (found, any)

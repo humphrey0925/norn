@@ -174,6 +174,7 @@ class Relation implements vscode.WebviewViewProvider {
       <script src="${file("relation.js")}"></script></body></html>`;
     w.onDidReceiveMessage(async (m: { ready?: boolean; open?: { uri: string; line: number; character: number }; show?: { uri: string; line: number; character: number }; beside?: boolean; mode?: Mode; expand?: Entry["data"]; id?: number }) => {
       if (m.ready) {
+        this.sendClick();
         await this.load(this.at ?? (current ? positionParams(current) : undefined));
       } else if (m.show) {
         this.showInContext(m.show);
@@ -186,6 +187,11 @@ class Relation implements vscode.WebviewViewProvider {
         void w.postMessage({ type: "children", id: m.id, entries: r?.entries ?? [] });
       }
     });
+  }
+
+  /** What one click on a row does, as the settings say. */
+  sendClick() {
+    void this.view?.webview.postMessage({ type: "click", click: vscode.workspace.getConfiguration("norn").get<string>("relation.click", "auto") });
   }
 
   setMode(mode: Mode) {
@@ -528,6 +534,9 @@ interface ConditionSettings {
   conditionFiles: string[];
   /** `false`: what the sources define themselves is not used across files. */
   sourceDefines?: boolean;
+  /** What else the set has (`notBuilt`, `includeFirst` and the like, from
+   *  a Kconfig build found in the tree): kept as it is. */
+  [other: string]: unknown;
 }
 
 /** What the server says of the conditions: every set, the one in force,
@@ -769,9 +778,9 @@ class ConditionsTree implements vscode.TreeDataProvider<ConditionRow> {
   }
 
   private of(c: Partial<ConditionSettings> | undefined): ConditionSettings {
-    const out: ConditionSettings = { defines: { ...c?.defines }, undefines: [...(c?.undefines ?? [])], assumeUndefined: [...(c?.assumeUndefined ?? [])], conditionFiles: [...(c?.conditionFiles ?? [])] };
-    if (c?.sourceDefines === false) {
-      out.sourceDefines = false;
+    const out: ConditionSettings = { ...c, defines: { ...c?.defines }, undefines: [...(c?.undefines ?? [])], assumeUndefined: [...(c?.assumeUndefined ?? [])], conditionFiles: [...(c?.conditionFiles ?? [])] };
+    if (c?.sourceDefines !== false) {
+      delete out.sourceDefines;
     }
     return out;
   }
@@ -876,8 +885,9 @@ class ConditionsTree implements vscode.TreeDataProvider<ConditionRow> {
     await this.send({ ...this.state.configurations, [active]: next }, active, what);
   }
 
-  async switchTo(name: string) {
-    await this.send(this.state.configurations, name, `Configuration ${name}`);
+  /** `null`: none, the index taking no compile conditions. */
+  async switchTo(name: string | null) {
+    await this.send(this.state.configurations, name, name === null ? "No configuration" : `Configuration ${name}`);
   }
 
   /** A new set, in force at once: empty, a copy, or one that follows a
@@ -1880,7 +1890,10 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
       // Beside the C/C++ extension, the server's hover says only what that
       // one's does not (a macro's value).
       // (Its IntelliSense off, Norn gives what it would: hovers, completion.)
-      initializationOptions: { alongside: !!vscode.extensions.getExtension("ms-vscode.cpptools") && vscode.workspace.getConfiguration("C_Cpp").get<string>("intelliSenseEngine", "default") !== "disabled" },
+      initializationOptions: {
+        alongside: !!vscode.extensions.getExtension("ms-vscode.cpptools") && vscode.workspace.getConfiguration("C_Cpp").get<string>("intelliSenseEngine", "default") !== "disabled",
+        followBuildConfig: vscode.workspace.getConfiguration("norn").get<boolean>("conditions.followBuildConfig", true),
+      },
     };
     // (Alt+O switches header and source with Norn where the C/C++ extension does not.)
     void vscode.commands.executeCommand("setContext", "norn.cppTools", !!vscode.extensions.getExtension("ms-vscode.cpptools"));
@@ -1950,6 +1963,13 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("norn.dimInactive") || e.affectsConfiguration("C_Cpp.intelliSenseEngine") || e.affectsConfiguration("C_Cpp.dimInactiveRegions")) {
         vscode.window.visibleTextEditors.forEach((v) => void dim(v));
+      }
+      if (e.affectsConfiguration("norn.relation.click")) {
+        relation.sendClick();
+      }
+      // The server reads it when it starts.
+      if (e.affectsConfiguration("norn.conditions.followBuildConfig")) {
+        void vscode.commands.executeCommand("norn.restart");
       }
     }),
     vscode.window.onDidChangeTextEditorSelection((e) => {
@@ -2051,6 +2071,9 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
         description: (s.configurations[name].conditionFiles ?? []).map(sourceLabel).join(", "),
         run: () => (name === s.active ? undefined : conditions.switchTo(name)),
       }));
+      if (s.active) {
+        picks.push({ label: "$(blank) No configuration", description: "index with no compile conditions", run: () => conditions.switchTo(null) });
+      }
       const followed = new Set(Object.values(s.configurations).flatMap((c) => c.conditionFiles ?? []));
       const fresh = s.available.filter((a) => !followed.has(a.source));
       if (fresh.length) {

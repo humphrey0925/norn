@@ -249,6 +249,10 @@ In the graph:
 
 ### 8.6 Lock and follow
 
+- **One click** on a caller or callee opens it in the editor, and on a
+  reference shows it in Context. Set `norn.relation.click` to `context` to show
+  every row in Context first (a double click opens it), or to `editor` to open
+  every row at once.
 - **Lock**: Relation stays on the symbol it shows while the cursor moves.
 - **Follow once (target icon)**: while locked, shows the symbol now under the
   cursor and stays locked. For looking at one function at a time and moving on
@@ -324,6 +328,11 @@ folder they list only where it is not built is taken as not built, as
 `"notBuilt"` would have it (U-Boot's `tiny-printf.c` beside `vsprintf.c`).
 What they do not name, or name in a way Norn does not work out, is left alone,
 and so are headers.
+
+To index with no compile conditions instead, choose **No configuration**
+when switching (see 10.2); or turn off `norn.conditions.followBuildConfig`, and
+a workspace that has no set of its own is indexed with none until you choose
+one (`norn --no-build-config` on the command line).
 
 With no build configuration at all, Norn still works out what it can: what the
 sources themselves define holds; a branch it cannot decide is kept both ways,
@@ -493,6 +502,8 @@ Search for `norn` in VS Code's settings.
 | `norn.cache.enabled` | on | Keep the index on disk, so that a reopened workspace only reads what changed |
 | `norn.cache.directory` | empty | Where the index is kept; empty is `.norn/cache` in the workspace |
 | `norn.codeLens.enabled` | on | The line above each function with its callers and callees |
+| `norn.relation.click` | auto | What one click on a Relation row does. auto: a reference is shown in Context, anything else opens; context: everything is shown in Context, a double click opens; editor: everything opens |
+| `norn.conditions.followBuildConfig` | on | With no set of its own, follow the first build configuration found in the workspace. Off: no compile conditions until you choose some |
 | `norn.fileSymbols.showLocals` | on | Parameters and locals under each function in File Symbols |
 | `norn.conditions.updateCppProperties` | off | Keep a "Norn" configuration in `c_cpp_properties.json` (see section 11) |
 | `norn.dimInactive` | auto | Dim the lines the set in force does not compile. auto: when the C/C++ extension does not; always; never |

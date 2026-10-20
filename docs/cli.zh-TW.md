@@ -56,6 +56,7 @@ norn live ~/src/myproject                            # 隨原始碼更新的查�
 |---|---|
 | `--threads <N>` | 工作執行緒數；`0`（預設）用全部核心 |
 | `--system-parser-alloc` | 讓解析器用系統的記憶體配置器，而不是 mimalloc（量測用） |
+| `--no-build-config` | `.norn/config.json` 沒有指定設定時，不套用任何編譯條件，而不是自動採用專案裡找到的第一組建置設定 |
 | `-h`、`--help` | 這個指令的選項 |
 | `-V`、`--version` | 版本 |
 
@@ -158,7 +159,7 @@ norn lsp [ROOT] [--cache-dir <DIR> | --no-cache] [--rebuild] [--include-alias <F
 Helix、Sublime Text、Zed…）。根目錄是編輯器開啟的工作區，除非另外給 `ROOT`。它提供「移至定義」
 （以及宣告、型別定義、實作）、「尋找所有參考」、呼叫階層、工作區和檔案符號、懸停說明、參數提示、
 自動完成、游標所在名稱的醒目提示、`#include` 的連結、快速修正、摺疊、語意上色、重新命名和
-inlay hint，並像 `live` 一樣保持索引最新。
+inlay hint，並像 `live` 一樣保持索引最新。VS Code 擴充套件各個視窗所用的 `si/*` 自訂請求，說明在[語言伺服器協定](lsp-api.zh-TW.md)。
 
 Neovim（0.11）：
 

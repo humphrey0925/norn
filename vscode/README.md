@@ -140,6 +140,8 @@ any distribution) and macOS (Intel and Apple silicon).
 | Setting | Default | |
 |---|---|---|
 | `norn.codeLens.enabled` | `true` | Caller and callee counts above each function |
+| `norn.relation.click` | `auto` | What one click on a Relation row does: `auto` shows a reference in Context and opens the rest; `context` shows every row in Context (double click opens); `editor` opens every row |
+| `norn.conditions.followBuildConfig` | `true` | With no configuration of its own, follow the first build configuration found in the workspace; off indexes with no compile conditions |
 | `norn.fileSymbols.showLocals` | `true` | Parameters and locals under functions in File Symbols |
 | `norn.dimInactive` | `auto` | Dim lines the current configuration does not compile (`auto`: when the C/C++ extension does not) |
 | `norn.cache.enabled` | `true` | Keep the index on disk, so a workspace reopens instantly |

@@ -2020,7 +2020,11 @@ impl Server {
             "textDocument/documentHighlight" => self.document_highlight(params),
             "si/conditions" => self.conditions(),
             "si/setConditions" => {
-                let project: si_core::cond::Project = serde_json::from_value(params.clone()).unwrap_or_default();
+                // Not what it should be: say so, and keep what is saved.
+                let project: si_core::cond::Project = match serde_json::from_value(params.clone()) {
+                    Ok(p) => p,
+                    Err(e) => return Some(json!({ "error": format!("the conditions are not as they should be: {e}") })),
+                };
                 match self.session.set_condition_project(&project) {
                     Ok(up) => {
                         let mut v = self.synced(up);
@@ -2166,6 +2170,11 @@ pub fn run(
         if method == "initialize" {
             let from_client = params["rootUri"].as_str().map(uri_to_path).or(params["rootPath"].as_str().map(PathBuf::from));
             let dir = root.map(Path::to_path_buf).or(from_client).unwrap_or_else(|| PathBuf::from("."));
+            // The editor's word on a project with no configuration of its
+            // own: follow the build's (the default), or none.
+            if params["initializationOptions"]["followBuildConfig"].as_bool() == Some(false) {
+                si_core::cond::follow_found(false);
+            }
             // What was saved answers at once; the index follows.
             let session = early(&dir).unwrap_or_else(|| Session::empty(&dir));
             let have = session.early_digest();

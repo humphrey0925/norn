@@ -27,6 +27,11 @@ struct Cli {
     /// Benchmark knob: let tree-sitter use the platform heap instead of mimalloc.
     #[arg(long, global = true)]
     system_parser_alloc: bool,
+    /// Where the project has no configuration of its own (in
+    /// `.norn/config.json`), index with no compile conditions instead of
+    /// following the first build configuration found in the tree.
+    #[arg(long, global = true)]
+    no_build_config: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -680,6 +685,9 @@ fn main() {
     }
     if !cli.system_parser_alloc {
         si_core::use_mimalloc_for_parser();
+    }
+    if cli.no_build_config {
+        si_core::cond::follow_found(false);
     }
     let result = match &cli.cmd {
         Cmd::Index { root, out, stores, stride, include_alias, dump_binds } => {

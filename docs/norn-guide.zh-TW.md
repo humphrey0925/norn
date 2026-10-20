@@ -207,6 +207,7 @@ Relation 和 Context 在下方面板的「Norn」分頁裡。**它們會跟著�
 
 ### 8.6 鎖定與同步
 
+- **單擊**呼叫者或被呼叫者會在編輯器開啟，單擊參考則顯示在 Context。把 `norn.relation.click` 設成 `context`，每一列都會先顯示在 Context（雙擊才開啟）；設成 `editor`，每一列都直接開啟。
 - **鎖頭**：鎖住後 Relation 停在目前的符號，游標移動不會改變它。
 - **同步（靶心圖示）**：在鎖定狀態下，把 Relation 更新成游標現在所在的符號，但維持鎖定。適合「先鎖住看一個函式，偶爾換一個」的用法。
 
@@ -253,6 +254,8 @@ Norn 會**自動採用專案裡找得到的建置設定**，往下找三層資�
 | Kconfig（Linux、U-Boot、Buildroot、BusyBox） | `include/generated/autoconf.h` 或 `.config`，在樹裡或 build 資料夾（`make O=build`） |
 
 專案檔裡的每個建置組態（Debug、Release、各個 target）會成為一組設定，第一組自動生效。Kconfig 的設定沒設的 `CONFIG_` 一律當作未定義，和 Kbuild 一樣；Linux 和 U-Boot 的設定寫明了架構（U-Boot 還有板子），其他架構和板子的資料夾以及 `tools/`、`scripts/` 仍會被索引，但同一個名字可能指那裡或指 build 會編譯的東西時，一律指後者。任何專案都可以在 `.norn/config.json` 用 `"notBuilt": ["vendor/other-board"]` 對自己的資料夾這樣設定。Kbuild 也會在每個檔案之前先讀 `include/linux/kconfig.h`（`-include`），`IS_ENABLED` 和 `CONFIG_IS_ENABLED` 就是在那裡定義的；Norn 也這樣做，任何專案都可以用 `"includeFirst": ["config/prefix.h"]` 指定這類標頭檔。Makefile 也寫明了這組設定會編譯哪些原始檔（`obj-$(CONFIG_X) += foo.o`、`ifdef`、`ifeq` 等）：只在不編譯的條件下被列出的檔案或資料夾，會當作不編譯，效果和 `"notBuilt"` 一樣（例如 U-Boot 的 `tiny-printf.c` 和 `vsprintf.c`）。Makefile 沒提到的、或 Norn 看不懂的寫法一律不動，標頭檔也不動。
+
+如果想在不套用任何編譯條件的情況下建立索引，切換設定時選 **No configuration**（見 10.2）；或者把 `norn.conditions.followBuildConfig` 關掉，這樣還沒有自己設定的工作區就不會自動套用找到的建置設定，直到你選一組為止（命令列是 `norn --no-build-config`）。
 
 完全找不到建置設定時，Norn 仍會盡量判斷：原始碼自己定義的巨集照樣生效；判斷不出來的分支兩邊都保留，相關的呼叫標示為不確定。
 
@@ -370,6 +373,8 @@ Norn 不提供編譯錯誤的紅色波浪線：那要由編譯器產生。
 | `norn.cache.enabled` | 開 | 把索引存在磁碟，下次開啟只處理有變動的檔案 |
 | `norn.cache.directory` | 空白 | 索引存放位置。留空為工作區的 `.norn/cache` |
 | `norn.codeLens.enabled` | 開 | 在每個函式上方顯示呼叫者與被呼叫者數量 |
+| `norn.relation.click` | auto | 單擊 Relation 一列時的動作。auto：參考顯示在 Context，其他直接開啟；context：全部先顯示在 Context，雙擊才開啟；editor：全部直接開啟 |
+| `norn.conditions.followBuildConfig` | 開 | 沒有自己的設定時，自動套用工作區裡找到的第一組建置設定。關閉：在你選一組之前不套用任何編譯條件 |
 | `norn.fileSymbols.showLocals` | 開 | 在 File Symbols 的函式底下列出參數與區域變數 |
 | `norn.conditions.updateCppProperties` | 關 | 在 `c_cpp_properties.json` 維護一組「Norn」設定（見第 11 節的說明） |
 | `norn.dimInactive` | auto | 目前設定不編譯的行變暗。auto：C/C++ 擴充套件不做時才做；always；never |
