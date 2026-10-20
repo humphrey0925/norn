@@ -548,7 +548,7 @@ fn bench_incr(root: &Path, n: usize, seed: u64) -> Value {
         facts[i] = si_core::extract_file(&mut ex, root, &files[i], &transparent);
         let t1 = Instant::now();
         // The content is the same, but an edit would not be: expand it again.
-        cache.forget(i);
+        cache.forget(i, &facts[i]);
         drop(std::mem::take(&mut g));
         let stats;
         (g, stats) = si_core::link::link_cached(&facts, &options, &mut cache);

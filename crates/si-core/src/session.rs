@@ -886,7 +886,7 @@ impl Session {
         for (&i, mut f) in stale.iter().zip(fresh) {
             // Read again, perhaps under other conditions with the very
             // same text: what the link kept of the file no longer holds.
-            self.cache.forget(i);
+            self.cache.forget(i, &self.facts[i]);
             crate::gather([&mut f]);
             self.facts[i] = f;
             self.stamps[i] = stamp(&self.files[i]);
@@ -1411,6 +1411,46 @@ int slow (void) { return 0; }
         assert!(up.settled && !up.settled_again);
         same(&s);
         assert_eq!(functions(&s, "net_up"), 1);
+    }
+
+    #[test]
+    fn a_changed_macro_is_expanded_again_where_it_was_asked_for() {
+        let d = Dir::new("asked");
+        let h1 = |body: &str, more: &str| format!("#define CAT(a, b) a ## b\n#define MAKE(n) int CAT (make_, n) (void) {{ return BODY; }}\n#define BODY {body}\n{more}");
+        d.write("h1.h", &h1("0", ""));
+        d.write("h2.h", "#define PLAIN(n) int n (void) { return 2; }\n");
+        d.write("a.c", "#include \"h1.h\"\nint helper (void);\nMAKE (one)\n");
+        d.write("b.c", "#include \"h2.h\"\nPLAIN (other)\n");
+        d.write("c.c", "#include \"h1.h\"\nMAKE (two)\n");
+        let mut s = Session::open(&d.0, Options::default());
+        let same = |s: &Session| assert_eq!(shape(s), shape(&Session::open(&d.0, Options::default())));
+        let again = |s: &mut Session| -> Vec<String> {
+            let mut v: Vec<String> = s.cache.take_changed().into_iter().map(|i| crate::rel_path(&d.0, &s.files[i])).collect();
+            v.sort();
+            v
+        };
+        assert_eq!((functions(&s, "make_one"), functions(&s, "make_two"), functions(&s, "other")), (1, 1, 1));
+        again(&mut s);
+        // A body the expansions of a.c and c.c read changed: they are
+        // expanded again, b.c is not.
+        d.write("h1.h", &h1("helper ()", ""));
+        s.update(&[d.0.join("h1.h")]);
+        assert_eq!(again(&mut s), ["a.c", "c.c", "h1.h"]);
+        same(&s);
+        // A macro of the name c.c's expansion makes of pieces: c.c, not
+        // b.c. (a.c may be: a file read again is expanded again.)
+        let redone = |v: Vec<String>| v.contains(&"c.c".to_string()) && !v.contains(&"b.c".to_string());
+        d.write("h1.h", &h1("helper ()", "#define make_two make_three\n"));
+        s.update(&[d.0.join("h1.h")]);
+        assert!(redone(again(&mut s)));
+        same(&s);
+        assert_eq!((functions(&s, "make_two"), functions(&s, "make_three")), (0, 1));
+        // And gone again.
+        d.write("h1.h", &h1("helper ()", ""));
+        s.update(&[d.0.join("h1.h")]);
+        assert!(redone(again(&mut s)));
+        same(&s);
+        assert_eq!(functions(&s, "make_two"), 1);
     }
 
     #[test]
