@@ -1912,8 +1912,9 @@ pub struct Cache {
     environment: u64,
     /// Per file: a digest of its macros.
     macros: Vec<u64>,
-    /// Per file: the names its expansion asked the table for, hashed and
-    /// sorted (`None`: not known, as from a save of before they were).
+    /// Per file: the names its expansion asked the table for, as a bloom
+    /// filter (`Asked::bloom`; `None`: not known, as from a save of before
+    /// they were).
     asked: Vec<Option<Box<[u64]>>>,
     /// The macros files had before they were read again (`forget`), each
     /// as its name and a digest of its definition (`macro_pairs`): those
@@ -2117,6 +2118,34 @@ fn name_hash(name: &str) -> u64 {
     xxhash_rust::xxh3::xxh3_64(name.as_bytes())
 }
 
+/// The bits of a bloom filter of `bits` bits (a power of two) a name's
+/// hash sets.
+fn bloom_bits(h: u64, bits: usize) -> [usize; 3] {
+    let (a, b) = (h as u32 as usize, (h >> 32) as usize | 1);
+    [0, 1, 2].map(|i| a.wrapping_add(i * b) & (bits - 1))
+}
+
+/// A bloom filter of `names` (hashes), about ten bits each: a name that
+/// is not among them is told so but for one in a hundred or so (a file is
+/// then expanded again that need not be; none that should is not).
+fn bloom(names: &[u64]) -> Box<[u64]> {
+    if names.is_empty() {
+        return Box::default();
+    }
+    let bits = (names.len() * 10).next_power_of_two().max(64);
+    let mut words = vec![0u64; bits / 64];
+    for &h in names {
+        for b in bloom_bits(h, bits) {
+            words[b / 64] |= 1 << (b % 64);
+        }
+    }
+    words.into()
+}
+
+fn in_bloom(words: &[u64], h: u64) -> bool {
+    !words.is_empty() && bloom_bits(h, words.len() * 64).iter().all(|&b| words[b / 64] & (1 << (b % 64)) != 0)
+}
+
 /// Each macro of a file as its name and a digest of all `macro_digest`
 /// reads of it, sorted.
 fn macro_pairs(f: &FileFacts, lines: Option<&[u32]>) -> Vec<(u64, u64)> {
@@ -2207,7 +2236,7 @@ pub fn expand(
                 }
                 let again: Vec<usize> = (0..files.len())
                     .into_par_iter()
-                    .filter(|&i| cache.asked[i].as_ref().is_some_and(|a| a.iter().any(|h| names.contains(h))))
+                    .filter(|&i| cache.asked[i].as_ref().is_some_and(|a| names.iter().any(|&h| in_bloom(a, h))))
                     .collect();
                 for i in again {
                     cache.hashes[i] = !files[i].hash;
@@ -2308,7 +2337,7 @@ pub fn expand(
                 if profile {
                     spent[fi].store(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
-                (out, asked.into())
+                (out, bloom(&asked))
             })
             .collect();
         if profile {
