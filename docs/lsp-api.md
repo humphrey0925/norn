@@ -42,6 +42,14 @@ session saved, or with nothing. When it is there the server sends
 `textDocument/didSave` and `workspace/didChangeWatchedFiles` wait until
 then, and are handled in the order they came.
 
+The server does not watch the tree itself. While it runs, it learns of
+changes from the client: `textDocument/didSave` for a file saved in the
+editor, and `workspace/didChangeWatchedFiles` for files changed, added or
+deleted otherwise (`git pull`, a build). The VS Code extension sends both,
+from its own file watcher on the C and C++ sources; another client should
+too, or send [`si/sync`](#sisync) after such changes. What changed while no
+server ran is found when the next one starts.
+
 ### `initializationOptions`
 
 | Key | Type | |

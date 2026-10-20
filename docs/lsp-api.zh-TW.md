@@ -37,6 +37,11 @@ norn lsp [ROOT] [--cache-dir <DIR> | --no-cache] [--rebuild] [--include-alias <F
 （`si/setConditions`、`si/setScope`、`si/sync`）以及 `textDocument/didSave` 和
 `workspace/didChangeWatchedFiles` 通知會等到那時，並依收到的順序處理。
 
+伺服器本身不監看檔案。執行期間，檔案的變動要由 client 告知：編輯器裡存檔時送 `textDocument/didSave`，
+其他方式造成的變更、新增或刪除（例如 `git pull`、建置）則送 `workspace/didChangeWatchedFiles`。
+VS Code 擴充套件用自己的 file watcher 監看 C 和 C++ 原始檔，兩種通知都會送；其他 client 也應該送，
+或在這類變動之後送 [`si/sync`](#sisync)。伺服器沒在執行時發生的變動，下次啟動時會自己找出來。
+
 ### `initializationOptions`
 
 | 鍵 | 型別 | |
