@@ -61,6 +61,7 @@ Options every command takes:
 |---|---|
 | `--threads <N>` | Worker threads; `0` (the default) uses every core |
 | `--system-parser-alloc` | Let the parser use the system heap instead of mimalloc (for measurements) |
+| `--no-build-config` | Where `.norn/config.json` names no configuration, index with no compile conditions instead of following the first build configuration found in the tree |
 | `-h`, `--help` | The command's options |
 | `-V`, `--version` | The version |
 
@@ -177,7 +178,9 @@ declaration, type definition, implementation), *Find References*, the call
 hierarchy, workspace and document symbols, hover, signature help,
 completion, highlights of the name under the cursor, links on `#include`s,
 quick fixes, folding, semantic highlighting, rename and inlay hints, and
-keeps the index as `live` does.
+keeps the index as `live` does. Its own `si/*` requests, which the VS Code
+extension's views are built on, are described in
+[the language server protocol](lsp-api.md).
 
 Neovim (0.11):
 

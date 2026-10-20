@@ -18,6 +18,10 @@
   let assigned = null; // assignments: {by, target, rows}
   let nodes = new Map(); // id -> node
   let nextId = 1;
+  // What one click does (norn.relation.click): "auto" shows a reference in
+  // the Context view and opens anything else; "context" shows everything
+  // there; "editor" opens everything. A double click, or Ctrl, opens.
+  let click = "auto";
 
   const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const base = (file) => String(file).split("/").pop();
@@ -303,14 +307,12 @@
 
   function act(e) {
     const beside = e.ctrlKey || e.metaKey;
-    const open = (t) => t && vscode.postMessage({ open: t, beside });
     const ref = e.target.closest("[data-ref]");
+    const preview = e.type !== "dblclick" && !beside && (click === "context" || (click === "auto" && ref));
+    const open = (t) => t && vscode.postMessage(preview ? { show: t } : { open: t, beside });
     if (ref) {
       const [g, i] = ref.dataset.ref.split(",").map(Number);
-      const at = { uri: refs[g].uri, line: refs[g].items[i].line, character: refs[g].items[i].character };
-      // One click: in the Context view. Two, or Ctrl: in the editor.
-      if (e.type === "dblclick" || beside) return open(at);
-      return vscode.postMessage({ show: at });
+      return open({ uri: refs[g].uri, line: refs[g].items[i].line, character: refs[g].items[i].character });
     }
     const what = e.target.closest("[data-act]")?.dataset.act;
     const row = e.target.closest("[data-assign]");
@@ -336,7 +338,9 @@
   }
   root.addEventListener("click", act);
   root.addEventListener("dblclick", (e) => {
-    if (e.target.closest("[data-ref]")) act(e);
+    // What one click showed in the Context view, two open.
+    if (e.target.closest("[data-act]")?.dataset.act === "toggle") return;
+    if (e.target.closest("[data-ref]") ? click !== "editor" : click === "context") act(e);
   });
   root.addEventListener("keydown", (e) => {
     // Enter on a reference opens it, as a double click does.
@@ -383,6 +387,9 @@
       message.textContent = d.message ?? "";
     } else if (d.type === "view") {
       view = d.view;
+    } else if (d.type === "click") {
+      click = d.click;
+      return;
     }
     render();
   });

@@ -605,6 +605,26 @@
           "scope": "resource",
           "description": "Keep a configuration named \"Norn\" in .vscode/c_cpp_properties.json in step with the compile configuration in force: its defines and, from a DS-5 / Eclipse .cproject, its include paths. Select that configuration in the C/C++ extension to use it."
         },
+        "norn.conditions.followBuildConfig": {
+          "type": "boolean",
+          "default": true,
+          "description": "Where the workspace has no compile configuration of its own, follow the first build configuration found in it (a Kconfig .config, a DS-5 / Eclipse .cproject, c_cpp_properties.json). Off: index with no compile conditions until you choose some. A configuration chosen in the Compile Conditions view holds either way."
+        },
+        "norn.relation.click": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "context",
+            "editor"
+          ],
+          "enumDescriptions": [
+            "A reference is shown in the Context view; a caller, callee or assignment opens in the editor.",
+            "Everything is shown in the Context view first; a double click opens it in the editor.",
+            "Everything opens in the editor at once."
+          ],
+          "default": "auto",
+          "description": "What one click on a row of the Relation view (Calls, Called by, References, Assignments) does. A double click, or Ctrl+click, always opens it in the editor."
+        },
         "norn.fileSymbols.showLocals": {
           "type": "boolean",
           "default": true,
