@@ -392,6 +392,11 @@ pub struct Script {
 pub struct Skeleton {
     /// A digest of the directives (`Script::ops`), without their places.
     pub shape: u64,
+    /// The same of the `#if`s, `#elif`s, `#else`s, `#endif`s and
+    /// `#include`s alone (and whether the file is read once): what decides
+    /// which branches and files a compilation reads, but for the values of
+    /// the names they test.
+    pub branches: u64,
     /// Where each `#if` and `#elif` starts, in order.
     pub ats: Vec<u32>,
     /// The line of each `#if`, `#elif`, `#else` and `#endif`, in order.
@@ -402,12 +407,20 @@ pub struct Skeleton {
 
 impl Script {
     pub fn skeleton(&self) -> Skeleton {
-        let mut h = xxhash_rust::xxh3::Xxh3::new();
+        let (mut h, mut b) = (xxhash_rust::xxh3::Xxh3::new(), xxhash_rust::xxh3::Xxh3::new());
         let mut bytes = |tag: u8, parts: &[&[u8]]| {
-            h.update(&[tag]);
+            // (`#define` and `#undef` are not branches.)
+            let branch = tag != 5 && tag != 6;
+            let mut put = |x: &[u8]| {
+                h.update(x);
+                if branch {
+                    b.update(x);
+                }
+            };
+            put(&[tag]);
             for p in parts {
-                h.update(&(p.len() as u32).to_le_bytes());
-                h.update(p);
+                put(&(p.len() as u32).to_le_bytes());
+                put(p);
             }
         };
         bytes(self.once as u8, &[]);
@@ -429,7 +442,7 @@ impl Script {
                 Op::Include { name, quoted } => bytes(7, &[name, &[*quoted as u8]]),
             }
         }
-        Skeleton { shape: h.digest(), ats, lines: self.lines.clone(), include_lines: self.include_lines.clone() }
+        Skeleton { shape: h.digest(), branches: b.digest(), ats, lines: self.lines.clone(), include_lines: self.include_lines.clone() }
     }
 }
 
