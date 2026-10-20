@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.25.0
+
+**Kconfig builds read as they are configured, and saving a file of the kernel in seconds**
+
+### Linux and U-Boot, as their configuration builds them
+
+- U-Boot's configuration names its architecture and board (`CONFIG_SYS_ARCH`, `CONFIG_SYS_BOARD`, `CONFIG_SYS_VENDOR`): the other architectures' and boards' folders are taken as not built, and `__UBOOT__` is defined.
+- Headers a build reads before every file (Kbuild's `-include include/linux/kconfig.h`) are read first; any project can name its own with `"includeFirst": [...]`. With it, `CONFIG_IS_ENABLED` is worked out as U-Boot has it (`CONFIG_<prefix>X`, the prefix none outside SPL, TPL and VPL).
+- The makefiles say which source files the configuration builds (`obj-$(CONFIG_X) += foo.o`, `ifdef`, `ifeq` and the like): a file or folder they list only where it is not built is taken as not built (U-Boot's `tiny-printf.c` beside `vsprintf.c`). What they do not name, or name in a way Norn does not work out, is left alone, and so are headers. `"notBuilt"` now takes files as well as folders.
+- Configured U-Boot (sandbox), against clang: certain calls 78.3% → 91.6%, calls found 97.5% → 98.8%, definitions precision 98.2% → 99.7%. Configured Linux (x86_64 defconfig): definitions precision 98.2% → 99.4%, certain calls 95.6% → 95.9%.
+
+### More accurate
+
+- A definition on a line a compilation does not compile is not there for it: FreeRTOS's `tasks.c` defines `MPU_WRAPPERS_INCLUDED_FROM_API_FILE` before including `mpu_wrappers.h`, so its `xTaskCreate` is not renamed `MPU_xTaskCreate`. FreeRTOS definitions precision 68.8% → 98.2%.
+- A called name may have up to 128 definitions, not 32 (FreeRTOS defines `vPortEnterCritical` in 86 ports): FreeRTOS calls found 80.0% → 98.6%.
+- `_Pragma (...)`, `__asm__ __volatile__ (...)` and the like in a macro's body are no calls; a `typedef` of a function pointer type (the kernel's `BPF_CALL_x`) declares no function. On the configured kernel, 28.76 million edges → 28.25 million, accuracy unchanged or better.
+- Measured against clang on six more projects: curl, SQLite, Mbed TLS, FreeRTOS, lwIP and U-Boot.
+
+### Saving a file
+
+- On the configured kernel, saving `kernel/sched/core.c` after an edit that changes no macro takes 4.6 s (48 s before); after new macros in `include/linux/sched.h`, about 10 s (48 s). On binutils, 0.12 s (1.0–1.4 s).
+- How it gets there: definitions are compared as the index has them, by the file's path; what the sources settle of a file is moved with its directives when lines are put in above them; when only definitions change, of names no `#if` tests, what the sources settle is worked out from where it stood instead of from nothing; and only the files whose expansion asked for a macro that changed are expanded again.
+- Fixed: what the sources settle of a file's `#if`s was kept for its old text after an edit that left every `#define` as it was. After a start from the save with a file edited meanwhile, or after edits while running, a branch could be indexed under the wrong answer until the conditions were set again.
+- Indexing the configured kernel from nothing: 82 s → 73 s (which compilations read each file is worked out once).
+
+### VS Code
+
+- `norn.conditions.followBuildConfig`: off, a workspace with no configuration of its own is indexed with no compile conditions instead of following the first build configuration found. The configuration switch also offers **No configuration**; on the command line, `norn --no-build-config`.
+- `norn.relation.click`: what one click on a row of the Relation view does. `auto` (as before): a reference is shown in Context, a caller or callee opens; `context`: every row is shown in Context first, a double click opens it; `editor`: every row opens.
+- Editing the configuration in force keeps the settings it does not touch (`notBuilt`, `includeFirst`, `kbuild` of a Kconfig configuration found in the tree).
+- `si/setConditions` with parameters that do not read answers an error instead of saving an empty configuration.
+
+### Documentation
+
+- [The language server protocol](https://github.com/humphrey0925/norn/blob/master/docs/lsp-api.md): the standard LSP methods, every `si/*` request and notification, `.norn/config.json` and the extension's commands, for other editors, front ends and tools; the server learns of changed files from its client.
+
+The first opening after the upgrade builds the index again.
+
 ## 0.24.0
 
 **C++ and the Linux kernel more accurate**
