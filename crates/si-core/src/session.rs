@@ -87,8 +87,13 @@ impl Packed {
     /// Those of every file. Packed by all threads, then moved into memory
     /// of this one's (see `crate::gather`).
     fn all(defines: Vec<Vec<Define>>) -> Vec<Packed> {
-        let packed: Vec<Packed> = defines.par_iter().map(|d| Packed::of(d)).collect();
+        let packed = Packed::each(&defines);
         drop(defines);
+        packed
+    }
+
+    fn each(defines: &[Vec<Define>]) -> Vec<Packed> {
+        let packed: Vec<Packed> = defines.par_iter().map(|d| Packed::of(d)).collect();
         packed.into_iter().map(|p| Packed(p.0.clone())).collect()
     }
 }
@@ -106,6 +111,11 @@ pub struct Update {
     pub extracted: usize,
     /// Macros that became or stopped being transparent or expanding.
     pub macros_reclassified: usize,
+    /// What the sources settle was worked out again: from nothing
+    /// (`settled`), or from where it stood, only definitions having changed
+    /// (`settled_again`).
+    pub settled: bool,
+    pub settled_again: bool,
     pub extract_ms: f64,
     pub link_ms: f64,
     /// At opening, with nothing of this root saved: files whose facts were
@@ -687,6 +697,13 @@ impl Session {
         // other. One whose directives only moved (lines put in or taken out
         // above them) has what is said of it moved with them.
         let mut told_changed = false;
+        // Files came or went: every condition is worked out again.
+        let mut whole = false;
+        // The macros whose definitions an edit changed, in files whose
+        // `#if`s and `#include`s it left as they were: unless an `#if`
+        // tests one of them, only what the sources settle of macros is
+        // worked out again, from where it stood (`crate::settle_again`).
+        let mut edited: FxHashSet<Vec<u8>> = FxHashSet::default();
         for p in paths {
             let path = if p.is_absolute() { p.clone() } else { self.root.join(p) };
             // (A file of another kind is in the index when a source includes it.)
@@ -711,11 +728,12 @@ impl Session {
                     }
                     let rel = crate::rel_path(&self.root, &path);
                     let skeleton = mask::script(&src).skeleton();
-                    let shaped = self.conditions.uses_source() && !self.facts[i].path.is_empty() && self.facts[i].skeleton.shape == skeleton.shape;
+                    let old = &self.facts[i].skeleton;
+                    let shaped = self.conditions.uses_source() && !self.facts[i].path.is_empty() && old.branches == skeleton.branches;
                     // Only moved: what the sources say of it moves with its
                     // directives, first, its definitions being read with it.
-                    if shaped && self.facts[i].skeleton != skeleton {
-                        let old = self.facts[i].skeleton.clone();
+                    if shaped && (old.ats != skeleton.ats || old.lines != skeleton.lines || old.include_lines != skeleton.include_lines) {
+                        let old = old.clone();
                         self.moved(&rel, &old, &skeleton);
                     }
                     // As `settle` has them: of this file, by its path.
@@ -728,11 +746,16 @@ impl Session {
                         let mut group = |start: u64| starts.iter().position(|&s| s == start).unwrap_or_else(|| (starts.push(start), starts.len() - 1).1) as u64 + 1;
                         d.iter().map(|d| Define { line: 0, branch: if d.branch == 0 { 0 } else { group(d.branch >> 16) << 16 | d.branch & 0xffff }, ..d.clone() }).collect::<Vec<_>>()
                     };
-                    if unlined(&defines) != unlined(&was) {
+                    let (now, then) = (unlined(&defines), unlined(&was));
+                    if now != then {
                         defines_changed = true;
-                    } else if self.conditions.uses_source() && !shaped {
-                        told_changed = true;
+                        let names = |d: &[Define]| d.iter().filter(|d| !d.include && !d.test).map(|d| d.name.clone()).collect::<FxHashSet<_>>();
+                        let (a, b) = (names(&now), names(&then));
+                        edited.extend(a.symmetric_difference(&b).cloned());
+                        // (A name defined in both, one way or the other.)
+                        edited.extend(a.intersection(&b).filter(|n| now.iter().filter(|d| &d.name == *n).ne(then.iter().filter(|d| &d.name == *n))).cloned());
                     }
+                    told_changed |= self.conditions.uses_source() && !shaped;
                     self.defines[i] = Packed::of(&defines);
                     up.changed += 1;
                 }
@@ -746,6 +769,7 @@ impl Session {
                     self.stamps.remove(i);
                     touched.remove(&path);
                     defines_changed = true;
+                    whole = true;
                     up.removed += 1;
                 }
                 (Err(i), true) => {
@@ -754,6 +778,7 @@ impl Session {
                     self.facts.insert(i, FileFacts::new(String::new()));
                     self.stamps.insert(i, (0, 0));
                     defines_changed = true;
+                    whole = true;
                     up.added += 1;
                 }
                 (Err(_), false) => {
@@ -762,20 +787,59 @@ impl Session {
             }
         }
 
-        mark(&format!("files read (definitions changed {defines_changed}, directives changed {told_changed})"));
+        mark(&format!("files read (definitions changed {defines_changed}, directives changed {told_changed}, files came or went {whole})"));
         // New conditions: which `#define`s count has to be seen again, and
         // every file read under them.
         let all_stale = std::mem::take(&mut self.all_stale);
-        let settling = all_stale || (defines_changed || told_changed) && self.conditions.uses_source();
+        let uses_source = self.conditions.uses_source();
+        // Every file's definitions, when they are wanted: to settle again
+        // from them, and for the macro sets.
+        let mut per_file: Option<Vec<Vec<Define>>> = None;
+        // Only definitions changed, of names no `#if` tests, even through
+        // the value of one it does.
+        let again = uses_source && !all_stale && !whole && !told_changed && defines_changed && {
+            let all: Vec<Vec<Define>> = self.defines.par_iter().map(Packed::get).collect();
+            let tested: FxHashSet<&[u8]> = all.iter().flatten().filter(|d| d.test).map(|d| &d.name[..]).collect();
+            let users = crate::users_of(&all);
+            let mut seen: FxHashSet<&[u8]> = edited.iter().map(|n| &n[..]).collect();
+            let mut work: Vec<&[u8]> = seen.iter().copied().collect();
+            let mut tests = false;
+            while let Some(n) = work.pop() {
+                tests |= tested.contains(n);
+                for &user in users.get(n).into_iter().flatten() {
+                    if seen.insert(user) {
+                        work.push(user);
+                    }
+                }
+            }
+            drop((users, tested, seen));
+            per_file = Some(all);
+            !tests
+        };
+        let settling = all_stale || !again && (defines_changed || told_changed) && uses_source;
         // What the sources settle about macros may have changed with the
         // definitions (an edit to a configuration header reaches every
         // file that includes it): the files told something else now are
         // read again.
         let mut retold: FxHashSet<PathBuf> = FxHashSet::default();
-        if settling {
+        if settling || again {
             let before = self.conditions.source().cloned();
-            self.defines = Packed::all(crate::settle(&self.root, &self.files, &mut self.conditions));
+            if again {
+                let all = per_file.as_mut().unwrap();
+                crate::settle_again(&self.root, &self.files, &mut self.conditions, all);
+                self.defines = Packed::each(all);
+                if std::env::var_os("SI_SETTLE_CHECK").is_some() {
+                    let mut whole = self.conditions.clone();
+                    let from_nothing = crate::settle(&self.root, &self.files, &mut whole);
+                    let differ = (0..self.files.len()).filter(|&i| from_nothing[i] != all[i]).count();
+                    eprintln!("settle    again: {} files' definitions differ from settling from nothing; conditions the same: {}", differ, whole == self.conditions);
+                }
+            } else {
+                per_file = None;
+                self.defines = Packed::all(crate::settle(&self.root, &self.files, &mut self.conditions));
+            }
             defines_changed = true;
+            (up.settled, up.settled_again) = (!again, again);
             let now = self.conditions.source();
             if before.as_ref() != now {
                 let digest = |s: Option<&std::sync::Arc<crate::cond::Source>>, rel: &str| s.map_or(0, |s| s.file_digest(rel));
@@ -795,7 +859,7 @@ impl Session {
         // Did any macro change character? Then whoever mentions it is stale.
         let mut reclassified = FxHashSet::default();
         if defines_changed {
-            let per_file: Vec<Vec<Define>> = self.defines.iter().map(Packed::get).collect();
+            let per_file: Vec<Vec<Define>> = per_file.take().unwrap_or_else(|| self.defines.par_iter().map(Packed::get).collect());
             let paths: Vec<String> = self.files.iter().map(|p| crate::rel_path(&self.root, p)).collect();
             let sets = MacroSets::of_files(&per_file, &paths, self.conditions.not_built()).with_conditions(self.conditions.clone());
             reclassified = self.sets.reclassified(&sets);
@@ -1312,6 +1376,41 @@ int slow (void) { return 0; }
         let (s, up) = Session::open_cached(&d.0, Options::default(), cache);
         assert_eq!((up.loaded, up.extracted), (4, 1));
         same(&s);
+    }
+
+    #[test]
+    fn a_definition_no_if_tests_is_settled_from_where_it_stood() {
+        let d = Dir::new("defined");
+        d.write("config.h", "#ifndef CONFIG_H\n#define CONFIG_H\n#define USE_NET 1\n#define USE_USB 0\n#endif\n");
+        d.write("net.h", "#if USE_NET\n#define NET_SEND(x) net_send (x)\nint net_send (int);\n#endif\n");
+        let a = |more: &str| format!("#include \"config.h\"\n#include \"net.h\"\n{more}#if USE_NET\nint net_up (void) {{ return NET_SEND (1); }}\n#endif\n#if USE_USB\nint usb_init (void) {{ return 1; }}\n#endif\n");
+        d.write("a.c", &a(""));
+        d.write("b.c", "#include \"net.h\"\nint quiet (void) { return 0; }\n");
+        let (mut s, _) = Session::open_cached(&d.0, Options::default(), d.0.join("cache-outside-scan"));
+        let same = |s: &Session| {
+            let fresh = Session::open(&d.0, Options::default());
+            assert_eq!(shape(s), shape(&fresh));
+            assert_eq!(s.conditions(), fresh.conditions());
+            assert!(s.defines.iter().map(Packed::get).eq(fresh.defines.iter().map(Packed::get)), "definitions differ");
+        };
+        same(&s);
+        // A macro of a.c's own, which no #if tests: from where it stood.
+        d.write("a.c", &a("#define TIMES(x) ((x) * 2)\nint twice (void) { return TIMES (net_up ()); }\n"));
+        let up = s.update(&[d.0.join("a.c")]);
+        assert_eq!((up.settled, up.settled_again), (false, true));
+        same(&s);
+        // One in a header that the value of a tested name refers to: from nothing.
+        d.write("config.h", "#ifndef CONFIG_H\n#define CONFIG_H\n#define NET_ON 0\n#define USE_NET NET_ON\n#define USE_USB 0\n#endif\n");
+        let up = s.update(&[d.0.join("config.h")]);
+        assert!(up.settled && !up.settled_again);
+        same(&s);
+        assert_eq!(functions(&s, "net_up"), 0);
+        // Its value changed: tested through USE_NET, from nothing again.
+        d.write("config.h", "#ifndef CONFIG_H\n#define CONFIG_H\n#define NET_ON 1\n#define USE_NET NET_ON\n#define USE_USB 0\n#endif\n");
+        let up = s.update(&[d.0.join("config.h")]);
+        assert!(up.settled && !up.settled_again);
+        same(&s);
+        assert_eq!(functions(&s, "net_up"), 1);
     }
 
     #[test]

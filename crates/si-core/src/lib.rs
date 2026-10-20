@@ -217,17 +217,6 @@ pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions)
         slowest("defines", times);
         defines
     };
-    // Read again: only the files `again` says, the others' as they were.
-    let reread = |c: &cond::Conditions, defines: &mut Vec<Vec<mask::Define>>, again: &[bool]| {
-        let fresh: Vec<(usize, Vec<mask::Define>)> = (0..files.len())
-            .into_par_iter()
-            .filter(|&i| again[i])
-            .map(|i| (i, mask::defines_of(&std::fs::read(&files[i]).unwrap_or_default(), c, Some(&paths[i]))))
-            .collect();
-        for (i, d) in fresh {
-            defines[i] = d;
-        }
-    };
     if !conditions.uses_source() {
         let defines = read(conditions);
         step("defines", &mut t);
@@ -281,11 +270,37 @@ pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions)
     }
     let mut defines = read(conditions);
     step("defines", &mut t);
+    settle_from(files, &paths, conditions, &mut defines, (&verdicts, &readings), &tested, &mut t);
+    drop(scripts);
+    defines
+}
+
+/// From every file's `#define`s as they are, what the sources settle put
+/// into `conditions`, and the files whose `#define`s that changes read
+/// again under it, until nothing changes (or four times). `tested`: the
+/// names each file's `#if`s test.
+fn settle_from<T: std::borrow::Borrow<[u8]> + Sync>(
+    files: &[PathBuf],
+    paths: &[String],
+    conditions: &mut cond::Conditions,
+    defines: &mut [Vec<mask::Define>],
+    (verdicts, readings): (&std::sync::Arc<units::Verdicts>, &std::sync::Arc<units::Readings>),
+    tested: &[rustc_hash::FxHashSet<T>],
+    t: &mut std::time::Instant,
+) {
+    let read = |c: &cond::Conditions, i: usize| mask::defines_of(&std::fs::read(&files[i]).unwrap_or_default(), c, Some(&paths[i]));
+    // Read again: only the files `again` says, the others' as they were.
+    let reread = |c: &cond::Conditions, defines: &mut [Vec<mask::Define>], again: &[bool]| {
+        let fresh: Vec<(usize, Vec<mask::Define>)> = (0..files.len()).into_par_iter().filter(|&i| again[i]).map(|i| (i, read(c, i))).collect();
+        for (i, d) in fresh {
+            defines[i] = d;
+        }
+    };
     for _ in 0..4 {
-        let mut source = mask::source_of(&defines, &paths);
+        let mut source = mask::source_of(defines, paths);
         source.set_verdicts(verdicts.clone());
         source.set_readings(readings.clone());
-        step("source", &mut t);
+        step("source", t);
         if conditions.source().map_or(source.is_empty(), |s| **s == source) {
             break;
         }
@@ -296,24 +311,7 @@ pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions)
         // (Where most files are read again whatever is found, all are.)
         let most = includes.iter().filter(|c| **c).count() * 2 > files.len();
         if !changed.is_empty() && !most {
-            // Who names whom, in a value: (named, naming), file by file.
-            let named: Vec<Vec<(&[u8], &[u8])>> = defines
-                .par_iter()
-                .map(|list| {
-                    let mut out = Vec::new();
-                    for d in list.iter().filter(|d| !d.include && !d.test) {
-                        out.extend(d.refs.iter().chain(d.deps.iter().flatten()).map(|r| (&r[..], &d.name[..])));
-                        if let Some(v) = &d.value {
-                            units::names_in(v, |n| out.push((n, &d.name[..])));
-                        }
-                    }
-                    out
-                })
-                .collect();
-            let mut users: rustc_hash::FxHashMap<&[u8], Vec<&[u8]>> = Default::default();
-            for (n, user) in named.iter().flatten() {
-                users.entry(n).or_default().push(user);
-            }
+            let users = users_of(defines);
             let mut work: Vec<Vec<u8>> = changed.iter().cloned().collect();
             while let Some(n) = work.pop() {
                 for &user in users.get(&n[..]).into_iter().flatten() {
@@ -324,20 +322,56 @@ pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions)
                 }
             }
         }
-        let again: Vec<bool> = (0..files.len()).map(|i| most || includes.get(i).copied().unwrap_or(true) || tested[i].iter().any(|n| changed.contains(*n))).collect();
+        let again: Vec<bool> = (0..files.len()).map(|i| most || includes.get(i).copied().unwrap_or(true) || tested[i].iter().any(|n| changed.contains(n.borrow()))).collect();
         conditions.set_source(Some(std::sync::Arc::new(source)));
         if std::env::var_os("SI_SETTLE_CHECK").is_some() {
-            let mut some = defines.clone();
+            let mut some = defines.to_vec();
             reread(conditions, &mut some, &again);
-            let all = read(conditions);
+            let all: Vec<Vec<mask::Define>> = (0..files.len()).into_par_iter().map(|i| read(conditions, i)).collect();
             let differ = (0..files.len()).filter(|&i| some[i] != all[i]).count();
             eprintln!("settle    {} of {} files read again, {} names changed; {} files would differ", again.iter().filter(|a| **a).count(), files.len(), changed.len(), differ);
         }
-        reread(conditions, &mut defines, &again);
-        step("defines", &mut t);
+        reread(conditions, defines, &again);
+        step("defines", t);
     }
-    drop(scripts);
-    defines
+}
+
+/// Who names whom in a value or body: the names each macro's definitions
+/// refer to, to the macros that refer to them.
+pub fn users_of(defines: &[Vec<mask::Define>]) -> rustc_hash::FxHashMap<&[u8], Vec<&[u8]>> {
+    let named: Vec<Vec<(&[u8], &[u8])>> = defines
+        .par_iter()
+        .map(|list| {
+            let mut out = Vec::new();
+            for d in list.iter().filter(|d| !d.include && !d.test) {
+                out.extend(d.refs.iter().chain(d.deps.iter().flatten()).map(|r| (&r[..], &d.name[..])));
+                if let Some(v) = &d.value {
+                    units::names_in(v, |n| out.push((n, &d.name[..])));
+                }
+            }
+            out
+        })
+        .collect();
+    let mut users: rustc_hash::FxHashMap<&[u8], Vec<&[u8]>> = Default::default();
+    for (n, user) in named.iter().flatten() {
+        users.entry(n).or_default().push(user);
+    }
+    users
+}
+
+/// `settle` again after the `#define`s of some files changed and nothing
+/// else did (no `#if` or `#include`, no file came or went), where none of
+/// the names changed is one an `#if` tests or one such a name refers to:
+/// what each compilation's conditions come to (the verdicts and readings)
+/// is then as it was, and what the sources settle is worked out from
+/// `defines`, every file's as they are now, rather than from nothing.
+pub fn settle_again(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions, defines: &mut [Vec<mask::Define>]) {
+    let mut t = std::time::Instant::now();
+    let Some(source) = conditions.source().cloned() else { return };
+    let paths: Vec<String> = files.iter().map(|p| rel_path(root, p)).collect();
+    // (The names a file's `#if`s test, as its `#define`s note them.)
+    let tested: Vec<rustc_hash::FxHashSet<Vec<u8>>> = defines.par_iter().map(|d| d.iter().filter(|d| d.test).map(|d| d.name.clone()).collect()).collect();
+    settle_from(files, &paths, conditions, defines, (source.verdicts(), source.readings()), &tested, &mut t);
 }
 
 /// How each compilation reads the headers compiled more than one way, as
