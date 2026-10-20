@@ -81,12 +81,14 @@ impl Readings {
     }
 
     /// What the ways come to, for knowing when expansions made with them
-    /// are stale.
+    /// are stale. (Not where the headers' lines are: lines put in above an
+    /// `#if` move its definitions with it. Which stretch each definition
+    /// is in is the header's own, in `expand`'s digest of its macros.)
     pub fn digest(&self) -> u64 {
         let mut h = xxhash_rust::xxh3::Xxh3::new();
         for (path, lines) in &self.files {
             h.update(path.as_bytes());
-            lines.iter().for_each(|l| h.update(&l.to_le_bytes()));
+            h.update(&(lines.len() as u32).to_le_bytes());
         }
         for ways in &self.ways {
             h.update(&(ways.len() as u32).to_le_bytes());

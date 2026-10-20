@@ -506,6 +506,30 @@ struct Engine<'a> {
     /// The compilation it stands for, as the readings number them, or
     /// `NONE`.
     unit: u32,
+    /// The names it asks the table for: the file's expansion depends on
+    /// their definitions, and on nothing else of other files'.
+    asked: Asked<'a>,
+}
+
+/// Names an engine asked the table for, told to `to` when it is done.
+#[derive(Default)]
+struct Asked<'a> {
+    to: Option<&'a std::sync::Mutex<Vec<Text>>>,
+    names: Vec<Text>,
+}
+
+impl<'a> Asked<'a> {
+    fn to(to: &'a std::sync::Mutex<Vec<Text>>) -> Self {
+        Asked { to: Some(to), names: Vec::new() }
+    }
+}
+
+impl Drop for Asked<'_> {
+    fn drop(&mut self) {
+        if let Some(to) = self.to {
+            to.lock().unwrap_or_else(|e| e.into_inner()).append(&mut self.names);
+        }
+    }
 }
 
 impl<'a> Table<'a> {
@@ -548,6 +572,7 @@ impl<'a> Engine<'a> {
             max_variants: if table.thorough { MAX_VARIANTS_READ } else { MAX_VARIANTS },
             sure: Vec::new(),
             unit: NONE,
+            asked: Asked::default(),
         }
     }
 
@@ -564,7 +589,11 @@ impl<'a> Engine<'a> {
         match self.merged {
             // Several units at once: sure only if the file itself always
             // defines the name.
-            Some(file) => !self.table.by_name.get(name).is_some_and(|v| {
+            Some(file) => !{
+                self.asked.names.push(text);
+                self.table.by_name.get(name)
+            }
+            .is_some_and(|v| {
                 v.iter().any(|&(f, i)| f == file && !self.table.files[f as usize].macros[i as usize].conditional)
             }),
             None => {
@@ -578,6 +607,7 @@ impl<'a> Engine<'a> {
 
     fn candidates(&mut self, name: Text) -> &[&'a Parsed] {
         if !self.cands.contains_key(&name) {
+            self.asked.names.push(name);
             // The definitions this unit can see, one of each text, in the
             // order of the texts (which must not depend on which file was
             // read first).
@@ -1509,6 +1539,7 @@ fn expand_file(
     fwd: &[Vec<u32>],
     sure_fwd: &[Vec<u32>],
     rev: &[Vec<u32>],
+    asked: &std::sync::Mutex<Vec<Text>>,
 ) -> Option<(FileFacts, u64, u64)> {
     if f.sites.is_empty() && f.inits.is_empty() {
         return None;
@@ -1538,12 +1569,13 @@ fn expand_file(
                 .map(|&r| Engine {
                     sure: closure(r, sure_fwd),
                     unit: table.unit_of.get(r as usize).copied().unwrap_or(NONE),
+                    asked: Asked::to(asked),
                     ..Engine::new(table, seen(closure(r, fwd)))
                 })
                 .collect()
         } else {
             // (What it reads for certain: what it includes so, itself.)
-            vec![Engine { merged: Some(fi as u32), sure: closure(fi as u32, sure_fwd), ..Engine::new(table, seen(visible(fi as u32, fwd, rev))) }]
+            vec![Engine { merged: Some(fi as u32), sure: closure(fi as u32, sure_fwd), asked: Asked::to(asked), ..Engine::new(table, seen(visible(fi as u32, fwd, rev))) }]
         }
     };
     let t_setup = std::time::Instant::now();
@@ -1868,13 +1900,28 @@ fn expand_file(
 }
 
 /// Expansions kept from one link to the next. What a file expands to
-/// depends on the file and on every macro body and include edge of the
-/// corpus; while the latter stand (the usual edit touches neither), only
-/// changed files are expanded again.
+/// depends on the file, on the include edges (and the readings and the
+/// like) of the corpus, and on the macros of the names its expansion asks
+/// for: while the edges stand (the usual edit touches none), only changed
+/// files are expanded again, and those that asked for a name whose macros
+/// changed.
 #[derive(Default)]
 pub struct Cache {
-    /// Digest of all macro bodies and include edges.
+    /// Digest of the files and include edges, the readings and the like:
+    /// all but the macros.
     environment: u64,
+    /// Per file: a digest of its macros.
+    macros: Vec<u64>,
+    /// Per file: the names its expansion asked the table for, hashed and
+    /// sorted (`None`: not known, as from a save of before they were).
+    asked: Vec<Option<Box<[u64]>>>,
+    /// The macros files had before they were read again (`forget`), each
+    /// as its name and a digest of its definition (`macro_pairs`): those
+    /// that are not as they were are the ones that changed.
+    gone: FxHashMap<usize, Vec<(u64, u64)>>,
+    /// The same of the headers compilations read more than one way, as the
+    /// last expansion had them, with which stretch of the header each is in.
+    stretched: FxHashMap<usize, Vec<(u64, u64)>>,
     /// Per file: its content hash when expanded, the replacement if it had
     /// anything to expand, and the definitions and references that added.
     hashes: Vec<u64>,
@@ -1962,6 +2009,8 @@ impl NameCache {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct CacheIndex {
     pub environment: u64,
+    pub macros: Vec<u64>,
+    pub asked: Vec<Option<Box<[u64]>>>,
     pub hashes: Vec<u64>,
     pub added: Vec<(u64, u64)>,
     /// Whether the file has an expansion saved.
@@ -1972,6 +2021,8 @@ impl Cache {
     pub fn index(&self) -> CacheIndex {
         CacheIndex {
             environment: self.environment,
+            macros: self.macros.clone(),
+            asked: self.asked.clone(),
             hashes: self.hashes.clone(),
             added: self.added.clone(),
             has: self.expanded.iter().map(Option::is_some).collect(),
@@ -1995,7 +2046,20 @@ impl Cache {
             .collect();
         crate::gather(expanded.iter_mut().flatten());
         let made = vec![1; hashes.len()];
-        Cache { environment: index.environment, hashes, expanded, added: index.added, changed: Vec::new(), epoch: 1, made, names: NameCache::default() }
+        Cache {
+            environment: index.environment,
+            macros: index.macros,
+            asked: index.asked,
+            gone: FxHashMap::default(),
+            stretched: FxHashMap::default(),
+            hashes,
+            expanded,
+            added: index.added,
+            changed: Vec::new(),
+            epoch: 1,
+            made,
+            names: NameCache::default(),
+        }
     }
 
     /// The files expanded anew since the last call, for saving.
@@ -2008,10 +2072,12 @@ impl Cache {
     }
 
     /// Expand file `i` again at the next link even if its hash is the same.
-    pub fn forget(&mut self, i: usize) {
+    /// `was`: its facts as they were, whose macros may be gone.
+    pub fn forget(&mut self, i: usize, was: &FileFacts) {
         if let Some(h) = self.hashes.get_mut(i) {
             *h = !*h;
         }
+        self.gone.insert(i, macro_pairs(was, None));
     }
 }
 
@@ -2025,13 +2091,71 @@ fn environment(files: &[FileFacts], includes: &[Vec<u32>]) -> u64 {
     for (f, edges) in files.iter().zip(includes) {
         h = mix(f.path.as_bytes(), h);
         h = mix(bytemuck::cast_slice(edges), h);
-        for m in &f.macros {
-            h = mix(f.name(m.name as usize).as_bytes(), h);
-            h = mix(f.name(m.text as usize).as_bytes(), h);
-            h = mix(guard_text(f, m).as_bytes(), h ^ (m.function_like as u64 | (m.conditional as u64) << 1 | (m.fallback as u64) << 2));
-        }
     }
     h
+}
+
+/// A digest of the macros of a file: what of it another file's expansion
+/// may read. Of a header compilations read more than one way (`lines`:
+/// those of its `#if`s and the like), which stretch between them each is
+/// in: whether it is there for a compilation.
+fn macro_digest(f: &FileFacts, lines: Option<&[u32]>) -> u64 {
+    use xxhash_rust::xxh3::xxh3_64_with_seed as mix;
+    let mut h = 3;
+    for m in &f.macros {
+        if let Some(lines) = lines {
+            h = mix(&(lines.partition_point(|&l| l < m.line) as u64).to_le_bytes(), h);
+        }
+        h = mix(f.name(m.name as usize).as_bytes(), h);
+        h = mix(f.name(m.text as usize).as_bytes(), h);
+        h = mix(guard_text(f, m).as_bytes(), h ^ (m.function_like as u64 | (m.conditional as u64) << 1 | (m.fallback as u64) << 2));
+    }
+    h
+}
+
+fn name_hash(name: &str) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(name.as_bytes())
+}
+
+/// Each macro of a file as its name and a digest of all `macro_digest`
+/// reads of it, sorted.
+fn macro_pairs(f: &FileFacts, lines: Option<&[u32]>) -> Vec<(u64, u64)> {
+    let mut v: Vec<(u64, u64)> = f
+        .macros
+        .iter()
+        .map(|m| {
+            let stretch = lines.map_or(0, |l| l.partition_point(|&x| x < m.line) as u64 + 1);
+            let flags = m.function_like as u64 | (m.conditional as u64) << 1 | (m.fallback as u64) << 2;
+            let mut h = xxhash_rust::xxh3::xxh3_64_with_seed(f.name(m.text as usize).as_bytes(), flags ^ stretch << 8);
+            h = xxhash_rust::xxh3::xxh3_64_with_seed(guard_text(f, m).as_bytes(), h);
+            (name_hash(f.name(m.name as usize)), h)
+        })
+        .collect();
+    v.sort_unstable();
+    v
+}
+
+/// The names whose macros differ between two lists of `macro_pairs`.
+fn differ(old: &[(u64, u64)], new: &[(u64, u64)], out: &mut FxHashSet<u64>) {
+    let (mut i, mut j) = (0, 0);
+    while i < old.len() || j < new.len() {
+        let name = match (old.get(i), new.get(j)) {
+            (Some(a), Some(b)) => a.0.min(b.0),
+            (Some(a), None) => a.0,
+            (None, Some(b)) => b.0,
+            (None, None) => break,
+        };
+        let (a0, b0) = (i, j);
+        while old.get(i).is_some_and(|a| a.0 == name) {
+            i += 1;
+        }
+        while new.get(j).is_some_and(|b| b.0 == name) {
+            j += 1;
+        }
+        if old[a0..i] != new[b0..j] {
+            out.insert(name);
+        }
+    }
 }
 
 /// Expand the macro uses recorded in `files` into `cache.expanded`: a
@@ -2055,9 +2179,61 @@ pub fn expand(
         ^ not_built.iter().fold(0, |acc, d| acc ^ xxhash_rust::xxh3::xxh3_64(d.as_bytes()))
         ^ (thorough as u64) << 63
         ^ readings.digest();
-    if cache.environment != environment || cache.hashes.len() != files.len() {
+    let lines: FxHashMap<&str, &[u32]> = readings.files.iter().map(|(p, l)| (p.as_str(), &l[..])).collect();
+    let macros: Vec<u64> = files.par_iter().map(|f| macro_digest(f, lines.get(f.path.as_str()).copied())).collect();
+    let mut kept = cache.environment == environment && cache.hashes.len() == files.len() && cache.macros.len() == files.len();
+    if kept {
+        // Macros of some files changed: those files were read again (and
+        // what they had is known), and the files that asked for a name of
+        // theirs, then or now, are expanded again; else all are.
+        let changed: Vec<usize> = (0..files.len()).filter(|&i| macros[i] != cache.macros[i]).collect();
+        if !changed.is_empty() {
+            kept = changed.iter().all(|i| cache.gone.contains_key(i)) && cache.asked.len() == files.len() && cache.asked.iter().all(Option::is_some);
+            if kept {
+                // The names whose macros are not as they were: compared with
+                // what the file had, where it is in what it was in (a header
+                // read more than one way as such, with the stretches).
+                let mut names: FxHashSet<u64> = FxHashSet::default();
+                for &i in &changed {
+                    let here = lines.get(files[i].path.as_str()).copied();
+                    match (here, cache.stretched.get(&i)) {
+                        (Some(_), Some(old)) => differ(old, &macro_pairs(&files[i], here), &mut names),
+                        (None, None) => differ(&cache.gone[&i], &macro_pairs(&files[i], None), &mut names),
+                        _ => {
+                            names.extend(cache.gone[&i].iter().map(|p| p.0));
+                            names.extend(files[i].macros.iter().map(|m| name_hash(files[i].name(m.name as usize))));
+                        }
+                    }
+                }
+                let again: Vec<usize> = (0..files.len())
+                    .into_par_iter()
+                    .filter(|&i| cache.asked[i].as_ref().is_some_and(|a| a.iter().any(|h| names.contains(h))))
+                    .collect();
+                for i in again {
+                    cache.hashes[i] = !files[i].hash;
+                }
+            }
+        }
+    }
+    if std::env::var_os("SI_EXPAND_PROFILE").is_some() {
+        let changed = (0..files.len().min(cache.macros.len())).filter(|&i| macros[i] != cache.macros[i]).count();
+        eprintln!(
+            "expand    cache kept {kept}: environment same {}, files {} -> {}, macros known {}, macros changed in {changed} files ({} told), names asked known {}",
+            cache.environment == environment,
+            cache.hashes.len(),
+            files.len(),
+            cache.macros.len(),
+            cache.gone.len(),
+            cache.asked.iter().filter(|a| a.is_some()).count()
+        );
+    }
+    if !kept {
         *cache = Cache {
             environment,
+            macros: Vec::new(),
+            asked: vec![None; files.len()],
+            gone: FxHashMap::default(),
+            stretched: FxHashMap::default(),
             // No file hashes to its own complement, so every file is stale.
             hashes: files.iter().map(|f| !f.hash).collect(),
             expanded: files.iter().map(|_| None).collect(),
@@ -2068,6 +2244,13 @@ pub fn expand(
             names: std::mem::take(&mut cache.names),
         };
     }
+    cache.macros = macros;
+    cache.gone.clear();
+    cache.stretched = files
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| lines.get(f.path.as_str()).map(|l| (i, macro_pairs(f, Some(l)))))
+        .collect();
     let stale: Vec<usize> = (0..files.len()).filter(|&i| cache.hashes[i] != files[i].hash).collect();
     if sites > 0 && !stale.is_empty() {
         let mut by_name: FxHashMap<&str, Vec<(u32, u32)>> = FxHashMap::default();
@@ -2113,15 +2296,19 @@ pub fn expand(
         }
         let profile = std::env::var_os("SI_EXPAND_PROFILE").is_some();
         let spent: Vec<std::sync::atomic::AtomicU64> = if profile { files.iter().map(|_| Default::default()).collect() } else { Vec::new() };
-        let done: Vec<Option<(FileFacts, u64, u64)>> = stale
+        let done: Vec<(Option<(FileFacts, u64, u64)>, Box<[u64]>)> = stale
             .par_iter()
             .map(|&fi| {
                 let t = std::time::Instant::now();
-                let out = expand_file(fi, &files[fi], &table, includes, sure_includes, &rev);
+                let asked = std::sync::Mutex::new(Vec::new());
+                let out = expand_file(fi, &files[fi], &table, includes, sure_includes, &rev, &asked);
+                let mut asked: Vec<u64> = asked.into_inner().unwrap_or_else(|e| e.into_inner()).into_iter().map(|t| name_hash(t.0)).collect();
+                asked.sort_unstable();
+                asked.dedup();
                 if profile {
                     spent[fi].store(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
-                out
+                (out, asked.into())
             })
             .collect();
         if profile {
@@ -2137,7 +2324,8 @@ pub fn expand(
                 eprintln!("  {:8.1} ms  {} sites {} inits {} rev {}", *us as f64 / 1e3, f.path, f.sites.len(), f.inits.len(), rev[*i].len());
             }
         }
-        for (&fi, d) in stale.iter().zip(done) {
+        for (&fi, (d, asked)) in stale.iter().zip(done) {
+            cache.asked[fi] = Some(asked.to_vec().into());
             (cache.expanded[fi], cache.added[fi]) = match d {
                 // Kept in memory of this thread's, not among what the
                 // workers made on the way and let go (see `crate::gather`).
