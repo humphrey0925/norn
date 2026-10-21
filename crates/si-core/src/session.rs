@@ -1478,6 +1478,25 @@ int slow (void) { return 0; }
     }
 
     #[test]
+    fn an_overload_declared_beside_inline_ones_is_the_definition_elsewhere() {
+        let d = Dir::new("arity-elsewhere");
+        d.write("cat.h", "#include <string>\nnamespace lib {\ninline std::string Cat () { return std::string (); }\ninline std::string Cat (int a) { return std::string (); }\nstd::string Cat (int a, int b);\n}\n");
+        d.write("cat.cpp", "#include \"cat.h\"\nnamespace lib {\nstd::string Cat (int a, int b) { return Cat (a) + Cat (b); }\n}\n");
+        d.write("use.cpp", "#include \"cat.h\"\nstd::string use () { return lib::Cat (1, 2) + lib::Cat (3); }\n");
+        let s = Session::open(&d.0, Options::default());
+        let g = &s.graph;
+        let mut calls: Vec<(String, u32, bool)> = g
+            .find("use")
+            .iter()
+            .flat_map(|&c| g.refs_from(c))
+            .map(|e| (g.file_path(g.syms[e.other as usize].file).to_string(), g.syms[e.other as usize].line, !e.ambiguous()))
+            .collect();
+        calls.sort();
+        calls.dedup();
+        assert_eq!(calls, [("cat.cpp".to_string(), 3, true), ("cat.h".to_string(), 4, true)]);
+    }
+
+    #[test]
     fn a_method_of_a_class_that_is_an_alias_in_another_reading_is_one_reading() {
         let d = Dir::new("aliased-class");
         d.write("view.h", "#include <string_view>\nnamespace lib {\n#ifdef USE_STD_VIEW\nusing view = std::string_view;\n#else\nclass view {\n public:\n  view () {}\n  view (const char* p) : p_ (p) {}\n  int size () const { return 0; }\n private:\n  const char* p_;\n};\n#endif\nclass Kept {\n public:\n  int count () const { return 1; }\n};\n}\n");
