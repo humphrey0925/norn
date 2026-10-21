@@ -1392,6 +1392,101 @@ pub fn top_commas(args: &[u8]) -> Vec<usize> {
     out
 }
 
+/// C++: a macro written as a whole parameter of a template
+/// (`template <class T, REQUIRES ("...", std::is_convertible<T*, U*>)>`,
+/// an `enable_if` made by a macro), made `class` and spaces for the parser,
+/// which can make nothing of it and loses the class it is in. Such a use is
+/// a name in capitals with arguments: no type, template or value is.
+pub fn template_macros(masked: &mut [u8]) {
+    let n = masked.len();
+    let word = |s: &[u8], i: usize| i < s.len() && is_ident(s[i]);
+    let mut i = 0;
+    while let Some(at) = masked[i..].windows(8).position(|w| w == b"template") {
+        let at = i + at;
+        i = at + 8;
+        if at > 0 && word(masked, at - 1) || word(masked, i) {
+            continue;
+        }
+        let mut j = i;
+        while j < n && masked[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if masked.get(j) != Some(&b'<') {
+            continue;
+        }
+        // The parameters, one at a time, at the top of the list.
+        let (mut angle, mut paren) = (1, 0);
+        let mut start = Some(j + 1);
+        j += 1;
+        while j < n && angle > 0 {
+            let b = masked[j];
+            if let Some(s) = start.filter(|_| paren == 0 && angle == 1) {
+                if s == j && b.is_ascii_whitespace() {
+                    start = Some(j + 1);
+                    j += 1;
+                    continue;
+                }
+                if s == j && b.is_ascii_uppercase() {
+                    let mut e = j;
+                    while e < n && is_ident(masked[e]) {
+                        e += 1;
+                    }
+                    let caps = masked[j..e].iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == b'_') && e - j > 1;
+                    let mut k = e;
+                    while k < n && masked[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                    if caps && masked.get(k) == Some(&b'(') {
+                        // To its closing parenthesis, strings and all.
+                        let mut depth = 0;
+                        let mut m = k;
+                        while m < n {
+                            match masked[m] {
+                                b'"' | b'\'' => {
+                                    let q = masked[m];
+                                    m += 1;
+                                    while m < n && masked[m] != q {
+                                        m += 1 + (masked[m] == b'\\') as usize;
+                                    }
+                                }
+                                b'(' => depth += 1,
+                                b')' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            m += 1;
+                        }
+                        if m < n && m + 1 - j >= 5 {
+                            for (o, c) in masked[j..=m].iter_mut().enumerate() {
+                                *c = if o < 5 { b"class"[o] } else if c.is_ascii_whitespace() { *c } else { b' ' };
+                            }
+                            j = m + 1;
+                            start = None;
+                            continue;
+                        }
+                    }
+                }
+                start = None;
+            }
+            match b {
+                b'(' | b'[' | b'{' => paren += 1,
+                b')' | b']' | b'}' => paren -= 1,
+                b'<' if paren == 0 => angle += 1,
+                b'>' if paren == 0 => angle -= 1,
+                b',' if paren == 0 && angle == 1 => start = Some(j + 1),
+                b';' => break,
+                _ => {}
+            }
+            j += 1;
+        }
+        i = i.max(j);
+    }
+}
+
 /// The parameters (of the first 64) `body` names only right after `##`,
 /// after `#`, or as a whole argument of another macro, as bits, with
 /// those it hands on (see `Define::pasted`).
@@ -2768,6 +2863,17 @@ pub fn defines_of(src: &[u8], conditions: &Conditions, path: Option<&str>) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_macro_written_as_a_template_parameter_is_a_class_to_the_parser() {
+        let mut text = b"template<class T, REQUIRES(\"T is a Token\", std::is_convertible<T*, const Token*> )>\nstatic T *at(T *tok);\ntemplate <typename U, int N = MAX(1, 2)> struct A;".to_vec();
+        template_macros(&mut text);
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.starts_with("template<class T, class "), "{text}");
+        assert!(text.contains(" >\nstatic T *at"), "{text}");
+        // (Not a default value.)
+        assert!(text.ends_with("int N = MAX(1, 2)> struct A;"), "{text}");
+    }
 
     #[test]
     fn an_argument_pasted_onto_a_name_is_no_reference_of_its_own() {

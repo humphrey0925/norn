@@ -437,8 +437,11 @@ impl Extractor {
     /// asked about discards what it did then. Says whether they were.
     pub fn extract_reusing(&mut self, path: &str, src: &[u8], transparent: &MacroSets, reuse: &dyn Fn(u64) -> Option<FileFacts>) -> (FileFacts, bool) {
         let t = std::time::Instant::now();
-        let lexed = mask::lex_file(src, transparent, Some(path));
+        let mut lexed = mask::lex_file(src, transparent, Some(path));
         let cpp = is_cpp(path, src);
+        if cpp {
+            mask::template_macros(&mut lexed.masked);
+        }
         let key = lexed.key(src, cpp);
         if let Some(saved) = reuse(key) {
             let same = saved.lex_key == key
