@@ -1631,7 +1631,7 @@ fn expand_file(
     for (i, r) in f.refs.iter().enumerate() {
         if let Some(v) = variants.get(&r.scope) {
             for &(scope, _) in &v[1..] {
-                out.refs.push(Ref { scope, ..*r });
+                out.refs.push(Ref { scope, ..r });
                 if let Some(&h) = hinted.get(&(i as u32)) {
                     out.ref_hints.push((out.refs.len() as u32 - 1, h));
                 }
@@ -1849,9 +1849,7 @@ fn expand_file(
         defs.push(out.defs[old as usize]);
     }
     out.defs = defs;
-    for r in &mut out.refs {
-        r.scope = new_index[r.scope as usize];
-    }
+    out.refs.map_scopes(|scope| new_index[scope as usize]);
     for b in &mut out.binds {
         b.scope = new_index[b.scope as usize];
     }

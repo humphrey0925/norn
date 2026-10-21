@@ -1566,7 +1566,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     counts[ambiguous as usize] += 1;
                     let meta = pack_meta(r.line, ambiguous, refkind::CALL);
                     edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta]));
-                    convert(ri, r, &tmp, ambiguous, &mut lineage, &mut edges);
+                    convert(ri, &r, &tmp, ambiguous, &mut lineage, &mut edges);
                     continue;
                 }
                 let (kind, maybe) = (r.kind & !refkind::MAYBE, r.kind & refkind::MAYBE != 0);
@@ -1976,7 +1976,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     syms[c as usize].kind == kind::FUNCTION && !g.syms_named(syms[c as usize].name).iter().any(|d| seen(d) && cpp.class(*d) == cpp.class(c))
                 });
                 if in_cpp && edge_kind != refkind::USE && !hidden {
-                    convert(ri, r, &tmp, ambiguous, &mut lineage, &mut edges);
+                    convert(ri, &r, &tmp, ambiguous, &mut lineage, &mut edges);
                 }
                 // A virtual method called on an object may run an override:
                 // those of the classes derived from its class.

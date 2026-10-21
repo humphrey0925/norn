@@ -9,8 +9,9 @@ fn main() {
     let mut ex = si_core::extract::Extractor::new();
     let f = si_core::extract_file(&mut ex, &root, &root.join(&rel), &sets);
     let name = |i: u32| if i == NONE { "-" } else { f.name(i as usize) };
+    let refs: Vec<_> = f.refs.iter().collect();
     for &(r, h) in &f.ref_hints {
-        let (r, h) = (&f.refs[r as usize], &f.hints[h as usize]);
+        let (r, h) = (&refs[r as usize], &f.hints[h as usize]);
         let path: Vec<&str> = f.hint_path[h.path as usize..(h.path + h.len) as usize].iter().map(|&m| name(m)).collect();
         println!("ref {}:{} kind {} <- root {} {} path {:?}", r.line, name(r.name), r.kind, h.root_kind, name(h.root), path);
     }

@@ -229,6 +229,140 @@ pub struct Ref {
     pub kind: u8,
 }
 
+/// A file's references, packed: per reference, LEB128 varints of its name,
+/// of its line and its scope as zigzagged steps from the reference before,
+/// and its kind. They are only ever read in order, and most are a name
+/// below 16384 a few lines from the last: about 5 bytes rather than 16.
+/// Serialized as the `Vec<Ref>` it stands for.
+#[derive(Clone, Debug, Default)]
+pub struct Refs {
+    bytes: Vec<u8>,
+    len: u32,
+    last: (u32, u32),
+}
+
+fn put_varint(out: &mut Vec<u8>, mut v: u32) {
+    while v >= 0x80 {
+        out.push(v as u8 | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+fn get_varint(bytes: &[u8], pos: &mut usize) -> u32 {
+    let (mut v, mut shift) = (0u32, 0);
+    loop {
+        let b = bytes[*pos];
+        *pos += 1;
+        v |= ((b & 0x7f) as u32) << shift;
+        if b < 0x80 {
+            return v;
+        }
+        shift += 7;
+    }
+}
+
+fn zigzag(from: u32, to: u32) -> u32 {
+    let d = to.wrapping_sub(from) as i32;
+    ((d << 1) ^ (d >> 31)) as u32
+}
+
+fn unzigzag(from: u32, z: u32) -> u32 {
+    from.wrapping_add(((z >> 1) as i32 ^ -((z & 1) as i32)) as u32)
+}
+
+impl Refs {
+    pub fn push(&mut self, r: Ref) {
+        put_varint(&mut self.bytes, r.name);
+        put_varint(&mut self.bytes, zigzag(self.last.0, r.line));
+        put_varint(&mut self.bytes, zigzag(self.last.1, r.scope));
+        self.bytes.push(r.kind);
+        self.last = (r.line, r.scope);
+        self.len += 1;
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn iter(&self) -> RefIter<'_> {
+        RefIter { bytes: &self.bytes, pos: 0, last: (0, 0), left: self.len as usize }
+    }
+
+    /// Each reference's scope through `f`.
+    pub fn map_scopes(&mut self, f: impl Fn(u32) -> u32) {
+        let old = std::mem::take(self);
+        self.bytes.reserve(old.bytes.len());
+        for r in old.iter() {
+            self.push(Ref { scope: f(r.scope), ..r });
+        }
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        self.bytes.shrink_to_fit();
+    }
+
+    pub fn heap_bytes(&self) -> usize {
+        self.bytes.capacity()
+    }
+}
+
+pub struct RefIter<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    last: (u32, u32),
+    left: usize,
+}
+
+impl Iterator for RefIter<'_> {
+    type Item = Ref;
+
+    fn next(&mut self) -> Option<Ref> {
+        if self.pos == self.bytes.len() {
+            return None;
+        }
+        let name = get_varint(self.bytes, &mut self.pos);
+        let line = unzigzag(self.last.0, get_varint(self.bytes, &mut self.pos));
+        let scope = unzigzag(self.last.1, get_varint(self.bytes, &mut self.pos));
+        let kind = self.bytes[self.pos];
+        self.pos += 1;
+        self.last = (line, scope);
+        self.left -= 1;
+        Some(Ref { name, line, scope, kind })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+/// Serializers such as bincode's need the length before the elements.
+impl ExactSizeIterator for RefIter<'_> {}
+
+impl FromIterator<Ref> for Refs {
+    fn from_iter<I: IntoIterator<Item = Ref>>(iter: I) -> Refs {
+        let mut refs = Refs::default();
+        iter.into_iter().for_each(|r| refs.push(r));
+        refs
+    }
+}
+
+impl Serialize for Refs {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(self.iter())
+    }
+}
+
+impl<'de> Deserialize<'de> for Refs {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Refs, D::Error> {
+        Ok(Vec::<Ref>::deserialize(d)?.into_iter().collect())
+    }
+}
+
 /// Everything extracted from a single file. Depends only on that file's
 /// content and the transparent-macro set, so it can be produced in parallel
 /// and cached by (content hash, set digest).
@@ -256,7 +390,7 @@ pub struct FileFacts {
     pub discards_asked: Vec<(u32, u64)>,
     names: Names,
     pub defs: Vec<Def>,
-    pub refs: Vec<Ref>,
+    pub refs: Refs,
     /// `#include` operands as written, as file-local name ids.
     pub includes: Vec<u32>,
     /// For each of them, whether it is under an `#if` (other than the
@@ -574,7 +708,7 @@ impl FileFacts {
         }
         exact(&mut self.names.off);
         exact(&mut self.defs);
-        exact(&mut self.refs);
+        self.refs.shrink_to_fit();
         exact(&mut self.includes);
         exact(&mut self.include_conditional);
         exact(&mut self.inactive);
@@ -635,7 +769,7 @@ impl FileFacts {
         let records = of(&self.records) + self.records.iter().map(|r| of(&r.fields) + of(&r.types) + of(&r.defs)).sum::<usize>();
         [
             ("names", self.names_bytes()),
-            ("refs", of(&self.refs)),
+            ("refs", self.refs.heap_bytes()),
             ("defs", of(&self.defs)),
             ("sites", of(&self.sites) + of(&self.inits)),
             ("macros", of(&self.macros) + of(&self.defined_names)),
@@ -702,4 +836,31 @@ impl EdgeHalf {
 
 pub fn pack_meta(line: u32, ambiguous: bool, kind: u8) -> u32 {
     (line << 4) | ((ambiguous as u32) << 3) | kind as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refs_read_back_as_written_and_save_as_a_vec() {
+        let refs = vec![
+            Ref { name: 0, line: 10, scope: 0, kind: refkind::CALL },
+            Ref { name: 70000, line: 3, scope: 5, kind: refkind::USE },
+            Ref { name: 1, line: u32::MAX, scope: NONE, kind: 0xff },
+            Ref { name: u32::MAX, line: 0, scope: 0, kind: 0 },
+        ];
+        let packed: Refs = refs.iter().copied().collect();
+        assert_eq!(packed.len(), refs.len());
+        let back: Vec<Ref> = packed.iter().collect();
+        let key = |r: &Ref| (r.name, r.line, r.scope, r.kind);
+        assert_eq!(back.iter().map(key).collect::<Vec<_>>(), refs.iter().map(key).collect::<Vec<_>>());
+        let bytes = bincode::serialize(&packed).unwrap();
+        assert_eq!(bytes, bincode::serialize(&refs).unwrap());
+        let again: Refs = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(again.iter().map(|r| key(&r)).collect::<Vec<_>>(), refs.iter().map(key).collect::<Vec<_>>());
+        let mut moved = packed.clone();
+        moved.map_scopes(|s| if s == NONE { s } else { s + 1 });
+        assert_eq!(moved.iter().map(|r| r.scope).collect::<Vec<_>>(), vec![1, 6, NONE, 1]);
+    }
 }
