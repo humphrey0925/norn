@@ -122,6 +122,10 @@ pub struct Site {
     /// The definition this use names (`NAME (a, b) (void) { }`), or `NONE`.
     pub def: u32,
     pub flags: u8,
+    /// C++: the class whose body the use is in, as `Outer::Inner`, or
+    /// `NONE`: the functions its expansion writes are that class's
+    /// (gmock's `MOCK_METHOD`).
+    pub class: u32,
 }
 
 /// A function stored where a call can later find it: in a struct member or
@@ -253,7 +257,7 @@ pub struct FileFacts {
     pub lex_key: u64,
     /// The macros asked what arguments they discard (by name, as numbered
     /// in this file), and the answers, sorted.
-    pub discards_asked: Vec<(u32, u64)>,
+    pub discards_asked: Vec<(u32, u64, u64)>,
     names: Names,
     pub defs: Vec<Def>,
     pub refs: Vec<Ref>,

@@ -441,7 +441,11 @@ impl Extractor {
         let cpp = is_cpp(path, src);
         let key = lexed.key(src, cpp);
         if let Some(saved) = reuse(key) {
-            let same = saved.lex_key == key && saved.discards_asked.iter().all(|&(n, d)| transparent.discards(saved.name(n as usize).as_bytes()) == d);
+            let same = saved.lex_key == key
+                && saved.discards_asked.iter().all(|&(n, d, p)| {
+                    let name = saved.name(n as usize).as_bytes();
+                    transparent.discards(name) == d && transparent.pasted(name) == p
+                });
             if same {
                 return (saved.rebased(path.to_string()), true);
             }
@@ -1514,7 +1518,8 @@ impl<'a> Walk<'a> {
                     let flags = s.flags | if self.in_fn() && !top { site::IN_FN } else { 0 };
                     let def = self.site_defs[&site_def_at(s)];
                     let scope = if top && def == NONE { 0 } else { self.scope.map_or(0, |s| s.def) };
-                    self.out.sites.push(Site { name, args, line: s.name.line, scope, def, flags });
+                    let class = if self.cpp { self.class_at(s.name.start as usize).map_or(NONE, |c| self.intern_str(&self.classes[c].chain.clone())) } else { NONE };
+                    self.out.sites.push(Site { name, args, line: s.name.line, scope, def, flags, class });
                     let (open, close) = (s.init.0 as usize, s.init.1 as usize);
                     if close > open && close - open <= MAX_INIT_TEXT {
                         let type_name = self.intern(&self.orig[s.init_type.0 as usize..s.init_type.1 as usize]);
@@ -2415,14 +2420,26 @@ impl<'a> Walk<'a> {
                         }
                         // A macro's arguments it does not use: not compiled.
                         let discards = self.sets.discards(self.text(f));
+                        let pasted = self.sets.pasted(self.text(f));
                         let asked = self.intern(self.text(f));
-                        self.out.discards_asked.push((asked, discards));
-                        if discards != 0 {
+                        self.out.discards_asked.push((asked, discards, pasted));
+                        if discards | pasted != 0 {
                             if let Some(args) = node.child_by_field_id(ids.f_arguments) {
                                 let mut c = args.walk();
                                 let list: Vec<Node<'a>> = args.named_children(&mut c).filter(|a| !a.is_extra()).collect();
-                                for (_, a) in list.into_iter().enumerate().filter(|(i, _)| *i < 64 && discards & 1 << i != 0) {
-                                    self.quiet.push((a.start_byte(), a.end_byte()));
+                                for (i, a) in list.into_iter().enumerate().filter(|(i, _)| *i < 64) {
+                                    if discards & 1 << i != 0 {
+                                        self.quiet.push((a.start_byte(), a.end_byte()));
+                                    } else if pasted & 1 << i != 0 {
+                                        // (Its first name is part of another.)
+                                        let mut first = a;
+                                        while let Some(c) = first.child(0) {
+                                            first = c;
+                                        }
+                                        if first.kind_id() == ids.identifier {
+                                            self.quiet.push((first.start_byte(), first.end_byte()));
+                                        }
+                                    }
                                 }
                             }
                         }

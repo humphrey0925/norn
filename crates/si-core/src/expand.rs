@@ -1084,22 +1084,44 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
     let mut storage = 0u8;
     // In a `typedef`: what it names is a type, whatever follows.
     let mut typedef = false;
-    // The function whose body, written in the expansion, is being read.
+    // The function whose body, written in the expansion, is being read,
+    // and the depth of braces its body ends at.
     let mut owner: Option<String> = None;
+    let mut owner_depth = 0;
+    // C++: the classes whose bodies the expansion writes (gtest's `TEST`
+    // makes one, gmock's `ACTION_P` one inside another), each with the
+    // depth of braces in it; and one named, its body not yet open.
+    let mut classes: Vec<(String, i32)> = Vec::new();
+    let mut naming: Option<String> = None;
+    // A constructor's initializers, up to its body: calls, not members.
+    let mut initializers_end = 0;
     for i in 0..n {
         let t = &toks[i];
         if t.k == K::Punct {
             match &*t.text {
                 "(" => paren += 1,
                 ")" => paren -= 1,
-                "{" => brace += 1,
-                "}" => {
-                    brace -= 1;
-                    if brace == 0 {
-                        owner = None;
+                "{" => {
+                    brace += 1;
+                    if let Some(class) = naming.take().filter(|_| paren == 0) {
+                        classes.push((class, brace));
                     }
                 }
-                ";" if paren == 0 && brace == 0 => (storage, typedef) = (0, false),
+                "}" => {
+                    brace -= 1;
+                    if brace == owner_depth {
+                        owner = None;
+                    }
+                    while classes.last().is_some_and(|c| c.1 > brace) {
+                        classes.pop();
+                    }
+                }
+                ";" if paren == 0 => {
+                    naming = None;
+                    if brace == 0 {
+                        (storage, typedef) = (0, false);
+                    }
+                }
                 _ => {}
             }
             continue;
@@ -1149,6 +1171,9 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
                 j += 1;
             }
         }
+        if cpp && paren == 0 && matches!(&*t.text, "class" | "struct") && toks.get(i + 1).is_some_and(|x| x.k == K::Ident) {
+            naming = Some(toks[i + 1].text.to_string());
+        }
         if is_keyword(t.text.as_bytes()) {
             continue;
         }
@@ -1156,6 +1181,57 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
         let next = toks.get(i + 1);
         let next_is = |s: &str| next.is_some_and(|x| x.is(s));
         let name = || t.text.to_string();
+        // C++: a member written in the body of a class the expansion makes
+        // (a constructor, `~` a destructor, a method), named with its
+        // classes: defined where a body, a constructor's initializers or
+        // `= default` follow it.
+        if cpp && paren == 0 && next_is("(") && i >= initializers_end && classes.last().is_some_and(|c| c.1 == brace) {
+            let dtor = prev.is_some_and(|p| p.is("~"));
+            let placed = prev.is_none_or(|p| dtor || decl_prev(p) || [";", "{", "}", ":", "&", "&&", ">", "*"].iter().any(|s| p.is(s)));
+            let not_member = matches!(
+                &*t.text,
+                "static_assert" | "decltype" | "alignas" | "alignof" | "noexcept" | "throw" | "new" | "delete" | "typeid" | "operator" | "requires"
+            );
+            if placed && !not_member {
+                let mut depth = 0;
+                let close = toks[i + 1..].iter().position(|x| {
+                    depth += x.is("(") as i32 - x.is(")") as i32;
+                    depth == 0
+                });
+                let mut after = close.map(|c| i + 2 + c);
+                while let Some(a) = after.filter(|&a| toks.get(a).is_some_and(|x| (x.k == K::Ident && matches!(&*x.text, "const" | "override" | "final" | "noexcept" | "volatile")) || x.is("&") || x.is("&&"))) {
+                    after = Some(a + 1);
+                }
+                let at = |k: usize, s: &str| toks.get(k).is_some_and(|x| x.is(s));
+                let body = after.is_some_and(|a| at(a, "{") || at(a, ":"));
+                let defaulted = after.is_some_and(|a| at(a, "=") && at(a + 1, "default"));
+                let declared = after.is_some_and(|a| at(a, ";") || at(a, "="));
+                if body || defaulted || declared {
+                    let mut parts: Vec<&str> = classes.iter().map(|c| c.0.as_str()).collect();
+                    let own = if dtor { format!("~{}", t.text) } else { name() };
+                    parts.push(&own);
+                    let qualified = parts.join("::");
+                    found.decls.push((qualified.clone(), kind::FUNCTION, if body || defaulted { 0 } else { flag::DECL }));
+                    if body {
+                        owner = Some(qualified);
+                        owner_depth = brace;
+                        // (Its body opens after `)` or `}`, `a{1}` being an
+                        // initializer; or at once, where the initializers
+                        // came to nothing.)
+                        if let Some(a) = after.filter(|&a| at(a, ":")) {
+                            let mut depth = 0;
+                            initializers_end = (a + 1..n)
+                                .find(|&k| {
+                                    depth += toks[k].is("(") as i32 - toks[k].is(")") as i32;
+                                    depth == 0 && toks[k].is("{") && (toks[k - 1].is(")") || toks[k - 1].is("}") || k == a + 1)
+                                })
+                                .unwrap_or(n);
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
         if cpp && next_is("(") && t.origin != Origin::Site {
             let mut depth = 0;
             let close = toks[i + 1..].iter().position(|x| {
@@ -1201,6 +1277,7 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
             found.decls.push((parts.join("::"), kind::FUNCTION, if defined { 0 } else { flag::DECL }));
             if after.is_some_and(|a| a.is("{")) {
                 owner = Some(parts.join("::"));
+                owner_depth = 0;
             }
             continue;
         }
@@ -1254,6 +1331,7 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
                 // A body written out in the expansion: what it calls, it calls.
                 if after.is_some_and(|a| a.is("{")) {
                     owner = Some(name());
+                    owner_depth = 0;
                 }
                 continue;
             }
@@ -1514,6 +1592,12 @@ struct Made {
     /// The first of the scopes the use is expanded for; declarations are
     /// taken from that one only.
     first: bool,
+    /// The class whose body the use is in (`Site::class`).
+    class: u32,
+    /// The references some of its expansions make and others do not: each
+    /// is one reading (another definition of a name, another branch of a
+    /// `COND_CODE`), so they are not certain.
+    partial: FxHashSet<(String, u8)>,
     found: Found,
     /// The initialized objects the expansions declare: each its type's
     /// name and the names in the initializer.
@@ -1665,9 +1749,17 @@ fn expand_file(
                     // Each expansion read once, as it is made; what they
                     // find together kept once.
                     let mut known = FxHashSet::default();
-                    let mut together = Made { line: s.line, scope, maybe, first: i == 0, found: Found::default(), stored: Vec::new() };
+                    let mut together = Made { line: s.line, scope, maybe, first: i == 0, class: s.class, partial: FxHashSet::default(), found: Found::default(), stored: Vec::new() };
+                    // What every expansion refers to, and what any does.
+                    let (mut every, mut any): (Option<FxHashSet<(String, u8)>>, FxHashSet<(String, u8)>) = (None, FxHashSet::default());
                     let novel = |exp: &[T]| {
                         let mut found = recognise(exp, s, macro_name, f.cpp());
+                        let here: FxHashSet<(String, u8)> = found.refs.iter().map(|r| (r.0.clone(), r.1)).collect();
+                        every = Some(match every.take() {
+                            None => here.clone(),
+                            Some(e) => e.intersection(&here).cloned().collect(),
+                        });
+                        any.extend(here);
                         let new = found.novel_in(&mut known);
                         // A use that names a definition: what else it makes,
                         // and what that calls; not its own name (a call of
@@ -1687,6 +1779,8 @@ fn expand_file(
                         new
                     };
                     engines[*ei].variants(&toks, pinned, false, novel);
+                    let every = every.unwrap_or_default();
+                    together.partial = any.into_iter().filter(|r| !every.contains(r)).collect();
                     if !together.found.is_empty() || !together.stored.is_empty() {
                         fruitful = true;
                         made.push(together);
@@ -1717,6 +1811,8 @@ fn expand_file(
     let mut seen_binds: FxHashSet<Bind> = FxHashSet::default();
     for m in made {
         for (n, kind, flags) in m.found.decls {
+            // Written in a class's body: a member of it.
+            let n = if kind == kind::FUNCTION && m.class != NONE { format!("{}::{n}", f.name(m.class as usize)) } else { n };
             // (Known to the uses inside it by its whole name, `A::f`.)
             let whole = names.id(&mut out, &n);
             let (name, classes) = names.member(&mut out, &n);
@@ -1758,7 +1854,8 @@ fn expand_file(
             // the macro may not be defined says only that neither may be.
             let made = owner.and_then(|o| made_here.get(&(names.id(&mut out, &o), m.line)).copied());
             let scope = made.unwrap_or(m.scope);
-            let kind = kind | if m.maybe && made.is_none() { refkind::MAYBE } else { 0 };
+            let partial = m.partial.contains(&(n.clone(), kind));
+            let kind = kind | if (m.maybe || partial) && made.is_none() { refkind::MAYBE } else { 0 };
             if seen_refs.insert((name, m.line, scope, kind)) {
                 out.refs.push(Ref { name, line: m.line, scope, kind });
             }
@@ -2405,7 +2502,7 @@ mod tests {
 
     #[test]
     fn a_qualified_name_after_else_or_an_operator_is_called_not_defined() {
-        let s = Site { name: 0, args: NONE, line: 1, scope: 0, def: NONE, flags: 0 };
+        let s = Site { name: 0, args: NONE, line: 1, scope: 0, def: NONE, flags: 0, class: NONE };
         let decls = |src: &str| -> Vec<String> {
             recognise(&tokenize(src.as_bytes(), Origin::Body), &s, "M", true).decls.into_iter().map(|d| d.0).collect()
         };
@@ -2421,10 +2518,26 @@ mod tests {
     }
 
     #[test]
+    fn members_written_in_a_class_an_expansion_makes() {
+        let s = Site { name: 0, args: NONE, line: 1, scope: 0, def: NONE, flags: site::TOP, class: NONE };
+        let decls = |src: &str| -> Vec<(String, u8)> {
+            recognise(&tokenize(src.as_bytes(), Origin::Body), &s, "M", true).decls.into_iter().filter(|d| d.1 == kind::FUNCTION).map(|d| (d.0, d.2)).collect()
+        };
+        // gmock's `MATCHER_P`.
+        let got = decls("template <typename p0_type> class IsMatcherP : public ::testing::internal::MatcherBaseImpl<IsMatcherP<p0_type>> { public: using IsMatcherP::MatcherBaseImpl::MatcherBaseImpl; template <typename arg_type> class gmock_Impl : public ::testing::MatcherInterface<const arg_type&> { public: explicit gmock_Impl(p0_type gmock_p0) : p0(::std::forward<p0_type>(gmock_p0)) {} bool MatchAndExplain(const arg_type& arg, ::testing::MatchResultListener* result_listener) const override; void DescribeTo(::std::ostream* gmock_os) const override { *gmock_os << FormatDescription(false); } const p0_type p0; private: ::std::string FormatDescription(bool negation) const { return d(negation); } }; };");
+        let names: Vec<&str> = got.iter().map(|d| d.0.as_str()).collect();
+        assert_eq!(names, ["IsMatcherP::gmock_Impl::gmock_Impl", "IsMatcherP::gmock_Impl::MatchAndExplain", "IsMatcherP::gmock_Impl::DescribeTo", "IsMatcherP::gmock_Impl::FormatDescription"], "{got:?}");
+        // cppcheck's `REGISTER_TEST`: the base's constructor is called, not defined.
+        let got = decls("namespace { class TestCondInstance : public TestInstance { public: TestCondInstance() : TestInstance(\"TestCond\") {} TestFixture* create() override { return new TestCond; } }; }");
+        let names: Vec<&str> = got.iter().map(|d| d.0.as_str()).collect();
+        assert_eq!(names, ["TestCondInstance::TestCondInstance", "TestCondInstance::create"]);
+    }
+
+    #[test]
     fn a_typedef_declares_no_function() {
         // The kernel's `BPF_CALL_x`: a function pointer type, then the
         // function.
-        let s = Site { name: 0, args: NONE, line: 1, scope: 0, def: NONE, flags: 0 };
+        let s = Site { name: 0, args: NONE, line: 1, scope: 0, def: NONE, flags: 0, class: NONE };
         let found = recognise(&tokenize(b"typedef u64 (*btf_f) (u32 a); u64 f (u64 a);", Origin::Body), &s, "M", false);
         let functions: Vec<&str> = found.decls.iter().filter(|d| d.1 == kind::FUNCTION).map(|d| d.0.as_str()).collect();
         assert_eq!(functions, ["f"]);
@@ -2440,6 +2553,12 @@ mod tests {
             ("STR", "(x) #x", true),
             ("LOG", "(fmt, ...) printf (fmt, ## __VA_ARGS__)", true),
             ("SELF", " SELF + 1", false),
+            // gmock's `GMOCK_PP_IF`: a name made in an argument, then its
+            // arguments after it.
+            ("IF_0", "(a, b) b", true),
+            ("IF_1", "(a, b) a", true),
+            ("PICK_one", " picked", false),
+            ("CHOOSE", "(c) CAT (PICK_, CAT (IF_, c) (one, two))", true),
         ];
         let mut f = FileFacts::new("a.c".into());
         for (name, text, function_like) in macros {
@@ -2463,6 +2582,8 @@ mod tests {
             ("LOG (\"x\", 1, 2)", "printf ( \"\" , 1 , 2 )"),
             ("SELF", "SELF + 1"),
             ("CAT", "CAT"),
+            ("CHOOSE (1)", "picked"),
+            ("CHOOSE (0)", "PICK_two"),
         ] {
             let v = eng.variants(&tokenize(src.as_bytes(), Origin::Site), &Choice::default(), true, |_| true);
             assert_eq!(texts(&v[0].0), want, "{src}");
