@@ -218,7 +218,7 @@ fn test(line: &str, value: &dyn Fn(&str) -> Option<String>) -> Tri {
             let pair = rest
                 .strip_prefix('(')
                 .and_then(|r| r.strip_suffix(')'))
-                .and_then(|r| split_args(r))
+                .and_then(split_args)
                 .or_else(|| {
                     // `ifeq "a" "b"`
                     let q: Vec<&str> = rest.split(['"', '\'']).collect();
