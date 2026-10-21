@@ -573,7 +573,18 @@ impl Types<'_> {
         closure: &Closure,
         scratch: &mut Vec<u32>,
     ) -> Option<u32> {
-        let t = self.type_of(hint, fi, g, own, closure, scratch)?;
+        let t = self.type_of(hint, fi, g, own.clone(), closure, scratch);
+        // `SI_HINT_WHY=<member>`: what each call of it is found to be made on.
+        static WHY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        if WHY.get_or_init(|| std::env::var("SI_HINT_WHY").ok()).as_deref().is_some_and(|w| g.name(member) == w) {
+            let path: Vec<&str> = self.files[fi].hint_path[hint.path as usize..(hint.path + hint.len) as usize].iter().map(|&p| g.name(self.remap[fi][p as usize])).collect();
+            eprintln!("hintwhy   {}: root {} {} path {:?} -> type {:?}, layout {:?}", self.files[fi].path, hint.root_kind, g.name(self.remap[fi][hint.root as usize]), path, t.map(|t| g.name(t)), t.and_then(|t| self.layout_of(t, fi, closure)).map(|(rf, _)| &self.files[rf as usize].path));
+            if let Some((rf, ri)) = t.and_then(|t| self.layout_of(t, fi, closure)) {
+                let r = &self.files[rf as usize].records[ri as usize];
+                eprintln!("hintwhy     fields {:?}", r.fields.iter().map(|&x| if x == NONE { "-" } else { g.name(self.remap[rf as usize][x as usize]) }).collect::<Vec<_>>());
+            }
+        }
+        let t = t?;
         let (rf, ri) = self.layout_of(t, fi, closure)?;
         let (rf, ri, at) = self.find(rf, ri, member, closure, 8)?;
         let def = self.files[rf as usize].records[ri as usize].defs[at];
@@ -697,9 +708,17 @@ impl Types<'_> {
                 }
             }
             let element_type = || self.files[mf as usize].cxx().elems.iter().find(|e| e.0 == mi && e.1 == at as u32).map(|e| e.2);
+            // (Of `StrictMock<M> m`, a class that derives from its argument:
+            // `M`, whose members it has.)
+            let wrapped = || {
+                let t = r.types[at];
+                (t != NONE && self.cpp.wrappers.contains(&self.remap[mf as usize][t as usize]))
+                    .then(|| self.files[mf as usize].cxx().targs.iter().find(|e| e.0 == mi && e.1 == at as u32).map(|e| e.2))
+                    .flatten()
+            };
             let next = match of_element.then(element_type).flatten() {
                 Some(e) => e,
-                None => r.types[at],
+                None => wrapped().unwrap_or(r.types[at]),
             };
             if next == NONE {
                 return None;
@@ -770,6 +789,9 @@ struct Cpp {
     /// A macro -> what it passes its arguments on to: (the function or
     /// macro called, its qualifier, the parameter, the argument, `...`).
     forwards: FxHashMap<u32, Vec<(u32, u32, u32, u32, bool)>>,
+    /// The class templates that derive from a parameter of theirs
+    /// (`Cxx::param_bases`), by name.
+    wrappers: FxHashSet<u32>,
 }
 
 impl Cpp {
@@ -830,6 +852,7 @@ impl Cpp {
                 let qual = if w.qual == NONE { NONE } else { remap[fi][w.qual as usize] };
                 c.forwards.entry((base + w.def as usize) as u32).or_default().push((remap[fi][w.callee as usize], qual, w.param, w.arg, w.rest));
             }
+            c.wrappers.extend(f.cxx().param_bases.iter().map(|&n| remap[fi][n as usize]));
             for &(class, b) in &f.cxx().bases {
                 let (class, b) = (remap[fi][class as usize], remap[fi][b as usize]);
                 if class != b {
