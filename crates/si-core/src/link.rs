@@ -1054,14 +1054,39 @@ impl Cpp {
     /// not all do. (One whose parameters are not known takes any number.)
     /// Not for a declaration alone where definitions do not fit: that may
     /// be one the compiler writes (`T () = default;`), which the reader
-    /// would rather see the class's for.
-    fn by_arity(&self, n: Option<u8>, cands: &mut Vec<u32>, syms: &[Sym]) {
+    /// would rather see the class's for. Unless `all` (every symbol of the
+    /// name) has definitions of it that fit, of its class and namespace,
+    /// elsewhere: those (abseil's `StrCat (a, b)`, declared in `str_cat.h`
+    /// beside inline overloads of other arities, defined in `str_cat.cc`).
+    fn by_arity(&self, n: Option<u8>, cands: &mut Vec<u32>, all: &[u32], syms: &[Sym]) {
         let Some(n) = n else { return };
         let fits = |c: &u32| self.arity.get(c).is_none_or(|&(least, most)| least <= n && n <= most);
         let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
         let defs = cands.iter().any(is_def);
-        if cands.iter().any(|c| fits(c) && (is_def(c) || !defs)) && !cands.iter().all(fits) {
+        if cands.iter().all(fits) {
+            return;
+        }
+        if cands.iter().any(|c| fits(c) && (is_def(c) || !defs)) {
             cands.retain(fits);
+            return;
+        }
+        let Some(&decl) = cands.iter().find(|c| fits(c)) else { return };
+        let (class, ns) = (self.class(decl), self.ns(decl));
+        let elsewhere = |c: &&u32| {
+            let s = &syms[**c as usize];
+            s.kind == kind::FUNCTION
+                && is_def(c)
+                && s.flags & flag::STATIC == 0
+                && self.arity.contains_key(c)
+                && fits(c)
+                && self.class(**c) == class
+                && self.ns(**c) == ns
+                && !cands.contains(c)
+        };
+        let found: Vec<u32> = all.iter().filter(elsewhere).copied().collect();
+        if !found.is_empty() {
+            cands.retain(fits);
+            cands.extend(found);
         }
     }
 
@@ -1582,7 +1607,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     if class != NONE {
                         tmp.extend(g.syms_named(class).iter().copied().filter(|&c| ctor_of(c, class)));
                     }
-                    cpp.by_arity(args_of.get(&(ri as u32)).copied(), &mut tmp, syms);
+                    cpp.by_arity(args_of.get(&(ri as u32)).copied(), &mut tmp, &[], syms);
                     if copies.contains(&(ri as u32)) {
                         // A copy: by the constructor taking one of its class,
                         // or by the compiler's, which is no call here.
@@ -1758,7 +1783,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     tmp.retain(callable);
                 }
                 if in_cpp {
-                    cpp.by_arity(args_of.get(&(ri as u32)).copied(), &mut tmp, syms);
+                    cpp.by_arity(args_of.get(&(ri as u32)).copied(), &mut tmp, cands, syms);
                 }
                 let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
                 if tmp.iter().any(is_def) {
