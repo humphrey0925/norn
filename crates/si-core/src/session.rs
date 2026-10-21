@@ -1497,11 +1497,11 @@ int slow (void) { return 0; }
     }
 
     #[test]
-    fn a_plain_call_in_a_method_is_of_its_class_its_bases_or_a_static_one() {
+    fn a_plain_call_in_a_method_is_of_its_class_or_its_bases() {
         let d = Dir::new("plain-in-method");
         d.write("a.h", "class Handler {\n protected:\n  int Parse () { return 0; }\n};\ntypedef Handler Gen;\nclass Sink {\n public:\n  void Send (int);\n};\nstruct Adjuster {\n  static int Adjust (int);\n};\nstruct B {\n  B& operator= (const B&);\n};\nstruct D : B {};\n");
         d.write("a.cpp", "#include \"a.h\"\nvoid Sink::Send (int) {}\nint Adjuster::Adjust (int a) { return a; }\nB& B::operator= (const B&) { return *this; }\n");
-        d.write("t.cpp", "#include <gtest/gtest.h>\n#include \"a.h\"\nstruct Gen_A_Test : Gen { int ParseIt () { return Parse (); } };\nstruct Case : testing::Test {\n  void SendIt () { Send (1); Adjust (2); }\n};\nvoid assign () { D a, b; a = b; }\n");
+        d.write("t.cpp", "#include <gtest/gtest.h>\n#include \"a.h\"\nstruct Gen_A_Test : Gen { int ParseIt () { return Parse (); } };\nstruct Case : testing::Test {\n  void SendIt () {\n    Send (1);\n    Adjust (2);\n  }\n};\nvoid assign () { D a, b; a = b; }\n");
         let s = Session::open(&d.0, Options::default());
         let g = &s.graph;
         let q = crate::graph::Qualifier::new(g);
@@ -1514,9 +1514,9 @@ int slow (void) { return 0; }
         // A base through a typedef of it.
         assert_eq!(callees("ParseIt"), [("Handler::Parse".to_string(), true)]);
         // Not a method of a class it is none of (the base's, the library's),
-        // but a `static` one, called by its class's name in a way not read.
-        let case = callees("SendIt");
-        assert!(!case.iter().any(|c| c.0 == "Sink::Send") && case.iter().any(|c| c.0 == "Adjuster::Adjust"), "{case:?}");
+        // not even a `static` one, written so. (In what a macro writes there,
+        // it may be: called by its class's name in a way not read.)
+        assert_eq!(callees("SendIt"), []);
         // The class's own `operator=`, the compiler's, hides its base's.
         assert_eq!(callees("assign"), []);
     }
