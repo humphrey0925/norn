@@ -1790,15 +1790,17 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                         // that name.)
                         if pick.is_empty() && qual == NONE {
                             pick.extend_from_slice(cands);
-                            // (In a method, not one of another class, unless
+                            // (In a method, not one of another class; unless
                             // `static`, called by its class's name in a way
-                            // not read: `X<T>::f ()`.)
+                            // not read, in what a macro there writes, where
+                            // the method is too: `X<T>::f ()`.)
                             if cpp.class(base + r.scope) != NONE {
+                                let written = syms[(base + r.scope) as usize].line == r.line;
                                 let class_static = |c: u32| {
                                     let class = cpp.class(c);
                                     g.syms_named(syms[c as usize].name).iter().any(|&d| syms[d as usize].flags & flag::CLASS_STATIC != 0 && cpp.class(d) == class)
                                 };
-                                pick.retain(|&c| cpp.class(c) == NONE || class_static(c));
+                                pick.retain(|&c| cpp.class(c) == NONE || written && class_static(c));
                             }
                         }
                         in_sight(&pick, syms, base..end, closure, &sure.member, want, &mut tmp);
