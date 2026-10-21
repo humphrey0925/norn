@@ -533,6 +533,18 @@ fn record_of(
         .copied()
 }
 
+/// C++: `c` is a method of a class that its header has only in one reading,
+/// an alias in the other (abseil's `string_view`: the class, or
+/// `std::string_view`): a call of it is one reading of the call.
+fn aliased_class(g: &Graph, cpp: &Cpp, c: u32) -> bool {
+    let s = &g.syms[c as usize];
+    let class = cpp.class(c);
+    s.kind == kind::FUNCTION
+        && s.flags & flag::CONDITIONAL != 0
+        && class != NONE
+        && g.syms_named(class).iter().any(|&t| g.syms[t as usize].kind == kind::TYPEDEF && g.syms[t as usize].file == s.file)
+}
+
 /// The members of the struct called `name` as seen from `file`.
 fn layout<'a>(
     name: u32,
@@ -1435,7 +1447,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 cpp.conversions(&g, &aliases, given, targets, literals, lineage, &mut made);
                 for &(c, class) in &made {
                     let several = made.iter().any(|&(o, k)| k == class && syms[o as usize].file != syms[c as usize].file);
-                    edges.push([base + r.scope, c, pack_meta(r.line, ambiguous || several, refkind::CALL)]);
+                    edges.push([base + r.scope, c, pack_meta(r.line, ambiguous || several || aliased_class(&g, &cpp, c), refkind::CALL)]);
                 }
             };
             for (ri, r) in f.refs.iter().enumerate() {
@@ -1585,7 +1597,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                         continue;
                     }
                     let first = syms[tmp[0] as usize].file;
-                    let ambiguous = tmp.iter().any(|&c| syms[c as usize].file != first);
+                    let ambiguous = tmp.iter().any(|&c| syms[c as usize].file != first) || tmp.iter().all(|&c| aliased_class(&g, &cpp, c));
                     counts[ambiguous as usize] += 1;
                     let meta = pack_meta(r.line, ambiguous, refkind::CALL);
                     edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta]));
@@ -1905,7 +1917,8 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     let wraps = tmp.iter().any(function);
                     tmp.iter().filter(|c| !(wraps && wrappers.contains(c))).count() > 1
                 };
-                let ambiguous = several || maybe || guessed || tmp.iter().any(optional);
+                let twin = in_cpp && tmp.iter().all(|&c| aliased_class(&g, &cpp, c));
+                let ambiguous = several || maybe || guessed || twin || tmp.iter().any(optional);
                 counts[ambiguous as usize] += 1;
                 // `SI_EDGE_WHY=<name>[,<name>...]`: why each call of those names that is
                 // not certain is not.
