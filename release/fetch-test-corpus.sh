@@ -9,6 +9,6 @@ for f in bfd/opncls.c bfd/bfd-in2.h bfd/libbfd.c bfd/libbfd.h bfd/cache.c bfd/bf
   out="corpus/c-only/$f"
   [ -s "$out" ] && continue
   mkdir -p "$(dirname "$out")"
-  curl -fsSL --retry 3 -o "$out" "https://sourceware.org/git/?p=binutils-gdb.git;a=blob_plain;f=$f;hb=$commit"
+  curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o "$out" "https://sourceware.org/git/?p=binutils-gdb.git;a=blob_plain;f=$f;hb=$commit"
 done
 echo "corpus/c-only: $(find corpus/c-only -type f | wc -l) files"

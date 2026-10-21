@@ -133,6 +133,11 @@ jobs:
           node-version: 20
           cache: npm
           cache-dependency-path: vscode/package-lock.json
+      # The test corpus, as fetched once: sourceware.org is not always there.
+      - uses: actions/cache@v4
+        with:
+          path: corpus/c-only
+          key: test-corpus-${{ hashFiles('release/fetch-test-corpus.sh') }}
       - name: Prepare
         shell: bash
         run: |

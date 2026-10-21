@@ -54,6 +54,11 @@ jobs:
       - name: Extension dependencies
         working-directory: vscode
         run: npm ci
+      # The test corpus, as fetched once: sourceware.org is not always there.
+      - uses: actions/cache@v4
+        with:
+          path: corpus/c-only
+          key: test-corpus-${{ hashFiles('release/fetch-test-corpus.sh') }}
       - name: Test corpus
         shell: bash
         run: release/fetch-test-corpus.sh
