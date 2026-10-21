@@ -1497,6 +1497,31 @@ int slow (void) { return 0; }
     }
 
     #[test]
+    fn a_plain_call_in_a_method_is_of_its_class_its_bases_or_a_static_one() {
+        let d = Dir::new("plain-in-method");
+        d.write("a.h", "class Handler {\n protected:\n  int Parse () { return 0; }\n};\ntypedef Handler Gen;\nclass Sink {\n public:\n  void Send (int);\n};\nstruct Adjuster {\n  static int Adjust (int);\n};\nstruct B {\n  B& operator= (const B&);\n};\nstruct D : B {};\n");
+        d.write("a.cpp", "#include \"a.h\"\nvoid Sink::Send (int) {}\nint Adjuster::Adjust (int a) { return a; }\nB& B::operator= (const B&) { return *this; }\n");
+        d.write("t.cpp", "#include <gtest/gtest.h>\n#include \"a.h\"\nstruct Gen_A_Test : Gen { int ParseIt () { return Parse (); } };\nstruct Case : testing::Test {\n  void SendIt () { Send (1); Adjust (2); }\n};\nvoid assign () { D a, b; a = b; }\n");
+        let s = Session::open(&d.0, Options::default());
+        let g = &s.graph;
+        let q = crate::graph::Qualifier::new(g);
+        let callees = |caller: &str| -> Vec<(String, bool)> {
+            let mut v: Vec<(String, bool)> = g.find(caller).iter().flat_map(|&c| g.refs_from(c)).filter(|e| e.kind() == crate::model::refkind::CALL).map(|e| (q.name(g, e.other).into_owned(), !e.ambiguous())).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        // A base through a typedef of it.
+        assert_eq!(callees("ParseIt"), [("Handler::Parse".to_string(), true)]);
+        // Not a method of a class it is none of (the base's, the library's),
+        // but a `static` one, called by its class's name in a way not read.
+        let case = callees("SendIt");
+        assert!(!case.iter().any(|c| c.0 == "Sink::Send") && case.iter().any(|c| c.0 == "Adjuster::Adjust"), "{case:?}");
+        // The class's own `operator=`, the compiler's, hides its base's.
+        assert_eq!(callees("assign"), []);
+    }
+
+    #[test]
     fn a_method_of_a_class_another_source_file_keeps_is_out_of_sight() {
         let d = Dir::new("unseen-class");
         d.write("a.cpp", "class Fixture {\n public:\n  int GetParam () const { return 1; }\n  int Run () { return GetParam (); }\n};\n");

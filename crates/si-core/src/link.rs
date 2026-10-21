@@ -847,6 +847,7 @@ impl Cpp {
         }
         c.namespace_aliases.retain(|a, _| !opened.contains(a));
         c.namespaces.retain(|name| !c.types.contains(name));
+        let mut typedefs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
         for (fi, f) in files.iter().enumerate() {
             let base = g.files[fi].sym_start as usize;
             for &(def, chain, own) in &f.cxx().owners {
@@ -888,6 +889,25 @@ impl Cpp {
                     c.derived.entry(b).or_default().push(class);
                 }
             }
+            for &(alias, tag) in &f.aliases {
+                let (alias, tag) = (remap[fi][alias as usize], remap[fi][tag as usize]);
+                if alias != tag {
+                    typedefs.entry(alias).or_default().push(tag);
+                }
+            }
+        }
+        // A base named by a typedef is the class it names (yaml-cpp's
+        // `typedef HandlerTest GenEmitterTest;`, then
+        // `TEST_F(GenEmitterTest, ...)`).
+        let named: Vec<(u32, u32)> = c
+            .bases
+            .iter()
+            .flat_map(|(&class, bs)| bs.iter().flat_map(|b| typedefs.get(b).into_iter().flatten()).map(move |&t| (class, t)))
+            .filter(|&(class, t)| class != t)
+            .collect();
+        for (class, t) in named {
+            c.bases.entry(class).or_default().push(t);
+            c.derived.entry(t).or_default().push(class);
         }
         for v in c.bases.values_mut().chain(c.derived.values_mut()) {
             v.sort_unstable();
@@ -1537,8 +1557,13 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                             tmp.push(c);
                         }
                     };
+                    // (A class's own `operator=`, written or the compiler's,
+                    // hides its bases'.)
+                    let own = |l: u32, s: u32| {
+                        !assign || types.layout_of(l, fi, closure).is_some_and(|(rf, ri)| remap[rf as usize][files[rf as usize].records[ri as usize].name as usize] == cpp.class(s))
+                    };
                     for name in std::iter::once(name).chain(rewritten) {
-                        if let Some(sym) = lt.and_then(|l| types.class_member(l, name, fi, &g, closure)).filter(|&s| syms[s as usize].kind == kind::FUNCTION) {
+                        if let Some(sym) = lt.and_then(|l| types.class_member(l, name, fi, &g, closure).filter(|&s| own(l, s))).filter(|&s| syms[s as usize].kind == kind::FUNCTION) {
                             // The class's: its overloads, of a binary one those
                             // taking the right operand best.
                             let class = cpp.class(sym);
@@ -1765,6 +1790,16 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                         // that name.)
                         if pick.is_empty() && qual == NONE {
                             pick.extend_from_slice(cands);
+                            // (In a method, not one of another class, unless
+                            // `static`, called by its class's name in a way
+                            // not read: `X<T>::f ()`.)
+                            if cpp.class(base + r.scope) != NONE {
+                                let class_static = |c: u32| {
+                                    let class = cpp.class(c);
+                                    g.syms_named(syms[c as usize].name).iter().any(|&d| syms[d as usize].flags & flag::CLASS_STATIC != 0 && cpp.class(d) == class)
+                                };
+                                pick.retain(|&c| cpp.class(c) == NONE || class_static(c));
+                            }
                         }
                         in_sight(&pick, syms, base..end, closure, &sure.member, want, &mut tmp);
                         // `T (a)`, `T x (a)`: a class named is made, by its
