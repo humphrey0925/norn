@@ -2576,7 +2576,10 @@ impl<'a> Walk<'a> {
                     let def = if self.cpp && is_fn {
                         // A method, declared.
                         let class = self.class_at(node.start_byte());
-                        let flags = flag::DECL | if self.is_virtual(node) { flag::VIRTUAL } else { 0 };
+                        let mut flags = flag::DECL | if self.is_virtual(node) { flag::VIRTUAL } else { 0 };
+                        if self.storage_flags(node) & flag::STATIC != 0 {
+                            flags |= flag::CLASS_STATIC;
+                        }
                         let def = self.push_def(name, node, kind::FUNCTION, flags);
                         let scope = self.declared_scope(d);
                         self.note_owner(def, &scope, class, node.start_byte());
@@ -2626,7 +2629,9 @@ impl<'a> Walk<'a> {
                 };
                 if class.is_some() || !scope.is_empty() {
                     // A member: `static` says nothing of where it is seen.
-                    flags &= !flag::STATIC;
+                    if flags & flag::STATIC != 0 {
+                        flags = flags & !flag::STATIC | flag::CLASS_STATIC;
+                    }
                     if self.is_virtual(node) {
                         flags |= flag::VIRTUAL;
                     }
@@ -2807,7 +2812,9 @@ impl<'a> Walk<'a> {
                         let (class, scope) = if self.cpp { (self.class_at(node.start_byte()), self.declared_scope(d)) } else { (None, Vec::new()) };
                         let member = class.is_some() || !scope.is_empty();
                         if member {
-                            flags &= !flag::STATIC;
+                            if flags & flag::STATIC != 0 {
+                                flags = flags & !flag::STATIC | flag::CLASS_STATIC;
+                            }
                             if is_fn && self.is_virtual(node) {
                                 flags |= flag::VIRTUAL;
                             }

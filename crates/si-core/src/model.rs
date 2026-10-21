@@ -53,6 +53,9 @@ pub mod flag {
     /// A C++ method declared `virtual` (or `override`, `final`): a call of
     /// it may run an override.
     pub const VIRTUAL: u8 = 32;
+    /// A C++ member declared `static`: called by its class's name, from
+    /// anywhere, not only on an object of it.
+    pub const CLASS_STATIC: u8 = 64;
 }
 
 pub mod refkind {
