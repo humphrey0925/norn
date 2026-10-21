@@ -1345,7 +1345,11 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
             found.decls.push((name(), k, 0));
             continue;
         }
-        if !in_fn && paren == 0 && brace == 0 && prev.is_some_and(decl_prev) {
+        // C++: a function returning a template or a reference
+        // (`::testing::MockSpec<F> gmock_Name (...) const { }`, of gmock's
+        // `MOCK_METHOD`), where it is defined.
+        let returned = cpp && prev.is_some_and(|p| p.is(">") || p.is(">>") || p.is("&") || p.is("&&"));
+        if !in_fn && paren == 0 && brace == 0 && (prev.is_some_and(decl_prev) || returned) {
             // (`typedef u64 (*btf_name) (...)`, of the kernel's `BPF_CALL_x`:
             // no function `u64`.)
             if next_is("(") && !typedef {
@@ -1354,11 +1358,16 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
                     depth += x.is("(") as i32 - x.is(")") as i32;
                     depth == 0
                 });
-                let after = close.and_then(|c| toks.get(i + 2 + c));
+                // (After the parameters, in C++, `const` and the like.)
+                let qualifier = |x: &&T| cpp && (x.k == K::Ident && matches!(&*x.text, "const" | "override" | "final" | "noexcept" | "volatile") || x.is("&") || x.is("&&"));
+                let after = close.and_then(|c| toks[i + 2 + c..].iter().find(|x| !qualifier(x)));
                 let defined = match after {
                     Some(a) => a.is("{"),
                     None => s.flags & site::BRACE_FOLLOWS != 0,
                 };
+                if returned && !prev.is_some_and(decl_prev) && !defined {
+                    continue;
+                }
                 found.decls.push((name(), kind::FUNCTION, storage & flag::STATIC | if defined { 0 } else { flag::DECL }));
                 // A body written out in the expansion: what it calls, it calls.
                 if after.is_some_and(|a| a.is("{")) {
@@ -2584,6 +2593,20 @@ mod tests {
         let got = decls("namespace { class TestCondInstance : public TestInstance { public: TestCondInstance() : TestInstance(\"TestCond\") {} TestFixture* create() override { return new TestCond; } }; }");
         let names: Vec<&str> = got.iter().map(|d| d.0.as_str()).collect();
         assert_eq!(names, ["TestCondInstance::TestCondInstance", "TestCondInstance::create"]);
+    }
+
+    #[test]
+    fn a_function_returning_a_template_is_defined_where_its_body_follows() {
+        let s = Site { name: 0, args: NONE, line: 1, scope: 0, def: NONE, flags: site::TOP, class: NONE };
+        let decls = |src: &str, cpp: bool| -> Vec<(String, u8)> {
+            recognise(&tokenize(src.as_bytes(), Origin::Body), &s, "M", cpp).decls.into_iter().filter(|d| d.1 == kind::FUNCTION).map(|d| (d.0, d.2)).collect()
+        };
+        // gmock's `MOCK_METHOD`: the mocker, const and all.
+        assert_eq!(decls("::testing::MockSpec<F> gmock_Scalar (int a) const { return m.With (a); }", true), [("gmock_Scalar".to_string(), 0)]);
+        assert_eq!(decls("std::string& name () { return n; }", true), [("name".to_string(), 0)]);
+        // An object made at the top, not a function; and C's comparison.
+        assert!(decls("std::vector<int> v (10);", true).is_empty());
+        assert!(decls("int x = a > f (1);", false).is_empty());
     }
 
     #[test]
