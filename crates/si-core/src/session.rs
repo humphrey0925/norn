@@ -1478,6 +1478,22 @@ int slow (void) { return 0; }
     }
 
     #[test]
+    fn a_method_of_a_class_that_is_an_alias_in_another_reading_is_one_reading() {
+        let d = Dir::new("aliased-class");
+        d.write("view.h", "#include <string_view>\nnamespace lib {\n#ifdef USE_STD_VIEW\nusing view = std::string_view;\n#else\nclass view {\n public:\n  view () {}\n  view (const char* p) : p_ (p) {}\n  int size () const { return 0; }\n private:\n  const char* p_;\n};\n#endif\nclass Kept {\n public:\n  int count () const { return 1; }\n};\n}\n");
+        d.write("a.cpp", "#include \"view.h\"\nint use (const char* p) {\n  lib::view v (p);\n  lib::view w;\n  lib::Kept k;\n  return v.size () + w.size () + k.count ();\n}\n");
+        let s = Session::open(&d.0, Options::default());
+        let g = &s.graph;
+        let q = crate::graph::Qualifier::new(g);
+        let mut calls: Vec<(String, bool)> = g.find("use").iter().flat_map(|&c| g.refs_from(c)).filter(|e| e.kind() == crate::model::refkind::CALL).map(|e| (q.name(g, e.other).into_owned(), !e.ambiguous())).collect();
+        calls.sort();
+        calls.dedup();
+        // `std::string_view`'s where the alias is compiled: not certainly
+        // the class's. (A class beside it, not in the branch, is certain.)
+        assert_eq!(calls, [("Kept::count".to_string(), true), ("view::size".to_string(), false), ("view::view".to_string(), false)]);
+    }
+
+    #[test]
     fn a_switch_in_a_configuration_header_decides_branches_everywhere() {
         let d = Dir::new("source-defines");
         d.write("config.h", "#ifndef CONFIG_H\n#define CONFIG_H\n#define USE_NET 1\n#define USE_USB 0\n#endif\n");
