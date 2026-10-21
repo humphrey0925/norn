@@ -78,7 +78,11 @@ each fetched at its release tag, configured with CMake
 (`-G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`, tests on), built with `ninja`, and
 `bench/gt_extract.py <src> <build> <out>` run on the build's
-`compile_commands.json`. The corpus is the source tree without `.git`.
+`compile_commands.json`. The corpus is the source tree without `.git`,
+with what CMake fetched for the build put beside it: ninja's googletest
+(`_deps/googletest-src`) as `third_party/googletest`, spdlog's Catch2
+(`_deps/catch2-src`) as `third_party/catch2`, and the truth's paths into
+them moved there (a tree a user indexes has its dependencies).
 Extra packages for bitcoin: `libboost-dev libevent-dev libsqlite3-dev
 libzmq3-dev`.
 
