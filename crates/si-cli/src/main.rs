@@ -330,7 +330,15 @@ fn index(root: &Path, out: &Path, stores: &str, stride: usize, options: &si_core
                 "cpu_walk": facts.iter().map(|f| f.walk_ns).sum::<u64>() as f64 / 1e6,
                 "slowest_file": (slowest.parse_ns + slowest.walk_ns) as f64 / 1e6 },
         "slowest_file": slowest.path,
-        "mem": { "facts_heap_bytes": facts_bytes, "graph_heap_bytes": g.heap_bytes(), "rss_bytes": rss, "peak_rss_bytes": peak_rss },
+        "mem": { "facts_heap_bytes": facts_bytes,
+                 "facts_parts": facts.iter().fold(serde_json::Map::new(), |mut m, f| {
+                     for (what, bytes) in f.parts() {
+                         let e = m.entry(what).or_insert(json!(0));
+                         *e = json!(e.as_u64().unwrap_or(0) + bytes as u64);
+                     }
+                     m
+                 }),
+                 "graph_heap_bytes": g.heap_bytes(), "rss_bytes": rss, "peak_rss_bytes": peak_rss },
         "stores": store_stats,
     })
 }
