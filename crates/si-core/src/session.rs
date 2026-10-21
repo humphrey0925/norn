@@ -1497,6 +1497,24 @@ int slow (void) { return 0; }
     }
 
     #[test]
+    fn a_method_of_a_class_another_source_file_keeps_is_out_of_sight() {
+        let d = Dir::new("unseen-class");
+        d.write("a.cpp", "class Fixture {\n public:\n  int GetParam () const { return 1; }\n  int Run () { return GetParam (); }\n};\n");
+        d.write("b.cpp", "#include <gtest/gtest.h>\nstruct Case : testing::TestWithParam<int> { int Body () { return GetParam (); } };\n");
+        let s = Session::open(&d.0, Options::default());
+        let g = &s.graph;
+        let q = crate::graph::Qualifier::new(g);
+        let callees = |caller: &str| -> Vec<String> {
+            let mut v: Vec<String> = g.find(caller).iter().flat_map(|&c| g.refs_from(c)).filter(|e| e.kind() == crate::model::refkind::CALL).map(|e| q.name(g, e.other).into_owned()).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        // Its own file's; not b.cpp's, which sees no `Fixture` (the library's).
+        assert_eq!((callees("Run"), callees("Body")), (vec!["Fixture::GetParam".to_string()], vec![]));
+    }
+
+    #[test]
     fn a_method_of_a_class_that_is_an_alias_in_another_reading_is_one_reading() {
         let d = Dir::new("aliased-class");
         d.write("view.h", "#include <string_view>\nnamespace lib {\n#ifdef USE_STD_VIEW\nusing view = std::string_view;\n#else\nclass view {\n public:\n  view () {}\n  view (const char* p) : p_ (p) {}\n  int size () const { return 0; }\n private:\n  const char* p_;\n};\n#endif\nclass Kept {\n public:\n  int count () const { return 1; }\n};\n}\n");
