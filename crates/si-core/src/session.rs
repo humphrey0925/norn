@@ -1454,6 +1454,30 @@ int slow (void) { return 0; }
     }
 
     #[test]
+    fn a_member_a_macro_calls_on_an_object_is_of_the_object_s_class() {
+        let d = Dir::new("receivers");
+        d.write("mock.h", "template <class M> class StrictMock : public M {};\n#define MOCK(n) void n (int); void gmock_##n (int a) { n (a); }\nnamespace app {\nstruct Mock { MOCK(X) };\nstruct Other { void gmock_X (int); };\n}\n");
+        d.write("fixture.h", "#include \"mock.h\"\nnamespace app {\nclass Fixture { protected: StrictMock<Mock> handler; Mock plain; };\n}\n");
+        d.write("t.cpp", "#include \"fixture.h\"\n#define TEST_F(F, N) class F##_##N##_Test : public F { void TestBody (); }; void F##_##N##_Test::TestBody ()\n#define CALL_IMPL(o, c) ((o).gmock_##c)\n#define EXPECT(o, c) CALL_IMPL (o, c)\n#define CHECK(x) do { app::Mock h; h.gmock_X (x); } while (0)\nnamespace app {\ntypedef Fixture Alias;\nTEST_F(Alias, A) { EXPECT (handler, X (1)); }\nTEST_F(Fixture, B) { EXPECT (plain, X (2)); }\nvoid check () { CHECK (3); }\n}\n");
+        let s = Session::open(&d.0, Options::default());
+        let g = &s.graph;
+        // (caller, callee, certain) of every call of `gmock_X`.
+        let q = crate::graph::Qualifier::new(g);
+        let mut calls: Vec<(String, String, bool)> = (0..g.syms.len() as u32)
+            .flat_map(|c| g.refs_from(c).iter().map(move |e| (c, *e)))
+            .filter(|(_, e)| g.sym_name(e.other) == "gmock_X")
+            .map(|(c, e)| (q.name(g, c).into_owned(), q.name(g, e.other).into_owned(), !e.ambiguous()))
+            .collect();
+        calls.sort();
+        calls.dedup();
+        // A fixture's member, through a typedef of it, of a class that
+        // derives from its argument; a member; an object the macro declares
+        // (a call its body writes, which is the macro's).
+        let want = |c: &str| (c.to_string(), "Mock::gmock_X".to_string(), true);
+        assert_eq!(calls, [want("Alias_A_Test::TestBody"), want("CHECK"), want("Fixture_B_Test::TestBody")]);
+    }
+
+    #[test]
     fn a_switch_in_a_configuration_header_decides_branches_everywhere() {
         let d = Dir::new("source-defines");
         d.write("config.h", "#ifndef CONFIG_H\n#define CONFIG_H\n#define USE_NET 1\n#define USE_USB 0\n#endif\n");

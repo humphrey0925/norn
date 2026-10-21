@@ -1021,6 +1021,11 @@ struct Found {
     /// Names the expansion uses that are not written at the use: name,
     /// kind, and the function the expansion defines around it, if any.
     refs: Vec<(String, u8, Option<String>)>,
+    /// C++: what a member called is called on, by the member's name: a
+    /// type (of an object the expansion declares, `Catch::AssertionHandler
+    /// catchAssertionHandler (...)`), or a variable's name (written at the
+    /// use, `EXPECT_CALL (handler, ...)`), as a [`root`] kind and name.
+    receivers: FxHashMap<String, (u8, String)>,
     /// C++: classes the expansion defines, with a class they derive from
     /// (gtest's `TEST_F (Fixture, Name)`, a class of the fixture's).
     bases: Vec<(String, String)>,
@@ -1060,6 +1065,9 @@ impl Found {
             self.single = other.single;
         }
         add(&mut self.decls, other.decls);
+        for (k, v) in other.receivers {
+            self.receivers.entry(k).or_insert(v);
+        }
         add(&mut self.refs, other.refs);
         add(&mut self.bases, other.bases);
         add(&mut self.result_calls, other.result_calls);
@@ -1127,6 +1135,8 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
     let mut naming: Option<String> = None;
     // A constructor's initializers, up to its body: calls, not members.
     let mut initializers_end = 0;
+    // C++: the objects the expansion declares, and their types.
+    let mut declared: FxHashMap<String, String> = FxHashMap::default();
     for i in 0..n {
         let t = &toks[i];
         if t.k == K::Punct {
@@ -1213,6 +1223,10 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
         let next = toks.get(i + 1);
         let next_is = |s: &str| next.is_some_and(|x| x.is(s));
         let name = || t.text.to_string();
+        // `Type object (...)`, `Type object = ...`, `Type object;`.
+        if cpp && prev.is_some_and(|p| p.k == K::Ident && !is_keyword(p.text.as_bytes())) && (next_is("(") || next_is("{") || next_is("=") || next_is(";")) {
+            declared.insert(name(), prev.unwrap().text.to_string());
+        }
         // C++: a member written in the body of a class the expansion makes
         // (a constructor, `~` a destructor, a method), named with its
         // classes: defined where a body, a constructor's initializers or
@@ -1330,6 +1344,19 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
                 }
                 if toks.get(k).is_some_and(|x| x.is("(")) {
                     found.refs.push((name(), refkind::ICALL, owner.clone()));
+                    // What it is called on: a name, or one in parentheses.
+                    let object = match i.checked_sub(2).map(|j| &toks[j]) {
+                        Some(o) if o.k == K::Ident => Some(o),
+                        Some(o) if o.is(")") && i >= 4 && toks[i - 4].is("(") && toks[i - 3].k == K::Ident => Some(&toks[i - 3]),
+                        _ => None,
+                    };
+                    if let Some(o) = object.filter(|o| cpp && &*o.text != "this" && !is_keyword(o.text.as_bytes())) {
+                        let root = match declared.get(&*o.text) {
+                            Some(ty) => (crate::model::root::TYPE, ty.clone()),
+                            None => (crate::model::root::VAR, o.text.to_string()),
+                        };
+                        found.receivers.entry(name()).or_insert(root);
+                    }
                 } else if t.origin == Origin::Pasted {
                     found.refs.push((name(), refkind::MEMBER, owner.clone()));
                 }
@@ -1871,7 +1898,7 @@ fn expand_file(
     // Definitions added by expansions: (name, line) -> index.
     let mut made_here: FxHashMap<(u32, u32), u32> = FxHashMap::default();
     let mut seen_binds: FxHashSet<Bind> = FxHashSet::default();
-    for m in made {
+    for mut m in made {
         for (n, kind, flags) in m.found.decls {
             // Written in a class's body: a member of it.
             let n = if kind == kind::FUNCTION && m.class != NONE { format!("{}::{n}", f.name(m.class as usize)) } else { n };
@@ -1888,6 +1915,18 @@ fn expand_file(
                 if let Some((chain, class)) = classes {
                     let at = out.defs.len() as u32;
                     out.cxx_mut().owners.push((at, chain, class));
+                    // Written in its class's body (gmock's `MOCK_METHOD`): a
+                    // member of it, called on its objects.
+                    if m.class != NONE && kind == kind::FUNCTION {
+                        // (By its text: a name may be in the file's table twice.)
+                        let own = out.name(class as usize).to_string();
+                        let record = (0..out.records.len()).rev().find(|&r| out.name(out.records[r].name as usize) == own);
+                        if let Some(r) = record.map(|r| &mut out.records[r]) {
+                            r.fields.push(name);
+                            r.types.push(NONE);
+                            r.defs.push(at);
+                        }
+                    }
                 }
                 out.defs.push(def);
             }
@@ -1909,7 +1948,9 @@ fn expand_file(
                 out.cxx_mut().operators.push((at, hint, NONE, false));
             }
         }
+        let receivers = std::mem::take(&mut m.found.receivers);
         for (n, kind, owner) in m.found.refs {
+            let receiver = (kind & refkind::ICALL == refkind::ICALL).then(|| receivers.get(&n)).flatten();
             let name = names.id(&mut out, &n);
             // Inside a function the expansion defines, that function is the
             // scope; and the call is there whenever the function is: that
@@ -1920,6 +1961,32 @@ fn expand_file(
             let kind = kind | if (m.maybe || partial) && made.is_none() { refkind::MAYBE } else { 0 };
             if seen_refs.insert((name, m.line, scope, kind)) {
                 out.refs.push(Ref { name, line: m.line, scope, kind });
+                // The object a member is called on: a local of the function
+                // the use is in, as its type; else as the expansion has it.
+                if let Some((root_kind, root)) = receiver {
+                    let local = (*root_kind == crate::model::root::VAR)
+                        .then(|| f.locals.iter().rev().find(|l| l.scope == m.scope && f.name(l.name as usize) == root && l.type_name != NONE))
+                        .flatten();
+                    // In a method, a name not local is a member of its class
+                    // (a test's fixture's `handler`), as the parser has it.
+                    let class = (*root_kind == crate::model::root::VAR && local.is_none())
+                        // (The last said of it: what the parser took for a function of
+                        // a namespace, `TEST_F (...) { }`, the expansion made a method.)
+                        .then(|| out.cxx.as_ref()?.owners.iter().rev().find(|o| o.0 == m.scope).map(|o| o.2))
+                        .flatten();
+                    let path = out.hint_path.len() as u32;
+                    let (root_kind, root, len) = match (local, class) {
+                        (Some(l), _) => (crate::model::root::TYPE, names.id(&mut out, f.name(l.type_name as usize)), 0),
+                        (None, Some(c)) => {
+                            let member = names.id(&mut out, root);
+                            out.hint_path.push(member);
+                            (crate::model::root::TYPE, c, 1)
+                        }
+                        (None, None) => (*root_kind, names.id(&mut out, root), 0),
+                    };
+                    out.hints.push(MemberHint { root_kind, root, path, len });
+                    out.ref_hints.push((out.refs.len() as u32 - 1, out.hints.len() as u32 - 1));
+                }
             }
         }
         for (type_name, stored) in m.stored {

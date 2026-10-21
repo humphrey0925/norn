@@ -1274,6 +1274,21 @@ impl<'a> Walk<'a> {
 
     /// C++: the type of the elements of a container type (`std::vector<T>`:
     /// `T`; a map's: its values'), or `NONE`.
+    /// C++: the first of the template arguments of a template type, a type
+    /// (`StrictMock<MockHandler>`: `MockHandler`), or `NONE`.
+    fn first_template_arg(&mut self, t: Node<'a>) -> u32 {
+        let ids = self.ids;
+        let t = if t.kind_id() == ids.qualified_identifier { self.qualified_parts(t).1 } else { t };
+        if t.kind_id() != ids.template_type {
+            return NONE;
+        }
+        let arg = t.child_by_field_id(ids.f_arguments).and_then(|a| a.named_child(0)).filter(|a| a.kind_id() == ids.type_descriptor);
+        match arg.and_then(|a| a.child_by_field_id(ids.f_type)) {
+            Some(a) => self.type_name(a),
+            None => NONE,
+        }
+    }
+
     fn element_type(&mut self, t: Node<'a>) -> u32 {
         let ids = self.ids;
         let t = if t.kind_id() == ids.qualified_identifier { self.qualified_parts(t).1 } else { t };
@@ -2142,7 +2157,7 @@ impl<'a> Walk<'a> {
     /// The members of a struct body in order, each with its type's name
     /// (see `type_name_of`). The members of an unnamed struct or union
     /// member are members of this one.
-    fn member_names(&mut self, body: Node<'a>, names: &mut Vec<u32>, types: &mut Vec<u32>, elems: &mut Vec<(u32, u32)>) {
+    fn member_names(&mut self, body: Node<'a>, names: &mut Vec<u32>, types: &mut Vec<u32>, elems: &mut Vec<(u32, u32, u32)>) {
         let ids = self.ids;
         let mut c = body.walk();
         // (A C++ class's methods are members too, declared or defined in it,
@@ -2165,15 +2180,15 @@ impl<'a> Walk<'a> {
                     None => {
                         names.push(NONE);
                         types.push(NONE);
-                        elems.push((NONE, NONE));
+                        elems.push((NONE, NONE, NONE));
                     }
                 }
                 continue;
             }
             let t = self.type_name_of(decl);
-            let (e, key) = match decl.child_by_field_id(ids.f_type).filter(|_| cpp) {
-                Some(ty) => (self.element_type(ty), self.key_type(ty)),
-                None => (NONE, NONE),
+            let (e, key, arg) = match decl.child_by_field_id(ids.f_type).filter(|_| cpp) {
+                Some(ty) => (self.element_type(ty), self.key_type(ty), self.first_template_arg(ty)),
+                None => (NONE, NONE, NONE),
             };
             for d in ds {
                 // A member that is a function pointer has no struct type,
@@ -2185,7 +2200,7 @@ impl<'a> Walk<'a> {
                 };
                 names.push(name);
                 types.push(t);
-                elems.push(if self.declares_function(d) { (NONE, NONE) } else { (e, key) });
+                elems.push(if self.declares_function(d) { (NONE, NONE, NONE) } else { (e, key, arg) });
             }
         }
     }
@@ -2195,9 +2210,12 @@ impl<'a> Walk<'a> {
         self.member_names(body, &mut fields, &mut types, &mut elems);
         let defs = vec![NONE; fields.len()];
         let record = self.out.records.len() as u32;
-        for (at, &(e, key)) in elems.iter().enumerate() {
+        for (at, &(e, key, arg)) in elems.iter().enumerate() {
             if e != NONE {
                 self.out.cxx_mut().elems.push((record, at as u32, e));
+            }
+            if arg != NONE {
+                self.out.cxx_mut().targs.push((record, at as u32, arg));
             }
             if key != NONE {
                 self.out.cxx_mut().keys.push((record, at as u32, key));
@@ -3082,10 +3100,30 @@ impl<'a> Walk<'a> {
                             }
                             let mut c = node.walk();
                             let clause: Vec<Node<'a>> = node.children(&mut c).filter(|ch| ch.kind_id() == ids.base_class_clause).collect();
+                            // (A class template's own parameters, which a base may be.)
+                            let params: Vec<&[u8]> = node
+                                .parent()
+                                .filter(|p| p.kind() == "template_declaration")
+                                .and_then(|p| p.child_by_field_id(ids.f_parameters))
+                                .map(|list| {
+                                    let mut c = list.walk();
+                                    list.named_children(&mut c)
+                                        .filter(|p| p.kind() == "type_parameter_declaration")
+                                        .filter_map(|p| {
+                                            let mut c = p.walk();
+                                            let name = p.named_children(&mut c).find(|n| n.kind() == "type_identifier");
+                                            name.map(|n| self.text(n))
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
                             for clause in clause {
                                 let mut c = clause.walk();
                                 let named: Vec<Node<'a>> = clause.named_children(&mut c).collect();
                                 for b in named {
+                                    if params.contains(&self.text(b)) && !self.out.cxx().param_bases.contains(&record) {
+                                        self.out.cxx_mut().param_bases.push(record);
+                                    }
                                     let base = self.type_name(b);
                                     if base != NONE {
                                         self.out.cxx_mut().bases.push((record, base));
