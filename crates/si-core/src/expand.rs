@@ -467,6 +467,8 @@ struct Table<'a> {
     /// has thousands of definitions.
     by_text: FxHashMap<&'a str, Vec<(u32, u32, u32)>>,
     parsed: Vec<Vec<Parsed>>,
+    /// Some macro's body writes `__COUNTER__`.
+    counts: bool,
 }
 
 type Choice = FxHashMap<Text, usize>;
@@ -509,6 +511,12 @@ struct Engine<'a> {
     /// The names it asks the table for: the file's expansion depends on
     /// their definitions, and on nothing else of other files'.
     asked: Asked<'a>,
+    /// What `__COUNTER__` stands for at the use being expanded, where that
+    /// is known (`expand_file` counts the file's uses in order), and next.
+    counter_from: Option<u32>,
+    counter: u32,
+    /// The most any reading of the use counted to.
+    counter_most: u32,
 }
 
 /// Names an engine asked the table for, told to `to` when it is done.
@@ -551,7 +559,8 @@ impl<'a> Table<'a> {
                 (name, out)
             })
             .collect();
-        Table { files, outside: vec![false; files.len()], apart: vec![false; files.len()], thorough: false, readings: None, unit_of: Vec::new(), header_of: Vec::new(), by_name, by_text, parsed }
+        let counts = parsed.iter().flatten().any(|p| p.body.iter().any(|t| &*t.text == "__COUNTER__"));
+        Table { files, outside: vec![false; files.len()], apart: vec![false; files.len()], thorough: false, readings: None, unit_of: Vec::new(), header_of: Vec::new(), by_name, by_text, parsed, counts }
     }
 }
 
@@ -573,6 +582,9 @@ impl<'a> Engine<'a> {
             sure: Vec::new(),
             unit: NONE,
             asked: Asked::default(),
+            counter_from: None,
+            counter: 0,
+            counter_most: 0,
         }
     }
 
@@ -746,6 +758,22 @@ impl<'a> Engine<'a> {
                 out.push(t);
                 continue;
             }
+            // The preprocessor's own: the line of the use, and how many
+            // `__COUNTER__`s the unit had before (where that is known).
+            if matches!(&*t.text, "__LINE__" | "__COUNTER__") && self.candidates(t.text).is_empty() {
+                let n = if &*t.text == "__LINE__" {
+                    self.site.map(|s| s.1)
+                } else {
+                    self.counter_from.map(|_| {
+                        self.counter += 1;
+                        self.counter - 1
+                    })
+                };
+                if let Some(n) = n {
+                    out.push(T { text: Text::of(&n.to_string()), k: K::Other, origin: t.origin, noexpand: false });
+                    continue;
+                }
+            }
             if self.active.contains(&t.text) {
                 t.noexpand = true;
                 out.push(t);
@@ -916,8 +944,12 @@ impl<'a> Engine<'a> {
             self.active.clear();
             self.active_defs.clear();
             self.steps = 0;
+            if let Some(from) = self.counter_from {
+                self.counter = from;
+            }
             let t = std::time::Instant::now();
             let out = self.expand(toks.to_vec());
+            self.counter_most = self.counter_most.max(self.counter);
             spend(0, t);
             SPENT[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             SPENT[5].fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1670,6 +1702,25 @@ fn expand_file(
     let live: Vec<&Site> =
         f.sites.iter().filter(|s| engines.iter_mut().any(|e| e.hides(Text::of(f.name(s.name as usize))))).collect();
 
+    // C++: what `__COUNTER__` stands for at each use, its uses counted in
+    // the file's order (Catch2's `TEST_CASE` makes `CATCH2_INTERNAL_TEST_0`,
+    // then `_2`), each use's readings expanded to count them: the most any
+    // counts to (a build's own definitions agree with each other, and expand
+    // in full; some readings of others together come to nothing).
+    let at = |s: &Site| s as *const Site as usize;
+    let mut counter_at: FxHashMap<usize, u32> = FxHashMap::default();
+    if let Some(eng) = engines.first_mut().filter(|_| f.cpp() && table.counts) {
+        let mut next = 0;
+        for s in &live {
+            (eng.counter_from, eng.counter_most, eng.site) = (Some(next), next, Some((fi as u32, s.line)));
+            eng.variants(&site_tokens(f, s), &Choice::default(), false, |_| true);
+            eng.counter = eng.counter_most;
+            counter_at.insert(at(s), next);
+            next = eng.counter;
+        }
+        eng.counter_from = None;
+    }
+
     spend(2, t_setup);
     // 1. Definitions written under a macro's name: one per expansion.
     let mut variants: FxHashMap<u32, Vec<(u32, Contexts)>> = FxHashMap::default();
@@ -1678,6 +1729,7 @@ fn expand_file(
         let macro_name = f.name(s.name as usize);
         let mut named: Vec<(String, Contexts)> = Vec::new();
         for (ei, eng) in engines.iter_mut().enumerate() {
+            (eng.site, eng.counter_from) = (Some((fi as u32, s.line)), counter_at.get(&at(s)).copied());
             // Where the name is not a macro, or may not be, it is the name.
             if (s.args == NONE || s.flags & site::TRAILING != 0) && eng.maybe_undefined(macro_name) {
                 add_name(&mut named, macro_name, (ei, Choice::default()));
@@ -1745,6 +1797,7 @@ fn expand_file(
             for (i, (scope, contexts)) in scopes.into_iter().enumerate() {
                 for (ei, pinned) in contexts {
                     engines[*ei].site = Some((fi as u32, s.line));
+                    engines[*ei].counter_from = counter_at.get(&at(s)).copied();
                     let maybe = engines[*ei].maybe_undefined(macro_name);
                     // Each expansion read once, as it is made; what they
                     // find together kept once.
@@ -2559,6 +2612,12 @@ mod tests {
             ("IF_1", "(a, b) a", true),
             ("PICK_one", " picked", false),
             ("CHOOSE", "(c) CAT (PICK_, CAT (IF_, c) (one, two))", true),
+            // Catch2's `TEST_CASE`: a unique name, twice over.
+            ("UNIQ", "(n) LINE1 (n, __COUNTER__)", true),
+            ("LINE1", "(n, l) LINE2 (n, l)", true),
+            ("LINE2", "(n, l) n ## l", true),
+            ("TC2", "(T) void T (); int UNIQ (reg); void T ()", true),
+            ("TC", "() TC2 (UNIQ (TEST_))", true),
         ];
         let mut f = FileFacts::new("a.c".into());
         for (name, text, function_like) in macros {
@@ -2584,7 +2643,11 @@ mod tests {
             ("CAT", "CAT"),
             ("CHOOSE (1)", "picked"),
             ("CHOOSE (0)", "PICK_two"),
+            ("TC ()", "void TEST_0 ( ) ; int reg1 ; void TEST_0 ( )"),
+            ("__LINE__", "1"),
         ] {
+            eng.counter_from = Some(0);
+            eng.site = Some((0, 1));
             let v = eng.variants(&tokenize(src.as_bytes(), Origin::Site), &Choice::default(), true, |_| true);
             assert_eq!(texts(&v[0].0), want, "{src}");
         }
