@@ -545,6 +545,22 @@ fn aliased_class(g: &Graph, cpp: &Cpp, c: u32) -> bool {
         && g.syms_named(class).iter().any(|&t| g.syms[t as usize].kind == kind::TYPEDEF && g.syms[t as usize].file == s.file)
 }
 
+/// C++: `c` is a method of a class that only source files other than `fi`
+/// and those it includes write (declared in no header): from `fi` it is
+/// out of sight.
+fn unseen_class(g: &Graph, cpp: &Cpp, c: u32, fi: u32, closure: &Closure) -> bool {
+    let s = &g.syms[c as usize];
+    let class = cpp.class(c);
+    let seen = |file: u32| file == fi || closure.member[file as usize];
+    let is_class = |t: &u32| matches!(g.syms[*t as usize].kind, kind::CLASS | kind::STRUCT | kind::UNION);
+    let classes = || g.syms_named(class).iter().filter(|t| is_class(t));
+    class != NONE
+        && s.flags & flag::HEADER == 0
+        && !seen(s.file)
+        && classes().next().is_some()
+        && classes().all(|&t| g.syms[t as usize].flags & flag::HEADER == 0 && !seen(g.syms[t as usize].file))
+}
+
 /// The members of the struct called `name` as seen from `file`.
 fn layout<'a>(
     name: u32,
@@ -1773,6 +1789,14 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 // `RedisQtAdapter::write`).
                 if !in_cpp && !cpp.class_of.is_empty() {
                     tmp.retain(|&c| cpp.class(c) == NONE);
+                }
+                // Nor, from a source file, only methods of classes other
+                // source files have all to themselves (a test's fixture):
+                // no name of them is in sight here. (`GetParam ()` in a test
+                // is gtest's.) (Beside others, one may be an override of
+                // them, through a base the file sees.)
+                if in_cpp && closure.unit && !member && tmp.iter().all(|&c| unseen_class(&g, &cpp, c, fi as u32, closure)) {
+                    tmp.clear();
                 }
                 if tmp.is_empty() {
                     counts[2] += 1;
