@@ -1,0 +1,9 @@
+// Cloudflare Workers: the website in site/, served as static assets at norn-c.com.
+{
+  "name": "norn",
+  "compatibility_date": "2025-09-01",
+  "assets": {
+    "directory": "./site",
+    "not_found_handling": "404-page"
+  }
+}
