@@ -19,6 +19,7 @@
 </p>
 
 <p align="center">
+  <a href="https://norn-c.com">Website</a> ·
   <a href="#why-norn">Why Norn</a> ·
   <a href="#benchmarks">Benchmarks</a> ·
   <a href="#features">Features</a> ·

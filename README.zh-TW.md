@@ -19,6 +19,7 @@
 </p>
 
 <p align="center">
+  <a href="https://norn-c.com/zh-TW/">網站</a> ·
   <a href="#為什麼用-norn">為什麼用 Norn</a> ·
   <a href="#基準測試">基準測試</a> ·
   <a href="#功能">功能</a> ·

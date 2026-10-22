@@ -70,3 +70,30 @@ device-tree-compiler python3-pyelftools efitools`.
 The source files were checked out on Windows (CRLF); SQLite's build
 scripts (every file not `.c` or `.h`) were converted to LF in the build's
 copy so `configure` and its Tcl tools run. Line numbers are unchanged.
+
+## C++ projects
+
+Ground truth for nine C++ corpora, made on WSL2 Ubuntu 24.04 with clang 18:
+each fetched at its release tag, configured with CMake
+(`-G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`, tests on), built with `ninja`, and
+`bench/gt_extract.py <src> <build> <out>` run on the build's
+`compile_commands.json`. The corpus is the source tree without `.git`,
+with what CMake fetched for the build put beside it: ninja's googletest
+(`_deps/googletest-src`) as `third_party/googletest`, spdlog's Catch2
+(`_deps/catch2-src`) as `third_party/catch2`, and the truth's paths into
+them moved there (a tree a user indexes has its dependencies).
+Extra packages for bitcoin: `libboost-dev libevent-dev libsqlite3-dev
+libzmq3-dev`.
+
+| Project | Source | Configured with |
+|---|---|---|
+| fmt | fmtlib/fmt `12.2.0` (`1be298e`) | `-DCMAKE_BUILD_TYPE=Release -DFMT_TEST=ON -DFMT_DOC=OFF` |
+| leveldb | google/leveldb `1.23` (`99b3c03`), its submodules (googletest, benchmark) included | `-DCMAKE_BUILD_TYPE=Release -DLEVELDB_BUILD_TESTS=ON -DLEVELDB_BUILD_BENCHMARKS=OFF` |
+| bitcoin | bitcoin/bitcoin `v31.1` (`9be056a`) | `-DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=OFF -DENABLE_WALLET=ON -DWITH_ZMQ=ON -DBUILD_TESTS=ON -DBUILD_BENCH=ON -DBUILD_FUZZ_BINARY=OFF -DENABLE_IPC=OFF` |
+| ninja | ninja-build/ninja `v1.12.1` (`2daa09b`) | `-DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON` |
+| googletest | google/googletest `v1.15.2` (`b514bdc`) | `-DCMAKE_BUILD_TYPE=Debug -Dgtest_build_tests=ON -Dgtest_build_samples=ON -Dgmock_build_tests=ON` |
+| abseil | abseil/abseil-cpp `20240722.0` (`4447c75`) | `-DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_STANDARD=17 -DABSL_BUILD_TESTING=ON -DABSL_USE_GOOGLETEST_HEAD=OFF -DABSL_FIND_GOOGLETEST=OFF -DABSL_LOCAL_GOOGLETEST_DIR=<googletest above>` |
+| yaml-cpp | jbeder/yaml-cpp `0.8.0` (`f732014`) | `-DCMAKE_BUILD_TYPE=Debug -DYAML_CPP_BUILD_TESTS=ON -DYAML_CPP_BUILD_TOOLS=ON` |
+| spdlog | gabime/spdlog `v1.14.1` (`27cb4c7`) | `-DCMAKE_BUILD_TYPE=Debug -DSPDLOG_BUILD_EXAMPLE=ON -DSPDLOG_BUILD_TESTS=ON -DSPDLOG_BUILD_BENCH=OFF` |
+| cppcheck | danmar/cppcheck `2.16.0` (`02be7e6`) | `-DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTS=ON -DHAVE_RULES=OFF -DUSE_MATCHCOMPILER=Off` |

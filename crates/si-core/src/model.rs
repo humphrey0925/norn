@@ -53,6 +53,9 @@ pub mod flag {
     /// A C++ method declared `virtual` (or `override`, `final`): a call of
     /// it may run an override.
     pub const VIRTUAL: u8 = 32;
+    /// A C++ member declared `static`: called by its class's name, from
+    /// anywhere, not only on an object of it.
+    pub const CLASS_STATIC: u8 = 64;
 }
 
 pub mod refkind {
@@ -122,6 +125,10 @@ pub struct Site {
     /// The definition this use names (`NAME (a, b) (void) { }`), or `NONE`.
     pub def: u32,
     pub flags: u8,
+    /// C++: the class whose body the use is in, as `Outer::Inner`, or
+    /// `NONE`: the functions its expansion writes are that class's
+    /// (gmock's `MOCK_METHOD`).
+    pub class: u32,
 }
 
 /// A function stored where a call can later find it: in a struct member or
@@ -450,7 +457,7 @@ pub struct FileFacts {
     pub lex_key: u64,
     /// The macros asked what arguments they discard (by name, as numbered
     /// in this file), and the answers, sorted.
-    pub discards_asked: Vec<(u32, u64)>,
+    pub discards_asked: Vec<(u32, u64, u64)>,
     names: Names,
     pub defs: Vec<Def>,
     pub refs: Refs,
@@ -521,6 +528,15 @@ pub struct Cxx {
     /// (record, member, its elements' type) of members that are containers
     /// (`std::vector<T> v`: `T`; of a map, its values').
     pub elems: Vec<(u32, u32, u32)>,
+    /// (record, member, the first of its type's template arguments) of
+    /// members of a template type (`StrictMock<MockHandler> handler`).
+    #[serde(default)]
+    pub targs: Vec<(u32, u32, u32)>,
+    /// The class templates that derive from one of their own parameters
+    /// (gmock's `template <class M> class StrictMock : public M`): what a
+    /// `StrictMock<MockHandler>` has, `MockHandler` has. By name.
+    #[serde(default)]
+    pub param_bases: Vec<u32>,
     /// (record, member, its keys' type) of members that are maps.
     pub keys: Vec<(u32, u32, u32)>,
     /// The references that make an object (`T x (a)`, `new T`, `: Base (a)`,
@@ -583,6 +599,8 @@ static NO_CXX: Cxx = Cxx {
     namespace_aliases: Vec::new(),
     nested: Vec::new(),
     elems: Vec::new(),
+    targs: Vec::new(),
+    param_bases: Vec::new(),
     keys: Vec::new(),
     constructs: Vec::new(),
     operators: Vec::new(),

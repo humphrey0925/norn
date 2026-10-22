@@ -437,11 +437,18 @@ impl Extractor {
     /// asked about discards what it did then. Says whether they were.
     pub fn extract_reusing(&mut self, path: &str, src: &[u8], transparent: &MacroSets, reuse: &dyn Fn(u64) -> Option<FileFacts>) -> (FileFacts, bool) {
         let t = std::time::Instant::now();
-        let lexed = mask::lex_file(src, transparent, Some(path));
+        let mut lexed = mask::lex_file(src, transparent, Some(path));
         let cpp = is_cpp(path, src);
+        if cpp {
+            mask::template_macros(&mut lexed.masked);
+        }
         let key = lexed.key(src, cpp);
         if let Some(saved) = reuse(key) {
-            let same = saved.lex_key == key && saved.discards_asked.iter().all(|&(n, d)| transparent.discards(saved.name(n as usize).as_bytes()) == d);
+            let same = saved.lex_key == key
+                && saved.discards_asked.iter().all(|&(n, d, p)| {
+                    let name = saved.name(n as usize).as_bytes();
+                    transparent.discards(name) == d && transparent.pasted(name) == p
+                });
             if same {
                 return (saved.rebased(path.to_string()), true);
             }
@@ -1282,6 +1289,21 @@ impl<'a, 't> Walk<'a> {
 
     /// C++: the type of the elements of a container type (`std::vector<T>`:
     /// `T`; a map's: its values'), or `NONE`.
+    /// C++: the first of the template arguments of a template type, a type
+    /// (`StrictMock<MockHandler>`: `MockHandler`), or `NONE`.
+    fn first_template_arg(&mut self, t: Node<'t>) -> u32 {
+        let ids = self.ids;
+        let t = if t.kind_id() == ids.qualified_identifier { self.qualified_parts(t).1 } else { t };
+        if t.kind_id() != ids.template_type {
+            return NONE;
+        }
+        let arg = t.child_by_field_id(ids.f_arguments).and_then(|a| a.named_child(0)).filter(|a| a.kind_id() == ids.type_descriptor);
+        match arg.and_then(|a| a.child_by_field_id(ids.f_type)) {
+            Some(a) => self.type_name(a),
+            None => NONE,
+        }
+    }
+
     fn element_type(&mut self, t: Node<'t>) -> u32 {
         let ids = self.ids;
         let t = if t.kind_id() == ids.qualified_identifier { self.qualified_parts(t).1 } else { t };
@@ -1529,7 +1551,8 @@ impl<'a, 't> Walk<'a> {
                     let flags = s.flags | if self.in_fn() && !top { site::IN_FN } else { 0 };
                     let def = self.site_defs[&site_def_at(s)];
                     let scope = if top && def == NONE { 0 } else { self.scope.map_or(0, |s| s.def) };
-                    self.out.sites.push(Site { name, args, line: s.name.line, scope, def, flags });
+                    let class = if self.cpp { self.class_at(s.name.start as usize).map_or(NONE, |c| self.intern_str(&self.classes[c].chain.clone())) } else { NONE };
+                    self.out.sites.push(Site { name, args, line: s.name.line, scope, def, flags, class });
                     let (open, close) = (s.init.0 as usize, s.init.1 as usize);
                     if close > open && close - open <= MAX_INIT_TEXT {
                         let type_name = self.intern(&self.orig[s.init_type.0 as usize..s.init_type.1 as usize]);
@@ -2149,7 +2172,7 @@ impl<'a, 't> Walk<'a> {
     /// The members of a struct body in order, each with its type's name
     /// (see `type_name_of`). The members of an unnamed struct or union
     /// member are members of this one.
-    fn member_names(&mut self, body: Node<'t>, names: &mut Vec<u32>, types: &mut Vec<u32>, elems: &mut Vec<(u32, u32)>) {
+    fn member_names(&mut self, body: Node<'t>, names: &mut Vec<u32>, types: &mut Vec<u32>, elems: &mut Vec<(u32, u32, u32)>) {
         let ids = self.ids;
         let mut c = body.walk();
         // (A C++ class's methods are members too, declared or defined in it,
@@ -2172,15 +2195,15 @@ impl<'a, 't> Walk<'a> {
                     None => {
                         names.push(NONE);
                         types.push(NONE);
-                        elems.push((NONE, NONE));
+                        elems.push((NONE, NONE, NONE));
                     }
                 }
                 continue;
             }
             let t = self.type_name_of(decl);
-            let (e, key) = match decl.child_by_field_id(ids.f_type).filter(|_| cpp) {
-                Some(ty) => (self.element_type(ty), self.key_type(ty)),
-                None => (NONE, NONE),
+            let (e, key, arg) = match decl.child_by_field_id(ids.f_type).filter(|_| cpp) {
+                Some(ty) => (self.element_type(ty), self.key_type(ty), self.first_template_arg(ty)),
+                None => (NONE, NONE, NONE),
             };
             for d in ds {
                 // A member that is a function pointer has no struct type,
@@ -2192,7 +2215,7 @@ impl<'a, 't> Walk<'a> {
                 };
                 names.push(name);
                 types.push(t);
-                elems.push(if self.declares_function(d) { (NONE, NONE) } else { (e, key) });
+                elems.push(if self.declares_function(d) { (NONE, NONE, NONE) } else { (e, key, arg) });
             }
         }
     }
@@ -2202,9 +2225,12 @@ impl<'a, 't> Walk<'a> {
         self.member_names(body, &mut fields, &mut types, &mut elems);
         let defs = vec![NONE; fields.len()];
         let record = self.out.records.len() as u32;
-        for (at, &(e, key)) in elems.iter().enumerate() {
+        for (at, &(e, key, arg)) in elems.iter().enumerate() {
             if e != NONE {
                 self.out.cxx_mut().elems.push((record, at as u32, e));
+            }
+            if arg != NONE {
+                self.out.cxx_mut().targs.push((record, at as u32, arg));
             }
             if key != NONE {
                 self.out.cxx_mut().keys.push((record, at as u32, key));
@@ -2430,14 +2456,26 @@ impl<'a, 't> Walk<'a> {
                         }
                         // A macro's arguments it does not use: not compiled.
                         let discards = self.sets.discards(self.text(f));
+                        let pasted = self.sets.pasted(self.text(f));
                         let asked = self.intern(self.text(f));
-                        self.out.discards_asked.push((asked, discards));
-                        if discards != 0 {
+                        self.out.discards_asked.push((asked, discards, pasted));
+                        if discards | pasted != 0 {
                             if let Some(args) = node.child_by_field_id(ids.f_arguments) {
                                 let mut c = args.walk();
                                 let list: Vec<Node<'t>> = args.named_children(&mut c).filter(|a| !a.is_extra()).collect();
-                                for (_, a) in list.into_iter().enumerate().filter(|(i, _)| *i < 64 && discards & 1 << i != 0) {
-                                    self.quiet.push((a.start_byte(), a.end_byte()));
+                                for (i, a) in list.into_iter().enumerate().filter(|(i, _)| *i < 64) {
+                                    if discards & 1 << i != 0 {
+                                        self.quiet.push((a.start_byte(), a.end_byte()));
+                                    } else if pasted & 1 << i != 0 {
+                                        // (Its first name is part of another.)
+                                        let mut first = a;
+                                        while let Some(c) = first.child(0) {
+                                            first = c;
+                                        }
+                                        if first.kind_id() == ids.identifier {
+                                            self.quiet.push((first.start_byte(), first.end_byte()));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2553,7 +2591,10 @@ impl<'a, 't> Walk<'a> {
                     let def = if self.cpp && is_fn {
                         // A method, declared.
                         let class = self.class_at(node.start_byte());
-                        let flags = flag::DECL | if self.is_virtual(node) { flag::VIRTUAL } else { 0 };
+                        let mut flags = flag::DECL | if self.is_virtual(node) { flag::VIRTUAL } else { 0 };
+                        if self.storage_flags(node) & flag::STATIC != 0 {
+                            flags |= flag::CLASS_STATIC;
+                        }
                         let def = self.push_def(name, node, kind::FUNCTION, flags);
                         let scope = self.declared_scope(d);
                         self.note_owner(def, &scope, class, node.start_byte());
@@ -2603,7 +2644,9 @@ impl<'a, 't> Walk<'a> {
                 };
                 if class.is_some() || !scope.is_empty() {
                     // A member: `static` says nothing of where it is seen.
-                    flags &= !flag::STATIC;
+                    if flags & flag::STATIC != 0 {
+                        flags = flags & !flag::STATIC | flag::CLASS_STATIC;
+                    }
                     if self.is_virtual(node) {
                         flags |= flag::VIRTUAL;
                     }
@@ -2784,7 +2827,9 @@ impl<'a, 't> Walk<'a> {
                         let (class, scope) = if self.cpp { (self.class_at(node.start_byte()), self.declared_scope(d)) } else { (None, Vec::new()) };
                         let member = class.is_some() || !scope.is_empty();
                         if member {
-                            flags &= !flag::STATIC;
+                            if flags & flag::STATIC != 0 {
+                                flags = flags & !flag::STATIC | flag::CLASS_STATIC;
+                            }
                             if is_fn && self.is_virtual(node) {
                                 flags |= flag::VIRTUAL;
                             }
@@ -3077,10 +3122,30 @@ impl<'a, 't> Walk<'a> {
                             }
                             let mut c = node.walk();
                             let clause: Vec<Node<'t>> = node.children(&mut c).filter(|ch| ch.kind_id() == ids.base_class_clause).collect();
+                            // (A class template's own parameters, which a base may be.)
+                            let params: Vec<&[u8]> = node
+                                .parent()
+                                .filter(|p| p.kind() == "template_declaration")
+                                .and_then(|p| p.child_by_field_id(ids.f_parameters))
+                                .map(|list| {
+                                    let mut c = list.walk();
+                                    list.named_children(&mut c)
+                                        .filter(|p| p.kind() == "type_parameter_declaration")
+                                        .filter_map(|p| {
+                                            let mut c = p.walk();
+                                            let name = p.named_children(&mut c).find(|n| n.kind() == "type_identifier");
+                                            name.map(|n| self.text(n))
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
                             for clause in clause {
                                 let mut c = clause.walk();
                                 let named: Vec<Node<'t>> = clause.named_children(&mut c).collect();
                                 for b in named {
+                                    if params.contains(&self.text(b)) && !self.out.cxx().param_bases.contains(&record) {
+                                        self.out.cxx_mut().param_bases.push(record);
+                                    }
                                     let base = self.type_name(b);
                                     if base != NONE {
                                         self.out.cxx_mut().bases.push((record, base));

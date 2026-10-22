@@ -277,6 +277,8 @@ pub(crate) struct Includes<'a> {
     paths: Vec<&'a str>,
     by_path: FxHashMap<&'a str, u32>,
     by_base: FxHashMap<&'a str, Vec<u32>>,
+    /// Every folder a file is in, as `a/b`.
+    dirs: FxHashSet<&'a str>,
     /// Per file, whether it is in a folder the build does not compile.
     outside: Vec<bool>,
 }
@@ -289,8 +291,9 @@ impl<'a> Includes<'a> {
         for (i, p) in paths.iter().enumerate() {
             by_base.entry(p.rsplit('/').next().unwrap_or(p)).or_default().push(i as u32);
         }
+        let dirs = paths.iter().flat_map(|p| p.match_indices('/').map(move |(i, _)| &p[..i])).collect();
         let outside = vec![false; paths.len()];
-        Includes { paths, by_path, by_base, outside }
+        Includes { paths, by_path, by_base, dirs, outside }
     }
 
     /// The same, the files in `folders` (`a/b/`) not compiled by the build.
@@ -342,9 +345,48 @@ impl<'a> Includes<'a> {
         // A folder the build does not compile is another architecture's,
         // say: of those not above the includer, one the build compiles.
         let built = |id: u32| !self.outside[id as usize];
+        // First, a folder the includer is in itself (bitcoin's `src/`, for
+        // `<rpc/util.h>` from `src/rpc/`): before `src/wallet/`, whose
+        // folder above holds the includer too. (Not the tree's own top.)
+        // (Of a source file only: a header is read with its includers'
+        // `-I`s, and Linux's `include/` would find `tools/include/`'s
+        // copies of its own headers through it.)
+        let source = !crate::is_header(includer);
+        // (Of several, the outermost: `<rpc/util.h>` from `src/wallet/rpc/`
+        // is `src/`'s, the `-I` of all; `src/wallet/` has its own headers
+        // as `<wallet/...>`.)
+        let own = |id: u32| {
+            let r = root(id);
+            let holds = source && !r.is_empty() && (dir == r || dir.starts_with(r) && dir.as_bytes().get(r.len()) == Some(&b'/'));
+            holds.then(|| -(r.split('/').count() as i64))
+        };
+        // A folder holding a copy of the includer's own folder is another
+        // program's tree (`tools/`, with `tools/include/linux/`): not what
+        // `include/linux/list.h` reads, `<asm/barrier.h>`, but where none
+        // other is. (A folder above the one looked up from: `include/`
+        // itself has `include/net/netfilter/`, for `net/netfilter/`.)
+        let several = cands.len() > 1;
+        let buf = std::cell::RefCell::new(String::new());
+        let copy = |id: u32| {
+            let r = root(id);
+            let mut b = buf.borrow_mut();
+            several
+                && !dir.is_empty()
+                && r.match_indices('/').map(|(i, _)| &r[..i]).any(|f| {
+                    // (Of the includer's folder or one it is in, two deep
+                    // at least: `include/linux/` for `include/linux/device/`.)
+                    dir.match_indices('/').skip(1).map(|(i, _)| &dir[..i]).chain(std::iter::once(dir)).filter(|d| d.contains('/')).any(|d| {
+                        b.clear();
+                        b.push_str(f);
+                        b.push('/');
+                        b.push_str(d);
+                        !f.is_empty() && self.dirs.contains(b.as_str())
+                    })
+                })
+        };
         let shared = |id: u32| {
             let other = dir_of(paths[id as usize]);
-            (above(id), built(id), include_folder(id), shallow(id), dir.split('/').zip(other.split('/')).take_while(|(a, b)| a == b).count())
+            (!copy(id), own(id), above(id), built(id), include_folder(id), shallow(id), dir.split('/').zip(other.split('/')).take_while(|(a, b)| a == b).count())
         };
         match cands.iter().map(|&c| shared(c)).max() {
             Some(best) => {
@@ -536,6 +578,34 @@ fn record_of(
         .copied()
 }
 
+/// C++: `c` is a method of a class that its header has only in one reading,
+/// an alias in the other (abseil's `string_view`: the class, or
+/// `std::string_view`): a call of it is one reading of the call.
+fn aliased_class(g: &Graph, cpp: &Cpp, c: u32) -> bool {
+    let s = &g.syms[c as usize];
+    let class = cpp.class(c);
+    s.kind == kind::FUNCTION
+        && s.flags & flag::CONDITIONAL != 0
+        && class != NONE
+        && g.syms_named(class).iter().any(|&t| g.syms[t as usize].kind == kind::TYPEDEF && g.syms[t as usize].file == s.file)
+}
+
+/// C++: `c` is a method of a class that only source files other than `fi`
+/// and those it includes write (declared in no header): from `fi` it is
+/// out of sight.
+fn unseen_class(g: &Graph, cpp: &Cpp, c: u32, fi: u32, closure: &Closure) -> bool {
+    let s = &g.syms[c as usize];
+    let class = cpp.class(c);
+    let seen = |file: u32| file == fi || closure.member[file as usize];
+    let is_class = |t: &u32| matches!(g.syms[*t as usize].kind, kind::CLASS | kind::STRUCT | kind::UNION);
+    let classes = || g.syms_named(class).iter().filter(|t| is_class(t));
+    class != NONE
+        && s.flags & flag::HEADER == 0
+        && !seen(s.file)
+        && classes().next().is_some()
+        && classes().all(|&t| g.syms[t as usize].flags & flag::HEADER == 0 && !seen(g.syms[t as usize].file))
+}
+
 /// The members of the struct called `name` as seen from `file`.
 fn layout<'a>(
     name: u32,
@@ -576,7 +646,18 @@ impl Types<'_> {
         closure: &Closure,
         scratch: &mut Vec<u32>,
     ) -> Option<u32> {
-        let t = self.type_of(hint, fi, g, own, closure, scratch)?;
+        let t = self.type_of(hint, fi, g, own.clone(), closure, scratch);
+        // `SI_HINT_WHY=<member>`: what each call of it is found to be made on.
+        static WHY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        if WHY.get_or_init(|| std::env::var("SI_HINT_WHY").ok()).as_deref().is_some_and(|w| g.name(member) == w) {
+            let path: Vec<&str> = self.files[fi].hint_path[hint.path as usize..(hint.path + hint.len) as usize].iter().map(|&p| g.name(self.remap[fi][p as usize])).collect();
+            eprintln!("hintwhy   {}: root {} {} path {:?} -> type {:?}, layout {:?}", self.files[fi].path, hint.root_kind, g.name(self.remap[fi][hint.root as usize]), path, t.map(|t| g.name(t)), t.and_then(|t| self.layout_of(t, fi, closure)).map(|(rf, _)| &self.files[rf as usize].path));
+            if let Some((rf, ri)) = t.and_then(|t| self.layout_of(t, fi, closure)) {
+                let r = &self.files[rf as usize].records[ri as usize];
+                eprintln!("hintwhy     fields {:?}", r.fields.iter().map(|&x| if x == NONE { "-" } else { g.name(self.remap[rf as usize][x as usize]) }).collect::<Vec<_>>());
+            }
+        }
+        let t = t?;
         let (rf, ri) = self.layout_of(t, fi, closure)?;
         let (rf, ri, at) = self.find(rf, ri, member, closure, 8)?;
         let def = self.files[rf as usize].records[ri as usize].defs[at];
@@ -700,9 +781,17 @@ impl Types<'_> {
                 }
             }
             let element_type = || self.files[mf as usize].cxx().elems.iter().find(|e| e.0 == mi && e.1 == at as u32).map(|e| e.2);
+            // (Of `StrictMock<M> m`, a class that derives from its argument:
+            // `M`, whose members it has.)
+            let wrapped = || {
+                let t = r.types[at];
+                (t != NONE && self.cpp.wrappers.contains(&self.remap[mf as usize][t as usize]))
+                    .then(|| self.files[mf as usize].cxx().targs.iter().find(|e| e.0 == mi && e.1 == at as u32).map(|e| e.2))
+                    .flatten()
+            };
             let next = match of_element.then(element_type).flatten() {
                 Some(e) => e,
-                None => r.types[at],
+                None => wrapped().unwrap_or(r.types[at]),
             };
             if next == NONE {
                 return None;
@@ -773,6 +862,9 @@ struct Cpp {
     /// A macro -> what it passes its arguments on to: (the function or
     /// macro called, its qualifier, the parameter, the argument, `...`).
     forwards: FxHashMap<u32, Vec<(u32, u32, u32, u32, bool)>>,
+    /// The class templates that derive from a parameter of theirs
+    /// (`Cxx::param_bases`), by name.
+    wrappers: FxHashSet<u32>,
 }
 
 impl Cpp {
@@ -800,6 +892,7 @@ impl Cpp {
         }
         c.namespace_aliases.retain(|a, _| !opened.contains(a));
         c.namespaces.retain(|name| !c.types.contains(name));
+        let mut typedefs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
         for (fi, f) in files.iter().enumerate() {
             let base = g.files[fi].sym_start as usize;
             for &(def, chain, own) in &f.cxx().owners {
@@ -833,6 +926,7 @@ impl Cpp {
                 let qual = if w.qual == NONE { NONE } else { remap[fi][w.qual as usize] };
                 c.forwards.entry((base + w.def as usize) as u32).or_default().push((remap[fi][w.callee as usize], qual, w.param, w.arg, w.rest));
             }
+            c.wrappers.extend(f.cxx().param_bases.iter().map(|&n| remap[fi][n as usize]));
             for &(class, b) in &f.cxx().bases {
                 let (class, b) = (remap[fi][class as usize], remap[fi][b as usize]);
                 if class != b {
@@ -840,6 +934,25 @@ impl Cpp {
                     c.derived.entry(b).or_default().push(class);
                 }
             }
+            for &(alias, tag) in &f.aliases {
+                let (alias, tag) = (remap[fi][alias as usize], remap[fi][tag as usize]);
+                if alias != tag {
+                    typedefs.entry(alias).or_default().push(tag);
+                }
+            }
+        }
+        // A base named by a typedef is the class it names (yaml-cpp's
+        // `typedef HandlerTest GenEmitterTest;`, then
+        // `TEST_F(GenEmitterTest, ...)`).
+        let named: Vec<(u32, u32)> = c
+            .bases
+            .iter()
+            .flat_map(|(&class, bs)| bs.iter().flat_map(|b| typedefs.get(b).into_iter().flatten()).map(move |&t| (class, t)))
+            .filter(|&(class, t)| class != t)
+            .collect();
+        for (class, t) in named {
+            c.bases.entry(class).or_default().push(t);
+            c.derived.entry(t).or_default().push(class);
         }
         for v in c.bases.values_mut().chain(c.derived.values_mut()) {
             v.sort_unstable();
@@ -1022,14 +1135,39 @@ impl Cpp {
     /// not all do. (One whose parameters are not known takes any number.)
     /// Not for a declaration alone where definitions do not fit: that may
     /// be one the compiler writes (`T () = default;`), which the reader
-    /// would rather see the class's for.
-    fn by_arity(&self, n: Option<u8>, cands: &mut Vec<u32>, syms: &[Sym]) {
+    /// would rather see the class's for. Unless `all` (every symbol of the
+    /// name) has definitions of it that fit, of its class and namespace,
+    /// elsewhere: those (abseil's `StrCat (a, b)`, declared in `str_cat.h`
+    /// beside inline overloads of other arities, defined in `str_cat.cc`).
+    fn by_arity(&self, n: Option<u8>, cands: &mut Vec<u32>, all: &[u32], syms: &[Sym]) {
         let Some(n) = n else { return };
         let fits = |c: &u32| self.arity.get(c).is_none_or(|&(least, most)| least <= n && n <= most);
         let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
         let defs = cands.iter().any(is_def);
-        if cands.iter().any(|c| fits(c) && (is_def(c) || !defs)) && !cands.iter().all(fits) {
+        if cands.iter().all(fits) {
+            return;
+        }
+        if cands.iter().any(|c| fits(c) && (is_def(c) || !defs)) {
             cands.retain(fits);
+            return;
+        }
+        let Some(&decl) = cands.iter().find(|c| fits(c)) else { return };
+        let (class, ns) = (self.class(decl), self.ns(decl));
+        let elsewhere = |c: &&u32| {
+            let s = &syms[**c as usize];
+            s.kind == kind::FUNCTION
+                && is_def(c)
+                && s.flags & flag::STATIC == 0
+                && self.arity.contains_key(c)
+                && fits(c)
+                && self.class(**c) == class
+                && self.ns(**c) == ns
+                && !cands.contains(c)
+        };
+        let found: Vec<u32> = all.iter().filter(elsewhere).copied().collect();
+        if !found.is_empty() {
+            cands.retain(fits);
+            cands.extend(found);
         }
     }
 
@@ -1573,7 +1711,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
             cpp.conversions(&g, &aliases, given, targets, literals, lineage, &mut made);
             for &(c, class) in &made {
                 let several = made.iter().any(|&(o, k)| k == class && syms[o as usize].file != syms[c as usize].file);
-                edges.push([base + r.scope, c, pack_meta(r.line, ambiguous || several, refkind::CALL)]);
+                edges.push([base + r.scope, c, pack_meta(r.line, ambiguous || several || aliased_class(&g, &cpp, c), refkind::CALL)]);
             }
         };
         for (ri, r) in f.refs.iter().enumerate() {
@@ -1622,8 +1760,13 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                         tmp.push(c);
                     }
                 };
+                // (A class's own `operator=`, written or the compiler's,
+                // hides its bases'.)
+                let own = |l: u32, s: u32| {
+                    !assign || types.layout_of(l, fi, closure).is_some_and(|(rf, ri)| remap[rf as usize][files[rf as usize].records[ri as usize].name as usize] == cpp.class(s))
+                };
                 for name in std::iter::once(name).chain(rewritten) {
-                    if let Some(sym) = lt.and_then(|l| types.class_member(l, name, fi, &g, closure)).filter(|&s| syms[s as usize].kind == kind::FUNCTION) {
+                    if let Some(sym) = lt.and_then(|l| types.class_member(l, name, fi, &g, closure).filter(|&s| own(l, s))).filter(|&s| syms[s as usize].kind == kind::FUNCTION) {
                         // The class's: its overloads, of a binary one those
                         // taking the right operand best.
                         let class = cpp.class(sym);
@@ -1648,8 +1791,19 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     } else if binary && !assign && (lt.is_some() || rt.is_some()) {
                         // (A unary one on an object of no class with it is
                         // a built-in: `*p` of a pointer.)
+                        // (From a source file, only one it sees: written
+                        // in what it includes, or declared there, of the
+                        // same parameters.)
+                        let seen = |c: u32| {
+                            let at = |file: u32| file == fi as u32 || closure.member[file as usize];
+                            let s = &syms[c as usize];
+                            !closure.unit
+                                || at(s.file)
+                                || s.flags & flag::HEADER == 0
+                                    && g.syms_named(s.name).iter().any(|&d| at(syms[d as usize].file) && cpp.class(d) == NONE && cpp.operator_params.get(&d) == cpp.operator_params.get(&c))
+                        };
                         for &c in g.syms_named(name) {
-                            if syms[c as usize].kind != kind::FUNCTION || cpp.class(c) != NONE {
+                            if syms[c as usize].kind != kind::FUNCTION || cpp.class(c) != NONE || !seen(c) {
                                 continue;
                             }
                             let Some(&(p0, p1)) = cpp.operator_params.get(&c) else { continue };
@@ -1699,7 +1853,12 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 };
                 let ctor_of = |c: u32, class: u32| syms[c as usize].kind == kind::FUNCTION && cpp.class(c) == class;
                 let has_ctor = |class: u32| g.syms_named(class).iter().any(|&c| ctor_of(c, class));
-                if class != NONE && !has_ctor(class) {
+                // (An alias only where it is seen: a function's own
+                // `using set = absl::btree_set<int>` is not `std::set`.)
+                let alias_seen = |class: u32| {
+                    g.syms_named(class).iter().any(|&t| syms[t as usize].kind == kind::TYPEDEF && (syms[t as usize].file == fi as u32 || closure.member[syms[t as usize].file as usize]))
+                };
+                if class != NONE && !has_ctor(class) && (!closure.unit || alias_seen(class)) {
                     if let Some(tag) = aliases.get(&class).into_iter().flatten().copied().find(|&t| has_ctor(t)) {
                         class = tag;
                     }
@@ -1708,7 +1867,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 if class != NONE {
                     tmp.extend(g.syms_named(class).iter().copied().filter(|&c| ctor_of(c, class)));
                 }
-                cpp.by_arity(args_of.get(&(ri as u32)).copied(), &mut tmp, syms);
+                cpp.by_arity(args_of.get(&(ri as u32)).copied(), &mut tmp, &[], syms);
                 if copies.contains(&(ri as u32)) {
                     // A copy: by the constructor taking one of its class,
                     // or by the compiler's, which is no call here.
@@ -1723,7 +1882,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     continue;
                 }
                 let first = syms[tmp[0] as usize].file;
-                let ambiguous = tmp.iter().any(|&c| syms[c as usize].file != first);
+                let ambiguous = tmp.iter().any(|&c| syms[c as usize].file != first) || tmp.iter().all(|&c| aliased_class(&g, &cpp, c));
                 counts[ambiguous as usize] += 1;
                 let meta = pack_meta(r.line, ambiguous, refkind::CALL);
                 edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta]));
@@ -1850,6 +2009,18 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     // that name.)
                     if pick.is_empty() && qual == NONE {
                         pick.extend_from_slice(cands);
+                        // (In a method, not one of another class; unless
+                        // `static`, called by its class's name in a way
+                        // not read, in what a macro there writes, where
+                        // the method is too: `X<T>::f ()`.)
+                        if cpp.class(base + r.scope) != NONE {
+                            let written = syms[(base + r.scope) as usize].line == r.line;
+                            let class_static = |c: u32| {
+                                let class = cpp.class(c);
+                                g.syms_named(syms[c as usize].name).iter().any(|&d| syms[d as usize].flags & flag::CLASS_STATIC != 0 && cpp.class(d) == class)
+                            };
+                            pick.retain(|&c| cpp.class(c) == NONE || written && class_static(c));
+                        }
                     }
                     in_sight(&pick, syms, base..end, closure, &sure.member, want, &mut tmp);
                     // `T (a)`, `T x (a)`: a class named is made, by its
@@ -1875,6 +2046,14 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
             if !in_cpp && !cpp.class_of.is_empty() {
                 tmp.retain(|&c| cpp.class(c) == NONE);
             }
+            // Nor, from a source file, only methods of classes other
+            // source files have all to themselves (a test's fixture):
+            // no name of them is in sight here. (`GetParam ()` in a test
+            // is gtest's.) (Beside others, one may be an override of
+            // them, through a base the file sees.)
+            if in_cpp && closure.unit && !member && tmp.iter().all(|&c| unseen_class(&g, &cpp, c, fi as u32, closure)) {
+                tmp.clear();
+            }
             if tmp.is_empty() {
                 counts[2] += 1;
                 continue;
@@ -1884,7 +2063,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 tmp.retain(callable);
             }
             if in_cpp {
-                cpp.by_arity(args_of.get(&(ri as u32)).copied(), &mut tmp, syms);
+                cpp.by_arity(args_of.get(&(ri as u32)).copied(), &mut tmp, cands, syms);
             }
             let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
             if tmp.iter().any(is_def) {
@@ -2043,12 +2222,13 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 let wraps = tmp.iter().any(function);
                 tmp.iter().filter(|c| !(wraps && wrappers.contains(c))).count() > 1
             };
-            let ambiguous = several || maybe || guessed || tmp.iter().any(optional);
+            let twin = in_cpp && tmp.iter().all(|&c| aliased_class(&g, &cpp, c));
+            let ambiguous = several || maybe || guessed || twin || tmp.iter().any(optional);
             counts[ambiguous as usize] += 1;
             // `SI_EDGE_WHY=<name>[,<name>...]`: why each call of those names that is
             // not certain is not.
             if ambiguous && edge_why.as_deref().is_some_and(|w| w.split(',').any(|w| g.name(remap[fi][r.name as usize]) == w)) {
-                let at = path_of.get(fi).and_then(|&p| readings.paths.get(p as usize)).map_or("?", |p| p.as_str());
+                let at = path_of.get(fi).and_then(|&p| readings.paths.get(p as usize)).map_or(files[fi].path.as_str(), |p| p.as_str());
                 let c = tmp[0];
                 // (Here worked out only to say: the link asks the turned-over table.)
                 let readers = readers.get_or_init(|| {
@@ -3051,6 +3231,56 @@ int f (struct t *h) { return htab_size (h); }
         assert_eq!(sure(&g, "f", "kfree"), [("mm/slab.c".to_string(), true)]);
         assert_eq!(sure(&g, "f", "set_bit"), [("arch/x86/include/asm/bitops.h".to_string(), true)]);
         assert_eq!(sure(&g, "g", "set_bit"), [("arch/arm64/include/asm/bitops.h".to_string(), true)]);
+    }
+
+    #[test]
+    fn an_include_is_looked_up_first_from_a_folder_the_includer_is_in() {
+        let paths = ["src/rpc/util.h", "src/wallet/rpc/util.h", "src/rpc/mempool.cpp", "src/wallet/rpc/coins.cpp", "include/linux/kernel.h", "tools/include/linux/kernel.h", "drivers/a.c"];
+        let found = Includes::new(paths.iter().copied());
+        let resolve = |includer: &str, operand: &str| {
+            let mut out = Vec::new();
+            found.resolve(includer, operand, &mut out);
+            out.iter().map(|&i| paths[i as usize]).collect::<Vec<_>>()
+        };
+        // `-Isrc`: `src/`'s, not `src/wallet/`'s, whose folder above
+        // holds the includer too.
+        assert_eq!(resolve("src/rpc/mempool.cpp", "rpc/util.h"), ["src/rpc/util.h"]);
+        // From inside `src/wallet/` too: `src/` is the `-I` of all.
+        assert_eq!(resolve("src/wallet/rpc/coins.cpp", "rpc/util.h"), ["src/rpc/util.h"]);
+        assert_eq!(resolve("src/wallet/rpc/coins.cpp", "wallet/rpc/util.h"), ["src/wallet/rpc/util.h"]);
+        assert_eq!(resolve("drivers/a.c", "linux/kernel.h"), ["include/linux/kernel.h"]);
+    }
+
+    #[test]
+    fn a_tree_with_a_copy_of_the_includer_s_folder_is_another_program_s() {
+        let paths = [
+            "include/linux/list.h",
+            "arch/x86/include/asm/barrier.h",
+            "tools/include/asm/barrier.h",
+            "tools/include/linux/list.h",
+            "tools/include/asm/only.h",
+            "include/linux/device/devres.h",
+            "include/net/netfilter/nf_tables.h",
+            "net/netfilter/nf_tables_api.c",
+        ];
+        let found = Includes::new(paths.iter().copied());
+        let resolve = |includer: &str, operand: &str| {
+            let mut out = Vec::new();
+            found.resolve(includer, operand, &mut out);
+            out.iter().map(|&i| paths[i as usize]).collect::<Vec<_>>()
+        };
+        // `tools/` has its own `include/linux/`: the shallower
+        // `tools/include/` is its, not the kernel's.
+        assert_eq!(resolve("include/linux/list.h", "asm/barrier.h"), ["arch/x86/include/asm/barrier.h"]);
+        assert_eq!(resolve("tools/include/linux/list.h", "asm/barrier.h"), ["tools/include/asm/barrier.h"]);
+        // Where there is none other, still the one.
+        assert_eq!(resolve("include/linux/list.h", "asm/only.h"), ["tools/include/asm/only.h"]);
+        // Of a folder the includer is in, too (`tools/` has no
+        // `include/linux/device/`).
+        assert_eq!(resolve("include/linux/device/devres.h", "asm/barrier.h"), ["arch/x86/include/asm/barrier.h"]);
+        // The folder looked up from is not a copy for having one of the
+        // includer's name: `include/` has `include/net/netfilter/`.
+        assert_eq!(resolve("net/netfilter/nf_tables_api.c", "linux/list.h"), ["include/linux/list.h"]);
     }
 
     #[test]

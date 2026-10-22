@@ -1514,6 +1514,131 @@ int slow (void) { return 0; }
     }
 
     #[test]
+    fn a_member_a_macro_calls_on_an_object_is_of_the_object_s_class() {
+        let d = Dir::new("receivers");
+        d.write("mock.h", "template <class M> class StrictMock : public M {};\n#define MOCK(n) void n (int); void gmock_##n (int a) { n (a); }\nnamespace app {\nstruct Mock { MOCK(X) };\nstruct Other { void gmock_X (int); };\n}\n");
+        d.write("fixture.h", "#include \"mock.h\"\nnamespace app {\nclass Fixture { protected: StrictMock<Mock> handler; Mock plain; };\n}\n");
+        d.write("t.cpp", "#include \"fixture.h\"\n#define TEST_F(F, N) class F##_##N##_Test : public F { void TestBody (); }; void F##_##N##_Test::TestBody ()\n#define CALL_IMPL(o, c) ((o).gmock_##c)\n#define EXPECT(o, c) CALL_IMPL (o, c)\n#define CHECK(x) do { app::Mock h; h.gmock_X (x); } while (0)\nnamespace app {\ntypedef Fixture Alias;\nTEST_F(Alias, A) { EXPECT (handler, X (1)); }\nTEST_F(Fixture, B) { EXPECT (plain, X (2)); }\nvoid check () { CHECK (3); }\n}\n");
+        let s = Session::open(&d.0, Options::default());
+        let g = &s.graph;
+        // (caller, callee, certain) of every call of `gmock_X`.
+        let q = crate::graph::Qualifier::new(g);
+        let mut calls: Vec<(String, String, bool)> = (0..g.syms.len() as u32)
+            .flat_map(|c| g.refs_from(c).iter().map(move |e| (c, *e)))
+            .filter(|(_, e)| g.sym_name(e.other) == "gmock_X")
+            .map(|(c, e)| (q.name(g, c).into_owned(), q.name(g, e.other).into_owned(), !e.ambiguous()))
+            .collect();
+        calls.sort();
+        calls.dedup();
+        // A fixture's member, through a typedef of it, of a class that
+        // derives from its argument; a member; an object the macro declares
+        // (a call its body writes, which is the macro's).
+        let want = |c: &str| (c.to_string(), "Mock::gmock_X".to_string(), true);
+        assert_eq!(calls, [want("Alias_A_Test::TestBody"), want("CHECK"), want("Fixture_B_Test::TestBody")]);
+    }
+
+    #[test]
+    fn an_overload_declared_beside_inline_ones_is_the_definition_elsewhere() {
+        let d = Dir::new("arity-elsewhere");
+        d.write("cat.h", "#include <string>\nnamespace lib {\ninline std::string Cat () { return std::string (); }\ninline std::string Cat (int a) { return std::string (); }\nstd::string Cat (int a, int b);\n}\n");
+        d.write("cat.cpp", "#include \"cat.h\"\nnamespace lib {\nstd::string Cat (int a, int b) { return Cat (a) + Cat (b); }\n}\n");
+        d.write("use.cpp", "#include \"cat.h\"\nstd::string use () { return lib::Cat (1, 2) + lib::Cat (3); }\n");
+        let s = Session::open(&d.0, Options::default());
+        let g = &s.graph;
+        let mut calls: Vec<(String, u32, bool)> = g
+            .find("use")
+            .iter()
+            .flat_map(|&c| g.refs_from(c))
+            .map(|e| (g.file_path(g.syms[e.other as usize].file).to_string(), g.syms[e.other as usize].line, !e.ambiguous()))
+            .collect();
+        calls.sort();
+        calls.dedup();
+        assert_eq!(calls, [("cat.cpp".to_string(), 3, true), ("cat.h".to_string(), 4, true)]);
+    }
+
+    #[test]
+    fn an_alias_or_an_operator_out_of_sight_is_none() {
+        let d = Dir::new("out-of-sight");
+        d.write("set.h", "namespace lib {\ntemplate <class T> class btree_set {\n public:\n  btree_set () {}\n};\n}\n");
+        d.write("matchers.h", "enum class Code { kOk, kBad };\ninline bool operator== (const Code& a, const Code& b) { return false; }\n");
+        d.write("set_test.cpp", "#include \"set.h\"\n#include \"matchers.h\"\nvoid local () {\n  using set = lib::btree_set<int>;\n  set s;\n}\nbool same (Code a) { return a == Code::kOk; }\n");
+        d.write("other.cpp", "#include <set>\nenum class Code { kOk, kBad };\nvoid made () { std::set<int> s; }\nbool also (Code a) { return a == Code::kOk; }\n");
+        let s = Session::open(&d.0, Options::default());
+        let g = &s.graph;
+        let q = crate::graph::Qualifier::new(g);
+        let callees = |caller: &str| -> Vec<String> {
+            let mut v: Vec<String> = g.find(caller).iter().flat_map(|&c| g.refs_from(c)).filter(|e| e.kind() == crate::model::refkind::CALL).map(|e| q.name(g, e.other).into_owned()).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        // Where they are seen, they are meant.
+        assert_eq!(callees("local"), ["btree_set::btree_set"]);
+        assert_eq!(callees("same"), ["operator=="]);
+        // Not elsewhere: `std::set`, and the built-in `==`.
+        assert_eq!((callees("made"), callees("also")), (vec![], vec![]));
+    }
+
+    #[test]
+    fn a_plain_call_in_a_method_is_of_its_class_or_its_bases() {
+        let d = Dir::new("plain-in-method");
+        d.write("a.h", "class Handler {\n protected:\n  int Parse () { return 0; }\n};\ntypedef Handler Gen;\nclass Sink {\n public:\n  void Send (int);\n};\nstruct Adjuster {\n  static int Adjust (int);\n};\nstruct B {\n  B& operator= (const B&);\n};\nstruct D : B {};\n");
+        d.write("a.cpp", "#include \"a.h\"\nvoid Sink::Send (int) {}\nint Adjuster::Adjust (int a) { return a; }\nB& B::operator= (const B&) { return *this; }\n");
+        d.write("t.cpp", "#include <gtest/gtest.h>\n#include \"a.h\"\nstruct Gen_A_Test : Gen { int ParseIt () { return Parse (); } };\nstruct Case : testing::Test {\n  void SendIt () {\n    Send (1);\n    Adjust (2);\n  }\n};\nvoid assign () { D a, b; a = b; }\n");
+        let s = Session::open(&d.0, Options::default());
+        let g = &s.graph;
+        let q = crate::graph::Qualifier::new(g);
+        let callees = |caller: &str| -> Vec<(String, bool)> {
+            let mut v: Vec<(String, bool)> = g.find(caller).iter().flat_map(|&c| g.refs_from(c)).filter(|e| e.kind() == crate::model::refkind::CALL).map(|e| (q.name(g, e.other).into_owned(), !e.ambiguous())).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        // A base through a typedef of it.
+        assert_eq!(callees("ParseIt"), [("Handler::Parse".to_string(), true)]);
+        // Not a method of a class it is none of (the base's, the library's),
+        // not even a `static` one, written so. (In what a macro writes there,
+        // it may be: called by its class's name in a way not read.)
+        assert_eq!(callees("SendIt"), []);
+        // The class's own `operator=`, the compiler's, hides its base's.
+        assert_eq!(callees("assign"), []);
+    }
+
+    #[test]
+    fn a_method_of_a_class_another_source_file_keeps_is_out_of_sight() {
+        let d = Dir::new("unseen-class");
+        d.write("a.cpp", "class Fixture {\n public:\n  int GetParam () const { return 1; }\n  int Run () { return GetParam (); }\n};\n");
+        d.write("b.cpp", "#include <gtest/gtest.h>\nstruct Case : testing::TestWithParam<int> { int Body () { return GetParam (); } };\n");
+        let s = Session::open(&d.0, Options::default());
+        let g = &s.graph;
+        let q = crate::graph::Qualifier::new(g);
+        let callees = |caller: &str| -> Vec<String> {
+            let mut v: Vec<String> = g.find(caller).iter().flat_map(|&c| g.refs_from(c)).filter(|e| e.kind() == crate::model::refkind::CALL).map(|e| q.name(g, e.other).into_owned()).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        // Its own file's; not b.cpp's, which sees no `Fixture` (the library's).
+        assert_eq!((callees("Run"), callees("Body")), (vec!["Fixture::GetParam".to_string()], vec![]));
+    }
+
+    #[test]
+    fn a_method_of_a_class_that_is_an_alias_in_another_reading_is_one_reading() {
+        let d = Dir::new("aliased-class");
+        d.write("view.h", "#include <string_view>\nnamespace lib {\n#ifdef USE_STD_VIEW\nusing view = std::string_view;\n#else\nclass view {\n public:\n  view () {}\n  view (const char* p) : p_ (p) {}\n  int size () const { return 0; }\n private:\n  const char* p_;\n};\n#endif\nclass Kept {\n public:\n  int count () const { return 1; }\n};\n}\n");
+        d.write("a.cpp", "#include \"view.h\"\nint use (const char* p) {\n  lib::view v (p);\n  lib::view w;\n  lib::Kept k;\n  return v.size () + w.size () + k.count ();\n}\n");
+        let s = Session::open(&d.0, Options::default());
+        let g = &s.graph;
+        let q = crate::graph::Qualifier::new(g);
+        let mut calls: Vec<(String, bool)> = g.find("use").iter().flat_map(|&c| g.refs_from(c)).filter(|e| e.kind() == crate::model::refkind::CALL).map(|e| (q.name(g, e.other).into_owned(), !e.ambiguous())).collect();
+        calls.sort();
+        calls.dedup();
+        // `std::string_view`'s where the alias is compiled: not certainly
+        // the class's. (A class beside it, not in the branch, is certain.)
+        assert_eq!(calls, [("Kept::count".to_string(), true), ("view::size".to_string(), false), ("view::view".to_string(), false)]);
+    }
+
+    #[test]
     fn a_switch_in_a_configuration_header_decides_branches_everywhere() {
         let d = Dir::new("source-defines");
         d.write("config.h", "#ifndef CONFIG_H\n#define CONFIG_H\n#define USE_NET 1\n#define USE_USB 0\n#endif\n");

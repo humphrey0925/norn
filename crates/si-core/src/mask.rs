@@ -209,6 +209,17 @@ pub struct Define {
     /// compiled.
     #[serde(default)]
     pub unused: u64,
+    /// Of a macro with parameters, those its body only pastes onto what
+    /// comes before them (`gmock_ ## call`), stringifies, or hands to
+    /// another macro whole (`forwards`): the first name written there
+    /// becomes part of another, and is no reference of its own, where the
+    /// macros handed it do the same (`MacroSets::pasted`).
+    #[serde(default)]
+    pub pasted: u64,
+    /// Those of them handed to another macro, each as (parameter, macro,
+    /// that macro's parameter).
+    #[serde(default)]
+    pub forwards: Vec<(u8, Vec<u8>, u8)>,
 }
 
 impl Define {
@@ -231,6 +242,8 @@ impl Define {
             local: false,
             branch: 0,
             unused: 0,
+            pasted: 0,
+            forwards: Vec::new(),
             system: false,
             head: Vec::new(),
         }
@@ -636,6 +649,7 @@ pub struct MacroSets {
     /// parameters, as bits.
     #[serde(default)]
     discards: FxHashMap<Vec<u8>, u64>,
+    pasted: FxHashMap<Vec<u8>, u64>,
     /// Per file, its rivals: the headers included in another branch of an
     /// `#if` not known that it is included in, and nowhere else (one per
     /// compiler, say: `cmsis_gcc.h`, `cmsis_iccarm.h`). No compilation
@@ -711,6 +725,9 @@ impl MacroSets {
         // (name, first word of the body) of each macro with arguments.
         let mut loop_heads: Vec<(&[u8], &[u8])> = Vec::new();
         let mut discards: FxHashMap<&[u8], u64> = FxHashMap::default();
+        // name -> each definition's (parameters it pastes or hands on, and
+        // those it hands on).
+        let mut pasting: FxHashMap<&[u8], Vec<(u64, &[(u8, Vec<u8>, u8)])>> = FxHashMap::default();
         for d in defines {
             // `#define inline` and the like: the keyword still matters to us.
             if is_keyword(&d.name) || d.undef || d.include || d.test {
@@ -730,6 +747,7 @@ impl MacroSets {
             }
             let unused = if d.function_like { d.unused } else { 0 };
             *discards.entry(&d.name).or_insert(u64::MAX) &= unused;
+            pasting.entry(&d.name).or_default().push(if d.function_like { (d.pasted, &d.forwards[..]) } else { (0, &[][..]) });
             let e = by_name.entry(&d.name).or_default();
             e.0 |= d.function_like;
             e.1.push(d.deps.as_deref());
@@ -780,13 +798,26 @@ impl MacroSets {
                 work.extend(users.get(name).into_iter().flatten().filter(|u| !set.contains_key(**u)));
             }
         }
-        // Kept: everything those bodies can reach.
+        // Kept: everything those bodies can reach, and what they can make
+        // by pasting: a name a body writes that is no macro's and ends in
+        // `_` (gmock's `GMOCK_PP_CAT (GMOCK_PP_INTERNAL_IF_, c)`) reaches
+        // every macro whose name begins with it.
+        let mut names: Vec<&[u8]> = bodies.keys().copied().collect();
+        names.sort_unstable();
+        let mut prefixes: FxHashSet<&[u8]> = FxHashSet::default();
         let mut kept: FxHashSet<Vec<u8>> = FxHashSet::default();
         let mut work: Vec<&[u8]> = expanding.keys().map(|n| &n[..]).collect();
         while let Some(name) = work.pop() {
             if let Some((key, b)) = bodies.get_key_value(name) {
                 if kept.insert(key.to_vec()) {
-                    work.extend(b.2.iter().copied());
+                    for &r in &b.2 {
+                        if bodies.contains_key(r) {
+                            work.push(r);
+                        } else if r.len() > 2 && r.ends_with(b"_") && prefixes.insert(r) {
+                            let from = names.partition_point(|n| *n < r);
+                            work.extend(names[from..].iter().take_while(|n| n.starts_with(r)).copied());
+                        }
+                    }
                 }
             }
         }
@@ -809,7 +840,32 @@ impl MacroSets {
             }
         }
         let discards = discards.into_iter().filter(|(_, bits)| *bits != 0).map(|(n, bits)| (n.to_vec(), bits)).collect();
-        MacroSets { transparent: set, expanding, kept, loops, discards, ..MacroSets::default() }
+        // Pasted: least fixed point over "every definition pastes it, or
+        // hands it to a macro whose parameter is pasted".
+        let mut pasted: FxHashMap<&[u8], u64> = FxHashMap::default();
+        loop {
+            let mut changed = false;
+            for (&name, defs) in &pasting {
+                let bits = defs.iter().fold(u64::MAX, |all, (bits, forwards)| {
+                    let mut ok = *bits;
+                    for (k, target, j) in forwards.iter() {
+                        if *j >= 64 || pasted.get(&target[..]).is_none_or(|t| t & 1 << j == 0) {
+                            ok &= !(1 << k);
+                        }
+                    }
+                    all & ok
+                });
+                if bits != 0 && pasted.get(name) != Some(&bits) {
+                    pasted.insert(name, bits);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let pasted = pasted.into_iter().map(|(n, bits)| (n.to_vec(), bits)).collect();
+        MacroSets { transparent: set, expanding, kept, loops, discards, pasted, ..MacroSets::default() }
     }
 
     /// The sets of every file's `#define`s (`per_file`, the files being
@@ -1054,6 +1110,12 @@ impl MacroSets {
     /// The parameters of macro `name` no definition of it uses, as bits.
     pub fn discards(&self, name: &[u8]) -> u64 {
         self.discards.get(name).copied().unwrap_or(0)
+    }
+
+    /// The parameters every definition of macro `name` only pastes onto
+    /// what comes before them, as bits (`Define::pasted`).
+    pub fn pasted(&self, name: &[u8]) -> u64 {
+        self.pasted.get(name).copied().unwrap_or(0)
     }
 
     /// Is `name` a transparent macro?
@@ -1328,6 +1390,164 @@ pub fn top_commas(args: &[u8]) -> Vec<usize> {
         i += 1;
     }
     out
+}
+
+/// C++: a macro written as a whole parameter of a template
+/// (`template <class T, REQUIRES ("...", std::is_convertible<T*, U*>)>`,
+/// an `enable_if` made by a macro), made `class` and spaces for the parser,
+/// which can make nothing of it and loses the class it is in. Such a use is
+/// a name in capitals with arguments: no type, template or value is.
+pub fn template_macros(masked: &mut [u8]) {
+    let n = masked.len();
+    let word = |s: &[u8], i: usize| i < s.len() && is_ident(s[i]);
+    let mut i = 0;
+    while let Some(at) = masked[i..].windows(8).position(|w| w == b"template") {
+        let at = i + at;
+        i = at + 8;
+        if at > 0 && word(masked, at - 1) || word(masked, i) {
+            continue;
+        }
+        let mut j = i;
+        while j < n && masked[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if masked.get(j) != Some(&b'<') {
+            continue;
+        }
+        // The parameters, one at a time, at the top of the list.
+        let (mut angle, mut paren) = (1, 0);
+        let mut start = Some(j + 1);
+        j += 1;
+        while j < n && angle > 0 {
+            let b = masked[j];
+            if let Some(s) = start.filter(|_| paren == 0 && angle == 1) {
+                if s == j && b.is_ascii_whitespace() {
+                    start = Some(j + 1);
+                    j += 1;
+                    continue;
+                }
+                if s == j && b.is_ascii_uppercase() {
+                    let mut e = j;
+                    while e < n && is_ident(masked[e]) {
+                        e += 1;
+                    }
+                    let caps = masked[j..e].iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == b'_') && e - j > 1;
+                    let mut k = e;
+                    while k < n && masked[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                    if caps && masked.get(k) == Some(&b'(') {
+                        // To its closing parenthesis, strings and all.
+                        let mut depth = 0;
+                        let mut m = k;
+                        while m < n {
+                            match masked[m] {
+                                b'"' | b'\'' => {
+                                    let q = masked[m];
+                                    m += 1;
+                                    while m < n && masked[m] != q {
+                                        m += 1 + (masked[m] == b'\\') as usize;
+                                    }
+                                }
+                                b'(' => depth += 1,
+                                b')' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            m += 1;
+                        }
+                        if m < n && m + 1 - j >= 5 {
+                            for (o, c) in masked[j..=m].iter_mut().enumerate() {
+                                *c = if o < 5 { b"class"[o] } else if c.is_ascii_whitespace() { *c } else { b' ' };
+                            }
+                            j = m + 1;
+                            start = None;
+                            continue;
+                        }
+                    }
+                }
+                start = None;
+            }
+            match b {
+                b'(' | b'[' | b'{' => paren += 1,
+                b')' | b']' | b'}' => paren -= 1,
+                b'<' if paren == 0 => angle += 1,
+                b'>' if paren == 0 => angle -= 1,
+                b',' if paren == 0 && angle == 1 => start = Some(j + 1),
+                b';' => break,
+                _ => {}
+            }
+            j += 1;
+        }
+        i = i.max(j);
+    }
+}
+
+/// The parameters (of the first 64) `body` names only right after `##`,
+/// after `#`, or as a whole argument of another macro, as bits, with
+/// those it hands on (see `Define::pasted`).
+fn pasted_params(params: &[&[u8]], body: &[u8]) -> (u64, Vec<(u8, Vec<u8>, u8)>) {
+    // The body's tokens: names, `##`, `#`, and single bytes.
+    let mut toks: Vec<&[u8]> = Vec::new();
+    let mut i = 0;
+    while i < body.len() {
+        let b = body[i];
+        if is_ident_start(b) {
+            let s = i;
+            while i < body.len() && is_ident(body[i]) {
+                i += 1;
+            }
+            toks.push(&body[s..i]);
+        } else if b == b'#' && body.get(i + 1) == Some(&b'#') {
+            toks.push(b"##");
+            i += 2;
+        } else if b.is_ascii_whitespace() {
+            i += 1;
+        } else {
+            toks.push(&body[i..i + 1]);
+            i += 1;
+        }
+    }
+    let (mut pasted, mut otherwise) = (0u64, 0u64);
+    let mut forwards = Vec::new();
+    // The calls open around each token: (where the name is, commas so far).
+    let mut open: Vec<Option<(usize, u8)>> = Vec::new();
+    for (j, t) in toks.iter().enumerate() {
+        match *t {
+            b"(" => open.push((j > 0 && is_ident_start(toks[j - 1][0])).then(|| (j - 1, 0))),
+            b")" => _ = open.pop(),
+            b"," => {
+                if let Some(Some((_, n))) = open.last_mut() {
+                    *n = n.saturating_add(1);
+                }
+            }
+            _ => {}
+        }
+        let Some(k) = params.iter().take(64).position(|p| p == t) else { continue };
+        let before = j.checked_sub(1).map(|b| toks[b]);
+        let after = toks.get(j + 1).copied();
+        // (`, ## args` is no paste but GNU's comma that goes with no
+        // arguments: what follows is compiled.)
+        if before == Some(b"##") && toks.get(j.wrapping_sub(2)).is_some_and(|t| *t != b",") {
+            pasted |= 1 << k;
+        } else if before == Some(b"##") {
+            otherwise |= 1 << k;
+        } else if before == Some(b"#") {
+            // (Made a string: nothing of it is compiled.)
+        } else if let (Some(b"(" | b","), Some(b")" | b","), Some(Some((at, n)))) = (before, after, open.last()) {
+            forwards.push((k as u8, toks[*at].to_vec(), *n));
+        } else {
+            otherwise |= 1 << k;
+        }
+    }
+    let handed: u64 = forwards.iter().fold(0, |b, f| b | 1 << f.0);
+    let bits = (pasted | handed) & !otherwise;
+    forwards.retain(|f| bits & 1 << f.0 != 0);
+    (bits, forwards)
 }
 
 /// The parameters (of the first 64) `body` does not name, as bits.
@@ -1922,6 +2142,21 @@ impl<'a> Lexer<'a> {
                         }
                     }
                 }
+                // The first name of an argument pasted onto another is
+                // part of that one: no reference.
+                let pasted = sets.pasted(&s[a..e]);
+                if pasted != 0 {
+                    let commas = top_commas(&s[open + 1..end - 1]);
+                    let mut seen = 0u64;
+                    args.retain(|t| {
+                        let k = commas.iter().filter(|&&c| open + 1 + c < t.start as usize).count();
+                        let first = k < 64 && pasted & 1 << k != 0 && seen & 1 << k == 0;
+                        if k < 64 {
+                            seen |= 1 << k;
+                        }
+                        !first
+                    });
+                }
                 self.out.events.extend(args.into_iter().map(Event::Ref));
                 blank(&mut self.out.masked, a, end);
                 return;
@@ -2350,6 +2585,7 @@ impl<'a> Lexer<'a> {
         let known = value.clone().or(Some(b"(".to_vec()));
         self.local.insert(s[a..e].to_vec(), (!conditional).then_some(known));
         if let Some(defines) = &mut self.defines {
+            let pasted = pasted_params(&params, &s[body..end]);
             defines.push(Define {
                 name: s[a..e].to_vec(),
                 function_like,
@@ -2369,6 +2605,8 @@ impl<'a> Lexer<'a> {
                 head: first_word(&s[body..end]),
                 branch: 0,
                 unused: unused_params(&params, &s[body..end]),
+                pasted: pasted.0,
+                forwards: pasted.1,
             });
         }
         // A `.c` file's own macros stand in it alone, so they are not in
@@ -2625,6 +2863,44 @@ pub fn defines_of(src: &[u8], conditions: &Conditions, path: Option<&str>) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_macro_written_as_a_template_parameter_is_a_class_to_the_parser() {
+        let mut text = b"template<class T, REQUIRES(\"T is a Token\", std::is_convertible<T*, const Token*> )>\nstatic T *at(T *tok);\ntemplate <typename U, int N = MAX(1, 2)> struct A;".to_vec();
+        template_macros(&mut text);
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.starts_with("template<class T, class "), "{text}");
+        assert!(text.contains(" >\nstatic T *at"), "{text}");
+        // (Not a default value.)
+        assert!(text.ends_with("int N = MAX(1, 2)> struct A;"), "{text}");
+    }
+
+    #[test]
+    fn an_argument_pasted_onto_a_name_is_no_reference_of_its_own() {
+        let sets = MacroSets::from_defines(defines(
+            b"#define IMPL(obj, setter, call) ((obj).gmock_##call)(0).setter(#obj, #call)\n\
+              #define EXPECT_CALL(obj, call) IMPL(obj, Expected, call)\n\
+              #define LOG(fmt, args...) printf(fmt, ##args)\n\
+              #define BOTH(x) x + pre_##x\n",
+            &Conditions::default(),
+        ));
+        // Pasted, stringified, or handed whole to a macro that does either.
+        assert_eq!((sets.pasted(b"IMPL"), sets.pasted(b"EXPECT_CALL")), (0b100, 0b10));
+        // GNU's `, ## args` is no paste; nor is a name also written alone.
+        assert_eq!((sets.pasted(b"LOG"), sets.pasted(b"BOTH")), (0, 0));
+    }
+
+    #[test]
+    fn what_a_pasted_prefix_can_make_is_kept() {
+        let sets = MacroSets::from_defines(defines(
+            b"#define CAT(a, b) a ## b\n#define IF(c, t, e) CAT(IF_, c)(t, e)\n#define IF_1(t, e) t\n#define IF_0(t, e) e\n#define OTHER_1 1\n",
+            &Conditions::default(),
+        ));
+        // (`IF_0` and `IF_1` are no names any body writes.)
+        let mut kept: Vec<String> = sets.kept.iter().map(|k| String::from_utf8_lossy(k).into_owned()).collect();
+        kept.sort();
+        assert_eq!(kept, ["CAT", "IF", "IF_0", "IF_1"]);
+    }
 
     fn transparent(src: &str) -> MacroSets {
         MacroSets::from_defines(defines(src.as_bytes(), &Conditions::default()))
