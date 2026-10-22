@@ -152,6 +152,7 @@ impl Session {
         let defines = Packed::all(defines);
         let facts = crate::extract_all_reusing(root, &files, &sets, reuse);
         let mut cache = Cache::default();
+        cache.relinking();
         let options = Options { readings: crate::readings_of(&conditions), not_built: conditions.not_built().to_vec(), ..options };
         let (graph, stats) = link_cached(&facts, &options, &mut cache);
         let stamps = files.par_iter().map(|p| stamp(p)).collect();
@@ -417,7 +418,11 @@ impl Session {
             defines: Vec::new(),
             facts: Vec::new(),
             sets: MacroSets::default(),
-            cache: Cache::default(),
+            cache: {
+                let mut cache = Cache::default();
+                cache.relinking();
+                cache
+            },
             options: Options::default(),
             store: None,
             stamps: Vec::new(),
@@ -572,7 +577,7 @@ impl Session {
         }
         // The macro expansions of the last link, where they were saved for
         // these very files: the link then only expands what changed.
-        let cache = match store.expansions().filter(|x| x.hashes.len() == files.len()) {
+        let mut cache = match store.expansions().filter(|x| x.hashes.len() == files.len()) {
             Some(index) => {
                 let expanded = manifest
                     .files
@@ -584,6 +589,7 @@ impl Session {
             }
             None => Cache::default(),
         };
+        cache.relinking();
         mark("expansions read");
         Some(Session {
             root: root.to_path_buf(),
@@ -788,6 +794,15 @@ impl Session {
         }
 
         mark(&format!("files read (definitions changed {defines_changed}, directives changed {told_changed}, files came or went {whole})"));
+        // Every file said to have changed reads as it was indexed (saved
+        // unchanged, or only touched), and the graph is of these files:
+        // the index stands as it is. (A session read back from a save
+        // has no graph until this links one.)
+        let linked = !self.graph.files.is_empty() && self.graph.files.len() == self.files.len();
+        if touched.is_empty() && !whole && !self.all_stale && linked {
+            up.extract_ms = ms(t);
+            return up;
+        }
         // New conditions: which `#define`s count has to be seen again, and
         // every file read under them.
         let all_stale = std::mem::take(&mut self.all_stale);
@@ -910,9 +925,9 @@ impl Session {
         mark("saved");
 
         let t = Instant::now();
-        // The graph that was goes first: nobody can ask it anything while
-        // this runs, and the link would make the new one beside it.
-        self.graph = Graph::default();
+        // The graph that was is the link's to take from (or let go first,
+        // when nothing of it holds): nobody can ask it anything while this runs.
+        self.cache.keep(std::mem::take(&mut self.graph));
         self.options.readings = crate::readings_of(&self.conditions);
         self.options.not_built = self.conditions.not_built().to_vec();
         (self.graph, self.stats) = link_cached(&self.facts, &self.options, &mut self.cache);
@@ -1058,6 +1073,51 @@ int slow (void) { return 0; }
         assert_eq!(up.reused, 1, "only c.c reads the same");
         assert_eq!((functions(&outer, "fast"), functions(&outer, "slow")), (1, 0));
         assert_eq!(shape(&outer), shape(&Session::open(&d.0, Options::default())));
+    }
+
+    /// The graph as it is laid out: what a link made anew and a link that
+    /// took from the one before must agree on to the byte.
+    fn layout(g: &Graph) -> Vec<Vec<u8>> {
+        use bytemuck::cast_slice;
+        vec![
+            g.str_bytes.clone(),
+            cast_slice(&g.str_off).to_vec(),
+            cast_slice(&g.syms).to_vec(),
+            cast_slice(&g.by_name).to_vec(),
+            cast_slice(&g.out_off).to_vec(),
+            cast_slice(&g.out).to_vec(),
+            cast_slice(&g.in_off).to_vec(),
+            cast_slice(&g.inc).to_vec(),
+        ]
+    }
+
+    #[test]
+    fn a_relink_resolves_again_only_what_an_edit_can_change_and_makes_the_same_graph() {
+        let d = Dir::new("relink");
+        d.write("a.h", "struct ops { int (*go) (void); };\n#ifdef FAST\nint fast (void);\n#endif\nint slow (void);\nint helper (int (*f) (void));\n");
+        d.write("a.c", "#include \"a.h\"\nint slow (void) { return 1; }\nint helper (int (*f) (void)) {\n  return f ();\n}\n");
+        d.write("b.c", "#include \"a.h\"\nstatic int cb (void) { return 3; }\nstatic struct ops o = { .go = slow };\nint main (void) {\n  helper (cb);\n  return slow ();\n}\n");
+        d.write("c.c", "int alone (void) { return 2; }\n");
+        let mut s = Session::open(&d.0, Options::default());
+        let n = s.files.len() as u64;
+        let mut edit = |name: &str, text: &str, resolved: u64, what: &str| {
+            let path = d.write(name, text);
+            s.update(&[path]);
+            assert_eq!(s.stats.resolved_files, resolved, "{what}: files resolved again");
+            assert!(layout(&s.graph) == layout(&Session::open(&d.0, Options::default()).graph), "{what}: the graph differs from one made anew");
+        };
+        // Its lines move, and the line `helper` calls its parameter on, at
+        // which `cb` handed to it is called: the files that name `helper`
+        // as well (b.c, which hands it, and a.h).
+        edit("a.c", "#include \"a.h\"\n\n\nint slow (void) { return 1; }\nint helper (int (*f) (void)) {\n  return f ();\n}\n", 3, "lines put in");
+        edit("c.c", "int alone (void) { return slow (); }\n", 1, "a call added");
+        edit("c.c", "int alone (void) {\n  int never_seen_before = 2;\n  return never_seen_before;\n}\n", 1, "a name no file had");
+        edit("b.c", "#include \"a.h\"\nstatic int cb (void) { return 3; }\nstatic struct ops o = { .go = cb };\nint main (void) {\n  return slow ();\n}\n", 1, "a call and a bind changed");
+        edit("c.c", "int alone (void) { return 2; }\nint another (void) { return alone (); }\n", n, "a function added");
+        edit("a.h", "struct ops { int (*go) (void); int (*stop) (void); };\n#ifdef FAST\nint fast (void);\n#endif\nint slow (void);\nint helper (int (*f) (void));\n", n, "a member added");
+        // Saved as it was: nothing to link.
+        let up = s.update(&[PathBuf::from("c.c")]);
+        assert_eq!((up.changed, up.link_ms), (0, 0.0));
     }
 
     #[test]

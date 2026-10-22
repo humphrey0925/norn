@@ -1946,6 +1946,12 @@ pub struct Cache {
     pub(crate) made: Vec<u64>,
     /// The link's table of names, kept from one link to the next.
     pub(crate) names: NameCache,
+    /// Links are made again of these files after edits (a session's):
+    /// each leaves what the next can start from (`last`), and is handed
+    /// the graph before (`previous`).
+    pub(crate) relinks: bool,
+    pub(crate) last: Option<Box<crate::link::Last>>,
+    pub(crate) previous: Option<crate::graph::Graph>,
 }
 
 /// The names in use, in order, kept between links: an edit seldom brings
@@ -2069,7 +2075,21 @@ impl Cache {
             epoch: 1,
             made,
             names: NameCache::default(),
+            relinks: false,
+            last: None,
+            previous: None,
         }
+    }
+
+    /// Keep what a link leaves for the next (see `link::Last`).
+    pub fn relinking(&mut self) {
+        self.relinks = true;
+    }
+
+    /// The graph the last link made, given back as the files change: the
+    /// next link takes from it what still holds.
+    pub fn keep(&mut self, g: crate::graph::Graph) {
+        self.previous = (self.relinks && self.last.is_some()).then_some(g);
     }
 
     /// The files expanded anew since the last call, for saving.
@@ -2280,6 +2300,9 @@ pub fn expand(
             epoch: cache.epoch,
             made: vec![0; files.len()],
             names: std::mem::take(&mut cache.names),
+            relinks: cache.relinks,
+            last: cache.last.take(),
+            previous: cache.previous.take(),
         };
     }
     cache.macros = macros;
