@@ -23,6 +23,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The website (site/), as Cloudflare builds it: pages, screenshots, charts
+  # and the README's benchmark table read into it.
+  website:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build the website
+        run: node site/build.mjs
+
   test:
     name: ${{ matrix.os }}
     strategy:

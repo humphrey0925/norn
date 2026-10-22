@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Norn — Source Insight-style C code navigation for VS Code</title>
+  <meta name="description" content="Source Insight-style C code navigation in VS Code. No build or compile_commands.json needed; follows calls through macros and function pointers.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Norn — Source Insight-style C code navigation for VS Code">
+  <meta property="og:description" content="Source Insight-style code navigation for large C codebases, in VS Code. No build, no compile_commands.json.">
+  <link rel="canonical" href="https://norn-c.com/">
+  <link rel="alternate" hreflang="en" href="https://norn-c.com/">
+  <link rel="alternate" hreflang="zh-Hant-TW" href="https://norn-c.com/zh-TW/">
+  <link rel="alternate" hreflang="x-default" href="https://norn-c.com/">
+  <meta property="og:url" content="https://norn-c.com/">
+  <meta property="og:site_name" content="Norn">
+  <meta property="og:locale" content="en_US">
+  <meta property="og:image" content="https://norn-c.com/assets/screenshots/overview.png">
+  <meta property="og:image:width" content="1456">
+  <meta property="og:image:height" content="908">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="theme-color" content="#0d1126">
+  <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+  <link rel="icon" href="/assets/icon.png" type="image/png">
+  <link rel="stylesheet" href="/style.css">
+  <script type="application/ld+json">
+{
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "Norn",
+    "alternateName": "Norn — Code Navigation & Symbol Index",
+    "url": "https://norn-c.com/",
+    "inLanguage": "en",
+    "description": "Source Insight-style code navigation for large C codebases, in VS Code. No build, no compile_commands.json. Calls through macros and function pointers, and only the code your build compiles.",
+    "applicationCategory": "DeveloperApplication",
+    "applicationSubCategory": "Code navigation",
+    "operatingSystem": "Windows, Linux, macOS",
+    "softwareVersion": "__NORN_VERSION__",
+    "softwareRequirements": "Visual Studio Code, VSCodium, Cursor or Windsurf",
+    "downloadUrl": "https://marketplace.visualstudio.com/items?itemName=humphrey0925.norn-c",
+    "installUrl": "https://marketplace.visualstudio.com/items?itemName=humphrey0925.norn-c",
+    "screenshot": "https://norn-c.com/assets/screenshots/overview.png",
+    "image": "https://norn-c.com/assets/icon.png",
+    "license": "https://www.apache.org/licenses/LICENSE-2.0",
+    "codeRepository": "https://github.com/humphrey0925/norn",
+    "programmingLanguage": "Rust",
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "USD"
+    },
+    "author": {
+      "@type": "Person",
+      "name": "humphrey0925",
+      "url": "https://github.com/humphrey0925"
+    }
+  }
+  </script>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="/"><img src="/assets/icon.svg" alt="">Norn</a>
+    <nav>
+      <a href="#why">Why Norn</a>
+      <a href="#benchmarks">Benchmarks</a>
+      <a href="#features">Features</a>
+      <a href="#start">Get started</a>
+      <a href="https://github.com/humphrey0925/norn">GitHub</a>
+      <a class="lang" href="/zh-TW/" hreflang="zh-TW" lang="zh-TW">繁體中文</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<div class="hero">
+  <div class="wrap">
+    <img class="logo" src="/assets/icon.svg" alt="Norn">
+    <h1>Code navigation for large C codebases,<br><em>without a build</em></h1>
+    <p class="lead">Source Insight-style navigation in VS Code. No <code>compile_commands.json</code>. Calls through macros and function pointers, and only the code your build compiles.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://marketplace.visualstudio.com/items?itemName=humphrey0925.norn-c">Install from VS Marketplace</a>
+      <a class="btn" href="https://open-vsx.org/extension/humphrey0925/norn-c">Open VSX</a>
+      <a class="btn" href="https://github.com/humphrey0925/norn/releases">.vsix &amp; <code>norn</code> CLI</a>
+    </div>
+    <p class="install-cmd">or <code>code --install-extension humphrey0925.norn-c</code> · Windows, Linux, macOS · x64 &amp; Arm64</p>
+    <img class="shot" fetchpriority="high" src="/assets/screenshots/overview.png" width="1456" height="908" alt="Norn in VS Code: Project Symbols, File Symbols, Relation and Context around the editor">
+  </div>
+</div>
+
+<section id="why">
+  <div class="wrap">
+    <h2>Why Norn</h2>
+    <p class="intro">Language servers built on a compiler, such as clangd, need to know exactly how every file is compiled. A great deal of real C cannot tell them: firmware built with a proprietary toolchain, SDKs with a header per chip, vendor trees that only build on one machine. Text indexers such as ctags and cscope work anywhere, but they find names, not calls. Norn reads the sources the way a person would, and the build's own description where there is one.</p>
+    <div class="points">
+      <div class="point"><h3>No setup</h3><p>Open a folder. Norn reads Arm DS-5, Keil, IAR, Visual Studio, CMake, Makefile, PlatformIO, Kconfig or <code>compile_commands.json</code> and works out which <code>#if</code> branches are compiled.</p></div>
+      <div class="point"><h3>Calls, not just names</h3><p>It follows calls through macros and through function pointers stored in structs, and says how each call comes about.</p></div>
+      <div class="point"><h3>Fast enough to forget about</h3><p>The whole Linux kernel indexes in about a minute on a desktop PC; saving a file updates the index in milliseconds.</p></div>
+      <div class="point"><h3>Checked against the compiler</h3><p>Measured call by call against clang's own view of real builds of public projects.</p></div>
+      <div class="point"><h3>Private</h3><p>Everything runs on your machine. No network, no telemetry.</p></div>
+    </div>
+
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th></th><th class="norn">Norn</th><th>clangd</th><th>ctags / cscope / GNU Global</th></tr></thead>
+        <tbody>
+          <tr><td>Works without a compilation database</td><td class="norn">✅</td><td>⚠️ less accurate</td><td>✅</td></tr>
+          <tr><td>Knows which <code>#if</code> branches the build compiles</td><td class="norn">✅</td><td>✅ with a database</td><td>❌</td></tr>
+          <tr><td>Call graph (callers and callees)</td><td class="norn">✅</td><td>✅</td><td>⚠️ cscope, by name</td></tr>
+          <tr><td>Calls through function pointers</td><td class="norn">✅</td><td>❌</td><td>❌</td></tr>
+          <tr><td>Calls generated by macros</td><td class="norn">✅</td><td>✅ with a database</td><td>❌</td></tr>
+          <tr><td>Index updated as you save</td><td class="norn">✅</td><td>✅</td><td>❌ re-run</td></tr>
+          <tr><td>Source Insight-style views (Relation, Context)</td><td class="norn">✅</td><td>❌</td><td>❌</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="benchmarks" class="alt">
+  <div class="wrap">
+    <h2>Benchmarks</h2>
+    <p class="intro">Measured on public projects against clang's own view of a real build of each. Every call a tool reports is checked against the call clang compiles. clangd is measured twice: with each build's own compilation database, and with none. Norn is given nothing.</p>
+    <div class="chart"><img src="/assets/calls-found.svg" width="1108" height="386" alt="Calls found, per project and tool"></div>
+    <div class="chart"><img src="/assets/index-time.svg" alt="Time to index, per project and tool"></div>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Project</th><th>Files</th><th class="norn">Norn</th><th>clangd + build database</th><th>clangd</th><th>cscope</th></tr></thead>
+        <tbody>
+          <!-- BENCHMARKS:BEGIN -->
+          <!-- Filled in from README.md by site/build.mjs. -->
+          <!-- BENCHMARKS:END -->
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Each cell: the share of calls found (checked against clang), and below it the time to index. Methods, every figure and tool versions: <a href="https://github.com/humphrey0925/norn/blob/master/docs/benchmarks/README.md">docs/benchmarks</a>. Every number is produced by <code>bench/compare.py</code>; none is typed in.</p>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <h2>Features</h2>
+    <p class="intro">Norn is a complete language server: Go to Definition, Find References, Call Hierarchy, signature help, rename, folding, formatting and quick fixes too. Alongside Microsoft's C/C++ extension it becomes IntelliSense's configuration provider instead of competing with it.</p>
+    <div class="features">
+      <div class="feature"><div class="txt"><h3>Project Symbols</h3><p>Fuzzy search over every symbol: fragments in any order, initials, letters in order.</p></div><div class="img"><img src="/assets/screenshots/search.png" width="302" height="200" alt="Project Symbols" loading="lazy"></div></div>
+      <div class="feature"><div class="txt"><h3>Relation</h3><p>Callers, callees, references and function-pointer assignments, as a tree or a graph.</p></div><div class="img"><img src="/assets/screenshots/relation-graph.png" width="1456" height="908" alt="Relation as a graph" loading="lazy"></div></div>
+      <div class="feature"><div class="txt"><h3>Hover with documentation</h3><p>A declaration and its doc comment; a macro's value worked out through other macros.</p></div><div class="img"><img src="/assets/screenshots/hover-function.png" width="948" height="487" alt="Hover" loading="lazy"></div></div>
+      <div class="feature"><div class="txt"><h3>Context</h3><p>The definition of whatever the cursor is on, beside your code, without leaving your place.</p></div><div class="img"><img src="/assets/screenshots/called-by.png" width="1087" height="292" alt="Relation and Context" loading="lazy"></div></div>
+      <div class="feature"><div class="txt"><h3>Completion</h3><p>Members after <code>.</code> and <code>-&gt;</code>, locals, keywords, <code>#include</code> paths, every indexed name.</p></div><div class="img"><img src="/assets/screenshots/member-completion.png" width="948" height="495" alt="Member completion" loading="lazy"></div></div>
+      <div class="feature"><div class="txt"><h3>Highlighting and hints</h3><p>Names coloured by what they are; parameter names at call sites.</p></div><div class="img"><img src="/assets/screenshots/highlighting-and-hints.png" width="948" height="487" alt="Semantic highlighting and inlay hints" loading="lazy"></div></div>
+      <div class="feature"><div class="txt"><h3>File Symbols with locals</h3><p>A function's parameters and local variables, and every line that uses one.</p></div><div class="img"><img src="/assets/screenshots/locals.png" width="1456" height="908" alt="File Symbols with locals" loading="lazy"></div></div>
+      <div class="feature"><div class="txt"><h3>Compile conditions</h3><p>Configurations read from the build; switch between Debug, Release or one per board.</p></div><div class="img"><img src="/assets/screenshots/conditions-switch.png" width="620" height="176" alt="Switching configuration" loading="lazy"></div></div>
+    </div>
+  </div>
+</section>
+
+<section id="start" class="alt">
+  <div class="wrap">
+    <h2>Get started</h2>
+    <ol class="steps">
+      <li>Install <b>Norn — Code Navigation &amp; Symbol Index</b> from the <a href="https://marketplace.visualstudio.com/items?itemName=humphrey0925.norn-c">Visual Studio Marketplace</a>, from <a href="https://open-vsx.org/extension/humphrey0925/norn-c">Open VSX</a> for VSCodium, Cursor and Windsurf, or a <code>.vsix</code> from the <a href="https://github.com/humphrey0925/norn/releases">releases</a>.</li>
+      <li>Open a folder with C sources. That is all.</li>
+    </ol>
+    <p class="intro" style="margin-top:28px">The <a href="https://github.com/humphrey0925/norn/blob/master/docs/norn-guide.md">user guide</a> covers every view and setting. Without VS Code, the same indexer is a command of its own, <code>norn</code>, for the terminal, scripts, CI and other editors: see <a href="https://github.com/humphrey0925/norn/blob/master/docs/cli.md">the command line</a>.</p>
+    <h2 style="margin-top:48px">How it works</h2>
+<pre><code>sources ─► tree-sitter parse ─► facts per file ─► link ─► call graph (CSR) ─► language server
+              ▲                                     ▲
+   #if worked out from the build's              calls through macros and
+   own configuration and the sources            function pointers resolved</code></pre>
+    <p class="intro">Norn is written in Rust. Each file is parsed once after its preprocessor conditions are worked out. The facts of each file are cached by content hash; linking them into a call graph takes milliseconds, and the graph answers a callers query in well under a microsecond.</p>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="links">
+      <a href="https://github.com/humphrey0925/norn">GitHub</a>
+      <a href="https://github.com/humphrey0925/norn/blob/master/CHANGELOG.md">Changelog</a>
+      <a href="https://github.com/humphrey0925/norn/blob/master/docs/norn-guide.md">User guide</a>
+      <a href="https://github.com/humphrey0925/norn/blob/master/docs/lsp-api.md">LSP API</a>
+      <a href="https://github.com/humphrey0925/norn/issues">Issues</a>
+    </div>
+    <p>Copyright 2026 humphrey0925 and the Norn contributors. Licensed under the <a href="https://github.com/humphrey0925/norn/blob/master/LICENSE">Apache License 2.0</a>.</p>
+    <p>Source Insight is a trademark of Source Dynamics, Inc. Norn is not affiliated with, or endorsed by, Source Dynamics; the name is used only to describe the style of navigation.</p>
+  </div>
+</footer>
+
+</body>
+</html>
