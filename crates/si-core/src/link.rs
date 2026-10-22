@@ -1603,8 +1603,19 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                         } else if binary && !assign && (lt.is_some() || rt.is_some()) {
                             // (A unary one on an object of no class with it is
                             // a built-in: `*p` of a pointer.)
+                            // (From a source file, only one it sees: written
+                            // in what it includes, or declared there, of the
+                            // same parameters.)
+                            let seen = |c: u32| {
+                                let at = |file: u32| file == fi as u32 || closure.member[file as usize];
+                                let s = &syms[c as usize];
+                                !closure.unit
+                                    || at(s.file)
+                                    || s.flags & flag::HEADER == 0
+                                        && g.syms_named(s.name).iter().any(|&d| at(syms[d as usize].file) && cpp.class(d) == NONE && cpp.operator_params.get(&d) == cpp.operator_params.get(&c))
+                            };
                             for &c in g.syms_named(name) {
-                                if syms[c as usize].kind != kind::FUNCTION || cpp.class(c) != NONE {
+                                if syms[c as usize].kind != kind::FUNCTION || cpp.class(c) != NONE || !seen(c) {
                                     continue;
                                 }
                                 let Some(&(p0, p1)) = cpp.operator_params.get(&c) else { continue };
@@ -1654,7 +1665,12 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     };
                     let ctor_of = |c: u32, class: u32| syms[c as usize].kind == kind::FUNCTION && cpp.class(c) == class;
                     let has_ctor = |class: u32| g.syms_named(class).iter().any(|&c| ctor_of(c, class));
-                    if class != NONE && !has_ctor(class) {
+                    // (An alias only where it is seen: a function's own
+                    // `using set = absl::btree_set<int>` is not `std::set`.)
+                    let alias_seen = |class: u32| {
+                        g.syms_named(class).iter().any(|&t| syms[t as usize].kind == kind::TYPEDEF && (syms[t as usize].file == fi as u32 || closure.member[syms[t as usize].file as usize]))
+                    };
+                    if class != NONE && !has_ctor(class) && (!closure.unit || alias_seen(class)) {
                         if let Some(tag) = aliases.get(&class).into_iter().flatten().copied().find(|&t| has_ctor(t)) {
                             class = tag;
                         }
