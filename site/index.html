@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Norn — Code navigation for large C codebases</title>
-  <meta name="description" content="Source Insight-style code navigation for large C codebases, in VS Code. No build, no compile_commands.json. Calls through macros and function pointers, and only the code your build compiles.">
+  <title>Norn — Source Insight-style C code navigation for VS Code</title>
+  <meta name="description" content="Source Insight-style C code navigation in VS Code. No build or compile_commands.json needed; follows calls through macros and function pointers.">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Norn — Code navigation for large C codebases">
+  <meta property="og:title" content="Norn — Source Insight-style C code navigation for VS Code">
   <meta property="og:description" content="Source Insight-style code navigation for large C codebases, in VS Code. No build, no compile_commands.json.">
   <link rel="canonical" href="https://norn-c.com/">
   <link rel="alternate" hreflang="en" href="https://norn-c.com/">
@@ -23,6 +23,39 @@
   <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
   <link rel="icon" href="/assets/icon.png" type="image/png">
   <link rel="stylesheet" href="/style.css">
+  <script type="application/ld+json">
+{
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "Norn",
+    "alternateName": "Norn — Code Navigation & Symbol Index",
+    "url": "https://norn-c.com/",
+    "inLanguage": "en",
+    "description": "Source Insight-style code navigation for large C codebases, in VS Code. No build, no compile_commands.json. Calls through macros and function pointers, and only the code your build compiles.",
+    "applicationCategory": "DeveloperApplication",
+    "applicationSubCategory": "Code navigation",
+    "operatingSystem": "Windows, Linux, macOS",
+    "softwareVersion": "__NORN_VERSION__",
+    "softwareRequirements": "Visual Studio Code, VSCodium, Cursor or Windsurf",
+    "downloadUrl": "https://marketplace.visualstudio.com/items?itemName=humphrey0925.norn-c",
+    "installUrl": "https://marketplace.visualstudio.com/items?itemName=humphrey0925.norn-c",
+    "screenshot": "https://norn-c.com/assets/screenshots/overview.png",
+    "image": "https://norn-c.com/assets/icon.png",
+    "license": "https://www.apache.org/licenses/LICENSE-2.0",
+    "codeRepository": "https://github.com/humphrey0925/norn",
+    "programmingLanguage": "Rust",
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "USD"
+    },
+    "author": {
+      "@type": "Person",
+      "name": "humphrey0925",
+      "url": "https://github.com/humphrey0925"
+    }
+  }
+  </script>
 </head>
 <body>
 
@@ -52,7 +85,7 @@
       <a class="btn" href="https://github.com/humphrey0925/norn/releases">.vsix &amp; <code>norn</code> CLI</a>
     </div>
     <p class="install-cmd">or <code>code --install-extension humphrey0925.norn-c</code> · Windows, Linux, macOS · x64 &amp; Arm64</p>
-    <img class="shot" src="/assets/screenshots/overview.png" width="1456" height="908" alt="Norn in VS Code: Project Symbols, File Symbols, Relation and Context around the editor">
+    <img class="shot" fetchpriority="high" src="/assets/screenshots/overview.png" width="1456" height="908" alt="Norn in VS Code: Project Symbols, File Symbols, Relation and Context around the editor">
   </div>
 </div>
 

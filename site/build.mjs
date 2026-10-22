@@ -1,6 +1,7 @@
 // Builds the website into out/site: the pages in site/, with the icon,
 // screenshots and benchmark charts copied from where the project keeps them,
-// and the benchmark table's rows taken from the README's. Run by
+// the benchmark table's rows taken from the README's, and the version from
+// the extension's package.json. Run by
 // `wrangler deploy` and `wrangler dev` (wrangler.jsonc) and by CI.
 //
 //   node site/build.mjs
@@ -68,4 +69,11 @@ for (const page of ["index.html", join("zh-TW", "index.html")]) {
   writeFileSync(path, html.replace(marked, `$1${tbody}$2`));
 }
 
-console.log(`out/site: ${rows.length} benchmark rows, ${readdirSync(join(assets, "screenshots")).length} screenshots`);
+// The version in the pages' structured data, from the extension's.
+const { version } = JSON.parse(readFileSync(join(root, "vscode", "package.json"), "utf8"));
+for (const page of ["index.html", join("zh-TW", "index.html")]) {
+  const path = join(out, page);
+  writeFileSync(path, readFileSync(path, "utf8").replaceAll("__NORN_VERSION__", version));
+}
+
+console.log(`out/site: version ${version}, ${rows.length} benchmark rows, ${readdirSync(join(assets, "screenshots")).length} screenshots`);

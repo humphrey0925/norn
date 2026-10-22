@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Norn — 大型 C 專案的程式碼瀏覽工具</title>
+  <title>Norn — VS Code 的 Source Insight 式 C 語言程式碼瀏覽工具</title>
   <meta name="description" content="在 VS Code 裡，用 Source Insight 的方式瀏覽大型 C 專案。不用編譯，不用 compile_commands.json。追得到透過巨集和函式指標的呼叫，只看 build 實際會編譯的程式碼。">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Norn — 大型 C 專案的程式碼瀏覽工具">
+  <meta property="og:title" content="Norn — VS Code 的 Source Insight 式 C 語言程式碼瀏覽工具">
   <meta property="og:description" content="在 VS Code 裡，用 Source Insight 的方式瀏覽大型 C 專案。不用編譯，不用 compile_commands.json。">
   <link rel="canonical" href="https://norn-c.com/zh-TW/">
   <link rel="alternate" hreflang="en" href="https://norn-c.com/">
@@ -23,6 +23,39 @@
   <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
   <link rel="icon" href="/assets/icon.png" type="image/png">
   <link rel="stylesheet" href="/style.css">
+  <script type="application/ld+json">
+{
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "Norn",
+    "alternateName": "Norn — Code Navigation & Symbol Index",
+    "url": "https://norn-c.com/zh-TW/",
+    "inLanguage": "zh-Hant-TW",
+    "description": "在 VS Code 裡，用 Source Insight 的方式瀏覽大型 C 專案。不用編譯，不用 compile_commands.json。追得到透過巨集和函式指標的呼叫，只看 build 實際會編譯的程式碼。",
+    "applicationCategory": "DeveloperApplication",
+    "applicationSubCategory": "Code navigation",
+    "operatingSystem": "Windows, Linux, macOS",
+    "softwareVersion": "__NORN_VERSION__",
+    "softwareRequirements": "Visual Studio Code, VSCodium, Cursor or Windsurf",
+    "downloadUrl": "https://marketplace.visualstudio.com/items?itemName=humphrey0925.norn-c",
+    "installUrl": "https://marketplace.visualstudio.com/items?itemName=humphrey0925.norn-c",
+    "screenshot": "https://norn-c.com/assets/screenshots/overview.png",
+    "image": "https://norn-c.com/assets/icon.png",
+    "license": "https://www.apache.org/licenses/LICENSE-2.0",
+    "codeRepository": "https://github.com/humphrey0925/norn",
+    "programmingLanguage": "Rust",
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "USD"
+    },
+    "author": {
+      "@type": "Person",
+      "name": "humphrey0925",
+      "url": "https://github.com/humphrey0925"
+    }
+  }
+  </script>
 </head>
 <body>
 
@@ -52,7 +85,7 @@
       <a class="btn" href="https://github.com/humphrey0925/norn/releases">.vsix 與 <code>norn</code> 指令</a>
     </div>
     <p class="install-cmd">或 <code>code --install-extension humphrey0925.norn-c</code> · Windows、Linux、macOS · x64 與 Arm64</p>
-    <img class="shot" src="/assets/screenshots/overview.png" width="1456" height="908" alt="VS Code 裡的 Norn：編輯器周圍的 Project Symbols、File Symbols、Relation 和 Context">
+    <img class="shot" fetchpriority="high" src="/assets/screenshots/overview.png" width="1456" height="908" alt="VS Code 裡的 Norn：編輯器周圍的 Project Symbols、File Symbols、Relation 和 Context">
   </div>
 </div>
 
