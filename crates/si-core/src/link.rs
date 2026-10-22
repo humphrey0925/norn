@@ -274,6 +274,8 @@ pub(crate) struct Includes<'a> {
     paths: Vec<&'a str>,
     by_path: FxHashMap<&'a str, u32>,
     by_base: FxHashMap<&'a str, Vec<u32>>,
+    /// Every folder a file is in, as `a/b`.
+    dirs: FxHashSet<&'a str>,
     /// Per file, whether it is in a folder the build does not compile.
     outside: Vec<bool>,
 }
@@ -286,8 +288,9 @@ impl<'a> Includes<'a> {
         for (i, p) in paths.iter().enumerate() {
             by_base.entry(p.rsplit('/').next().unwrap_or(p)).or_default().push(i as u32);
         }
+        let dirs = paths.iter().flat_map(|p| p.match_indices('/').map(move |(i, _)| &p[..i])).collect();
         let outside = vec![false; paths.len()];
-        Includes { paths, by_path, by_base, outside }
+        Includes { paths, by_path, by_base, dirs, outside }
     }
 
     /// The same, the files in `folders` (`a/b/`) not compiled by the build.
@@ -354,9 +357,28 @@ impl<'a> Includes<'a> {
             let holds = source && !r.is_empty() && (dir == r || dir.starts_with(r) && dir.as_bytes().get(r.len()) == Some(&b'/'));
             holds.then(|| -(r.split('/').count() as i64))
         };
+        // A folder holding a copy of the includer's own folder is another
+        // program's tree (`tools/`, with `tools/include/linux/`): not what
+        // `include/linux/list.h` reads, `<asm/barrier.h>`, but where none
+        // other is.
+        let several = cands.len() > 1;
+        let buf = std::cell::RefCell::new(String::new());
+        let copy = |id: u32| {
+            let r = root(id);
+            let mut b = buf.borrow_mut();
+            several
+                && !dir.is_empty()
+                && r.match_indices('/').map(|(i, _)| &r[..i]).chain(std::iter::once(r)).any(|f| {
+                    b.clear();
+                    b.push_str(f);
+                    b.push('/');
+                    b.push_str(dir);
+                    !f.is_empty() && self.dirs.contains(b.as_str())
+                })
+        };
         let shared = |id: u32| {
             let other = dir_of(paths[id as usize]);
-            (own(id), above(id), built(id), include_folder(id), shallow(id), dir.split('/').zip(other.split('/')).take_while(|(a, b)| a == b).count())
+            (!copy(id), own(id), above(id), built(id), include_folder(id), shallow(id), dir.split('/').zip(other.split('/')).take_while(|(a, b)| a == b).count())
         };
         match cands.iter().map(|&c| shared(c)).max() {
             Some(best) => {
@@ -2885,6 +2907,23 @@ int f (struct t *h) { return htab_size (h); }
         assert_eq!(resolve("src/wallet/rpc/coins.cpp", "rpc/util.h"), ["src/rpc/util.h"]);
         assert_eq!(resolve("src/wallet/rpc/coins.cpp", "wallet/rpc/util.h"), ["src/wallet/rpc/util.h"]);
         assert_eq!(resolve("drivers/a.c", "linux/kernel.h"), ["include/linux/kernel.h"]);
+    }
+
+    #[test]
+    fn a_tree_with_a_copy_of_the_includer_s_folder_is_another_program_s() {
+        let paths = ["include/linux/list.h", "arch/x86/include/asm/barrier.h", "tools/include/asm/barrier.h", "tools/include/linux/list.h", "tools/include/asm/only.h"];
+        let found = Includes::new(paths.iter().copied());
+        let resolve = |includer: &str, operand: &str| {
+            let mut out = Vec::new();
+            found.resolve(includer, operand, &mut out);
+            out.iter().map(|&i| paths[i as usize]).collect::<Vec<_>>()
+        };
+        // `tools/` has its own `include/linux/`: the shallower
+        // `tools/include/` is its, not the kernel's.
+        assert_eq!(resolve("include/linux/list.h", "asm/barrier.h"), ["arch/x86/include/asm/barrier.h"]);
+        assert_eq!(resolve("tools/include/linux/list.h", "asm/barrier.h"), ["tools/include/asm/barrier.h"]);
+        // Where there is none other, still the one.
+        assert_eq!(resolve("include/linux/list.h", "asm/only.h"), ["tools/include/asm/only.h"]);
     }
 
     #[test]
