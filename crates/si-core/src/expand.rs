@@ -2087,9 +2087,11 @@ impl Cache {
     }
 
     /// The graph the last link made, given back as the files change: the
-    /// next link takes from it what still holds.
+    /// next link takes from it what still holds, which is the edges from
+    /// each symbol. The rest is let go at once: the link makes the new
+    /// graph beside what is kept.
     pub fn keep(&mut self, g: crate::graph::Graph) {
-        self.previous = (self.relinks && self.last.is_some()).then_some(g);
+        self.previous = (self.relinks && self.last.is_some()).then(|| crate::graph::Graph { out_off: g.out_off, out: g.out, ..Default::default() });
     }
 
     /// The files expanded anew since the last call, for saving.

@@ -50,47 +50,23 @@ fn ms(t: Instant) -> f64 {
 /// The adjacency lists the other way round: for each symbol, the edges
 /// that end at it, in the order of where they start. `next` is scratch,
 /// as long as `off`.
-/// `all` cut where `ends` say (each the end of a stretch, from the start).
-fn stretches<T>(mut all: &mut [T], ends: impl Iterator<Item = usize>) -> Vec<&mut [T]> {
-    let mut at = 0;
-    let mut v = Vec::new();
-    for end in ends {
-        let (part, rest) = std::mem::take(&mut all).split_at_mut(end - at);
-        v.push(part);
-        all = rest;
-        at = end;
-    }
-    v
-}
-
 fn transposed(n: usize, off: &[u32], adj: &[EdgeHalf], mut next: Vec<u32>) -> (Vec<u32>, Vec<EdgeHalf>) {
-    // The targets in stretches, one a worker: each goes through every edge,
-    // in order, and takes those to its own.
-    let parts = rayon::current_num_threads().clamp(1, 8);
-    let bounds: Vec<usize> = (0..=parts).map(|p| n * p / parts).collect();
     let mut back_off = vec![0u32; n + 1];
-    stretches(&mut back_off[1..], bounds[1..].iter().copied()).into_par_iter().enumerate().for_each(|(p, count)| {
-        let (a, b) = (bounds[p] as u32, bounds[p + 1] as u32);
-        for e in adj.iter().filter(|e| a <= e.other && e.other < b) {
-            count[(e.other - a) as usize] += 1;
-        }
-    });
+    for e in adj {
+        back_off[e.other as usize + 1] += 1;
+    }
     for i in 0..n {
         back_off[i + 1] += back_off[i];
     }
     next.copy_from_slice(&back_off);
     let mut back = vec![EdgeHalf { other: 0, meta: 0 }; adj.len()];
-    let backs = stretches(&mut back, bounds[1..].iter().map(|&b| back_off[b] as usize));
-    backs.into_par_iter().zip(stretches(&mut next[..n], bounds[1..].iter().copied())).enumerate().for_each(|(p, (back, next))| {
-        let (a, b, base) = (bounds[p] as u32, bounds[p + 1] as u32, back_off[bounds[p]]);
-        for from in 0..n {
-            for e in adj[off[from] as usize..off[from + 1] as usize].iter().filter(|e| a <= e.other && e.other < b) {
-                let slot = &mut next[(e.other - a) as usize];
-                back[(*slot - base) as usize] = EdgeHalf { other: from as u32, meta: e.meta };
-                *slot += 1;
-            }
+    for from in 0..n {
+        for e in &adj[off[from] as usize..off[from + 1] as usize] {
+            let slot = &mut next[e.other as usize];
+            back[*slot as usize] = EdgeHalf { other: from as u32, meta: e.meta };
+            *slot += 1;
         }
-    });
+    }
     (back_off, back)
 }
 
@@ -1183,6 +1159,20 @@ struct Resolved {
     handed: Vec<[u32; 3]>,
 }
 
+/// The edges of a file whose references the link before resolved as this
+/// one would (see `Last`), read from the graph it made: of the lists of the
+/// file's symbols there, those of its references (after the callbacks
+/// handed over, which come first, and but for binds, which are kept
+/// apart); then its binds.
+fn kept_edges<'a>(previous: &'a Graph, handed_from: &'a FxHashMap<u32, usize>, syms: std::ops::Range<u32>, binds: &'a [[u32; 3]]) -> impl Iterator<Item = [u32; 3]> + 'a {
+    syms.flat_map(move |s| {
+        let list = &previous.out[previous.out_off[s as usize] as usize..previous.out_off[s as usize + 1] as usize];
+        let skip = handed_from.get(&s).copied().unwrap_or(0);
+        list[skip..].iter().filter(|e| e.meta & 7 != refkind::BIND as u32).map(move |e| [s, e.other, e.meta])
+    })
+    .chain(binds.iter().copied())
+}
+
 fn graph_id(g: &Graph) -> (usize, u64) {
     (g.out.len(), xxhash_rust::xxh3::xxh3_64(bytemuck::cast_slice(&g.out_off)))
 }
@@ -1309,11 +1299,11 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         eprintln!("facts     {}", part(&mut files.iter()));
         eprintln!("expanded  {}", part(&mut cache.expanded.iter().flatten()));
     }
-    let crate::expand::Cache { expanded, names: name_cache, made, relinks, last: kept, previous, .. } = cache;
+    let crate::expand::Cache { expanded, names: name_cache, made, relinks, last: left, previous, .. } = cache;
     // What the link sees of each file: its content, and when it was last
     // expanded (see `Last`).
     let keys: Vec<(u64, u64)> = files.iter().zip(made.iter()).map(|(f, &m)| (f.hash, m)).collect();
-    let (relinks, last, previous) = (*relinks, kept.take(), previous.take());
+    let (relinks, last, previous) = (*relinks, left.take(), previous.take());
     let files: Vec<&FileFacts> = files.iter().zip(expanded.iter()).map(|(f, e)| e.as_ref().unwrap_or(f)).collect();
     let files = &files[..];
 
@@ -2374,48 +2364,46 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         let n = again.iter().filter(|&&a| a).count();
         (n <= 64 || n <= files.len() / 2).then_some(again)
     });
-    let per_file: Vec<PerFile> = match (&again, last.as_deref(), previous.as_ref()) {
-        (Some(again), Some(last), Some(previous)) => {
-            // A list in the graph is the edges handed over first, then
-            // each file's: of the file's own symbols, those of its references
-            // and of the binds of any file; the binds are kept apart.
-            let mut handed_from: FxHashMap<u32, usize> = FxHashMap::default();
-            for e in &last.handed {
-                *handed_from.entry(e[0]).or_default() += 1;
-            }
-            (0..files.len())
-                .into_par_iter()
-                .map_init(fresh, |st, fi| {
-                    if again[fi] {
-                        return resolve(st, fi);
-                    }
-                    let r = &last.files[fi];
-                    let base = g.files[fi].sym_start;
-                    let mut edges = Vec::new();
-                    for s in base..base + files[fi].defs.len() as u32 {
-                        let list = &previous.out[previous.out_off[s as usize] as usize..previous.out_off[s as usize + 1] as usize];
-                        let skip = handed_from.get(&s).copied().unwrap_or(0);
-                        edges.extend(list[skip..].iter().filter(|e| e.meta & 7 != refkind::BIND as u32).map(|e| [s, e.other, e.meta]));
-                    }
-                    edges.extend_from_slice(&r.binds);
-                    (edges, r.counts, r.sites.clone(), r.handed.clone())
-                })
-                .collect()
+    // A file resolved as before is not resolved, nor are its edges taken
+    // out of the graph before: they are read from it as the new one is made.
+    let mut handed_from: FxHashMap<u32, usize> = FxHashMap::default();
+    if let (Some(_), Some(last)) = (&again, last.as_deref()) {
+        for e in &last.handed {
+            *handed_from.entry(e[0]).or_default() += 1;
         }
+    }
+    let reused = |k: usize| again.as_ref().is_some_and(|a| !a[k]);
+    let kept = |k: usize| {
+        let (previous, last) = (previous.as_ref().expect("the graph before"), last.as_deref().expect("the link before"));
+        let base = g.files[k].sym_start;
+        kept_edges(previous, &handed_from, base..base + files[k].defs.len() as u32, &last.files[k].binds)
+    };
+    let per_file: Vec<PerFile> = match (&again, last.as_deref()) {
+        (Some(again), Some(last)) => (0..files.len())
+            .into_par_iter()
+            .map_init(fresh, |st, fi| {
+                if again[fi] {
+                    return resolve(st, fi);
+                }
+                let r = &last.files[fi];
+                (Vec::new(), r.counts, r.sites.clone(), r.handed.clone())
+            })
+            .collect(),
         _ => files.par_iter().enumerate().map_init(fresh, |st, (fi, _)| resolve(st, fi)).collect(),
     };
-    drop(previous);
     stats.resolved_files = again.as_ref().map_or(files.len(), |a| a.iter().filter(|&&a| a).count()) as u64;
     lp(&format!("resolved {} of {} files", stats.resolved_files, files.len()));
     if again.is_some() && std::env::var_os("SI_LINK_CHECK").is_some() {
         let all: Vec<PerFile> = files.par_iter().enumerate().map_init(fresh, |st, (fi, _)| resolve(st, fi)).collect();
         // What the graph makes of them: each symbol's edges, in order.
-        let by_source = |p: &PerFile| {
-            let mut e = p.0.clone();
+        let by_source = |p: &PerFile, edges: Vec<[u32; 3]>| {
+            let mut e = edges;
             e.sort_by_key(|e| e[0]);
             (e, p.1, p.2.clone(), p.3.clone())
         };
-        let differ: Vec<&str> = (0..files.len()).filter(|&i| by_source(&per_file[i]) != by_source(&all[i])).map(|i| files[i].path.as_str()).collect();
+        let edges = |i: usize| if reused(i) { kept(i).collect() } else { per_file[i].0.clone() };
+        let differ: Vec<&str> =
+            (0..files.len()).filter(|&i| by_source(&per_file[i], edges(i)) != by_source(&all[i], all[i].0.clone())).map(|i| files[i].path.as_str()).collect();
         eprintln!("link      check: {} of {} files resolved again; {} differ from resolving every file {:?}", stats.resolved_files, files.len(), differ.len(), &differ[..differ.len().min(5)]);
     }
     let snapshot = relinks.then(|| {
@@ -2430,7 +2418,14 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         };
         let resolved = per_file
             .par_iter()
-            .map(|p| Resolved { binds: p.0.iter().filter(|e| e[2] & 7 == refkind::BIND as u32).copied().collect(), counts: p.1, sites: p.2.clone(), handed: p.3.clone() })
+            .enumerate()
+            .map(|(k, p)| {
+                let binds = match &last {
+                    Some(last) if reused(k) => last.files[k].binds.clone(),
+                    _ => p.0.iter().filter(|e| e[2] & 7 == refkind::BIND as u32).copied().collect(),
+                };
+                Resolved { binds, counts: p.1, sites: p.2.clone(), handed: p.3.clone() }
+            })
             .collect();
         Last {
             keys,
@@ -2458,7 +2453,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         stats.capped += c[3];
     }
     stats.refs = stats.resolved + stats.ambiguous + stats.unresolved;
-    stats.edges = (handed.len() + per_file.iter().map(|p| p.0.len()).sum::<usize>()) as u64;
+    stats.edges = (handed.len() + per_file.iter().enumerate().map(|(k, p)| if reused(k) { kept(k).count() } else { p.0.len() }).sum::<usize>()) as u64;
     stats.resolve_ms = ms(t);
     drop((remap, names));
     crate::mem_mark("resolved");
@@ -2468,68 +2463,37 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     //    reverse is made from the forward one.
     lp("handed, stats");
     let t = Instant::now();
-    // A file's references' edges start at its own symbols, whose lists are
-    // one stretch of the adjacency: those are put in place a file at a
-    // time, the files in parallel. A list has first the edges handed over,
-    // then each file's in turn (the binds of a file can start anywhere):
-    // those go around them, in that order.
-    let starts: Vec<u32> = g.files.iter().map(|f| f.sym_start).chain([n_syms as u32]).collect();
-    let file_of = |s: u32| starts.partition_point(|&b| b <= s) - 1;
-    let (refs, binds): (Vec<Vec<[u32; 3]>>, Vec<Vec<[u32; 3]>>) = per_file
-        .into_par_iter()
-        .map(|p| {
-            let mut edges = p.0;
-            let at = edges.iter().position(|e| e[2] & 7 == refkind::BIND as u32).unwrap_or(edges.len());
-            let binds = edges.split_off(at);
-            (edges, binds)
-        })
-        .unzip();
     let mut out_off = vec![0u32; n_syms + 1];
-    stretches(&mut out_off[1..], starts[1..].iter().map(|&s| s as usize)).into_par_iter().zip(&refs).enumerate().for_each(|(k, (count, list))| {
-        for e in list {
-            count[(e[0] - starts[k]) as usize] += 1;
-        }
-    });
-    for e in handed.iter().chain(binds.iter().flatten()) {
+    for e in handed.iter().copied() {
         out_off[e[0] as usize + 1] += 1;
+    }
+    for (k, p) in per_file.iter().enumerate() {
+        let mut count = |e: [u32; 3]| out_off[e[0] as usize + 1] += 1;
+        if reused(k) {
+            kept(k).for_each(&mut count);
+        } else {
+            p.0.iter().copied().for_each(&mut count);
+        }
     }
     for i in 0..n_syms {
         out_off[i + 1] += out_off[i];
     }
     let mut next = out_off.clone();
     let mut out = vec![EdgeHalf { other: 0, meta: 0 }; stats.edges as usize];
-    let place = |next: &mut [u32], out: &mut [EdgeHalf], e: &[u32; 3]| {
+    let mut place = |e: [u32; 3]| {
         let slot = &mut next[e[0] as usize];
         out[*slot as usize] = EdgeHalf { other: e[1], meta: e[2] };
         *slot += 1;
     };
-    for e in &handed {
-        place(&mut next, &mut out, e);
-    }
-    for (j, list) in binds.iter().enumerate() {
-        for e in list.iter().filter(|e| j < file_of(e[0])) {
-            place(&mut next, &mut out, e);
+    handed.into_iter().for_each(&mut place);
+    for (k, p) in per_file.into_iter().enumerate() {
+        if reused(k) {
+            kept(k).for_each(&mut place);
+        } else {
+            p.0.into_iter().for_each(&mut place);
         }
     }
-    {
-        let ends = starts[1..].iter().map(|&s| out_off[s as usize] as usize);
-        let outs = stretches(&mut out, ends);
-        let nexts = stretches(&mut next[..n_syms], starts[1..].iter().map(|&s| s as usize));
-        outs.into_par_iter().zip(nexts).zip(refs).enumerate().for_each(|(k, ((out, next), list))| {
-            let (base, first) = (out_off[starts[k] as usize], starts[k]);
-            for e in &list {
-                let slot = &mut next[(e[0] - first) as usize];
-                out[(*slot - base) as usize] = EdgeHalf { other: e[1], meta: e[2] };
-                *slot += 1;
-            }
-        });
-    }
-    for (j, list) in binds.iter().enumerate() {
-        for e in list.iter().filter(|e| j >= file_of(e[0])) {
-            place(&mut next, &mut out, e);
-        }
-    }
-    drop(binds);
+    drop(previous);
     lp("out filled");
     let (in_off, inc) = transposed(n_syms, &out_off, &out, next);
     g.out_off = out_off;
@@ -2542,7 +2506,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     lp("transposed");
     if let Some(mut s) = snapshot.take() {
         s.graph = graph_id(&g);
-        *kept = Some(Box::new(s));
+        *left = Some(Box::new(s));
     }
     crate::progress::idle();
     (g, stats)
