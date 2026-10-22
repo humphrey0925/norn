@@ -1497,6 +1497,29 @@ int slow (void) { return 0; }
     }
 
     #[test]
+    fn an_alias_or_an_operator_out_of_sight_is_none() {
+        let d = Dir::new("out-of-sight");
+        d.write("set.h", "namespace lib {\ntemplate <class T> class btree_set {\n public:\n  btree_set () {}\n};\n}\n");
+        d.write("matchers.h", "enum class Code { kOk, kBad };\ninline bool operator== (const Code& a, const Code& b) { return false; }\n");
+        d.write("set_test.cpp", "#include \"set.h\"\n#include \"matchers.h\"\nvoid local () {\n  using set = lib::btree_set<int>;\n  set s;\n}\nbool same (Code a) { return a == Code::kOk; }\n");
+        d.write("other.cpp", "#include <set>\nenum class Code { kOk, kBad };\nvoid made () { std::set<int> s; }\nbool also (Code a) { return a == Code::kOk; }\n");
+        let s = Session::open(&d.0, Options::default());
+        let g = &s.graph;
+        let q = crate::graph::Qualifier::new(g);
+        let callees = |caller: &str| -> Vec<String> {
+            let mut v: Vec<String> = g.find(caller).iter().flat_map(|&c| g.refs_from(c)).filter(|e| e.kind() == crate::model::refkind::CALL).map(|e| q.name(g, e.other).into_owned()).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        // Where they are seen, they are meant.
+        assert_eq!(callees("local"), ["btree_set::btree_set"]);
+        assert_eq!(callees("same"), ["operator=="]);
+        // Not elsewhere: `std::set`, and the built-in `==`.
+        assert_eq!((callees("made"), callees("also")), (vec![], vec![]));
+    }
+
+    #[test]
     fn a_plain_call_in_a_method_is_of_its_class_or_its_bases() {
         let d = Dir::new("plain-in-method");
         d.write("a.h", "class Handler {\n protected:\n  int Parse () { return 0; }\n};\ntypedef Handler Gen;\nclass Sink {\n public:\n  void Send (int);\n};\nstruct Adjuster {\n  static int Adjust (int);\n};\nstruct B {\n  B& operator= (const B&);\n};\nstruct D : B {};\n");
