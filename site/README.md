@@ -1,21 +1,27 @@
 # Norn website
 
-The static site for Norn: `index.html` (English), `zh-TW/index.html` (繁體中文),
-`style.css`, and `assets/` (copies of the icon, screenshots and benchmark charts).
-No build step.
+The static site for Norn: `index.html` (English), `zh-TW/index.html` (繁體中文)
+and `style.css`. `build.mjs` builds it into `out/site`, copying in the icon
+(`vscode/media`), the screenshots (`vscode/media/screenshots`) and the benchmark
+charts (`docs/benchmarks`), and filling the benchmark table from the README's.
+Nothing is copied by hand: a new screenshot or benchmark is on the site at the
+next deploy.
 
 ## Preview locally
 
 ```bash
-python3 -m http.server -d site 8000
+npx wrangler dev
 ```
 
-and open http://localhost:8000.
+builds it and serves it at http://localhost:8787, rebuilding when a page,
+screenshot or chart changes. Or `node site/build.mjs` and any static server on
+`out/site`.
 
 ## Deploy on Cloudflare
 
-`wrangler.jsonc` at the top of the repository serves `site/` as a Worker's static
-assets (`site/README.md` is left out by `site/.assetsignore`).
+`wrangler.jsonc` at the top of the repository runs `site/build.mjs` and serves
+`out/site` as a Worker's static assets (`README.md` is left out by
+`.assetsignore`).
 
 1. Cloudflare dashboard → **Workers & Pages** → **Create** → import the
    `humphrey0925/norn` repository.
@@ -25,8 +31,8 @@ assets (`site/README.md` is left out by `site/.assetsignore`).
    domain**: `norn-c.com` (and `www.norn-c.com` if wanted). The DNS is on
    Cloudflare, so the record and certificate are set up for you.
 
-## Updating
+## Checked in CI
 
-The screenshots and charts in `assets/` are copies of `vscode/media/screenshots`
-and `docs/benchmarks/*.svg`; copy them again when those change. The benchmark
-table is a subset of the one in the top-level README.
+The `website` job in `.github/workflows/ci.yml` builds the site on every push
+and pull request, so a change to the README's benchmark table that the build
+cannot read fails there, not at deploy.

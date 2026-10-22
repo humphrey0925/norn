@@ -1,9 +1,14 @@
-// Cloudflare Workers: the website in site/, served as static assets at norn-c.com.
+// Cloudflare Workers: the website, served as static assets at norn-c.com.
+// site/build.mjs builds it into out/site before each deploy and in `wrangler dev`.
 {
   "name": "norn",
   "compatibility_date": "2025-09-01",
+  "build": {
+    "command": "node site/build.mjs",
+    "watch_dir": ["site", "vscode/media", "docs/benchmarks"]
+  },
   "assets": {
-    "directory": "./site",
+    "directory": "./out/site",
     "not_found_handling": "404-page"
   }
 }
