@@ -2178,6 +2178,9 @@ pub struct Cache {
     pub(crate) relinks: bool,
     pub(crate) last: Option<Box<crate::link::Last>>,
     pub(crate) previous: Option<crate::graph::Graph>,
+    /// Of the files read again since the last link, what that link saw
+    /// of them (`forget`): what they defined then.
+    pub(crate) was: FxHashMap<usize, FileFacts>,
 }
 
 /// The names in use, in order, kept between links: an edit seldom brings
@@ -2197,6 +2200,12 @@ impl NameCache {
     /// in the graph of each of its names, a name's number being its
     /// lexicographic rank among the names in use (`NONE` for what is the
     /// file's own text, which is no name); and the names in that order.
+    /// The number a name (by its number among all files') has in the
+    /// table last made, if it is in use.
+    pub(crate) fn rank_of(&self, id: u32) -> Option<u32> {
+        self.rank.get(id as usize).copied().filter(|&r| r != NONE)
+    }
+
     pub(crate) fn table(&mut self, files: &[&FileFacts]) -> (Vec<Vec<u32>>, Vec<&'static str>) {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         let n = crate::names::count() as usize;
@@ -2304,6 +2313,7 @@ impl Cache {
             relinks: false,
             last: None,
             previous: None,
+            was: FxHashMap::default(),
         }
     }
 
@@ -2334,6 +2344,11 @@ impl Cache {
     pub fn forget(&mut self, i: usize, was: &FileFacts) {
         if let Some(h) = self.hashes.get_mut(i) {
             *h = !*h;
+        }
+        // (What the link saw: the expansion, if the file had one.)
+        if self.relinks && self.last.is_some() && !self.was.contains_key(&i) {
+            let seen = self.expanded.get(i).and_then(Option::as_ref).unwrap_or(was);
+            self.was.insert(i, seen.clone());
         }
         self.gone.insert(i, macro_pairs(was, None));
     }
@@ -2531,6 +2546,7 @@ pub fn expand(
             relinks: cache.relinks,
             last: cache.last.take(),
             previous: cache.previous.take(),
+            was: std::mem::take(&mut cache.was),
         };
     }
     cache.macros = macros;

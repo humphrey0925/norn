@@ -1113,7 +1113,20 @@ int slow (void) { return 0; }
         edit("c.c", "int alone (void) { return slow (); }\n", 1, "a call added");
         edit("c.c", "int alone (void) {\n  int never_seen_before = 2;\n  return never_seen_before;\n}\n", 1, "a name no file had");
         edit("b.c", "#include \"a.h\"\nstatic int cb (void) { return 3; }\nstatic struct ops o = { .go = cb };\nint main (void) {\n  return slow ();\n}\n", 1, "a call and a bind changed");
-        edit("c.c", "int alone (void) { return 2; }\nint another (void) { return alone (); }\n", n, "a function added");
+        // A function put in: its own file, and who names it.
+        edit("c.c", "int alone (void) { return 2; }\nint another (void) { return alone (); }\n", 1, "a function added");
+        // Put in before the functions others call: theirs are numbered
+        // anew, and calls to them from files not read again follow. (And
+        // `helper` calls its parameter a line further down: a.h, which
+        // names it, is resolved again too.)
+        let a_c = "int first (void) { return 0; }\nint slow (void) { return 1; }\nint helper (int (*f) (void)) {\n  return f ();\n}\n";
+        edit("a.c", &format!("#include \"a.h\"\n{a_c}"), 2, "a function put in first");
+        // Renamed: who named it as it was (a.h, b.c) or is now.
+        edit("a.c", &format!("#include \"a.h\"\n{}", a_c.replace("int slow", "int slower")), 3, "a function renamed");
+        edit("c.c", "int counter;\nint alone (void) { return 2; }\nint another (void) { return alone (); }\n", 1, "a variable put in");
+        edit("c.c", "int counter;\nint alone (void) { return 2; }\n", 1, "a function taken out");
+        // Another #if group: in full.
+        edit("c.c", "int counter;\n#ifdef FAST\nint alone (void) { return 2; }\n#endif\n", n, "a function put under #ifdef");
         edit("a.h", "struct ops { int (*go) (void); int (*stop) (void); };\n#ifdef FAST\nint fast (void);\n#endif\nint slow (void);\nint helper (int (*f) (void));\n", n, "a member added");
         // Saved as it was: nothing to link.
         let up = s.update(&[PathBuf::from("c.c")]);

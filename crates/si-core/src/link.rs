@@ -1277,8 +1277,10 @@ pub(crate) struct Last {
     handing: Vec<u64>,
     /// The paths, the includes, the options.
     environment: u64,
-    /// The macros that wrap functions.
-    wrappers: u64,
+    /// The macros that wrap functions, in order.
+    wrappers: Vec<u32>,
+    /// Where each file's symbols start, and how many there are in all.
+    starts: Vec<u32>,
     readings: std::sync::Arc<crate::units::Readings>,
     /// The callbacks handed over, as the graph has them first in each list.
     handed: Vec<[u32; 3]>,
@@ -1321,26 +1323,72 @@ fn graph_id(g: &Graph) -> (usize, u64) {
 /// is in, and of a header read more than one way (`directives`: the lines
 /// of its `#if`s and the like), which stretch between them.
 fn seen(f: &FileFacts, directives: Option<&[u32]>) -> u64 {
+    digest(f, directives, true)
+}
+
+/// The same but for its functions and variables, and with the definitions
+/// the rest refers to by what they are rather than where in the list: what
+/// stays the same when a function is put in, taken out or changed.
+fn shape(f: &FileFacts, directives: Option<&[u32]>) -> u64 {
+    digest(f, directives, false)
+}
+
+fn movable(kind: u8) -> bool {
+    kind == kind::FUNCTION || kind == kind::GLOBAL
+}
+
+/// Of each definition, what it is: its name, kind, and the how-manyth of
+/// that name and kind in the file.
+fn identities(f: &FileFacts) -> Vec<(u32, u8, u32)> {
+    let ids: Vec<u32> = f.shared_names().collect();
+    let mut seen: FxHashMap<(u32, u8), u32> = FxHashMap::default();
+    f.defs
+        .iter()
+        .map(|d| {
+            let id = (ids[d.name as usize], d.kind);
+            let n = seen.entry(id).or_default();
+            *n += 1;
+            (id.0, id.1, *n - 1)
+        })
+        .collect()
+}
+
+/// Where a definition is, as far as resolving reads it (see `seen`).
+fn place(f: &FileFacts, line: u32, directives: Option<&[u32]>, put: &mut impl FnMut(u32)) {
+    for u in f.undecided.iter().filter(|u| u.0 <= line && line <= u.1) {
+        put(u.3 as u32);
+        put((u.3 >> 32) as u32);
+    }
+    put(directives.map_or(NONE, |lines| lines.partition_point(|&l| l < line) as u32));
+}
+
+fn digest(f: &FileFacts, directives: Option<&[u32]>, all: bool) -> u64 {
     let mut h = xxhash_rust::xxh3::Xxh3::new();
     let mut put = |v: u32| h.update(&v.to_le_bytes());
     let ids: Vec<u32> = f.shared_names().collect();
     let name = |n: u32| if n == NONE { NONE } else { ids[n as usize] };
-    put(f.defs.len() as u32);
-    for d in &f.defs {
+    let identity = if all { Vec::new() } else { identities(f) };
+    let def = |d: u32, put: &mut dyn FnMut(u32)| match identity.get(d as usize) {
+        Some(&(n, k, i)) => {
+            put(n);
+            put(k as u32);
+            put(i);
+        }
+        None => put(d),
+    };
+    let defs: Vec<&crate::model::Def> = f.defs.iter().filter(|d| all || !movable(d.kind)).collect();
+    put(defs.len() as u32);
+    for d in defs {
         put(name(d.name));
         put(d.kind as u32 | (d.flags as u32) << 8);
-        for u in f.undecided.iter().filter(|u| u.0 <= d.line && d.line <= u.1) {
-            put(u.3 as u32);
-            put((u.3 >> 32) as u32);
-        }
-        put(directives.map_or(NONE, |lines| lines.partition_point(|&l| l < d.line) as u32));
+        place(f, d.line, directives, &mut put);
     }
     put(f.records.len() as u32);
     for r in f.records.iter() {
         put(name(r.name));
         put(r.fields.len() as u32);
         r.fields.iter().chain(&r.types).for_each(|&n| put(name(n)));
-        r.defs.iter().for_each(|&d| put(d));
+        r.defs.iter().for_each(|&d| def(d, &mut put));
     }
     put(f.aliases.len() as u32);
     for &(alias, tag) in f.aliases.iter() {
@@ -1350,14 +1398,14 @@ fn seen(f: &FileFacts, directives: Option<&[u32]>) -> u64 {
     // (A definition of this file, and a type's name.)
     for list in [&f.typed, &f.field_types] {
         put(list.len() as u32);
-        for &(def, t) in list.iter() {
-            put(def);
+        for &(d, t) in list.iter() {
+            def(d, &mut put);
             put(name(t));
         }
     }
     put(f.param_calls.len() as u32);
     for c in f.param_calls.iter() {
-        put(c.scope);
+        def(c.scope, &mut put);
         put(c.index);
     }
     put(f.macros.len() as u32);
@@ -1377,6 +1425,35 @@ fn seen(f: &FileFacts, directives: Option<&[u32]>) -> u64 {
     put(path as u32);
     put((path >> 32) as u32);
     h.digest()
+}
+
+/// The names of the functions and variables `was` and `now` (the same
+/// file before and after an edit) do not define alike: as they are, where
+/// they are (see `seen`); and where each definition of `was` is in `now`
+/// (`NONE`: gone).
+fn redefined(was: &FileFacts, now: &FileFacts, directives: Option<&[u32]>) -> (Vec<u32>, Vec<u32>) {
+    let signatures = |f: &FileFacts| -> FxHashMap<(u32, u64), i32> {
+        let ids: Vec<u32> = f.shared_names().collect();
+        let mut m: FxHashMap<(u32, u64), i32> = FxHashMap::default();
+        for d in f.defs.iter().filter(|d| movable(d.kind)) {
+            let mut h = xxhash_rust::xxh3::Xxh3::new();
+            let mut put = |v: u32| h.update(&v.to_le_bytes());
+            put(d.kind as u32 | (d.flags as u32) << 8);
+            place(f, d.line, directives, &mut put);
+            *m.entry((ids[d.name as usize], h.digest())).or_default() += 1;
+        }
+        m
+    };
+    let mut both = signatures(now);
+    for (k, n) in signatures(was) {
+        *both.entry(k).or_default() -= n;
+    }
+    let mut names: Vec<u32> = both.into_iter().filter(|e| e.1 != 0).map(|e| e.0 .0).collect();
+    names.sort_unstable();
+    names.dedup();
+    let at: FxHashMap<(u32, u8, u32), u32> = identities(now).into_iter().enumerate().map(|(i, id)| (id, i as u32)).collect();
+    let map = identities(was).into_iter().map(|id| at.get(&id).copied().unwrap_or(NONE)).collect();
+    (names, map)
 }
 
 /// The lines of a file's calls through parameters: what the callbacks
@@ -1437,7 +1514,8 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         eprintln!("facts     {}", part(&mut files.iter()));
         eprintln!("expanded  {}", part(&mut cache.expanded.iter().flatten()));
     }
-    let crate::expand::Cache { expanded, names: name_cache, made, relinks, last: left, previous, .. } = cache;
+    let crate::expand::Cache { expanded, names: name_cache, made, relinks, last: left, previous, was, .. } = cache;
+    let was = std::mem::take(was);
     // What the link sees of each file: its content, and when it was last
     // expanded (see `Last`).
     let keys: Vec<(u64, u64)> = files.iter().zip(made.iter()).map(|(f, &m)| (f.hash, m)).collect();
@@ -2483,26 +2561,25 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         }
         h
     };
-    let wrappers_digest = {
+    let wrappers_sorted = {
         let mut w: Vec<u32> = wrappers.iter().copied().collect();
         w.sort_unstable();
-        xxhash_rust::xxh3::xxh3_64(bytemuck::cast_slice(&w))
+        w
     };
     let directives: FxHashMap<&str, &[u32]> = options.readings.files.iter().map(|(p, lines)| (p.as_str(), &lines[..])).collect();
+    // Files whose functions or variables changed (one put in, taken out,
+    // renamed, moved into another `#if`) number their symbols otherwise:
+    // `moved` is where a symbol of the graph before is now.
+    let mut maps: FxHashMap<usize, Vec<u32>> = FxHashMap::default();
     let again: Option<Vec<bool>> = last.as_deref().zip(previous.as_ref()).and_then(|(last, previous)| {
         // (What the names are numbered in the graph is no matter: the
         // edges are between symbols.)
-        let same = last.keys.len() == files.len()
-            && last.environment == environment
-            && last.wrappers == wrappers_digest
-            && *last.readings == *options.readings
-            && last.graph == graph_id(previous);
+        let same = last.keys.len() == files.len() && last.environment == environment && *last.readings == *options.readings && last.graph == graph_id(previous);
         if !same {
             lp(&format!(
-                "relink in full: files {}, environment {}, wrappers {}, readings {}, graph {}",
+                "relink in full: files {}, environment {}, readings {}, graph {}",
                 last.keys.len() == files.len(),
                 last.environment == environment,
-                last.wrappers == wrappers_digest,
                 *last.readings == *options.readings,
                 last.graph == graph_id(previous)
             ));
@@ -2513,29 +2590,46 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         if changed.len() > 64 && changed.len() > files.len() / 8 {
             return None;
         }
-        let mut handing_moved = Vec::new();
+        let mut named = vec![false; names.len()];
+        let mut any = false;
+        let mut name = |n: u32| {
+            if let Some(slot) = named.get_mut(n as usize) {
+                *slot = true;
+                any = true;
+            }
+        };
         for &i in &changed {
-            if files[i].cpp() || seen(files[i], directives.get(files[i].path.as_str()).copied()) != last.seen[i] {
-                lp(&format!("relink in full: {} is C++, or changed what other files see of it", files[i].path));
+            let f = files[i];
+            let lines = directives.get(f.path.as_str()).copied();
+            if f.cpp() {
+                lp(&format!("relink in full: {} is C++", f.path));
                 return None;
             }
-            if handing(files[i]) != last.handing[i] {
-                handing_moved.push(i);
+            if seen(f, lines) != last.seen[i] {
+                // What changed is its functions and variables alone: who
+                // names one that is not as it was is resolved again.
+                let Some(was) = was.get(&i).filter(|w| !w.cpp() && shape(w, lines) == shape(f, lines)) else {
+                    lp(&format!("relink in full: {} changed what other files see of it", f.path));
+                    return None;
+                };
+                let (redefined, map) = redefined(was, f, lines);
+                let rank = |id: u32| name_cache.rank_of(id);
+                redefined.into_iter().filter_map(rank).for_each(&mut name);
+                maps.insert(i, map);
+            }
+            // The callbacks handed to a function are called where it calls
+            // its parameter: who hands one over is resolved again.
+            if handing(f) != last.handing[i] {
+                for c in f.param_calls.iter() {
+                    name(remap[i][f.defs[c.scope as usize].name as usize]);
+                }
             }
         }
         let mut again = vec![false; files.len()];
         for &i in &changed {
             again[i] = true;
         }
-        // The callbacks handed to a function are called where it calls its
-        // parameter: who hands one over is resolved again.
-        if !handing_moved.is_empty() {
-            let mut named = vec![false; names.len()];
-            for &i in &handing_moved {
-                for c in files[i].param_calls.iter() {
-                    named[remap[i][files[i].defs[c.scope as usize].name as usize] as usize] = true;
-                }
-            }
+        if any {
             let users: Vec<bool> = remap.par_iter().map(|r| r.iter().any(|&n| n != NONE && named[n as usize])).collect();
             for (a, u) in again.iter_mut().zip(users) {
                 *a |= u;
@@ -2543,6 +2637,49 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         }
         let n = again.iter().filter(|&&a| a).count();
         (n <= 64 || n <= files.len() / 2).then_some(again)
+    });
+    // Where a symbol of the graph before is now: past the files whose
+    // symbols changed, as many places on as they gained.
+    let spans: Vec<(u32, u32, usize, i64)> = match last.as_deref() {
+        Some(last) => {
+            let mut spans: Vec<(u32, u32, usize, i64)> = maps.keys().map(|&k| (last.starts[k], last.starts[k + 1], k, 0)).collect();
+            spans.sort_unstable();
+            let mut shift = 0i64;
+            for s in &mut spans {
+                shift += files[s.2].defs.len() as i64 - (s.1 - s.0) as i64;
+                s.3 = shift;
+            }
+            spans
+        }
+        None => Vec::new(),
+    };
+    let moved = |s: u32| -> u32 {
+        if spans.is_empty() {
+            return s;
+        }
+        let i = spans.partition_point(|sp| sp.1 <= s);
+        match spans.get(i) {
+            Some(&(a, _, k, _)) if a <= s => {
+                let at = maps[&k][(s - a) as usize];
+                if at == NONE {
+                    NONE
+                } else {
+                    g.files[k].sym_start + at
+                }
+            }
+            _ => (s as i64 + if i == 0 { 0 } else { spans[i - 1].3 }) as u32,
+        }
+    };
+    // The macros that wrap functions are the same, but for where.
+    let again = again.filter(|_| {
+        let last = last.as_deref().expect("the link before");
+        let mut w: Vec<u32> = last.wrappers.iter().map(|&s| moved(s)).collect();
+        w.sort_unstable();
+        let same = w == wrappers_sorted;
+        if !same {
+            lp("relink in full: the macros that wrap functions changed");
+        }
+        same
     });
     // A file resolved as before is not resolved, nor are its edges taken
     // out of the graph before: they are read from it as the new one is made.
@@ -2555,9 +2692,13 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     let reused = |k: usize| again.as_ref().is_some_and(|a| !a[k]);
     let kept = |k: usize| {
         let (previous, last) = (previous.as_ref().expect("the graph before"), last.as_deref().expect("the link before"));
-        let base = g.files[k].sym_start;
-        kept_edges(previous, &handed_from, base..base + files[k].defs.len() as u32, &last.files[k].binds)
+        // (What started or ended at a symbol now gone was named by a file
+        // resolved again: none of these.)
+        kept_edges(previous, &handed_from, last.starts[k]..last.starts[k + 1], &last.files[k].binds)
+            .map(|e| [moved(e[0]), moved(e[1]), e[2]])
+            .filter(|e| e[0] != NONE && e[1] != NONE)
     };
+    let moved_all = |list: &[[u32; 3]]| -> Vec<[u32; 3]> { list.iter().map(|e| [moved(e[0]), moved(e[1]), e[2]]).collect() };
     let per_file: Vec<PerFile> = match (&again, last.as_deref()) {
         (Some(again), Some(last)) => (0..files.len())
             .into_par_iter()
@@ -2566,7 +2707,8 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                     return resolve(st, fi);
                 }
                 let r = &last.files[fi];
-                (Vec::new(), r.counts, r.sites.clone(), r.handed.clone())
+                let sites = r.sites.iter().map(|s| [s[0], s[1], moved(s[2]), moved(s[3])]).collect();
+                (Vec::new(), r.counts, sites, moved_all(&r.handed))
             })
             .collect(),
         _ => files.par_iter().enumerate().map_init(fresh, |st, (fi, _)| resolve(st, fi)).collect(),
@@ -2601,7 +2743,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
             .enumerate()
             .map(|(k, p)| {
                 let binds = match &last {
-                    Some(last) if reused(k) => last.files[k].binds.clone(),
+                    Some(last) if reused(k) => moved_all(&last.files[k].binds),
                     _ => p.0.iter().filter(|e| e[2] & 7 == refkind::BIND as u32).copied().collect(),
                 };
                 Resolved { binds, counts: p.1, sites: p.2.clone(), handed: p.3.clone() }
@@ -2612,7 +2754,8 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
             seen: digests(&|i| seen(files[i], directives.get(files[i].path.as_str()).copied()), last.as_ref().map(|l| &l.seen)),
             handing: digests(&|i| handing(files[i]), last.as_ref().map(|l| &l.handing)),
             environment,
-            wrappers: wrappers_digest,
+            wrappers: wrappers_sorted.clone(),
+            starts: g.files.iter().map(|f| f.sym_start).chain([n_syms as u32]).collect(),
             readings: options.readings.clone(),
             handed: Vec::new(),
             files: resolved,
