@@ -360,7 +360,8 @@ impl<'a> Includes<'a> {
         // A folder holding a copy of the includer's own folder is another
         // program's tree (`tools/`, with `tools/include/linux/`): not what
         // `include/linux/list.h` reads, `<asm/barrier.h>`, but where none
-        // other is.
+        // other is. (A folder above the one looked up from: `include/`
+        // itself has `include/net/netfilter/`, for `net/netfilter/`.)
         let several = cands.len() > 1;
         let buf = std::cell::RefCell::new(String::new());
         let copy = |id: u32| {
@@ -368,12 +369,16 @@ impl<'a> Includes<'a> {
             let mut b = buf.borrow_mut();
             several
                 && !dir.is_empty()
-                && r.match_indices('/').map(|(i, _)| &r[..i]).chain(std::iter::once(r)).any(|f| {
-                    b.clear();
-                    b.push_str(f);
-                    b.push('/');
-                    b.push_str(dir);
-                    !f.is_empty() && self.dirs.contains(b.as_str())
+                && r.match_indices('/').map(|(i, _)| &r[..i]).any(|f| {
+                    // (Of the includer's folder or one it is in, two deep
+                    // at least: `include/linux/` for `include/linux/device/`.)
+                    dir.match_indices('/').skip(1).map(|(i, _)| &dir[..i]).chain(std::iter::once(dir)).filter(|d| d.contains('/')).any(|d| {
+                        b.clear();
+                        b.push_str(f);
+                        b.push('/');
+                        b.push_str(d);
+                        !f.is_empty() && self.dirs.contains(b.as_str())
+                    })
                 })
         };
         let shared = |id: u32| {
@@ -2911,7 +2916,16 @@ int f (struct t *h) { return htab_size (h); }
 
     #[test]
     fn a_tree_with_a_copy_of_the_includer_s_folder_is_another_program_s() {
-        let paths = ["include/linux/list.h", "arch/x86/include/asm/barrier.h", "tools/include/asm/barrier.h", "tools/include/linux/list.h", "tools/include/asm/only.h"];
+        let paths = [
+            "include/linux/list.h",
+            "arch/x86/include/asm/barrier.h",
+            "tools/include/asm/barrier.h",
+            "tools/include/linux/list.h",
+            "tools/include/asm/only.h",
+            "include/linux/device/devres.h",
+            "include/net/netfilter/nf_tables.h",
+            "net/netfilter/nf_tables_api.c",
+        ];
         let found = Includes::new(paths.iter().copied());
         let resolve = |includer: &str, operand: &str| {
             let mut out = Vec::new();
@@ -2924,6 +2938,12 @@ int f (struct t *h) { return htab_size (h); }
         assert_eq!(resolve("tools/include/linux/list.h", "asm/barrier.h"), ["tools/include/asm/barrier.h"]);
         // Where there is none other, still the one.
         assert_eq!(resolve("include/linux/list.h", "asm/only.h"), ["tools/include/asm/only.h"]);
+        // Of a folder the includer is in, too (`tools/` has no
+        // `include/linux/device/`).
+        assert_eq!(resolve("include/linux/device/devres.h", "asm/barrier.h"), ["arch/x86/include/asm/barrier.h"]);
+        // The folder looked up from is not a copy for having one of the
+        // includer's name: `include/` has `include/net/netfilter/`.
+        assert_eq!(resolve("net/netfilter/nf_tables_api.c", "linux/list.h"), ["include/linux/list.h"]);
     }
 
     #[test]
