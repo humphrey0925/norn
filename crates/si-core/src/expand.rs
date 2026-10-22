@@ -1853,14 +1853,23 @@ fn expand_file(
     for b in &mut out.binds {
         b.scope = new_index[b.scope as usize];
     }
-    for t in &mut out.field_types {
-        t.0 = new_index[t.0 as usize];
+    // What these say is shared with the file's own facts until it is
+    // written to: written to only where the order changed what it says.
+    let moved = |d: u32| new_index[d as usize] != d;
+    if out.field_types.iter().any(|t| moved(t.0)) {
+        for t in out.field_types.iter_mut() {
+            t.0 = new_index[t.0 as usize];
+        }
     }
-    for c in &mut out.param_calls {
-        c.scope = new_index[c.scope as usize];
+    if out.param_calls.iter().any(|c| moved(c.scope)) {
+        for c in out.param_calls.iter_mut() {
+            c.scope = new_index[c.scope as usize];
+        }
     }
-    for t in &mut out.typed {
-        t.0 = new_index[t.0 as usize];
+    if out.typed.iter().any(|t| moved(t.0)) {
+        for t in out.typed.iter_mut() {
+            t.0 = new_index[t.0 as usize];
+        }
     }
     if let Some(c) = out.cxx.as_mut() {
         for o in &mut c.owners {
@@ -1882,8 +1891,10 @@ fn expand_file(
             f.def = new_index[f.def as usize];
         }
     }
-    for d in out.records.iter_mut().flat_map(|r| r.defs.iter_mut()).filter(|d| **d != NONE) {
-        *d = new_index[*d as usize];
+    if out.records.iter().flat_map(|r| &r.defs).any(|&d| d != NONE && moved(d)) {
+        for d in out.records.iter_mut().flat_map(|r| r.defs.iter_mut()).filter(|d| **d != NONE) {
+            *d = new_index[*d as usize];
+        }
     }
     // The uses are expanded: the link has no use for them, nor for the
     // initializers that were read.

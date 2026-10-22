@@ -229,6 +229,66 @@ pub struct Ref {
     pub kind: u8,
 }
 
+/// What a file's facts and the copy its macro expansion makes of them
+/// (`expand`) hold together until one of them changes it: the copy is most
+/// of what the expansions hold, and most of it is never changed. Reads as,
+/// and is serialized as, the `T` it holds.
+#[derive(Debug, Default)]
+pub struct Shared<T>(std::sync::Arc<T>);
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Shared(self.0.clone())
+    }
+}
+
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+/// Writing to what is shared writes to a copy of one's own.
+impl<T: Clone> std::ops::DerefMut for Shared<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        std::sync::Arc::make_mut(&mut self.0)
+    }
+}
+
+impl<T> Shared<T> {
+    /// The value, unless it is shared.
+    pub fn unique_mut(&mut self) -> Option<&mut T> {
+        std::sync::Arc::get_mut(&mut self.0)
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Shared<Vec<T>> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<T> From<T> for Shared<T> {
+    fn from(t: T) -> Self {
+        Shared(std::sync::Arc::new(t))
+    }
+}
+
+impl<T: Serialize> Serialize for Shared<T> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        (*self.0).serialize(s)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Shared<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        T::deserialize(d).map(Shared::from)
+    }
+}
+
 /// A file's references, packed: per reference, LEB128 varints of its name,
 /// of its line and its scope as zigzagged steps from the reference before,
 /// and its kind. They are only ever read in order, and most are a name
@@ -302,8 +362,11 @@ impl Refs {
         }
     }
 
-    pub fn shrink_to_fit(&mut self) {
-        self.bytes.shrink_to_fit();
+    /// Into a block of its size (see `FileFacts::shrink`).
+    pub fn shrink(&mut self) {
+        if self.bytes.capacity() > self.bytes.len() {
+            self.bytes = self.bytes.clone();
+        }
     }
 
     pub fn heap_bytes(&self) -> usize {
@@ -408,21 +471,21 @@ pub struct FileFacts {
     pub sites: Vec<Site>,
     pub binds: Vec<Bind>,
     pub inits: Vec<InitSite>,
-    pub records: Vec<Record>,
+    pub records: Shared<Vec<Record>>,
     /// `typedef struct tag name;` as (name, tag).
-    pub aliases: Vec<(u32, u32)>,
+    pub aliases: Shared<Vec<(u32, u32)>>,
     /// Members declared with a typedef name, as (definition, type name):
     /// whether they can hold a function depends on the typedef.
-    pub field_types: Vec<(u32, u32)>,
-    pub param_calls: Vec<ParamCall>,
-    pub arg_passes: Vec<ArgPass>,
-    pub hints: Vec<MemberHint>,
-    pub hint_path: Vec<u32>,
+    pub field_types: Shared<Vec<(u32, u32)>>,
+    pub param_calls: Shared<Vec<ParamCall>>,
+    pub arg_passes: Shared<Vec<ArgPass>>,
+    pub hints: Shared<Vec<MemberHint>>,
+    pub hint_path: Shared<Vec<u32>>,
     /// (reference, hint): which member references have one.
-    pub ref_hints: Vec<(u32, u32)>,
+    pub ref_hints: Shared<Vec<(u32, u32)>>,
     /// (definition, type name) of variables and functions at file scope
     /// whose type, or return type, is a struct, union or typedef.
-    pub typed: Vec<(u32, u32)>,
+    pub typed: Shared<Vec<(u32, u32)>>,
     /// Every name the file `#define`s, in whatever branch.
     pub defined_names: Vec<u32>,
     /// The parameters and local variables of the file's functions, in the
@@ -550,18 +613,22 @@ pub struct Local {
 /// ([`crate::names`]), or, marked with [`OWN`], a place in the file's own
 /// text. The file's own are what is kept to be expanded later (a macro's
 /// body, the arguments of a use, an initializer): long, and written once.
+///
+/// An expansion's copy shares the file's names and adds its own after
+/// them (`more`).
 #[derive(Clone, Debug)]
 struct Names {
-    ids: Vec<u32>,
-    buf: String,
-    off: Vec<u32>,
+    ids: Shared<Vec<u32>>,
+    more: Vec<u32>,
+    buf: Shared<String>,
+    off: Shared<Vec<u32>>,
 }
 
 const OWN: u32 = crate::names::LIMIT;
 
 impl Default for Names {
     fn default() -> Self {
-        Names { ids: Vec::new(), buf: String::new(), off: vec![0] }
+        Names { ids: Shared::default(), more: Vec::new(), buf: Shared::default(), off: vec![0].into() }
     }
 }
 
@@ -578,7 +645,7 @@ struct SavedNames {
 impl Serialize for Names {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let mut saved = SavedNames { buf: String::new(), off: vec![0], own: Vec::new() };
-        for (i, &id) in self.ids.iter().enumerate() {
+        for (i, id) in self.ids.iter().chain(&self.more).copied().enumerate() {
             if id & OWN != 0 {
                 saved.own.push(i as u32);
             }
@@ -599,7 +666,7 @@ impl<'de> Deserialize<'de> for Names {
             if own.next_if_eq(&(i as u32)).is_some() {
                 names.push_own(text);
             } else {
-                names.ids.push(crate::names::id(text));
+                names.push_id(crate::names::id(text));
             }
         }
         names.ids.shrink_to_fit();
@@ -610,14 +677,30 @@ impl<'de> Deserialize<'de> for Names {
 }
 
 impl Names {
+    fn push_id(&mut self, id: u32) {
+        match self.ids.unique_mut() {
+            Some(ids) if self.more.is_empty() => ids.push(id),
+            _ => self.more.push(id),
+        }
+    }
+
     fn push_own(&mut self, s: &str) {
-        self.ids.push(OWN | (self.off.len() - 1) as u32);
+        self.push_id(OWN | (self.off.len() - 1) as u32);
         self.buf.push_str(s);
-        self.off.push(self.buf.len() as u32);
+        let end = self.buf.len() as u32;
+        self.off.push(end);
+    }
+
+    fn len(&self) -> usize {
+        self.ids.len() + self.more.len()
+    }
+
+    fn id(&self, i: usize) -> u32 {
+        self.ids.get(i).copied().unwrap_or_else(|| self.more[i - self.ids.len()])
     }
 
     fn get(&self, i: usize) -> &str {
-        let id = self.ids[i];
+        let id = self.id(i);
         if id & OWN == 0 {
             crate::names::text(id)
         } else {
@@ -657,18 +740,18 @@ impl FileFacts {
 
     /// A name: an identifier, a path, anything other files say too.
     pub fn push_name(&mut self, s: &str) -> u32 {
-        self.names.ids.push(crate::names::id(s));
-        (self.names.ids.len() - 1) as u32
+        self.names.push_id(crate::names::id(s));
+        (self.names.len() - 1) as u32
     }
 
     /// Text kept under a name's number that is no name: only this file has it.
     pub fn push_text(&mut self, s: &str) -> u32 {
         self.names.push_own(s);
-        (self.names.ids.len() - 1) as u32
+        (self.names.len() - 1) as u32
     }
 
     pub fn n_names(&self) -> usize {
-        self.names.ids.len()
+        self.names.len()
     }
 
     pub fn name(&self, i: usize) -> &str {
@@ -678,7 +761,7 @@ impl FileFacts {
     /// For each name, its number among all files' names, or `NONE` for
     /// what is the file's own text.
     pub fn shared_names(&self) -> impl Iterator<Item = u32> + '_ {
-        self.names.ids.iter().map(|&id| if id & OWN == 0 { id } else { NONE })
+        self.names.ids.iter().chain(&self.names.more).map(|&id| if id & OWN == 0 { id } else { NONE })
     }
 
     /// The bytes of the file's own text.
@@ -702,13 +785,25 @@ impl FileFacts {
                 *v = fitting;
             }
         }
-        exact(&mut self.names.ids);
-        if self.names.buf.capacity() > self.names.buf.len() {
-            self.names.buf = self.names.buf.clone();
+        fn shared<T>(v: &mut Shared<Vec<T>>) {
+            if let Some(v) = v.unique_mut() {
+                exact(v);
+            }
         }
-        exact(&mut self.names.off);
+        // What is shared is left as it is: the facts it was shrunk with
+        // did that, and a copy would no longer be shared.
+        if let Some(ids) = self.names.ids.unique_mut() {
+            exact(ids);
+        }
+        exact(&mut self.names.more);
+        if let Some(buf) = self.names.buf.unique_mut().filter(|b| b.capacity() > b.len()) {
+            *buf = buf.clone();
+        }
+        if let Some(off) = self.names.off.unique_mut() {
+            exact(off);
+        }
         exact(&mut self.defs);
-        self.refs.shrink_to_fit();
+        self.refs.shrink();
         exact(&mut self.includes);
         exact(&mut self.include_conditional);
         exact(&mut self.inactive);
@@ -717,14 +812,16 @@ impl FileFacts {
         exact(&mut self.sites);
         exact(&mut self.binds);
         exact(&mut self.inits);
-        for r in &mut self.records {
-            exact(&mut r.fields);
-            exact(&mut r.types);
-            exact(&mut r.defs);
+        if let Some(records) = self.records.unique_mut() {
+            for r in records.iter_mut() {
+                exact(&mut r.fields);
+                exact(&mut r.types);
+                exact(&mut r.defs);
+            }
+            exact(records);
         }
-        exact(&mut self.records);
-        exact(&mut self.aliases);
-        exact(&mut self.field_types);
+        shared(&mut self.aliases);
+        shared(&mut self.field_types);
         if let Some(c) = self.cxx.as_mut() {
             exact(&mut c.owners);
             exact(&mut c.bases);
@@ -745,12 +842,12 @@ impl FileFacts {
             exact(&mut c.explicit);
             exact(&mut c.forwards);
         }
-        exact(&mut self.param_calls);
-        exact(&mut self.arg_passes);
-        exact(&mut self.hints);
-        exact(&mut self.hint_path);
-        exact(&mut self.ref_hints);
-        exact(&mut self.typed);
+        shared(&mut self.param_calls);
+        shared(&mut self.arg_passes);
+        shared(&mut self.hints);
+        shared(&mut self.hint_path);
+        shared(&mut self.ref_hints);
+        shared(&mut self.typed);
         exact(&mut self.defined_names);
         exact(&mut self.locals);
         exact(&mut self.local_uses);
@@ -758,7 +855,7 @@ impl FileFacts {
 
     /// What the names (and the texts kept as names) take.
     pub fn names_bytes(&self) -> usize {
-        self.names.buf.capacity() + (self.names.off.capacity() + self.names.ids.capacity()) * 4
+        self.names.buf.capacity() + (self.names.off.capacity() + self.names.ids.capacity() + self.names.more.capacity()) * 4
     }
 
     /// What each part of the facts takes, in bytes, by name.
@@ -862,5 +959,33 @@ mod tests {
         let mut moved = packed.clone();
         moved.map_scopes(|s| if s == NONE { s } else { s + 1 });
         assert_eq!(moved.iter().map(|r| r.scope).collect::<Vec<_>>(), vec![1, 6, NONE, 1]);
+    }
+
+    #[test]
+    fn a_copy_shares_until_written_and_adds_names_of_its_own() {
+        let mut f = FileFacts::new("a.c".into());
+        let a = f.push_name("alpha");
+        let t = f.push_text("#define X 1");
+        f.hints.push(MemberHint { root_kind: root::VAR, root: a, path: 0, len: 0 });
+        f.shrink();
+        let saved = bincode::serialize(&f).unwrap();
+
+        let mut copy = f.clone();
+        assert!(std::sync::Arc::ptr_eq(&f.hints.0, &copy.hints.0));
+        copy.shrink();
+        assert!(std::sync::Arc::ptr_eq(&f.hints.0, &copy.hints.0), "shrinking leaves what is shared");
+        let b = copy.push_name("beta");
+        assert!(std::sync::Arc::ptr_eq(&f.names.ids.0, &copy.names.ids.0), "a new name goes after the shared ones");
+        assert_eq!((copy.name(a as usize), copy.name(t as usize), copy.name(b as usize)), ("alpha", "#define X 1", "beta"));
+        assert_eq!(copy.n_names(), 3);
+        assert_eq!(f.n_names(), 2);
+        copy.hints.push(MemberHint { root_kind: root::TYPE, root: b, path: 0, len: 0 });
+        assert_eq!((f.hints.len(), copy.hints.len()), (1, 2), "writing copies");
+
+        // Saved and read back as before: names in order, the copy's after.
+        assert_eq!(bincode::serialize(&f).unwrap(), saved);
+        let back: FileFacts = bincode::deserialize(&bincode::serialize(&copy).unwrap()).unwrap();
+        assert_eq!((back.name(0), back.name(1), back.name(2)), ("alpha", "#define X 1", "beta"));
+        assert_eq!(back.shared_names().collect::<Vec<_>>(), copy.shared_names().collect::<Vec<_>>());
     }
 }
