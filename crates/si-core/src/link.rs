@@ -346,9 +346,13 @@ impl<'a> Includes<'a> {
         // `-I`s, and Linux's `include/` would find `tools/include/`'s
         // copies of its own headers through it.)
         let source = !crate::is_header(includer);
+        // (Of several, the outermost: `<rpc/util.h>` from `src/wallet/rpc/`
+        // is `src/`'s, the `-I` of all; `src/wallet/` has its own headers
+        // as `<wallet/...>`.)
         let own = |id: u32| {
             let r = root(id);
-            source && !r.is_empty() && (dir == r || dir.starts_with(r) && dir.as_bytes().get(r.len()) == Some(&b'/'))
+            let holds = source && !r.is_empty() && (dir == r || dir.starts_with(r) && dir.as_bytes().get(r.len()) == Some(&b'/'));
+            holds.then(|| -(r.split('/').count() as i64))
         };
         let shared = |id: u32| {
             let other = dir_of(paths[id as usize]);
@@ -2861,7 +2865,8 @@ int f (struct t *h) { return htab_size (h); }
         // `-Isrc`: `src/`'s, not `src/wallet/`'s, whose folder above
         // holds the includer too.
         assert_eq!(resolve("src/rpc/mempool.cpp", "rpc/util.h"), ["src/rpc/util.h"]);
-        // From inside `src/wallet/`, its own (the nearest).
+        // From inside `src/wallet/` too: `src/` is the `-I` of all.
+        assert_eq!(resolve("src/wallet/rpc/coins.cpp", "rpc/util.h"), ["src/rpc/util.h"]);
         assert_eq!(resolve("src/wallet/rpc/coins.cpp", "wallet/rpc/util.h"), ["src/wallet/rpc/util.h"]);
         assert_eq!(resolve("drivers/a.c", "linux/kernel.h"), ["include/linux/kernel.h"]);
     }
