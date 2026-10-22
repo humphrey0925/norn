@@ -5,3 +5,5 @@
 __pycache__/
 # Release archives are attached to GitHub releases, not committed.
 /release/*.7z
+# Wrangler's local state (wrangler dev).
+/.wrangler
