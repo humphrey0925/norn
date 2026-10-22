@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Norn — 大型 C 專案的程式碼瀏覽工具</title>
+  <meta name="description" content="在 VS Code 裡，用 Source Insight 的方式瀏覽大型 C 專案。不用編譯，不用 compile_commands.json。追得到透過巨集和函式指標的呼叫，只看 build 實際會編譯的程式碼。">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Norn — 大型 C 專案的程式碼瀏覽工具">
+  <meta property="og:description" content="在 VS Code 裡，用 Source Insight 的方式瀏覽大型 C 專案。不用編譯，不用 compile_commands.json。">
+  <link rel="canonical" href="https://norn-c.com/zh-TW/">
+  <link rel="alternate" hreflang="en" href="https://norn-c.com/">
+  <link rel="alternate" hreflang="zh-Hant-TW" href="https://norn-c.com/zh-TW/">
+  <link rel="alternate" hreflang="x-default" href="https://norn-c.com/">
+  <meta property="og:url" content="https://norn-c.com/zh-TW/">
+  <meta property="og:site_name" content="Norn">
+  <meta property="og:locale" content="zh_TW">
+  <meta property="og:image" content="https://norn-c.com/assets/screenshots/overview.png">
+  <meta property="og:image:width" content="1456">
+  <meta property="og:image:height" content="908">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="theme-color" content="#0d1126">
+  <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+  <link rel="icon" href="/assets/icon.png" type="image/png">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="/zh-TW/"><img src="/assets/icon.svg" alt="">Norn</a>
+    <nav>
+      <a href="#why">為什麼用 Norn</a>
+      <a href="#benchmarks">基準測試</a>
+      <a href="#features">功能</a>
+      <a href="#start">開始使用</a>
+      <a href="https://github.com/humphrey0925/norn">GitHub</a>
+      <a class="lang" href="/" hreflang="en" lang="en">English</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<div class="hero">
+  <div class="wrap">
+    <img class="logo" src="/assets/icon.svg" alt="Norn">
+    <h1>大型 C 專案的程式碼瀏覽，<br><em>不用先編譯</em></h1>
+    <p class="lead">在 VS Code 裡，用 Source Insight 的方式瀏覽程式碼。不用 <code>compile_commands.json</code>。追得到透過巨集和函式指標的呼叫，只看 build 實際會編譯的程式碼。</p>
+    <div class="cta">
+      <a class="btn primary" href="https://marketplace.visualstudio.com/items?itemName=humphrey0925.norn-c">從 VS Marketplace 安裝</a>
+      <a class="btn" href="https://open-vsx.org/extension/humphrey0925/norn-c">Open VSX</a>
+      <a class="btn" href="https://github.com/humphrey0925/norn/releases">.vsix 與 <code>norn</code> 指令</a>
+    </div>
+    <p class="install-cmd">或 <code>code --install-extension humphrey0925.norn-c</code> · Windows、Linux、macOS · x64 與 Arm64</p>
+    <img class="shot" src="/assets/screenshots/overview.png" width="1456" height="908" alt="VS Code 裡的 Norn：編輯器周圍的 Project Symbols、File Symbols、Relation 和 Context">
+  </div>
+</div>
+
+<section id="why">
+  <div class="wrap">
+    <h2>為什麼用 Norn</h2>
+    <p class="intro">以編譯器為基礎的語言伺服器（例如 clangd）需要精確知道每個檔案怎麼編譯。很多實際的 C 專案很難提供這些資訊：用專屬工具鏈建置的韌體、每顆晶片一份標頭檔的 SDK、只能在某台機器上建置的程式碼。ctags、cscope 這類文字索引工具到哪裡都能用，但它們找的是名稱而不是呼叫。Norn 像人一樣直接讀原始碼，有 build 描述檔時也一併讀取。</p>
+    <div class="points">
+      <div class="point"><h3>不用設定</h3><p>開啟資料夾即可。Norn 會從 Arm DS-5、Keil、IAR、Visual Studio、CMake、Makefile、PlatformIO、Kconfig 或 <code>compile_commands.json</code> 找出 build 的設定，判斷哪些 <code>#if</code> 分支會被編譯。</p></div>
+      <div class="point"><h3>找的是呼叫，不只是名稱</h3><p>追得到透過巨集、以及透過存在結構裡的函式指標的呼叫，並標出每個呼叫是怎麼發生的。</p></div>
+      <div class="point"><h3>快到不用在意</h3><p>整個 Linux kernel 在一般桌機上大約一分鐘建好索引；存檔後幾毫秒內更新。</p></div>
+      <div class="point"><h3>和編譯器對照過</h3><p>在公開專案上，逐一呼叫和 clang 實際編譯的結果比對。</p></div>
+      <div class="point"><h3>只在本機執行</h3><p>不連網，不收集任何資料。</p></div>
+    </div>
+
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th></th><th class="norn">Norn</th><th>clangd</th><th>ctags / cscope / GNU Global</th></tr></thead>
+        <tbody>
+          <tr><td>沒有 compilation database 也能用</td><td class="norn">✅</td><td>⚠️ 準確度較低</td><td>✅</td></tr>
+          <tr><td>知道 build 會編譯哪些 <code>#if</code> 分支</td><td class="norn">✅</td><td>✅ 需要 database</td><td>❌</td></tr>
+          <tr><td>呼叫圖（呼叫者與被呼叫者）</td><td class="norn">✅</td><td>✅</td><td>⚠️ cscope，只比對名稱</td></tr>
+          <tr><td>透過函式指標的呼叫</td><td class="norn">✅</td><td>❌</td><td>❌</td></tr>
+          <tr><td>由巨集產生的呼叫</td><td class="norn">✅</td><td>✅ 需要 database</td><td>❌</td></tr>
+          <tr><td>存檔即更新索引</td><td class="norn">✅</td><td>✅</td><td>❌ 要重跑</td></tr>
+          <tr><td>Source Insight 式的檢視（Relation、Context）</td><td class="norn">✅</td><td>❌</td><td>❌</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="benchmarks" class="alt">
+  <div class="wrap">
+    <h2>基準測試</h2>
+    <p class="intro">在公開專案上量測，標準答案是 clang 對該專案實際 build 的結果。每個工具回報的每個呼叫都和 clang 實際編譯的呼叫對照。clangd 量了兩次：一次給它真實 build 的 compilation database，一次什麼都不給。Norn 什麼都不給。</p>
+    <div class="chart"><img src="/assets/calls-found.svg" width="1108" height="386" alt="各專案、各工具找到的呼叫比例"></div>
+    <div class="chart"><img src="/assets/index-time.svg" alt="各專案、各工具建立索引的時間"></div>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>專案</th><th>檔案數</th><th class="norn">Norn</th><th>clangd + build database</th><th>clangd</th><th>cscope</th></tr></thead>
+        <tbody>
+          <tr><td>Redis</td><td>801</td><td class="norn"><b>100.0%</b><sub>0.32 s</sub></td><td>100.0%<sub>1.67 s</sub></td><td>95.8%<sub>11 s</sub></td><td>96.9%<sub>0.26 s</sub></td></tr>
+          <tr><td>git</td><td>919</td><td class="norn"><b>99.9%</b><sub>0.25 s</sub></td><td>99.9%<sub>2.40 s</sub></td><td>64.2%<sub>32 s</sub></td><td>87.9%<sub>0.27 s</sub></td></tr>
+          <tr><td>binutils</td><td>1,622</td><td class="norn"><b>99.6%</b><sub>2.72 s</sub></td><td>92.7%<sub>9.72 s</sub></td><td>32.2%<sub>16 s</sub></td><td>70.6%<sub>1.34 s</sub></td></tr>
+          <tr><td>STM32F4 HAL</td><td>253</td><td class="norn"><b>96.5%</b><sub>0.64 s</sub></td><td>95.0%<sub>3.14 s</sub></td><td>0.0%<sub>1.14 s</sub></td><td>75.7%<sub>0.44 s</sub></td></tr>
+          <tr><td>nrfx</td><td>535</td><td class="norn"><b>98.0%</b><sub>0.84 s</sub></td><td>100.0%<sub>1.15 s</sub></td><td>14.1%<sub>1.22 s</sub></td><td>12.0%<sub>0.28 s</sub></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">每格：找到的呼叫比例（和 clang 對照），下方為建立索引的時間。量測方法、所有數字與工具版本見 <a href="https://github.com/humphrey0925/norn/blob/master/docs/benchmarks/README.md">docs/benchmarks</a>。所有數字都由 <code>bench/compare.py</code> 產生，沒有手打的。</p>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <h2>功能</h2>
+    <p class="intro">Norn 是完整的語言伺服器：移至定義、尋找參考、呼叫階層、參數提示、重新命名、摺疊、格式化、快速修正都有。和微軟的 C/C++ 擴充套件一起使用時，Norn 會成為 IntelliSense 的 configuration provider，而不是和它重複。</p>
+    <div class="features">
+      <div class="feature"><div class="txt"><h3>Project Symbols</h3><p>模糊搜尋所有符號：片段順序不拘、縮寫、依序出現的字母都可以。</p></div><div class="img"><img src="/assets/screenshots/search.png" width="302" height="200" alt="Project Symbols" loading="lazy"></div></div>
+      <div class="feature"><div class="txt"><h3>Relation</h3><p>呼叫者、被呼叫者、參考位置、函式指標的指派位置，可用樹狀或關係圖檢視。</p></div><div class="img"><img src="/assets/screenshots/relation-graph.png" width="1456" height="908" alt="以關係圖顯示的 Relation" loading="lazy"></div></div>
+      <div class="feature"><div class="txt"><h3>附文件的懸停</h3><p>顯示宣告和文件註解；巨集會一路展開算出值。</p></div><div class="img"><img src="/assets/screenshots/hover-function.png" width="948" height="487" alt="懸停" loading="lazy"></div></div>
+      <div class="feature"><div class="txt"><h3>Context</h3><p>在程式碼旁邊顯示游標所在名稱的定義，不用離開目前位置。</p></div><div class="img"><img src="/assets/screenshots/called-by.png" width="1087" height="292" alt="Relation 與 Context" loading="lazy"></div></div>
+      <div class="feature"><div class="txt"><h3>自動完成</h3><p><code>.</code>、<code>-&gt;</code> 後的成員、區域變數、關鍵字、<code>#include</code> 路徑、所有索引到的名稱。</p></div><div class="img"><img src="/assets/screenshots/member-completion.png" width="948" height="495" alt="成員補全" loading="lazy"></div></div>
+      <div class="feature"><div class="txt"><h3>上色與提示</h3><p>依名稱種類上色；呼叫處顯示參數名稱。</p></div><div class="img"><img src="/assets/screenshots/highlighting-and-hints.png" width="948" height="487" alt="語意上色與參數名稱提示" loading="lazy"></div></div>
+      <div class="feature"><div class="txt"><h3>File Symbols 與區域變數</h3><p>函式的參數和區域變數，以及每個用到它的行。</p></div><div class="img"><img src="/assets/screenshots/locals.png" width="1456" height="908" alt="File Symbols 與區域變數" loading="lazy"></div></div>
+      <div class="feature"><div class="txt"><h3>編譯條件</h3><p>從 build 讀取設定組，在 Debug、Release 或各板子的設定之間切換。</p></div><div class="img"><img src="/assets/screenshots/conditions-switch.png" width="620" height="176" alt="切換設定組" loading="lazy"></div></div>
+    </div>
+  </div>
+</section>
+
+<section id="start" class="alt">
+  <div class="wrap">
+    <h2>開始使用</h2>
+    <ol class="steps">
+      <li>安裝 <b>Norn — Code Navigation &amp; Symbol Index</b>：從 <a href="https://marketplace.visualstudio.com/items?itemName=humphrey0925.norn-c">Visual Studio Marketplace</a>，或給 VSCodium、Cursor、Windsurf 用的 <a href="https://open-vsx.org/extension/humphrey0925/norn-c">Open VSX</a>，或從 <a href="https://github.com/humphrey0925/norn/releases">releases</a> 下載 <code>.vsix</code>。</li>
+      <li>開啟一個有 C 原始碼的資料夾。這樣就好了。</li>
+    </ol>
+    <p class="intro" style="margin-top:28px">每個檢視和設定的說明見<a href="https://github.com/humphrey0925/norn/blob/master/docs/norn-guide.zh-TW.md">使用指南</a>。不用 VS Code 時，同一個索引程式也是獨立的指令 <code>norn</code>，可在終端機、腳本、CI 和其他編輯器使用：見<a href="https://github.com/humphrey0925/norn/blob/master/docs/cli.zh-TW.md">命令列手冊</a>。</p>
+    <h2 style="margin-top:48px">運作原理</h2>
+<pre><code>原始碼 ─► tree-sitter 解析 ─► 每個檔案的事實 ─► 連結 ─► 呼叫圖（CSR）─► 語言伺服器
+             ▲                                  ▲
+   依 build 自己的設定和原始碼               解析透過巨集與
+   判斷 #if                                 函式指標的呼叫</code></pre>
+    <p class="intro">Norn 用 Rust 寫成。每個檔案先判斷前置處理器條件，再解析一次。每個檔案的結果依內容雜湊快取；連結成呼叫圖只要幾毫秒，查一個函式的呼叫者遠不到一微秒。</p>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="links">
+      <a href="https://github.com/humphrey0925/norn">GitHub</a>
+      <a href="https://github.com/humphrey0925/norn/blob/master/CHANGELOG.md">更新紀錄</a>
+      <a href="https://github.com/humphrey0925/norn/blob/master/docs/norn-guide.zh-TW.md">使用指南</a>
+      <a href="https://github.com/humphrey0925/norn/blob/master/docs/lsp-api.zh-TW.md">LSP API</a>
+      <a href="https://github.com/humphrey0925/norn/issues">Issues</a>
+    </div>
+    <p>Copyright 2026 humphrey0925 and the Norn contributors。以 <a href="https://github.com/humphrey0925/norn/blob/master/LICENSE">Apache License 2.0</a> 授權。</p>
+    <p>Source Insight 是 Source Dynamics, Inc. 的商標。Norn 與 Source Dynamics 沒有任何關係，也未獲其背書；提到這個名稱只是為了說明瀏覽方式的風格。</p>
+  </div>
+</footer>
+
+</body>
+</html>

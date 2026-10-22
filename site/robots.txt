@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://norn-c.com/sitemap.xml
