@@ -23,7 +23,7 @@ and open http://localhost:8000.
    - Build output directory: `site`
 3. **Save and Deploy**. Every push to `master` redeploys; pull requests get preview URLs.
 4. In the project → **Custom domains** → **Set up a custom domain**, enter the
-   domain (and `www.` if wanted). Since the domain's DNS is already on Cloudflare,
+   domain `norn-c.com` (and `www.norn-c.com` if wanted). Since the domain's DNS is already on Cloudflare,
    the record is added for you and the certificate is issued in a few minutes.
 
 ## Updating
