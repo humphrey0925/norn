@@ -339,9 +339,20 @@ impl<'a> Includes<'a> {
         // A folder the build does not compile is another architecture's,
         // say: of those not above the includer, one the build compiles.
         let built = |id: u32| !self.outside[id as usize];
+        // First, a folder the includer is in itself (bitcoin's `src/`, for
+        // `<rpc/util.h>` from `src/rpc/`): before `src/wallet/`, whose
+        // folder above holds the includer too. (Not the tree's own top.)
+        // (Of a source file only: a header is read with its includers'
+        // `-I`s, and Linux's `include/` would find `tools/include/`'s
+        // copies of its own headers through it.)
+        let source = !crate::is_header(includer);
+        let own = |id: u32| {
+            let r = root(id);
+            source && !r.is_empty() && (dir == r || dir.starts_with(r) && dir.as_bytes().get(r.len()) == Some(&b'/'))
+        };
         let shared = |id: u32| {
             let other = dir_of(paths[id as usize]);
-            (above(id), built(id), include_folder(id), shallow(id), dir.split('/').zip(other.split('/')).take_while(|(a, b)| a == b).count())
+            (own(id), above(id), built(id), include_folder(id), shallow(id), dir.split('/').zip(other.split('/')).take_while(|(a, b)| a == b).count())
         };
         match cands.iter().map(|&c| shared(c)).max() {
             Some(best) => {
@@ -2009,7 +2020,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
                 // `SI_EDGE_WHY=<name>[,<name>...]`: why each call of those names that is
                 // not certain is not.
                 if ambiguous && edge_why.as_deref().is_some_and(|w| w.split(',').any(|w| g.name(remap[fi][r.name as usize]) == w)) {
-                    let at = path_of.get(fi).and_then(|&p| readings.paths.get(p as usize)).map_or("?", |p| p.as_str());
+                    let at = path_of.get(fi).and_then(|&p| readings.paths.get(p as usize)).map_or(files[fi].path.as_str(), |p| p.as_str());
                     let c = tmp[0];
                     // (Here worked out only to say: the link asks the turned-over table.)
                     let readers = readers.get_or_init(|| {
@@ -2836,6 +2847,23 @@ int f (struct t *h) { return htab_size (h); }
         assert_eq!(sure(&g, "f", "kfree"), [("mm/slab.c".to_string(), true)]);
         assert_eq!(sure(&g, "f", "set_bit"), [("arch/x86/include/asm/bitops.h".to_string(), true)]);
         assert_eq!(sure(&g, "g", "set_bit"), [("arch/arm64/include/asm/bitops.h".to_string(), true)]);
+    }
+
+    #[test]
+    fn an_include_is_looked_up_first_from_a_folder_the_includer_is_in() {
+        let paths = ["src/rpc/util.h", "src/wallet/rpc/util.h", "src/rpc/mempool.cpp", "src/wallet/rpc/coins.cpp", "include/linux/kernel.h", "tools/include/linux/kernel.h", "drivers/a.c"];
+        let found = Includes::new(paths.iter().copied());
+        let resolve = |includer: &str, operand: &str| {
+            let mut out = Vec::new();
+            found.resolve(includer, operand, &mut out);
+            out.iter().map(|&i| paths[i as usize]).collect::<Vec<_>>()
+        };
+        // `-Isrc`: `src/`'s, not `src/wallet/`'s, whose folder above
+        // holds the includer too.
+        assert_eq!(resolve("src/rpc/mempool.cpp", "rpc/util.h"), ["src/rpc/util.h"]);
+        // From inside `src/wallet/`, its own (the nearest).
+        assert_eq!(resolve("src/wallet/rpc/coins.cpp", "wallet/rpc/util.h"), ["src/wallet/rpc/util.h"]);
+        assert_eq!(resolve("drivers/a.c", "linux/kernel.h"), ["include/linux/kernel.h"]);
     }
 
     #[test]
