@@ -250,6 +250,9 @@ find_callees main
   shows the wiring, not whether a real model chooses the tools.
 - Tried: VS Code (Linux, Windows): the extension's MCP server answers
   `initialize`, `tools/list` and `tools/call`.
+- Tried: VSCodium 1.140 (VS Code's open-source build), with Claude Code,
+  Codex and OpenCode on the machine: the offer came a little after start,
+  and **Connect** wrote all three agents' settings and both skill folders.
 - Tried: `install.sh` on Linux, against a release, and with a checksum that
   did not match (nothing installed).
 - Not tried: `install.ps1` (no PowerShell where it was written).

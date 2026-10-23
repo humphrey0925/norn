@@ -2233,6 +2233,13 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
  *  to start it. Once it is there, each start of the extension brings it up
  *  to date with the server the extension has (`setup --refresh`), so an
  *  update of the extension updates what the agents run too. */
+/** `Claude Code, Codex and OpenCode`, of the names `norn setup` gives them. */
+function agentList(names: string[]): string {
+  const shown: Record<string, string> = { claude: "Claude Code", codex: "Codex", opencode: "OpenCode" };
+  const list = names.map((n) => shown[n] ?? n);
+  return list.length <= 1 ? list.join("") : `${list.slice(0, -1).join(", ")} and ${list[list.length - 1]}`;
+}
+
 function connectAgents(context: vscode.ExtensionContext): void {
   const setup = (args: string[]) =>
     new Promise<{ ok: boolean; out: string }>((resolve) =>
@@ -2262,11 +2269,8 @@ function connectAgents(context: vscode.ExtensionContext): void {
       return;
     }
     await context.globalState.update("norn.agentsOffered", [...offered, ...fresh.map((a) => a.name)]);
-    const names: Record<string, string> = { claude: "Claude Code", codex: "Codex", opencode: "OpenCode" };
-    const list = fresh.map((a) => names[a.name] ?? a.name);
-    const who = list.length === 1 ? list[0] : `${list.slice(0, -1).join(", ")} and ${list[list.length - 1]}`;
     const pick = await vscode.window.showInformationMessage(
-      `Give ${who} Norn's index as tools? They then find callers through macros and function pointers, and see which #if branches the build compiles. (Later: Norn: Connect AI Agents.)`,
+      `Give ${agentList(fresh.map((a) => a.name))} Norn's index as tools? They then find callers through macros and function pointers, and see which #if branches the build compiles. (Later: Norn: Connect AI Agents.)`,
       "Connect",
       "Not Now",
     );
@@ -2283,7 +2287,7 @@ function connectAgents(context: vscode.ExtensionContext): void {
       channel.clear();
       channel.appendLine(r.out);
       const done = r.out.split("\n").filter((l) => /^\S+\s+(set up|already set up):/.test(l)).map((l) => l.split(/\s+/)[0]);
-      const message = done.length ? `Norn's tools are set up for ${done.join(", ")}: an agent started from now on has them.` : "Norn found no agent to set up (Claude Code, Codex, OpenCode).";
+      const message = done.length ? `Norn's tools are set up for ${agentList(done)}: an agent started from now on has them.` : "Norn found no agent to set up (Claude Code, Codex, OpenCode).";
       const show = await (r.ok ? vscode.window.showInformationMessage(message, "Details") : vscode.window.showWarningMessage(`${message} Some need a step by hand.`, "Details"));
       if (show) {
         channel.show();

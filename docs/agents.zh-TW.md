@@ -208,5 +208,6 @@ find_callees main
 - `[已驗證]` Claude Code 2.1.309、Codex CLI 0.164.0、OpenCode 1.19.4：`norn setup` 寫入的設定能讓它們啟動 `norn mcp`、呼叫工具並收到回答，也都會載入
   skill。測試時模型是用本機替身代替的，所以只驗證了接線，沒有驗證真模型會不會主動選用工具。
 - `[已驗證]` VS Code（Linux、Windows）：擴充套件提供的 MCP server 能回答 `initialize`、`tools/list`、`tools/call`。
+- `[已驗證]` VSCodium 1.140（VS Code 的開源建置）：機器上有 Claude Code、Codex、OpenCode 時，啟動後不久會跳出提示；按 **Connect** 會寫好三個 agent 的設定和兩個 skill 資料夾。
 - `[未測]` Copilot 是否會載入 `~/.agents/skills/norn/`：依 VS Code 文件應該會，但沒有實測。
 - `[未測]` VS Code 的 Codex 擴充套件和 ChatGPT 桌面 app 的 Codex：不確定它們在哪個資料夾啟動 server。
