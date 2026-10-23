@@ -5,6 +5,8 @@
 ### For AI agents
 
 - `norn mcp`: a Model Context Protocol server, for Claude Code, VS Code's Copilot, Cursor and other agents. Its tools find definitions, callers and callees (through macros and function pointers stored in members or variables, as the rest of Norn), references, call trees, a definition's source, and which lines the build compiles, answered as text for the agent to read. It watches the tree as the extension does: only the files an agent edits are read again, a changed build configuration has the whole tree looked at, and with nothing changed an answer reads nothing. The index is kept between runs as `live` keeps it. See [the command line](docs/cli.md#mcp).
+- One project, one index: the agents' `norn mcp`s of a project and VS Code's language server share the index the first of them makes (the language server taking it over when it starts), instead of each making its own. Who holds which project is kept in `~/.norn/run`; the others are answered from it on this machine only. If the holder ends, another takes over from the index kept on disk.
+- Which project: the folder given, else the one the client says it has open (MCP roots), else the current folder, but never the home folder or the root of the file system, where a desktop app starts a server: there each tool says how to name the project instead of the server indexing the home folder.
 - In VS Code, nothing to set up: the extension offers the same tools to Copilot's agent mode and the other agents VS Code serves MCP servers to, answered by the language server it already runs (`si/mcp`), from the index the editor has, kept up to date as the editor keeps it: no second index, nothing more in memory. VS Code 1.101 or later; `norn.mcp.enabled` turns it off.
 
 ## 0.25.0

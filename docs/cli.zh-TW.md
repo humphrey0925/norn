@@ -190,8 +190,18 @@ norn mcp [ROOT] [--cache-dir <DIR> | --no-cache] [--rebuild] [--include-alias <F
 ```
 
 透過 stdin/stdout 的 [Model Context Protocol](https://modelcontextprotocol.io) 伺服器，給 AI agent
-用：Claude Code、VS Code 的 Copilot、Cursor，以及其他支援 MCP 伺服器的工具。根目錄是目前所在的資料夾，
-除非另外給 `ROOT`。它會立刻回應，同時在背景建索引；第一次呼叫工具時會等索引建好。它像 VS Code
+用：Claude Code、VS Code 的 Copilot、Cursor，以及其他支援 MCP 伺服器的工具。專案資料夾的決定順序：
+有給 `ROOT` 就用它；否則用工具告知的已開啟資料夾（MCP roots）；再否則用目前所在的資料夾，但如果那是
+家目錄或檔案系統的根目錄（桌面 app 通常在這裡啟動 server），就不建索引，每個工具都會說明怎麼指定專案。
+它會立刻回應，同時在背景建索引；第一次呼叫工具時會等索引建好。
+
+一個專案只有一份索引，不管有幾個 agent 在用。某個專案的第一個 `norn mcp` 負責建索引，之後為同一個
+專案啟動的（另一個 agent、另一個工作階段）都直接用它的索引回答，不再自己建；它結束時，其中一個會接手，
+從磁碟上保留的索引載入。VS Code 的語言伺服器一開啟該資料夾，就會接手這個專案，agent 改用編輯器的索引
+回答。哪個程序負責哪個專案記在 `~/.norn/run`（一個鎖，以及負責者在哪裡回答：只在本機，而且只回答知道
+那裡寫的密語的程序）。
+
+它像 VS Code
 擴充套件一樣監看檔案：agent 改了哪個原始檔，下次回答前就只重讀那個檔；建置設定（`.norn/config.json`、
 Keil、IAR、Eclipse、Visual Studio 專案、`compile_commands.json`…）改了，或新增、刪除了資料夾，才重新
 檢查整棵樹。沒有任何變動時，什麼都不讀。索引也像 `live` 一樣保留到下次執行。

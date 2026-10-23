@@ -160,7 +160,7 @@ struct LocalHit {
 }
 
 /// `file:///e%3A/dir/a.c` to a path, and back.
-fn uri_to_path(uri: &str) -> PathBuf {
+pub(crate) fn uri_to_path(uri: &str) -> PathBuf {
     let rest = uri.strip_prefix("file://").unwrap_or(uri);
     let mut bytes = Vec::with_capacity(rest.len());
     let raw = rest.as_bytes();
@@ -2047,7 +2047,7 @@ impl Server {
             "si/scope" => self.scope(),
             // A message of the Model Context Protocol, which the editor
             // serves to agents: answered from this index (see `crate::mcp`).
-            "si/mcp" => crate::mcp::message(params, &self.root, |tool, args| crate::mcp::Tools::new(&self.root, &self.session).call(tool, args))
+            "si/mcp" => crate::mcp::message(params, Some(&self.root), |tool, args| crate::mcp::Tools::new(&self.root, &self.session).call(tool, args))
                 .unwrap_or(Value::Null),
             "si/setScope" => {
                 let list = |key: &str| -> Vec<String> {
@@ -2118,6 +2118,41 @@ enum Event {
     Opened(Box<(Session, si_core::session::Update)>),
     /// The editor is gone.
     Closed,
+    /// An agent's message, from a `norn mcp` of this project, and where its
+    /// answer goes (see `crate::share`).
+    Agent(Value, std::sync::mpsc::Sender<Value>),
+    /// The project is this server's to answer for: kept while it runs.
+    Held(crate::share::Held),
+}
+
+/// Hold the project, for the agents' `norn mcp`s to be answered from this
+/// index rather than make their own: one that holds it is asked to give
+/// it up. Given up after a while if it does not (another editor's server).
+fn hold(root: &Path, events: std::sync::mpsc::Sender<Event>) {
+    use crate::share::{claim, Asked, Claim};
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < end {
+        match claim(root) {
+            Ok(Claim::Held(held, listener, word)) => {
+                let agents = events.clone();
+                crate::share::serve(listener, word, move |asked| match asked {
+                    Asked::Message(msg, tx) => agents.send(Event::Agent(msg, tx)).is_ok(),
+                    // (Another editor's server: this one keeps it.)
+                    Asked::Yield => true,
+                });
+                trace(|| "  holds the project for agents".into());
+                let _ = events.send(Event::Held(held));
+                return;
+            }
+            Ok(Claim::Taken(at)) => crate::share::ask_to_yield(&at),
+            Ok(Claim::Busy) => {}
+            Err(e) => {
+                trace(|| format!("  cannot hold the project for agents: {e}"));
+                return;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
 }
 
 /// `early` gives what the last session left to answer with at once (see
@@ -2176,6 +2211,9 @@ pub fn run(
         });
     }
     let mut server: Option<Server> = None;
+    // Agents' tool calls that wait for the index, and the project held for them.
+    let mut agents_waiting: Vec<(Value, std::sync::mpsc::Sender<Value>)> = Vec::new();
+    let mut _held: Option<crate::share::Held> = None;
     trace(|| format!("started at {} ms since 1970", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis())));
     let handle = |server: &mut Option<Server>, msg: Value, out: &mut std::io::Stdout| -> bool {
         let method = msg["method"].as_str().unwrap_or("").to_string();
@@ -2192,6 +2230,10 @@ pub fn run(
             // What was saved answers at once; the index follows.
             let session = early(&dir).unwrap_or_else(|| Session::empty(&dir));
             let have = session.early_digest();
+            {
+                let (events, at) = (events.clone(), dir.clone());
+                std::thread::spawn(move || hold(&at, events));
+            }
             let (open, events, at) = (open.clone(), events.clone(), dir.clone());
             std::thread::spawn(move || {
                 let _ = events.send(Event::Opened(Box::new(open(&at, have))));
@@ -2259,8 +2301,19 @@ pub fn run(
                 Err(_) => break,
             }
         };
+        // An agent's message, answered from this index.
+        let answer = |s: &Server, msg: &Value| {
+            crate::mcp::message(msg, Some(&s.root), |tool, args| crate::mcp::Tools::new(&s.root, &s.session).call(tool, args)).unwrap_or(Value::Null)
+        };
         match event {
             Event::Closed => break,
+            Event::Held(held) => _held = Some(held),
+            Event::Agent(msg, tx) => match &server {
+                Some(s) if !(s.loading && msg["method"] == "tools/call") => {
+                    let _ = tx.send(answer(s, &msg));
+                }
+                _ => agents_waiting.push((msg, tx)),
+            },
             Event::Message(msg) => {
                 if !handle(&mut server, msg, &mut out) {
                     break;
@@ -2287,6 +2340,11 @@ pub fn run(
                 // What was asked of the index while there was none.
                 for msg in std::mem::take(&mut s.waiting) {
                     handle(&mut server, msg, &mut out);
+                }
+                if let Some(s) = &server {
+                    for (msg, tx) in agents_waiting.drain(..) {
+                        let _ = tx.send(answer(s, &msg));
+                    }
                 }
             }
         }

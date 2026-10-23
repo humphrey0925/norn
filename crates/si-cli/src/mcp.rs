@@ -198,14 +198,14 @@ fn tools() -> Value {
 }
 
 /// What an agent is told of the server when it starts.
-fn instructions(root: &Path) -> String {
+fn instructions(root: Option<&Path>) -> String {
+    let under = root.map_or("the project's folder".to_string(), |r| r.display().to_string());
     format!(
-        "Norn indexes the C and C++ sources under {} without a build: definitions, references, and the call graph, \
+        "Norn indexes the C and C++ sources under {under} without a build: definitions, references, and the call graph, \
          including calls made by macros and calls through function pointers stored in struct members or variables, \
          under the #if branches the project's build compiles. Prefer these tools to text search for finding \
          definitions, callers and callees, and read_symbol to reading whole files. Paths are relative to that folder. \
-         The index follows the files as they change on disk.",
-        root.display()
+         The index follows the files as they change on disk."
     )
 }
 
@@ -708,29 +708,6 @@ fn lines(a: u32, b: u32) -> String {
     if a == b { format!("line {a}") } else { format!("lines {a}–{b}") }
 }
 
-/// The index being made, or made.
-enum Index {
-    Opening(std::sync::mpsc::Receiver<((Session, Update), Option<Watch>)>),
-    Ready(Box<Server>),
-    Failed,
-}
-
-impl Index {
-    /// The index, waiting for it if it is still being made.
-    fn get(&mut self, root: &Path) -> Option<&mut Server> {
-        if let Index::Opening(rx) = self {
-            *self = match rx.recv() {
-                Ok(((session, _), watch)) => Index::Ready(Box::new(Server { root: root.to_path_buf(), session, watch, synced: Instant::now() })),
-                Err(_) => Index::Failed,
-            };
-        }
-        match self {
-            Index::Ready(s) => Some(s),
-            _ => None,
-        }
-    }
-}
-
 fn reply(id: &Value, result: Result<Value, (i64, String)>) -> Value {
     match result {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
@@ -740,7 +717,7 @@ fn reply(id: &Value, result: Result<Value, (i64, String)>) -> Value {
 
 /// The answer to one message of the protocol, if it asks for one; `call`
 /// runs a tool.
-pub fn message(msg: &Value, root: &Path, call: impl FnOnce(&str, &Value) -> Result<String, String>) -> Option<Value> {
+pub fn message(msg: &Value, root: Option<&Path>, call: impl FnOnce(&str, &Value) -> Result<String, String>) -> Option<Value> {
     // A notification (`notifications/initialized`, `…/cancelled`) asks
     // for no answer, and none of them for anything to be done.
     let id = msg.get("id").filter(|_| msg.get("method").is_some())?;
@@ -775,45 +752,294 @@ pub fn message(msg: &Value, root: &Path, call: impl FnOnce(&str, &Value) -> Resu
     Some(reply(id, result))
 }
 
-pub fn run(root: &Path, open: impl FnOnce(&Path) -> (Session, Update) + Send + 'static) {
+/// Which folder is the project, for a server started without one: the
+/// folder it was started in, unless that is no project's (the home folder,
+/// the root of the file system, where a desktop app starts it).
+fn project_root(dir: &Path) -> Result<PathBuf, String> {
     // (Not `canonicalize`, which on Windows writes `\\?\C:\…`.)
-    let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
-    // Indexing takes its time: the agent is answered at once, and its
-    // first tool call waits for the index.
-    let (tx, rx) = std::sync::mpsc::channel();
-    {
-        let root = root.clone();
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let same = |a: &Path, b: &Path| std::fs::canonicalize(a).ok().zip(std::fs::canonicalize(b).ok()).is_some_and(|(a, b)| a == b);
+    let why = if dir.parent().is_none() {
+        "the root of the file system"
+    } else if std::env::home_dir().is_some_and(|home| same(&home, &dir)) {
+        "your home folder"
+    } else {
+        return Ok(dir);
+    };
+    Err(format!(
+        "Norn does not know which project to index: it was started in {} ({why}), and was not told of one. \
+         Give the project's folder where this MCP server is set up: the command `norn` with the arguments `mcp` and the folder.",
+        dir.display()
+    ))
+}
+
+/// Where an answer goes: to this process's own client, or to another
+/// process that asked.
+enum To {
+    Out,
+    Other(std::sync::mpsc::Sender<Value>),
+}
+
+enum Ev {
+    Line(String),
+    Closed,
+    /// The index this process made (of the start numbered so).
+    Opened(u64, Box<((Session, Update), Option<Watch>)>),
+    Asked(crate::share::Asked),
+}
+
+/// Whose index answers.
+enum Mode {
+    /// The project is not known yet (the client is asked for it).
+    Unknown,
+    /// No project to index, and why.
+    Refused(String),
+    /// This process's own: being made (`None`), or made. `held`: the others
+    /// are answered from it.
+    Own { server: Option<Box<Server>>, held: Option<crate::share::Held> },
+    /// Another process's, that holds the project.
+    Forward(crate::share::Line),
+}
+
+type Open = std::sync::Arc<dyn Fn(&Path) -> (Session, Update) + Send + Sync>;
+
+struct Agent {
+    root: Option<PathBuf>,
+    mode: Mode,
+    /// Tool calls that wait for the project or its index.
+    waiting: Vec<(Value, To)>,
+    events: std::sync::mpsc::Sender<Ev>,
+    open: Open,
+    /// Starts so far: an index made for an earlier one is let go.
+    starts: u64,
+    /// The client tells the folders it has open (MCP `roots`).
+    roots: bool,
+}
+
+/// The id this server asks the client its roots with.
+const ROOTS_ID: &str = "norn-roots";
+
+impl Agent {
+    fn send(&self, to: To, answer: Value) {
+        match to {
+            To::Out => {
+                let mut out = std::io::stdout().lock();
+                let _ = writeln!(out, "{answer}").and_then(|_| out.flush());
+            }
+            To::Other(tx) => {
+                let _ = tx.send(answer);
+            }
+        }
+    }
+
+    /// Index `root`, or reach the process that does.
+    fn start(&mut self, root: PathBuf) {
+        use crate::share::{claim, reach, Claim};
+        self.starts += 1;
+        self.root = Some(root.clone());
+        self.mode = Mode::Unknown;
+        for _ in 0..3 {
+            match claim(&root) {
+                Ok(Claim::Held(held, listener, word)) => {
+                    let events = self.events.clone();
+                    crate::share::serve(listener, word, move |asked| events.send(Ev::Asked(asked)).is_ok());
+                    self.own(&root, Some(held));
+                    break;
+                }
+                Ok(Claim::Taken(_)) | Ok(Claim::Busy) => match reach(&root, Duration::from_secs(3)) {
+                    Ok((line, at)) => {
+                        eprintln!("norn: answering from the index process {} keeps of {}", at.pid, root.display());
+                        self.mode = Mode::Forward(line);
+                        break;
+                    }
+                    // Let go meanwhile: try again to hold it.
+                    Err(true) => continue,
+                    // Of another version, or not answering: an index of its own.
+                    Err(false) => {
+                        eprintln!("norn: another process holds {} but does not answer; indexing it apart", root.display());
+                        self.own(&root, None);
+                        break;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("norn: cannot share the index of {} ({e}); indexing it apart", root.display());
+                    self.own(&root, None);
+                    break;
+                }
+            }
+        }
+        if matches!(self.mode, Mode::Unknown) {
+            self.own(&root, None);
+        }
+        for (msg, to) in std::mem::take(&mut self.waiting) {
+            self.call(msg, to);
+        }
+    }
+
+    fn own(&mut self, root: &Path, held: Option<crate::share::Held>) {
+        let (events, open, start, root) = (self.events.clone(), self.open.clone(), self.starts, root.to_path_buf());
         std::thread::spawn(move || {
             // Watched first: what changes while it is indexed is read again.
             let watch = Watch::start(&root);
-            let _ = tx.send((open(&root), watch));
+            let _ = events.send(Ev::Opened(start, Box::new((open(&root), watch))));
+        });
+        self.mode = Mode::Own { server: None, held };
+    }
+
+    /// A tool call, answered now or once there is an index to answer it.
+    fn call(&mut self, msg: Value, to: To) {
+        let root = self.root.clone();
+        match &mut self.mode {
+            Mode::Unknown | Mode::Own { server: None, .. } => self.waiting.push((msg, to)),
+            Mode::Refused(why) => {
+                let why = why.clone();
+                let answer = message(&msg, root.as_deref(), |_, _| Err(why)).unwrap_or(Value::Null);
+                self.send(to, answer);
+            }
+            Mode::Own { server: Some(server), .. } => {
+                server.sync();
+                let answer = message(&msg, Some(&server.root), |tool, args| Tools::new(&server.root, &server.session).call(tool, args)).unwrap_or(Value::Null);
+                self.send(to, answer);
+            }
+            Mode::Forward(line) => match line.ask(&msg) {
+                Ok(answer) => self.send(to, answer),
+                // The holder is gone: hold the project now, or reach who does.
+                Err(_) => {
+                    let root = root.expect("a project to forward for");
+                    self.start(root);
+                    self.call(msg, to);
+                }
+            },
+        }
+    }
+
+    /// The client's folders (`roots/list`): the first is the project.
+    fn rooted(&mut self, result: &Value) {
+        let first = result["roots"].as_array().and_then(|r| r.first()).and_then(|r| r["uri"].as_str()).filter(|u| u.starts_with("file:"));
+        let dir = match first {
+            Some(uri) => crate::lsp::uri_to_path(uri),
+            None => std::env::current_dir().unwrap_or_default(),
+        };
+        match project_root(&dir) {
+            Ok(root) => self.start(root),
+            Err(why) => self.refuse(why),
+        }
+    }
+
+    fn refuse(&mut self, why: String) {
+        self.mode = Mode::Refused(why);
+        for (msg, to) in std::mem::take(&mut self.waiting) {
+            self.call(msg, to);
+        }
+    }
+
+    fn line(&mut self, line: &str) {
+        let Ok(msg) = serde_json::from_str::<Value>(line) else {
+            self.send(To::Out, reply(&Value::Null, Err((-32700, "not JSON".into()))));
+            return;
+        };
+        // The client's answer to what this server asked it.
+        if msg.get("method").is_none() {
+            if msg["id"] == ROOTS_ID && self.root.is_none() {
+                self.rooted(&msg["result"]);
+            }
+            return;
+        }
+        match msg["method"].as_str().unwrap_or("") {
+            "tools/call" => self.call(msg, To::Out),
+            "initialize" => {
+                // Not given a folder: the client's, if it says, else the one started in.
+                if self.root.is_none() {
+                    self.roots = msg["params"]["capabilities"]["roots"].is_object();
+                    if !self.roots {
+                        let dir = std::env::current_dir().unwrap_or_default();
+                        match project_root(&dir) {
+                            Ok(root) => self.start(root),
+                            Err(why) => self.refuse(why),
+                        }
+                    }
+                }
+                let answer = message(&msg, self.root.as_deref(), |_, _| unreachable!()).unwrap_or(Value::Null);
+                self.send(To::Out, answer);
+            }
+            "notifications/initialized" if self.roots && self.root.is_none() => {
+                self.send(To::Out, json!({ "jsonrpc": "2.0", "id": ROOTS_ID, "method": "roots/list" }));
+            }
+            _ => {
+                if let Some(answer) = message(&msg, self.root.as_deref(), |_, _| unreachable!()) {
+                    self.send(To::Out, answer);
+                }
+            }
+        }
+    }
+
+    /// A language server wants the project: let it have it, and be
+    /// answered from its index.
+    fn yield_project(&mut self) {
+        let Mode::Own { held: Some(_), .. } = &self.mode else { return };
+        let root = self.root.clone().expect("a project held");
+        // What this process made is let go, and the memory with it.
+        self.mode = Mode::Unknown;
+        self.starts += 1;
+        si_core::trim_memory();
+        let end = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(200));
+            if let Ok((line, at)) = crate::share::reach(&root, Duration::from_millis(500)) {
+                eprintln!("norn: answering from the index process {} keeps of {}", at.pid, root.display());
+                self.mode = Mode::Forward(line);
+                for (msg, to) in std::mem::take(&mut self.waiting) {
+                    self.call(msg, to);
+                }
+                return;
+            }
+        }
+        self.start(root);
+    }
+}
+
+pub fn run(root: Option<&Path>, open: impl Fn(&Path) -> (Session, Update) + Send + Sync + 'static) {
+    let (events, inbox) = std::sync::mpsc::channel();
+    {
+        let events = events.clone();
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                if !line.trim().is_empty() && events.send(Ev::Line(line)).is_err() {
+                    return;
+                }
+            }
+            let _ = events.send(Ev::Closed);
         });
     }
-    let mut index = Index::Opening(rx);
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    for line in std::io::stdin().lock().lines() {
-        let Ok(line) = line else { break };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-            let _ = writeln!(out, "{}", reply(&Value::Null, Err((-32700, "not JSON".into())))).and_then(|_| out.flush());
-            continue;
-        };
-        let answer = message(&msg, &root, |tool, args| match index.get(&root) {
-            Some(server) => {
-                server.sync();
-                Tools::new(&server.root, &server.session).call(tool, args)
+    let mut agent = Agent { root: None, mode: Mode::Unknown, waiting: Vec::new(), events, open: std::sync::Arc::new(open), starts: 0, roots: false };
+    // Given the folder: indexed at once, the agent answered meanwhile; its
+    // first tool call waits for the index.
+    if let Some(root) = root {
+        agent.start(std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf()));
+    }
+    for event in inbox {
+        match event {
+            Ev::Line(line) => agent.line(&line),
+            Ev::Closed => break,
+            Ev::Opened(start, opened) => {
+                let ((session, _), watch) = *opened;
+                if start != agent.starts {
+                    continue;
+                }
+                if let (Mode::Own { server, .. }, Some(root)) = (&mut agent.mode, &agent.root) {
+                    *server = Some(Box::new(Server { root: root.clone(), session, watch, synced: Instant::now() }));
+                }
+                for (msg, to) in std::mem::take(&mut agent.waiting) {
+                    agent.call(msg, to);
+                }
             }
-            None => Err("The index could not be made; see the server's error output.".into()),
-        });
-        if let Some(answer) = answer {
-            let _ = writeln!(out, "{answer}").and_then(|_| out.flush());
+            Ev::Asked(crate::share::Asked::Message(msg, tx)) => agent.call(msg, To::Other(tx)),
+            Ev::Asked(crate::share::Asked::Yield) => agent.yield_project(),
         }
     }
     // The graph as it is now, for the next start to begin with.
-    if let Index::Ready(server) = &mut index {
+    if let Mode::Own { server: Some(server), held: Some(_) } = &mut agent.mode {
         while server.session.save_some(4096) {}
         server.session.save_graph();
     }

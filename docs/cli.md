@@ -212,9 +212,23 @@ norn mcp [ROOT] [--cache-dir <DIR> | --no-cache] [--rebuild] [--include-alias <F
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server on
 stdin/stdout, for AI agents: Claude Code, VS Code's Copilot, Cursor and the
-others that take MCP servers. The root is the current folder, unless `ROOT`
-is given. It answers at once and indexes meanwhile; the first tool called
-waits for the index. It watches the tree as the VS Code extension does: a
+others that take MCP servers. The project is `ROOT` if given; else the
+folder the client says it has open (MCP roots), where it says; else the
+current folder, unless that is the home folder or the root of the file
+system, where a desktop app starts a server: then nothing is indexed, and
+each tool says how to name the project. It answers at once and indexes
+meanwhile; the first tool called waits for the index.
+
+One project has one index, however many ask of it. The first `norn mcp` of
+a project makes it, and the others started for the same project (another
+agent, another session) are answered from it rather than make their own;
+if it ends, one of them takes over, from the index kept on disk. VS Code's
+language server, once it opens the folder, takes the project over, and the
+agents are answered from the editor's index. Who holds which project is
+kept in `~/.norn/run` (a lock, and where the holder answers: on this
+machine only, to a process that knows the word written there).
+
+It watches the tree as the VS Code extension does: a
 source file the agent edits is read again before the next answer, and only
 it; a changed build configuration (`.norn/config.json`, a Keil, IAR,
 Eclipse or Visual Studio project, `compile_commands.json`…) or a folder

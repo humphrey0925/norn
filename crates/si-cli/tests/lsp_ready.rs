@@ -17,6 +17,8 @@ impl Server {
     fn start(root: &std::path::Path) -> Server {
         let mut child = Command::new(env!("CARGO_BIN_EXE_norn"))
             .args(["lsp", root.to_str().unwrap(), "--no-cache"])
+            // (Not the user's own locks.)
+            .env("NORN_RUN_DIR", root.join(".run"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

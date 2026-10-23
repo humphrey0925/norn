@@ -1,8 +1,12 @@
 //! `norn mcp` as an agent runs it: started, asked what tools there are, and
-//! asked of calls a text search would not find.
+//! asked of calls a text search would not find; several of them, and the
+//! editor's language server, on one project; and started with no project.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -10,20 +14,53 @@ struct Server {
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
+    /// What it wrote to its error output, line by line.
+    said: Arc<Mutex<Vec<String>>>,
 }
 
 impl Server {
-    fn start(root: &std::path::Path) -> Server {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_norn"))
-            .args(["mcp", root.to_str().unwrap(), "--no-cache"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("norn mcp");
+    fn start(root: &Path) -> Server {
+        Server::spawn(Some(root), root, &root.join(".run"), None)
+    }
+
+    /// `norn mcp [root]` in `cwd`, keeping its locks in `run` (not the
+    /// user's own), with `home` as the home folder if given.
+    fn spawn(root: Option<&Path>, cwd: &Path, run: &Path, home: Option<&Path>) -> Server {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_norn"));
+        command.arg("mcp").args(root).arg("--no-cache").current_dir(cwd).env("NORN_RUN_DIR", run);
+        if let Some(home) = home {
+            command.env("HOME", home).env("USERPROFILE", home);
+        }
+        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("norn mcp");
         let input = child.stdin.take().unwrap();
         let output = BufReader::new(child.stdout.take().unwrap());
-        Server { child, input, output }
+        let said = Arc::new(Mutex::new(Vec::new()));
+        let (into, errors) = (said.clone(), child.stderr.take().unwrap());
+        std::thread::spawn(move || {
+            for line in BufReader::new(errors).lines().map_while(Result::ok) {
+                into.lock().unwrap().push(line);
+            }
+        });
+        Server { child, input, output, said }
+    }
+
+    fn read(&mut self) -> Value {
+        let mut line = String::new();
+        self.output.read_line(&mut line).expect("an answer");
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line}"))
+    }
+
+    /// Whether it says, within a while, that it is answered from the index
+    /// process `pid` keeps.
+    fn answered_by(&self, pid: u32) -> bool {
+        let end = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < end {
+            if self.said.lock().unwrap().iter().any(|l| l.contains(&format!("from the index process {pid} keeps"))) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
     }
 
     fn send(&mut self, msg: Value) {
@@ -34,9 +71,7 @@ impl Server {
     /// The answer to request `id`, whole.
     fn ask(&mut self, id: u64, method: &str, params: Value) -> Value {
         self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
-        let mut line = String::new();
-        self.output.read_line(&mut line).expect("an answer");
-        let msg: Value = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line}"));
+        let msg = self.read();
         assert_eq!(msg["id"], id, "{msg}");
         msg
     }
@@ -111,4 +146,111 @@ fn an_agent_finds_calls_through_macros_and_members() {
     let unknown = s.ask(8, "tools/call", json!({ "name": "no_such_tool", "arguments": {} }));
     assert_eq!(unknown["error"]["code"], -32602, "{unknown}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A small project in a folder of its own.
+fn project(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("norn-mcp-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.c"), "int helper(void) { return 1; }\nint main(void) { return helper(); }\n").unwrap();
+    dir
+}
+
+fn init(s: &mut Server) {
+    s.ask(0, "initialize", json!({ "protocolVersion": "2025-06-18", "capabilities": {} }));
+    s.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+}
+
+#[test]
+fn agents_of_one_project_share_one_index() {
+    let dir = project("share");
+    let run = dir.with_extension("run");
+    let mut a = Server::spawn(Some(&dir), &dir, &run, None);
+    init(&mut a);
+    assert!(a.call(1, "find_callers", json!({ "name": "helper" })).0.contains("a.c:2  in main"));
+
+    // The second is answered from the first's index.
+    let mut b = Server::spawn(Some(&dir), &dir, &run, None);
+    init(&mut b);
+    assert!(b.call(1, "find_callers", json!({ "name": "helper" })).0.contains("a.c:2  in main"));
+    assert!(b.answered_by(a.child.id()), "{:?}", b.said.lock().unwrap());
+    // What changes is seen there.
+    std::fs::write(dir.join("b.c"), "int helper(void);\nint twice(void) { return helper() + helper(); }\n").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(b.call(2, "find_callers", json!({ "name": "helper" })).0.contains("b.c:2  in twice"));
+
+    // The first gone, the second makes the index and answers.
+    let _ = a.child.kill();
+    let _ = a.child.wait();
+    let (callers, error) = b.call(3, "find_callers", json!({ "name": "helper" }));
+    assert!(!error && callers.contains("b.c:2  in twice"), "{callers}");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&run);
+}
+
+#[test]
+fn the_editors_language_server_takes_the_project_from_an_agent() {
+    let dir = project("editor");
+    let run = dir.with_extension("run");
+    let mut agent = Server::spawn(Some(&dir), &dir, &run, None);
+    init(&mut agent);
+    assert!(agent.call(1, "find_callers", json!({ "name": "helper" })).0.contains("a.c:2  in main"));
+
+    // The editor opens the folder: its server holds the project from then,
+    // and the agent is answered from its index.
+    let mut lsp = Command::new(env!("CARGO_BIN_EXE_norn"))
+        .args(["lsp", dir.to_str().unwrap(), "--no-cache"])
+        .env("NORN_RUN_DIR", &run)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("norn lsp");
+    let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "rootUri": null, "capabilities": {} } }).to_string();
+    let mut input = lsp.stdin.take().unwrap();
+    write!(input, "Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+    input.flush().unwrap();
+    let mut output = lsp.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        let mut sink = [0u8; 4096];
+        while output.read(&mut sink).is_ok_and(|n| n > 0) {}
+    });
+    assert!(agent.answered_by(lsp.id()), "{:?}", agent.said.lock().unwrap());
+    let (callers, error) = agent.call(2, "find_callers", json!({ "name": "helper" }));
+    assert!(!error && callers.contains("a.c:2  in main"), "{callers}");
+    let _ = lsp.kill();
+    let _ = lsp.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&run);
+}
+
+#[test]
+fn started_in_the_home_folder_it_indexes_only_a_project_it_is_told_of() {
+    let dir = project("home");
+    let home = dir.with_extension("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let run = dir.with_extension("run");
+
+    // As a desktop app starts it: no folder, in the home folder.
+    let mut s = Server::spawn(None, &home, &run, Some(&home));
+    init(&mut s);
+    let (said, error) = s.call(1, "find_callers", json!({ "name": "helper" }));
+    assert!(error && said.contains("home folder"), "{said}");
+    drop(s);
+
+    // A client that says which folder it has open (MCP roots) is asked.
+    let mut s = Server::spawn(None, &home, &run, Some(&home));
+    s.ask(0, "initialize", json!({ "protocolVersion": "2025-06-18", "capabilities": { "roots": {} } }));
+    s.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+    let asked = s.read();
+    assert_eq!(asked["method"], "roots/list", "{asked}");
+    let uri = format!("file:///{}", dir.to_string_lossy().replace('\\', "/").trim_start_matches('/'));
+    s.send(json!({ "jsonrpc": "2.0", "id": asked["id"], "result": { "roots": [{ "uri": uri, "name": "project" }] } }));
+    let (callers, error) = s.call(1, "find_callers", json!({ "name": "helper" }));
+    assert!(!error && callers.contains("a.c:2  in main"), "{callers}");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&run);
 }

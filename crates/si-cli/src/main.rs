@@ -15,6 +15,7 @@ use std::time::Instant;
 mod lsp;
 mod mcp;
 mod mem;
+mod share;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -134,7 +135,9 @@ enum Cmd {
     /// Model Context Protocol server over stdin/stdout, for AI agents: the
     /// queries as tools, over the sources, kept up to date.
     Mcp {
-        /// The source tree (default: the current folder).
+        /// The source tree (default: the folder the client says it has
+        /// open, else the current folder, unless that is the home folder
+        /// or the root of the file system).
         root: Option<PathBuf>,
         /// `FROM=TO`: an `#include` of a file named FROM reads TO instead. Repeatable.
         #[arg(long, value_name = "FROM=TO")]
@@ -834,7 +837,7 @@ fn main() {
         Cmd::Mcp { root, include_alias, keep } => {
             let options = si_core::link::Options { include_aliases: aliases(include_alias), ..Default::default() };
             let keep = keep.clone();
-            return mcp::run(root.as_deref().unwrap_or(Path::new(".")), move |dir: &Path| keep.open(dir, &options));
+            return mcp::run(root.as_deref(), move |dir: &Path| keep.open(dir, &options));
         }
         Cmd::Symbols { dir } => return symbols(dir),
         Cmd::Calls { dir } => return calls(dir),

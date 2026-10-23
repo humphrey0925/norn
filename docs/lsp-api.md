@@ -532,6 +532,11 @@ result is the answer to it, as JSON-RPC, or `null` for a notification.
 
 A `tools/call` waits while the index is still loading; the rest do not.
 
+The server also holds its project for the agents' `norn mcp`s (see
+[the command line](cli.md#mcp)): they are answered from its index, the same
+way, rather than make their own, and one that held the project before the
+editor opened it gives it up.
+
 ## Notifications from the server
 
 The server sends no diagnostics and no refresh requests. It sends two
