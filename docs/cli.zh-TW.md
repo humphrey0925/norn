@@ -220,6 +220,8 @@ Keil、IAR、Eclipse、Visual Studio 專案、`compile_commands.json`…）改�
 | `find_references` | 一個符號的每個使用處 |
 | `call_tree` | 一個函式往下呼叫到哪些函式，或有哪些函式呼叫到它，幾層深 |
 | `compiled_lines` | 一個檔案的哪些行在建置設定下會編譯，或某一行是否會編譯 |
+| `read_file` | 讀一個檔案或其中幾行，附行號，每行標出設定組是否編譯 |
+| `search_code` | 搜尋 C/C++ 檔案的文字或 regular expression，只看設定組會編譯的部分（`include_inactive` 才列出其餘的） |
 | `list_configurations` | 有哪些設定組、目前生效的是哪個，以及它定義了什麼 |
 | `switch_configuration` | 讓另一個設定組生效（這是專案的設定，和編輯器共用），並重建索引 |
 

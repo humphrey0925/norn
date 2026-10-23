@@ -17,9 +17,12 @@ Grep finds where a name is written. It does not find:
 - which of several definitions of a name a given call reaches;
 - whether a line is compiled at all, in this board's or this target's build.
 
-So for any question about a C/C++ symbol, ask Norn first. Use text search for
-text: strings, comments, log messages, build files, non-C files, or a name
-Norn says it has not indexed.
+So for any question about a C/C++ symbol, ask Norn first. And read and
+search C/C++ files through Norn too: `read_file` rather than your own file
+reader, `search_code` rather than grep. Code in a switched-off `#if` branch
+looks like any other code in a plain read or grep; these mark it (`✗`), or
+leave it out. Plain tools are for everything else: build files, other
+languages, documentation.
 
 ## 1. Set the context first
 
@@ -49,6 +52,8 @@ Answers under the wrong configuration look right and are wrong.
 | A symbol whose exact name you do not know | `search_symbols` (fragments in any order, initials) |
 | Where a name is defined and declared | `find_definition`; with the `file` and `line` where it is used, the definition that place sees |
 | Its code | `read_symbol`: the definition with its comment, not the whole file |
+| A C/C++ file, or some of its lines | `read_file` (`from`, `to`; `hide_inactive` folds what is not compiled) |
+| Text in C/C++ code: a string, a log message, a register name, a pattern | `search_code` (`regex`, `in` a folder): only what is compiled; `include_inactive` for the rest |
 | Who calls a function | `find_callers` |
 | What a function calls | `find_callees` |
 | Every use of a symbol (reads, writes, stores of a function) | `find_references` |
@@ -66,9 +71,10 @@ Typical paths:
 - **Where a callback is called from**: `find_references` on the function
   shows where it is stored (`stored in member ...`); `find_callers` shows the
   calls through that member.
-- **Before editing inside `#if`**: `compiled_lines` with the file and line.
-  Do not edit, or reason from, a branch the configuration switches off,
-  unless the task is about that other configuration (then switch to it).
+- **Before editing inside `#if`**: `compiled_lines` with the file and line,
+  or look at the marks `read_file` gives. Do not edit, or reason from, a
+  branch the configuration switches off, unless the task is about that
+  other configuration (then switch to it).
 
 ## 3. Reading the answers
 
@@ -84,6 +90,10 @@ Typical paths:
   that settles it, if the task depends on it.
 - `[in a file the build does not compile]`: no compilation of the build
   reads that file.
+- In `read_file`, `search_code` and `read_symbol`, a line marked `✗` is not
+  compiled under the configuration in force: the code is there, but this
+  build does not have it. `?` marks a line under an `#if` the configuration
+  does not settle.
 - A name with several definitions (one per board, a `static` function in
   several files) answers for each; pass `file` to choose one.
 - `Listed N of M`: pass a larger `limit`, or narrow with `file`.
@@ -92,7 +102,7 @@ Typical paths:
 
 - A tool says no symbol is indexed by that name: check the spelling with
   `search_symbols`; then it may be generated code, assembly, or outside the
-  project's folders. Text search is fine then.
+  project's folders: `search_code` for its text.
 - A tool says Norn does not know which project to index: the agent started
   it outside the project. Tell the user to give the project's folder in the
   agent's MCP settings (`norn mcp /path/to/project`), or run `norn setup`

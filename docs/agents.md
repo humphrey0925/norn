@@ -82,11 +82,14 @@ This is what the skill tells the agent, in short:
    name; `read_symbol` for its code rather than the whole file;
    `find_callers`, `find_callees`, `call_tree` and `find_references` for how
    it is used.
-3. **Before editing inside `#if`**, `compiled_lines`: do not change a branch
-   the configuration does not compile, unless the task is about that other
-   configuration.
-4. **Text search for text**: strings, comments, build files, other languages,
-   or a name Norn says it has not indexed.
+3. **Read and search C/C++ through Norn too**: `read_file` rather than a
+   plain file read, `search_code` rather than grep. Code in a switched-off
+   `#if` branch looks like any other in a plain read; these mark it `✗`, or
+   leave it out.
+4. **Before editing inside `#if`**, look at those marks, or ask
+   `compiled_lines`: do not change a branch the configuration does not
+   compile, unless the task is about that other configuration.
+5. **Plain tools for the rest**: build files, other languages, documentation.
 
 Prompts that work well:
 
@@ -106,7 +109,9 @@ Prompts that work well:
 | `switch_configuration` | Puts another configuration in force (the project's setting, shared with the editor) and re-indexes |
 | `search_symbols` | Symbols matching part of a name: fragments in any order, initials, letters in order |
 | `find_definition` | Where a name is defined and declared; given the file and line it is used on, the definition that place sees |
-| `read_symbol` | The source of a definition with the comment above it, numbered |
+| `read_symbol` | The source of a definition with the comment above it, numbered and marked |
+| `read_file` | A file, or some of its lines, numbered, each line marked by whether the configuration compiles it (`✗` not, `?` maybe); `hide_inactive` folds what is not compiled |
+| `search_code` | Text or a regular expression in the C/C++ files, as grep, but only in what the configuration compiles (`include_inactive` for the rest, marked); each match with the function it is in |
 | `find_callers` | Every call of a function, including through macros and function pointers |
 | `find_callees` | Every call a function makes, including the functions a member or variable it calls through can hold |
 | `find_references` | Every use of a symbol |
@@ -148,6 +153,19 @@ int main(void)
 ```
 
 ```
+read_file a.c                (BoardA in force)
+     5   #ifdef BOARD_A
+     6       return uart_a();
+     7   #else
+     8 ✗     return uart_b();
+     9   #endif
+
+search_code uart_b
+a.c:2   int uart_b(void) { return 2; }  [in uart_b]
+(1 more where BoardA does not compile it: include_inactive to see it)
+```
+
+```
 find_callees main            (no configuration in force)
   a.c:6  uart_a (function, a.c:1) [maybe not compiled: under the #if at line 5]
   a.c:8  uart_b (function, a.c:2) [maybe not compiled: under the #if at line 7]
@@ -168,6 +186,8 @@ find_callees main
 | `[uncertain]` | Several definitions could be meant |
 | `[maybe not compiled: under the #if at line N]` | The configuration in force does not settle that `#if` |
 | `[in a file the build does not compile]` | No compilation of the build reads the file |
+| `✗` before a line (`read_file`, `search_code`, `read_symbol`) | The line is there but not compiled under the configuration in force |
+| `?` before a line | The line is under an `#if` the configuration does not settle |
 | `Listed N of M` | Ask for more with `limit`, or narrow with `file` |
 
 ## How it works

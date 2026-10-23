@@ -26,6 +26,10 @@ const MAX_LIMIT: usize = 2000;
 /// Lines of source shown for one definition at most.
 const MAX_SOURCE_LINES: u32 = 400;
 
+/// Lines `read_file` shows unless asked for others, and at most.
+const READ_LINES: u32 = 300;
+const MAX_READ_LINES: u32 = 2000;
+
 /// Where the files cannot be watched: the tree is looked at again for
 /// files changed on disk before a tool answers, unless it was this recently.
 const SYNC_AFTER: Duration = Duration::from_millis(500);
@@ -133,6 +137,32 @@ fn tools() -> Value {
             "annotations": read_only,
         },
         {
+            "name": "read_file",
+            "title": "Read a file, compiled lines marked",
+            "description": "Read a C/C++ file (or some of its lines) with each line numbered and marked by whether the build configuration in force compiles it: ✗ not compiled (the code is there, but this build does not have it), ? under an #if the configuration does not settle. Use it instead of reading C/C++ files as plain text: code in a switched-off #if branch looks like any other. With hide_inactive, each stretch that is not compiled is one line.",
+            "inputSchema": { "type": "object", "properties": {
+                "file": { "type": "string", "description": "The file (relative to the project root)." },
+                "from": { "type": "integer", "minimum": 1, "description": "The first line to show (default 1)." },
+                "to": { "type": "integer", "minimum": 1, "description": format!("The last line to show (default: {READ_LINES} lines from `from`).") },
+                "hide_inactive": { "type": "boolean", "description": "Show each stretch the configuration does not compile as one line (default false: shown, marked ✗)." },
+            }, "required": ["file"] },
+            "annotations": read_only,
+        },
+        {
+            "name": "search_code",
+            "title": "Search the code, compiled lines only",
+            "description": "Search the text of the project's C/C++ files, as grep does, but only in what the build configuration in force compiles: a match in a switched-off #if branch, or in a file the build does not compile, is left out and counted (include_inactive to see them, marked ✗). A match under an #if the configuration does not settle is marked ?. Each match says which function it is in. Use it instead of grep on C/C++ code; for a symbol's definition, callers or uses, the other tools are more exact.",
+            "inputSchema": { "type": "object", "properties": {
+                "pattern": { "type": "string", "description": "What to look for: text, or a regular expression with regex." },
+                "regex": { "type": "boolean", "description": "pattern is a regular expression (Rust syntax; default false: plain text)." },
+                "ignore_case": { "type": "boolean", "description": "Upper and lower case alike (default false)." },
+                "in": { "type": "string", "description": "Only in this folder or file (relative to the project root)." },
+                "include_inactive": { "type": "boolean", "description": "Also list matches the configuration does not compile, marked ✗ (default false)." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "description": format!("Most matches to list (default {DEFAULT_LIMIT}).") },
+            }, "required": ["pattern"] },
+            "annotations": read_only,
+        },
+        {
             "name": "find_definition",
             "title": "Find definition",
             "description": "Where a symbol is defined and declared. Given the file and line where the name is used, only the definition that place sees (as Go to Definition does), where there are several.",
@@ -224,7 +254,9 @@ fn instructions(root: Option<&Path>) -> String {
          compiled. First establish the build context: list_configurations, and switch_configuration if the one in \
          force is not the board, target or build the task is about. Then search_symbols or find_definition, read_symbol \
          rather than reading whole files, find_callers / find_callees / call_tree for relations, and compiled_lines \
-         before editing code inside #if branches. Paths are relative to that folder. The index follows the files as \
+         before editing code inside #if branches. Read C/C++ files with read_file and search their text with \
+         search_code rather than a plain file read or grep: they mark, or leave out, what the configuration does not \
+         compile. Paths are relative to that folder. The index follows the files as \
          they change on disk."
     )
 }
@@ -308,7 +340,7 @@ impl<'a> Tools<'a> {
     pub fn call(&mut self, tool: &str, args: &Value) -> Result<String, String> {
         let name = args["name"].as_str().unwrap_or("").trim();
         let limit = args["limit"].as_u64().map_or(DEFAULT_LIMIT, |n| (n as usize).clamp(1, MAX_LIMIT));
-        let needs_name = !matches!(tool, "search_symbols" | "compiled_lines" | "list_configurations");
+        let needs_name = !matches!(tool, "search_symbols" | "compiled_lines" | "list_configurations" | "read_file" | "search_code");
         if needs_name && name.is_empty() {
             return Err("`name` is required.".into());
         }
@@ -327,6 +359,20 @@ impl<'a> Tools<'a> {
             }
             "compiled_lines" => self.compiled_lines(args["file"].as_str().unwrap_or(""), args["line"].as_u64()),
             "list_configurations" => self.configurations(),
+            "read_file" => self.read_file(
+                args["file"].as_str().unwrap_or(""),
+                args["from"].as_u64().map(|n| n as u32),
+                args["to"].as_u64().map(|n| n as u32),
+                args["hide_inactive"].as_bool().unwrap_or(false),
+            ),
+            "search_code" => self.search_code(
+                args["pattern"].as_str().unwrap_or(""),
+                args["regex"].as_bool().unwrap_or(false),
+                args["ignore_case"].as_bool().unwrap_or(false),
+                args["in"].as_str().unwrap_or(""),
+                args["include_inactive"].as_bool().unwrap_or(false),
+                limit,
+            ),
             "switch_configuration" => self.switch_configuration(name),
             other => Err(format!("No tool named `{other}`.")),
         }
@@ -508,8 +554,9 @@ impl<'a> Tools<'a> {
             }
             let end = last.min(first + MAX_SOURCE_LINES - 1);
             let _ = writeln!(out, "{}:", self.describe(&q, s));
+            let facts = self.session.facts_of(path);
             for n in first..=end {
-                let _ = writeln!(out, "{n:>6}  {}", lines.get(n as usize - 1).copied().unwrap_or(""));
+                let _ = writeln!(out, "{n:>6} {} {}", mark(facts, n).0, lines.get(n as usize - 1).copied().unwrap_or(""));
             }
             if end < last {
                 let _ = writeln!(out, "        … {} lines more, to line {last}", last - end);
@@ -771,6 +818,152 @@ impl<'a> Tools<'a> {
         ))
     }
 
+    /// The file `file` as the index names it, and its path, if it is in the
+    /// project's folder.
+    fn project_file(&self, file: &str) -> Result<(String, PathBuf), String> {
+        let rel = self.relative(file);
+        let path = self.root.join(&rel);
+        let inside = std::fs::canonicalize(&path).ok().zip(std::fs::canonicalize(self.root).ok()).is_some_and(|(p, r)| p.starts_with(r));
+        if !inside || !path.is_file() {
+            return Err(format!("No file {rel} in the project."));
+        }
+        Ok((rel, path))
+    }
+
+    /// The configuration in force, said in a few words.
+    fn in_force(&self) -> String {
+        match si_core::cond::Project::load_told(self.root).0.active {
+            Some(active) => format!("Configuration in force: {active}."),
+            None => "No configuration in force.".into(),
+        }
+    }
+
+    fn read_file(&self, file: &str, from: Option<u32>, to: Option<u32>, hide: bool) -> Result<String, String> {
+        if file.is_empty() {
+            return Err("`file` is required.".into());
+        }
+        let (rel, path) = self.project_file(file)?;
+        let bytes = std::fs::read(&path).map_err(|e| format!("{rel} cannot be read: {e}"))?;
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text.lines().collect();
+        let total = lines.len() as u32;
+        let first = from.unwrap_or(1).clamp(1, total.max(1));
+        let last = to.unwrap_or(first + READ_LINES - 1).clamp(first, total.max(1)).min(first + MAX_READ_LINES - 1);
+        let facts = self.session.facts_of(&rel);
+        let mut out = format!("{rel}, lines {first}–{last} of {total}. ");
+        match facts {
+            Some(_) => out.push_str(&self.in_force()),
+            None => out.push_str("Not indexed: nothing is known of what is compiled in it."),
+        }
+        out.push('\n');
+        let marks: Vec<(char, u32)> = (first..=last).map(|n| mark(facts, n)).collect();
+        if marks.iter().any(|m| m.0 != ' ') {
+            out.push_str("✗ not compiled under it (the code is there; this build does not have it); ? under an #if it does not settle.\n");
+        }
+        let mut n = first;
+        while n <= last {
+            let (m, directive) = marks[(n - first) as usize];
+            if hide && m == '✗' {
+                let mut end = n;
+                while end < last && marks[(end + 1 - first) as usize].0 == '✗' {
+                    end += 1;
+                }
+                let _ = writeln!(out, "{:>6} ✗ … {} not compiled", n, count((end - n + 1) as usize, "line", "lines"));
+                n = end + 1;
+                continue;
+            }
+            let why = if m == '?' && directive > 0 && (n == first || marks[(n - first - 1) as usize] != (m, directive)) {
+                format!("    ← under the #if at line {directive}")
+            } else {
+                String::new()
+            };
+            let _ = writeln!(out, "{n:>6} {m} {}{why}", lines.get(n as usize - 1).copied().unwrap_or(""));
+            n += 1;
+        }
+        if last < total {
+            let _ = writeln!(out, "… lines {}–{total} not shown; pass `from` and `to` for them.", last + 1);
+        }
+        Ok(out)
+    }
+
+    fn search_code(&self, pattern: &str, regex: bool, ignore_case: bool, within: &str, inactive_too: bool, limit: usize) -> Result<String, String> {
+        use rayon::prelude::*;
+        if pattern.is_empty() {
+            return Err("`pattern` is required.".into());
+        }
+        let source = if regex { pattern.to_string() } else { regex::escape(pattern) };
+        let re = regex::RegexBuilder::new(&source).case_insensitive(ignore_case).build().map_err(|e| format!("Not a regular expression: {e}"))?;
+        let g = self.g();
+        let within = self.relative(within);
+        let within = within.trim_end_matches('/');
+        let files: Vec<u32> = (0..g.files.len() as u32)
+            .filter(|&f| {
+                let p = g.file_path(f);
+                within.is_empty() || p == within || p.strip_prefix(within).is_some_and(|r| r.starts_with('/'))
+            })
+            .collect();
+        // Every matching line: (file, line, text).
+        let mut found: Vec<(u32, u32, String)> = files
+            .par_iter()
+            .flat_map_iter(|&f| {
+                let text = std::fs::read(self.root.join(g.file_path(f))).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+                let hits: Vec<(u32, u32, String)> = if re.is_match(&text) {
+                    text.lines().enumerate().filter(|(_, l)| re.is_match(l)).map(|(i, l)| (f, i as u32 + 1, l.to_string())).collect()
+                } else {
+                    Vec::new()
+                };
+                hits
+            })
+            .collect();
+        found.sort_by(|a, b| g.file_path(a.0).cmp(g.file_path(b.0)).then(a.1.cmp(&b.1)));
+        let q = Qualifier::new(g);
+        let (mut shown, mut hidden, mut listed) = (String::new(), 0, 0);
+        for (f, line, text) in &found {
+            let (mut m, _) = mark(self.session.facts_of(g.file_path(*f)), *line);
+            if self.unread.get(*f as usize).copied().unwrap_or(false) {
+                m = '✗';
+            }
+            if m == '✗' && !inactive_too {
+                hidden += 1;
+                continue;
+            }
+            if listed == limit {
+                listed += 1;
+                continue;
+            }
+            listed += 1;
+            let at = match g.symbol_at(*f, *line) {
+                Some(s) if g.syms[s as usize].kind != kind::FILE => format!("  [in {}]", q.name(g, s)),
+                _ => String::new(),
+            };
+            let text = text.trim();
+            let text = match text.char_indices().nth(200) {
+                Some((cut, _)) => format!("{}…", &text[..cut]),
+                None => text.to_string(),
+            };
+            let _ = writeln!(shown, "{}:{line} {m} {text}{at}", g.file_path(*f));
+        }
+        let matching = found.len() - hidden;
+        let config = si_core::cond::Project::load_told(self.root).0.active.unwrap_or_else(|| "no configuration".into());
+        let mut out = if inactive_too {
+            format!("{} of `{pattern}`, compiled under {config} or not.", count(matching, "match", "matches"))
+        } else {
+            format!("{} of `{pattern}` in the code {config} compiles.", count(matching, "match", "matches"))
+        };
+        if hidden > 0 {
+            let _ = write!(out, " {hidden} more where it does not (include_inactive to see them).");
+        }
+        out.push('\n');
+        if shown.contains(" ? ") || shown.contains(" ✗ ") {
+            out.push_str("? under an #if the configuration does not settle; ✗ not compiled.\n");
+        }
+        out.push_str(&shown);
+        if listed > limit {
+            let _ = writeln!(out, "Listed {limit} of {}; pass a larger `limit`, or `in` for a folder.", listed);
+        }
+        Ok(out)
+    }
+
     fn compiled_lines(&self, file: &str, line: Option<u64>) -> Result<String, String> {
         if file.is_empty() {
             return Err("`file` is required.".into());
@@ -831,6 +1024,20 @@ impl<'a> Tools<'a> {
         if listed == limit && all > listed {
             let _ = writeln!(out, "Listed {listed} of {all}; pass a larger `limit`, or `file` to choose one definition.");
         }
+    }
+}
+
+/// How line `line` of a file whose facts are `facts` is compiled: ✗ not
+/// at all, ? maybe (with the line of the #if that decides), or (' ') so.
+fn mark(facts: Option<&si_core::model::FileFacts>, line: u32) -> (char, u32) {
+    let Some(facts) = facts else { return (' ', 0) };
+    if facts.inactive.iter().any(|&(a, b)| a <= line && line <= b) {
+        return ('✗', 0);
+    }
+    // The innermost branch around the line: the last to start.
+    match facts.undecided.iter().rev().find(|&&(a, b, _, _)| a <= line && line <= b) {
+        Some(&(_, _, directive, _)) => ('?', directive),
+        None => (' ', 0),
     }
 }
 

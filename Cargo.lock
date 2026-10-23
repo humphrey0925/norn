@@ -591,6 +591,7 @@ dependencies = [
  "mimalloc",
  "notify",
  "rayon",
+ "regex",
  "serde",
  "serde_json",
  "si-core",

@@ -67,8 +67,10 @@ Skill 就是 [`skills/norn/SKILL.md`](../skills/norn/SKILL.md) 這個檔案；�
    板子、target 或 build 時，用 `switch_configuration` 切過去，並告訴使用者。設定組錯了，查到的結果看起來對，其實是錯的。
 2. **再查詢，不要 grep。** 用 `search_symbols` 或 `find_definition` 找名稱；用 `read_symbol` 看程式碼，不要讀整個檔案；
    用 `find_callers`、`find_callees`、`call_tree`、`find_references` 看它怎麼被使用。
-3. **修改 `#if` 裡的程式碼之前**，先用 `compiled_lines` 確認。設定組沒有編譯的分支不要改，除非任務講的就是那個設定組。
-4. **文字才用文字搜尋**：字串、註解、build 檔、其他語言，或 Norn 說沒有索引到的名稱。
+3. **讀檔和搜尋 C/C++ 也透過 Norn**：用 `read_file` 取代一般讀檔，用 `search_code` 取代 grep。一般讀檔時，被關掉的 `#if`
+   分支看起來和其他程式碼一樣；這兩個工具會標上 `✗`，或直接不列出。
+4. **修改 `#if` 裡的程式碼之前**，先看這些標記或用 `compiled_lines` 確認。設定組沒有編譯的分支不要改，除非任務講的就是那個設定組。
+5. **其他東西才用一般工具**：build 檔、其他語言、文件。
 
 好用的問法：
 
@@ -85,7 +87,9 @@ Skill 就是 [`skills/norn/SKILL.md`](../skills/norn/SKILL.md) 這個檔案；�
 | `switch_configuration` | 讓另一個設定組生效（這是專案的設定，和編輯器共用），並重建索引 |
 | `search_symbols` | 名稱符合部分字串的符號：片段順序不拘、字首縮寫、依序出現的字母 |
 | `find_definition` | 名稱在哪裡定義和宣告；給了使用該名稱的檔案和行號時，只回答那個位置看到的定義 |
-| `read_symbol` | 一個定義的原始碼，連同上方的註解，附行號 |
+| `read_symbol` | 一個定義的原始碼，連同上方的註解，附行號與標記 |
+| `read_file` | 讀一個檔案或其中幾行，附行號，每行標出設定組是否編譯（`✗` 不編譯、`?` 不一定）；`hide_inactive` 會把不編譯的部分摺成一行 |
+| `search_code` | 像 grep 一樣搜尋 C/C++ 檔案的文字或 regular expression，但只看設定組會編譯的部分（`include_inactive` 才列出其餘的，並加標記）；每筆結果附上所在的函式 |
 | `find_callers` | 一個函式的每個呼叫，包括經由巨集和函式指標的 |
 | `find_callees` | 一個函式發出的每個呼叫，包括經由成員或變數呼叫時，那個成員或變數可能存放的函式 |
 | `find_references` | 一個符號的每個使用處 |
@@ -120,6 +124,19 @@ int main(void)
 ```
 
 ```
+read_file a.c                （BoardA 生效中）
+     5   #ifdef BOARD_A
+     6       return uart_a();
+     7   #else
+     8 ✗     return uart_b();
+     9   #endif
+
+search_code uart_b
+a.c:2   int uart_b(void) { return 2; }  [in uart_b]
+（另有 1 筆在 BoardA 不編譯的地方：用 include_inactive 才會列出）
+```
+
+```
 find_callees main            （沒有生效的設定組）
   a.c:6  uart_a (function, a.c:1) [maybe not compiled: under the #if at line 5]
   a.c:8  uart_b (function, a.c:2) [maybe not compiled: under the #if at line 7]
@@ -140,6 +157,8 @@ find_callees main
 | `[uncertain]` | 可能指向多個定義中的任一個 |
 | `[maybe not compiled: under the #if at line N]` | 目前的設定組決定不了那個 `#if` |
 | `[in a file the build does not compile]` | build 沒有任何編譯單元會讀這個檔案 |
+| 行首的 `✗`（`read_file`、`search_code`、`read_symbol`） | 這行程式碼存在，但目前的設定組不會編譯它 |
+| 行首的 `?` | 這行在目前設定組決定不了的 `#if` 裡 |
 | `Listed N of M` | 用 `limit` 要更多，或用 `file` 縮小範圍 |
 
 ## 運作方式

@@ -251,6 +251,8 @@ root:
 | `find_references` | Every use of a symbol |
 | `call_tree` | What a function reaches through calls, or what reaches it, a few levels deep |
 | `compiled_lines` | Which lines of a file the build configuration compiles, or whether one line is |
+| `read_file` | A file, or some of its lines, numbered, each line marked by whether the configuration compiles it |
+| `search_code` | Text or a regular expression in the C/C++ files, only where the configuration compiles (`include_inactive` for the rest) |
 | `list_configurations` | The build configurations, which is in force, and what it defines |
 | `switch_configuration` | Puts another configuration in force (the project's setting, shared with the editor) and re-indexes |
 
