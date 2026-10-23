@@ -2224,7 +2224,38 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
     { dispose: () => void client?.stop() },
   );
   agentTools(context);
+  connectAgents(context);
   await start();
+}
+
+/** The agents outside VS Code's own (Claude Code, Codex, OpenCode, in VS Code
+ *  or not): `norn setup` puts the server at ~/.norn/bin and sets each one up
+ *  to start it. Once it is there, each start of the extension brings it up
+ *  to date with the server the extension has (`setup --refresh`), so an
+ *  update of the extension updates what the agents run too. */
+function connectAgents(context: vscode.ExtensionContext): void {
+  const setup = (args: string[]) =>
+    new Promise<{ ok: boolean; out: string }>((resolve) =>
+      cp.execFile(serverPath(), ["setup", ...args], { timeout: 120_000 }, (err, stdout, stderr) => resolve({ ok: !err, out: `${stdout}${stderr}`.trim() })),
+    );
+  // (Nothing is written unless the agents were set up before.)
+  void setup(["--refresh"]);
+  let channel: vscode.OutputChannel | undefined;
+  context.subscriptions.push(
+    vscode.commands.registerCommand("norn.connectAgents", async () => {
+      const r = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Norn: setting up the agents" }, () => setup([]));
+      channel ??= vscode.window.createOutputChannel("Norn: Agents");
+      context.subscriptions.push(channel);
+      channel.clear();
+      channel.appendLine(r.out);
+      const done = r.out.split("\n").filter((l) => /^\S+\s+(set up|already set up):/.test(l)).map((l) => l.split(/\s+/)[0]);
+      const message = done.length ? `Norn's tools are set up for ${done.join(", ")}: an agent started from now on has them.` : "Norn found no agent to set up (Claude Code, Codex, OpenCode).";
+      const show = await (r.ok ? vscode.window.showInformationMessage(message, "Details") : vscode.window.showWarningMessage(`${message} Some need a step by hand.`, "Details"));
+      if (show) {
+        channel.show();
+      }
+    }),
+  );
 }
 
 /** The index's tools for AI agents in VS Code (Copilot's agent mode, and any

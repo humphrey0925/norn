@@ -141,6 +141,10 @@
         "title": "Norn: Restart Index (parse only what changed)"
       },
       {
+        "command": "norn.connectAgents",
+        "title": "Norn: Connect AI Agents (Claude Code, Codex, OpenCode)"
+      },
+      {
         "command": "norn.relation.tree",
         "title": "Norn: Show Relation as a Tree"
       },

@@ -7,7 +7,7 @@ C 原始碼建索引，查詢符號和呼叫關係，提供給腳本、編輯器
 - [安裝](#安裝)
 - [五個指令上手](#五個指令上手)
 - [指令](#指令)：[`index`](#index)、[`query`](#query)、[`serve`](#serve)、
-  [`live`](#live)、[`lsp`](#lsp)、[`mcp`](#mcp)、[`symbols`](#symbols)、[`calls`](#calls)、
+  [`live`](#live)、[`lsp`](#lsp)、[`mcp`](#mcp)、[`setup`](#setup)、[`symbols`](#symbols)、[`calls`](#calls)、
   [`sample`](#sample)、[`bench-query`](#bench-query)、[`bench-incr`](#bench-incr)
 - [結果的格式](#結果的格式)
 - [專案設定](#專案設定)
@@ -226,13 +226,35 @@ Keil、IAR、Eclipse、Visual Studio 專案、`compile_commands.json`…）改�
 的 agent 模式），由它已經在執行的語言伺服器回答。所以 agent 用的就是編輯器手上的那份索引，跟編輯器一樣
 保持最新，不會多建第二份索引（需要 VS Code 1.101 以上；`norn.mcp.enabled` 可以關掉）。
 
-Claude Code，在專案的資料夾裡：
+Claude Code、Codex、OpenCode：用 [`norn setup`](#setup) 一次設定好。其他工具：指令是 `norn`，參數是 `mcp`；
+如果工具不是在專案資料夾裡啟動它，也不會告知開啟的資料夾，就再加上專案資料夾。
 
-```sh
-claude mcp add norn -- norn mcp "$PWD"
+### `setup`
+
+```
+norn setup [claude | codex | opencode]... [--remove | --print | --refresh]
 ```
 
-其他工具：指令是 `norn`，參數是 `mcp` 和專案的資料夾。
+把 [`mcp`](#mcp) 的工具提供給這台電腦上的 agent，不必逐一手動設定：
+
+1. 把這個程式放到 `~/.norn/bin/norn`（Windows 為 `norn.exe`），這是不會變動的路徑；那裡已經有同版或更新的版本時就保留它。
+2. 把指定的 agent（沒指定就是這台電腦上找得到的每一個）設定成以 `norn mcp` 啟動它。專案就是 agent 當下工作的那個資料夾。
+
+| Agent | 寫在哪裡 |
+|---|---|
+| Claude Code（終端機、VS Code、桌面 app） | 用 Claude Code 自己的指令 `claude mcp add --scope user`；`PATH` 上沒有 `claude` 時，照印出來的指令手動執行 |
+| Codex（命令列、VS Code、ChatGPT 桌面 app 的 Codex） | `~/.codex/config.toml`（`$CODEX_HOME`）的 `[mcp_servers.norn]` |
+| OpenCode | `~/.config/opencode/opencode.json` 的 `"mcp": { "norn": … }` |
+
+只寫入 Norn 自己的那一項：每個檔案的其他內容（包括註解）都維持原樣。已經在執行的 agent，重新啟動後就有這些工具。
+
+| 選項 | |
+|---|---|
+| `--remove` | 從每個 agent 的設定中移除 Norn |
+| `--print` | 只印出每個 agent 的設定會加入什麼 |
+| `--refresh` | 只在 `~/.norn/bin` 已有副本時把它更新到最新。VS Code 擴充套件每次啟動都會做，所以擴充套件更新後 agent 也會跟著更新 |
+
+在 VS Code 裡：**Norn: Connect AI Agents** 做的是同一件事。Copilot 的 agent 模式不需要這些（見 [`mcp`](#mcp)）。
 
 ### `symbols`
 

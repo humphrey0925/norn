@@ -523,6 +523,7 @@ Search for `norn` in VS Code's settings.
 | Norn: Lock Relation / Lock Context | Stop following the cursor |
 | Norn: Sync Index with Disk | Bring the index in line with the disk |
 | Norn: Restart Index | Restart the indexer; only what changed is read again |
+| Norn: Connect AI Agents | Give Claude Code, Codex and OpenCode the index's tools (`norn setup`); Copilot's agent mode has them already |
 | Norn: Discard the Saved Index and Rebuild | Throw the saved index away and index from nothing |
 | Norn: Switch Compile Configuration… | Switch the set of compile conditions |
 | Norn: Open the Scope File | Open `.norn/config.json` |

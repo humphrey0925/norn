@@ -15,6 +15,7 @@ use std::time::Instant;
 mod lsp;
 mod mcp;
 mod mem;
+mod setup;
 mod share;
 
 #[global_allocator]
@@ -144,6 +145,23 @@ enum Cmd {
         include_alias: Vec<String>,
         #[command(flatten)]
         keep: Keep,
+    },
+    /// Give the agents on this machine (Claude Code, Codex, OpenCode) the
+    /// index's tools: put this program at ~/.norn/bin and set each agent
+    /// up to start it as `norn mcp`.
+    Setup {
+        /// claude | codex | opencode (default: each one on this machine).
+        agents: Vec<String>,
+        /// Take Norn out of each agent's settings instead.
+        #[arg(long)]
+        remove: bool,
+        /// Only print what each agent's settings would get.
+        #[arg(long, conflicts_with = "remove")]
+        print: bool,
+        /// Only bring ~/.norn/bin's copy up to date, if there is one (an
+        /// update of the extension does).
+        #[arg(long, conflicts_with_all = ["remove", "print"])]
+        refresh: bool,
     },
     /// Every symbol as `file<TAB>line<TAB>kind<TAB>decl|def<TAB>name` (for accuracy checks).
     Symbols {
@@ -839,6 +857,7 @@ fn main() {
             let keep = keep.clone();
             return mcp::run(root.as_deref(), move |dir: &Path| keep.open(dir, &options));
         }
+        Cmd::Setup { agents, remove, print, refresh } => std::process::exit(setup::run_setup(agents, *remove, *print, *refresh)),
         Cmd::Symbols { dir } => return symbols(dir),
         Cmd::Calls { dir } => return calls(dir),
     };

@@ -394,6 +394,7 @@ Norn 不提供編譯錯誤的紅色波浪線：那要由編譯器產生。
 | Norn: Lock Relation / Lock Context | 鎖定，不再跟著游標 |
 | Norn: Sync Index with Disk | 和磁碟同步 |
 | Norn: Restart Index | 重新啟動索引程式，只重新處理有變動的檔案 |
+| Norn: Connect AI Agents | 把索引的工具提供給 Claude Code、Codex、OpenCode（`norn setup`）；Copilot 的 agent 模式本來就有 |
 | Norn: Discard the Saved Index and Rebuild | 丟掉存檔，從頭建立索引 |
 | Norn: Switch Compile Configuration… | 切換編譯條件的設定組 |
 | Norn: Open the Scope File | 開啟 `.norn/config.json` |

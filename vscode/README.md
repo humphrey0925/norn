@@ -131,7 +131,8 @@ itself:
 The status bar shows progress while the first index is built. Nothing else
 has to be set up. AI agents in VS Code, such as Copilot's agent mode, get the
 same index as tools (callers and callees through macros and function
-pointers, a definition's source, which lines are compiled) by themselves. To index only part of a large tree, use the **Index Scope**
+pointers, a definition's source, which lines are compiled) by themselves;
+for Claude Code, Codex and OpenCode, run **Norn: Connect AI Agents** once. To index only part of a large tree, use the **Index Scope**
 view to choose the folders.
 
 Norn includes its index server for Windows (x64, Arm64), Linux (x64, Arm64;

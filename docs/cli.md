@@ -8,7 +8,7 @@ serves them to scripts, editors and AI agents, and lists everything it found.
 - [Installing](#installing)
 - [In five commands](#in-five-commands)
 - [Commands](#commands): [`index`](#index), [`query`](#query),
-  [`serve`](#serve), [`live`](#live), [`lsp`](#lsp), [`mcp`](#mcp), [`symbols`](#symbols),
+  [`serve`](#serve), [`live`](#live), [`lsp`](#lsp), [`mcp`](#mcp), [`setup`](#setup), [`symbols`](#symbols),
   [`calls`](#calls), [`sample`](#sample), [`bench-query`](#bench-query),
   [`bench-incr`](#bench-incr)
 - [What a result looks like](#what-a-result-looks-like)
@@ -259,14 +259,43 @@ language server it already runs, so an agent is answered from the index the
 editor has, kept up to date as the editor keeps it, with no second index
 (VS Code 1.101 or later; `norn.mcp.enabled` turns it off).
 
-Claude Code, in the project's folder:
+Claude Code, Codex and OpenCode: [`norn setup`](#setup) sets each of them
+up. Any other client: the command `norn` with the argument `mcp`, and the
+project's folder if the client neither starts it in that folder nor says
+which one it has open.
 
-```sh
-claude mcp add norn -- norn mcp "$PWD"
+### `setup`
+
+```
+norn setup [claude | codex | opencode]... [--remove | --print | --refresh]
 ```
 
-Any other client: the command `norn`, with the arguments `mcp` and the
-project's folder.
+Gives the agents on this machine the tools of [`mcp`](#mcp), with nothing
+to type for each:
+
+1. Puts this program at `~/.norn/bin/norn` (`norn.exe` on Windows), a path
+   that does not move: one as new or newer already there is kept.
+2. Sets up each agent named, or each one found on this machine, to start
+   it as `norn mcp`. Which project is then the one the agent works in.
+
+| Agent | Where |
+|---|---|
+| Claude Code (terminal, VS Code, desktop app) | `claude mcp add --scope user`, Claude Code's own command; done by hand, as printed, where it is not on the `PATH` |
+| Codex (command line, VS Code, the ChatGPT desktop app's Codex) | `[mcp_servers.norn]` in `~/.codex/config.toml` (`$CODEX_HOME`) |
+| OpenCode | `"mcp": { "norn": … }` in `~/.config/opencode/opencode.json` |
+
+Only Norn's own entry is written: the rest of each file, comments
+included, stays as it was. An agent running already has the tools once it
+starts again.
+
+| Option | |
+|---|---|
+| `--remove` | Take Norn out of each agent's settings |
+| `--print` | Only print what each agent's settings would get |
+| `--refresh` | Only bring `~/.norn/bin`'s copy up to date, if there is one. The VS Code extension does this at each start, so its updates reach the agents |
+
+In VS Code: **Norn: Connect AI Agents** does the same. Copilot's agent mode
+needs none of it (see [`mcp`](#mcp)).
 
 ### `symbols`
 
