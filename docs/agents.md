@@ -99,8 +99,8 @@ This is what the skill tells the agent, in short:
    it is used.
 3. **Read and search C/C++ through Norn too**: `read_file` rather than a
    plain file read, `search_code` rather than grep. Code in a switched-off
-   `#if` branch looks like any other in a plain read; these mark it `✗`, or
-   leave it out.
+   `#if` branch looks like any other in a plain read; these say where it
+   begins and ends, or leave it out.
 4. **Before editing inside `#if`**, look at those marks, or ask
    `compiled_lines`: do not change a branch the configuration does not
    compile, unless the task is about that other configuration.
@@ -125,7 +125,7 @@ Prompts that work well:
 | `search_symbols` | Symbols matching part of a name: fragments in any order, initials, letters in order |
 | `find_definition` | Where a name is defined and declared; given the file and line it is used on, the definition that place sees |
 | `read_symbol` | The source of a definition with the comment above it, numbered and marked |
-| `read_file` | A file, or some of its lines, numbered, each line marked by whether the configuration compiles it (`✗` not, `?` maybe); `hide_inactive` folds what is not compiled |
+| `read_file` | A file, or some of its lines, numbered, with where the configuration stops and starts compiling it said on a line of its own; `hide_inactive` folds what is not compiled into that line |
 | `search_code` | Text or a regular expression in the C/C++ files, as grep, but only in what the configuration compiles (`include_inactive` for the rest, marked); each match with the function it is in |
 | `find_callers` | Every call of a function, including through macros and function pointers |
 | `find_callees` | Every call a function makes, including the functions a member or variable it calls through can hold |
@@ -169,11 +169,13 @@ int main(void)
 
 ```
 read_file a.c                (BoardA in force)
-     5   #ifdef BOARD_A
-     6       return uart_a();
-     7   #else
-     8 ✗     return uart_b();
-     9   #endif
+     5  #ifdef BOARD_A
+     6      return uart_a();
+     7  #else
+        >>> not compiled under BoardA (line 8)
+     8      return uart_b();
+        <<< end of not compiled (line 8)
+     9  #endif
 
 search_code uart_b
 a.c:2   int uart_b(void) { return 2; }  [in uart_b]
@@ -201,8 +203,9 @@ find_callees main
 | `[uncertain]` | Several definitions could be meant |
 | `[maybe not compiled: under the #if at line N]` | The configuration in force does not settle that `#if` |
 | `[in a file the build does not compile]` | No compilation of the build reads the file |
-| `✗` before a line (`read_file`, `search_code`, `read_symbol`) | The line is there but not compiled under the configuration in force |
-| `?` before a line | The line is under an `#if` the configuration does not settle |
+| `>>> not compiled under X (lines a–b)` … `<<< end of not compiled` (`read_file`, `read_symbol`) | The code between is there but not compiled under the configuration in force |
+| `>>> maybe not compiled: under the #if at line N` … `<<< end` | The code between is under an `#if` the configuration does not settle |
+| `✗` / `?` before a match (`search_code`) | The same, for one line |
 | `Listed N of M` | Ask for more with `limit`, or narrow with `file` |
 
 ## How it works

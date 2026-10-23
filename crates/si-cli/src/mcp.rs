@@ -139,12 +139,12 @@ fn tools() -> Value {
         {
             "name": "read_file",
             "title": "Read a file, compiled lines marked",
-            "description": "Read a C/C++ file (or some of its lines) with each line numbered and marked by whether the build configuration in force compiles it: ✗ not compiled (the code is there, but this build does not have it), ? under an #if the configuration does not settle. Use it instead of reading C/C++ files as plain text: code in a switched-off #if branch looks like any other. With hide_inactive, each stretch that is not compiled is one line.",
+            "description": "Read a C/C++ file (or some of its lines), numbered, with where the build configuration in force stops compiling it said on a line of its own: `>>> not compiled under X (lines a–b)` before such a stretch and `<<< end of not compiled` after it (the code is there, but this build does not have it); the same for a stretch under an #if the configuration does not settle. Use it instead of reading C/C++ files as plain text, where code in a switched-off #if branch looks like any other. With hide_inactive, a stretch not compiled is that one line.",
             "inputSchema": { "type": "object", "properties": {
                 "file": { "type": "string", "description": "The file (relative to the project root)." },
                 "from": { "type": "integer", "minimum": 1, "description": "The first line to show (default 1)." },
                 "to": { "type": "integer", "minimum": 1, "description": format!("The last line to show (default: {READ_LINES} lines from `from`).") },
-                "hide_inactive": { "type": "boolean", "description": "Show each stretch the configuration does not compile as one line (default false: shown, marked ✗)." },
+                "hide_inactive": { "type": "boolean", "description": "Show a stretch the configuration does not compile as one line instead of its code (default false)." },
             }, "required": ["file"] },
             "annotations": read_only,
         },
@@ -554,10 +554,7 @@ impl<'a> Tools<'a> {
             }
             let end = last.min(first + MAX_SOURCE_LINES - 1);
             let _ = writeln!(out, "{}:", self.describe(&q, s));
-            let facts = self.session.facts_of(path);
-            for n in first..=end {
-                let _ = writeln!(out, "{n:>6} {} {}", mark(facts, n).0, lines.get(n as usize - 1).copied().unwrap_or(""));
-            }
+            out.push_str(&listing(&lines, first, end, self.session.facts_of(path), &self.config_name(), false));
             if end < last {
                 let _ = writeln!(out, "        … {} lines more, to line {last}", last - end);
             }
@@ -830,6 +827,11 @@ impl<'a> Tools<'a> {
         Ok((rel, path))
     }
 
+    /// The name of the configuration in force, or that there is none.
+    fn config_name(&self) -> String {
+        si_core::cond::Project::load_told(self.root).0.active.unwrap_or_else(|| "no configuration".into())
+    }
+
     /// The configuration in force, said in a few words.
     fn in_force(&self) -> String {
         match si_core::cond::Project::load_told(self.root).0.active {
@@ -856,30 +858,7 @@ impl<'a> Tools<'a> {
             None => out.push_str("Not indexed: nothing is known of what is compiled in it."),
         }
         out.push('\n');
-        let marks: Vec<(char, u32)> = (first..=last).map(|n| mark(facts, n)).collect();
-        if marks.iter().any(|m| m.0 != ' ') {
-            out.push_str("✗ not compiled under it (the code is there; this build does not have it); ? under an #if it does not settle.\n");
-        }
-        let mut n = first;
-        while n <= last {
-            let (m, directive) = marks[(n - first) as usize];
-            if hide && m == '✗' {
-                let mut end = n;
-                while end < last && marks[(end + 1 - first) as usize].0 == '✗' {
-                    end += 1;
-                }
-                let _ = writeln!(out, "{:>6} ✗ … {} not compiled", n, count((end - n + 1) as usize, "line", "lines"));
-                n = end + 1;
-                continue;
-            }
-            let why = if m == '?' && directive > 0 && (n == first || marks[(n - first - 1) as usize] != (m, directive)) {
-                format!("    ← under the #if at line {directive}")
-            } else {
-                String::new()
-            };
-            let _ = writeln!(out, "{n:>6} {m} {}{why}", lines.get(n as usize - 1).copied().unwrap_or(""));
-            n += 1;
-        }
+        out.push_str(&listing(&lines, first, last, facts, &self.config_name(), hide));
         if last < total {
             let _ = writeln!(out, "… lines {}–{total} not shown; pass `from` and `to` for them.", last + 1);
         }
@@ -944,7 +923,7 @@ impl<'a> Tools<'a> {
             let _ = writeln!(shown, "{}:{line} {m} {text}{at}", g.file_path(*f));
         }
         let matching = found.len() - hidden;
-        let config = si_core::cond::Project::load_told(self.root).0.active.unwrap_or_else(|| "no configuration".into());
+        let config = self.config_name();
         let mut out = if inactive_too {
             format!("{} of `{pattern}`, compiled under {config} or not.", count(matching, "match", "matches"))
         } else {
@@ -1039,6 +1018,75 @@ fn mark(facts: Option<&si_core::model::FileFacts>, line: u32) -> (char, u32) {
         Some(&(_, _, directive, _)) => ('?', directive),
         None => (' ', 0),
     }
+}
+
+/// A stretch of a file the configuration has a word on: not compiled
+/// (`off`), or under an #if it does not settle (`directive`, that #if's
+/// line); from line `a` to line `b`.
+#[derive(Clone, Copy, PartialEq)]
+struct Region {
+    off: bool,
+    a: u32,
+    b: u32,
+    directive: u32,
+}
+
+/// The stretch line `line` is in, if it is not simply compiled.
+fn region(facts: Option<&si_core::model::FileFacts>, line: u32) -> Option<Region> {
+    let facts = facts?;
+    if let Some(&(a, b)) = facts.inactive.iter().find(|&&(a, b)| a <= line && line <= b) {
+        return Some(Region { off: true, a, b, directive: 0 });
+    }
+    // The innermost branch around the line: the last to start.
+    facts.undecided.iter().rev().find(|&&(a, b, _, _)| a <= line && line <= b).map(|&(a, b, directive, _)| Region { off: false, a, b, directive })
+}
+
+/// Lines `first` to `last` of `lines`, numbered, with where a stretch the
+/// configuration (`config`) does not compile, or does not settle, begins
+/// and ends said on a line of its own. `hide`: a stretch not compiled is
+/// that one line.
+fn listing(text: &[&str], first: u32, last: u32, facts: Option<&si_core::model::FileFacts>, config: &str, hide: bool) -> String {
+    let what = |r: &Region| {
+        if r.off {
+            format!("not compiled under {config}")
+        } else {
+            format!("maybe not compiled: under the #if at line {}, which {config} does not settle", r.directive)
+        }
+    };
+    let close = |out: &mut String, r: &Region, at: u32| {
+        let word = if r.off { "not compiled" } else { "maybe not compiled" };
+        if r.b > at {
+            let _ = writeln!(out, "        ... still {word}, to line {}", r.b);
+        } else {
+            let _ = writeln!(out, "        <<< end of {word} ({})", lines(r.a, r.b));
+        }
+    };
+    let mut out = String::new();
+    let mut open: Option<Region> = None;
+    let mut n = first;
+    while n <= last {
+        let here = region(facts, n);
+        if here != open {
+            if let Some(r) = open.take() {
+                close(&mut out, &r, n - 1);
+            }
+            if let Some(r) = here {
+                if hide && r.off {
+                    let _ = writeln!(out, "        --- {} {} (hidden) ---", lines(r.a, r.b), what(&r));
+                    n = r.b.min(last) + 1;
+                    continue;
+                }
+                let _ = writeln!(out, "        >>> {} ({})", what(&r), lines(r.a, r.b));
+            }
+            open = here;
+        }
+        let _ = writeln!(out, "{n:>6}  {}", text.get(n as usize - 1).copied().unwrap_or(""));
+        n += 1;
+    }
+    if let Some(r) = open {
+        close(&mut out, &r, last);
+    }
+    out
 }
 
 /// `1 call`, `3 calls`.

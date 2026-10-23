@@ -20,8 +20,8 @@ Grep finds where a name is written. It does not find:
 So for any question about a C/C++ symbol, ask Norn first. And read and
 search C/C++ files through Norn too: `read_file` rather than your own file
 reader, `search_code` rather than grep. Code in a switched-off `#if` branch
-looks like any other code in a plain read or grep; these mark it (`✗`), or
-leave it out. Plain tools are for everything else: build files, other
+looks like any other code in a plain read or grep; these say where it
+begins and ends, or leave it out. Plain tools are for everything else: build files, other
 languages, documentation.
 
 ## 1. Set the context first
@@ -90,10 +90,12 @@ Typical paths:
   that settles it, if the task depends on it.
 - `[in a file the build does not compile]`: no compilation of the build
   reads that file.
-- In `read_file`, `search_code` and `read_symbol`, a line marked `✗` is not
-  compiled under the configuration in force: the code is there, but this
-  build does not have it. `?` marks a line under an `#if` the configuration
-  does not settle.
+- In `read_file` and `read_symbol`, `>>> not compiled under X (lines a–b)`
+  begins a stretch the configuration in force does not compile, and
+  `<<< end of not compiled` ends it: the code is there, but this build does
+  not have it. `>>> maybe not compiled: under the #if at line N` begins one
+  it does not settle.
+- In `search_code`, a match marked `✗` is not compiled, `?` maybe not.
 - A name with several definitions (one per board, a `static` function in
   several files) answers for each; pass `file` to choose one.
 - `Listed N of M`: pass a larger `limit`, or narrow with `file`.

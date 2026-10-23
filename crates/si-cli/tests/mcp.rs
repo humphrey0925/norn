@@ -128,7 +128,7 @@ fn an_agent_finds_calls_through_macros_and_members() {
     assert!(!callers.contains("dead"), "{callers}");
 
     let (source, _) = s.call(4, "read_symbol", json!({ "name": "uart_send", "file": "uart.c" }));
-    assert!(source.contains("     2   /* Sends one byte. */") && source.contains("     3   int uart_send(int c) { return c; }"), "{source}");
+    assert!(source.contains("     2  /* Sends one byte. */") && source.contains("     3  int uart_send(int c) { return c; }"), "{source}");
 
     let (line, _) = s.call(5, "compiled_lines", json!({ "file": "uart.c", "line": 6 }));
     assert!(line.contains("Line 6 is not compiled"), "{line}");
@@ -286,11 +286,15 @@ fn an_agent_sees_the_configurations_and_switches_to_the_one_its_task_is_about() 
     let saved = std::fs::read_to_string(dir.join(".norn").join("config.json")).unwrap();
     assert!(saved.contains("\"activeConfiguration\": \"BoardA\""), "{saved}");
 
-    // The other board's line is there, marked; grep-like search leaves it out.
+    // The other board's line is there, where it is said not to be compiled;
+    // grep-like search leaves it out.
     let (read, _) = s.call(6, "read_file", json!({ "file": "a.c" }));
-    assert!(read.contains("     8 ✗     return uart_b();") && read.contains("     6       return uart_a();"), "{read}");
+    assert!(
+        read.contains("     7  #else\n        >>> not compiled under BoardA (line 8)\n     8      return uart_b();\n        <<< end of not compiled (line 8)\n     9  #endif"),
+        "{read}"
+    );
     let (folded, _) = s.call(7, "read_file", json!({ "file": "a.c", "hide_inactive": true }));
-    assert!(folded.contains("     8 ✗ … 1 line not compiled") && !folded.contains("return uart_b"), "{folded}");
+    assert!(folded.contains("     7  #else\n        --- line 8 not compiled under BoardA (hidden) ---\n     9  #endif") && !folded.contains("return uart_b"), "{folded}");
     let (found, _) = s.call(8, "search_code", json!({ "pattern": "uart_b" }));
     assert!(found.contains("a.c:2 ") && !found.contains("a.c:8") && found.contains("1 more where it does not"), "{found}");
     let (all, _) = s.call(9, "search_code", json!({ "pattern": "return uart_[ab]", "regex": true, "include_inactive": true }));
