@@ -171,6 +171,24 @@ impl Store {
         }
     }
 
+    /// What the link that made the saved graph leaves for the next (see
+    /// `link::Last`), under the same digest.
+    pub(crate) fn save_last(&self, digest: u64, last: &crate::link::Last) {
+        self.prepare();
+        if let Ok(bytes) = bincode::serialize(&(FORMAT, digest, last)) {
+            let tmp = self.dir.join("relink.tmp");
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, self.dir.join("relink"));
+            }
+        }
+    }
+
+    /// The same, if it was saved with the graph of digest `digest`.
+    pub(crate) fn load_last(&self, digest: u64) -> Option<crate::link::Last> {
+        let (format, of, last): (u32, u64, crate::link::Last) = bincode::deserialize(&std::fs::read(self.dir.join("relink")).ok()?).ok()?;
+        (format == FORMAT && of == digest).then_some(last)
+    }
+
     /// The digest of the saved graph, if there is one of this version.
     pub fn graph_digest(&self) -> Option<u64> {
         use std::io::Read;

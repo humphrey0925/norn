@@ -359,7 +359,12 @@ impl Session {
             let digest = session.state_digest();
             if paths.is_empty() {
                 let mut up = Update { loaded, extract_ms: ms(t), ..Update::default() };
+                // What the link that made the saved graph left, for the
+                // first edit to be relinked from (checked against the graph
+                // the session ends up with when it is).
+                let last = session.store.as_ref().and_then(|s| s.load_last(digest)).and_then(|l| l.restored(&session.cache.made));
                 if have == Some(digest) {
+                    session.cache.last = last.map(Box::new);
                     up.graph_kept = true;
                     profile("graph kept");
                     return (session, up);
@@ -368,8 +373,22 @@ impl Session {
                 if let Some((_, graph, binds)) = saved {
                     session.graph = graph;
                     session.stats.bind_sites = binds;
+                    session.cache.last = last.map(Box::new);
                     profile("graph read");
                     return (session, up);
+                }
+            }
+            // Files changed since: if the saved graph is the graph of the
+            // facts read back (not of facts saved since, under other
+            // conditions), the link takes what still holds from it.
+            if let Some(store) = session.store.as_ref().filter(|s| s.graph_digest() == Some(digest)) {
+                if let Some(last) = store.load_last(digest).and_then(|l| l.restored(&session.cache.made)) {
+                    if let Some((_, graph, binds)) = store.load_graph().filter(|g| g.0 == digest) {
+                        session.graph = graph;
+                        session.stats.bind_sites = binds;
+                        session.cache.last = Some(Box::new(last));
+                        profile("graph read, to relink from");
+                    }
                 }
             }
             let mut up = session.update_listed(&paths, Some(&listed));
@@ -512,7 +531,11 @@ impl Session {
     pub fn save_graph(&mut self) {
         if self.graph_unsaved && self.unsaved.is_empty() && !self.unsaved_manifest {
             if let Some(store) = &self.store {
-                store.save_graph(self.state_digest(), &self.graph, &self.stats.bind_sites);
+                let digest = self.state_digest();
+                store.save_graph(digest, &self.graph, &self.stats.bind_sites);
+                if let Some(last) = self.cache.last.as_deref().filter(|l| l.of(&self.graph)) {
+                    store.save_last(digest, last);
+                }
                 self.graph_unsaved = false;
             }
         }
@@ -1131,6 +1154,32 @@ int slow (void) { return 0; }
         // Saved as it was: nothing to link.
         let up = s.update(&[PathBuf::from("c.c")]);
         assert_eq!((up.changed, up.link_ms), (0, 0.0));
+    }
+
+    #[test]
+    fn a_session_read_back_relinks_from_the_saved_graph() {
+        let d = Dir::new("relink-saved");
+        d.write("a.h", "int slow (void);\nint helper (int (*f) (void));\n");
+        d.write("a.c", "#include \"a.h\"\nint slow (void) { return 1; }\nint helper (int (*f) (void)) {\n  return f ();\n}\n");
+        d.write("b.c", "#include \"a.h\"\nstatic int cb (void) { return 3; }\nint main (void) {\n  helper (cb);\n  return slow ();\n}\n");
+        d.write("c.c", "int alone (void) { return 2; }\n");
+        let fresh = |d: &Dir| layout(&Session::open(&d.0, Options::default()).graph);
+        drop(opened(&d.0));
+        // Read back, its first edit is resolved alone.
+        let (mut s, up) = opened(&d.0);
+        assert_eq!(up.extracted, 0);
+        let c = d.write("c.c", "int alone (void) { return slow (); }\n");
+        s.update(&[c]);
+        assert_eq!(s.stats.resolved_files, 1, "the first edit after a start");
+        assert!(layout(&s.graph) == fresh(&d), "the graph differs from one made anew");
+        while s.save_some(usize::MAX) {}
+        drop(s);
+        // Edited while no session had it open: the start relinks from the
+        // saved graph.
+        d.write("c.c", "int alone (void) { return 4; }\n");
+        let (s, up) = opened(&d.0);
+        assert_eq!((up.extracted, s.stats.resolved_files), (1, 1), "a file edited before a start");
+        assert!(layout(&s.graph) == fresh(&d), "the graph differs from one made anew");
     }
 
     #[test]
