@@ -101,9 +101,10 @@ fn an_agent_finds_calls_through_macros_and_members() {
     let (missing, error) = s.call(6, "find_definition", json!({ "name": "uart_snd" }));
     assert!(error && missing.contains("uart_send"), "{missing}");
 
-    // An edit between calls is seen by the next.
-    std::thread::sleep(std::time::Duration::from_millis(600));
+    // A file added between calls is seen by the next (the watcher given a
+    // moment to tell, as an agent's next turn gives it).
     std::fs::write(dir.join("more.c"), "#include \"uart.h\"\nint twice(void) { return uart_send(1) + uart_send(2); }\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
     let (callers, _) = s.call(7, "find_callers", json!({ "name": "uart_send" }));
     assert!(callers.contains("more.c:2  in twice"), "{callers}");
 

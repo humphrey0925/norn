@@ -214,9 +214,12 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server on
 stdin/stdout, for AI agents: Claude Code, VS Code's Copilot, Cursor and the
 others that take MCP servers. The root is the current folder, unless `ROOT`
 is given. It answers at once and indexes meanwhile; the first tool called
-waits for the index. Before each tool answers, files changed on disk since
-the last call are read again, so what the agent edits is seen by its next
-call; the index is kept between runs as `live` keeps it.
+waits for the index. It watches the tree as the VS Code extension does: a
+source file the agent edits is read again before the next answer, and only
+it; a changed build configuration (`.norn/config.json`, a Keil, IAR,
+Eclipse or Visual Studio project, `compile_commands.json`…) or a folder
+added or removed has the whole tree looked at again. With nothing changed,
+nothing is read. The index is kept between runs as `live` keeps it.
 
 Its tools answer in text, for the agent to read, with paths relative to the
 root:

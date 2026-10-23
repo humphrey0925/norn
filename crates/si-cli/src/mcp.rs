@@ -26,10 +26,95 @@ const MAX_LIMIT: usize = 2000;
 /// Lines of source shown for one definition at most.
 const MAX_SOURCE_LINES: u32 = 400;
 
-/// The tree is looked at again for files changed on disk before a tool
-/// answers, unless it was this recently: an agent edits files between its
-/// calls, and nothing tells the server.
+/// Where the files cannot be watched: the tree is looked at again for
+/// files changed on disk before a tool answers, unless it was this recently.
 const SYNC_AFTER: Duration = Duration::from_millis(500);
+
+/// The build's own descriptions, and the project's settings: when one
+/// changes, the conditions may have, and the whole tree is looked at again
+/// (as the extension does on the same files).
+fn is_build_config(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    matches!(name, ".cproject" | "compile_commands.json" | "compile_flags.txt" | "platformio.ini" | "c_cpp_properties.json")
+        || [".uvprojx", ".uvproj", ".ewp", ".vcxproj"].iter().any(|x| name.ends_with(x))
+        || name == "config.json" && path.parent().and_then(Path::file_name).is_some_and(|d| d == ".norn")
+}
+
+/// What changed on disk since the index last looked, as the watcher told.
+#[derive(Default)]
+struct Changes {
+    /// Files written, created, deleted or renamed.
+    files: std::collections::BTreeSet<PathBuf>,
+    /// The whole tree is to be looked at: a build configuration changed, a
+    /// folder came or went, or the watcher lost track.
+    all: bool,
+}
+
+/// Watches the tree, as the editor watches it for the language server:
+/// a tool then reads again only what changed, and nothing when nothing did.
+struct Watch {
+    _watcher: notify::RecommendedWatcher,
+    events: std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+    /// The root as given, and as the system may name it in what it tells
+    /// (macOS: `/private/tmp/…` for `/tmp/…`).
+    root: PathBuf,
+    real_root: PathBuf,
+}
+
+impl Watch {
+    fn start(root: &Path) -> Option<Watch> {
+        use notify::Watcher as _;
+        let (tx, events) = std::sync::mpsc::channel();
+        let made = notify::recommended_watcher(move |e| {
+            let _ = tx.send(e);
+        })
+        .and_then(|mut w| w.watch(root, notify::RecursiveMode::Recursive).map(|_| w));
+        match made {
+            Ok(watcher) => {
+                let real_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+                Some(Watch { _watcher: watcher, events, root: root.to_path_buf(), real_root })
+            }
+            Err(e) => {
+                eprintln!("norn: cannot watch {} for changes ({e}); the tree is looked at again before each answer instead", root.display());
+                None
+            }
+        }
+    }
+
+    /// What the watcher told of since it was last asked; `skip`: what is
+    /// no part of the sources (the index's own files).
+    fn changes(&self, skip: &dyn Fn(&Path) -> bool) -> Changes {
+        use notify::EventKind;
+        let mut out = Changes::default();
+        for event in self.events.try_iter() {
+            let Ok(event) = event else {
+                out.all = true;
+                continue;
+            };
+            if event.need_rescan() {
+                out.all = true;
+            }
+            // (A folder made, removed or renamed is told of as itself, not
+            // as the files in it: a name with no extension may be one.)
+            let comes_or_goes = matches!(event.kind, EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(notify::event::ModifyKind::Name(_)));
+            for path in event.paths {
+                let path = match path.strip_prefix(&self.real_root) {
+                    Ok(rel) if !path.starts_with(&self.root) => self.root.join(rel),
+                    _ => path,
+                };
+                if skip(&path) || path.components().any(|c| c.as_os_str() == ".git") {
+                    continue;
+                }
+                if is_build_config(&path) || comes_or_goes && path.extension().is_none() {
+                    out.all = true;
+                } else if !matches!(event.kind, EventKind::Access(_)) {
+                    out.files.insert(path);
+                }
+            }
+        }
+        out
+    }
+}
 
 fn tools() -> Value {
     let name = json!({ "type": "string", "description": "The symbol's name as written in the code, e.g. `uart_send`." });
@@ -128,6 +213,9 @@ fn instructions(root: &Path) -> String {
 struct Server {
     root: PathBuf,
     session: Session,
+    /// What tells of changes on disk; without it, the tree is looked at
+    /// before each answer.
+    watch: Option<Watch>,
     /// When the tree was last looked at for changes.
     synced: Instant,
     /// For each file of the graph: no compilation of the build reads it.
@@ -135,8 +223,8 @@ struct Server {
 }
 
 impl Server {
-    fn new(root: PathBuf, session: Session) -> Server {
-        let mut s = Server { root, session, synced: Instant::now(), unread: Vec::new() };
+    fn new(root: PathBuf, session: Session, watch: Option<Watch>) -> Server {
+        let mut s = Server { root, session, watch, synced: Instant::now(), unread: Vec::new() };
         s.indexed();
         s
     }
@@ -153,16 +241,42 @@ impl Server {
         self.unread = (0..g.files.len() as u32).map(|f| unread.contains(g.file_path(f))).collect();
     }
 
-    /// Bring the index in line with the disk, if it was not just now.
+    /// Bring the index in line with the disk: the files the watcher told
+    /// of, or without one, the whole tree if it was not just now looked at.
     fn sync(&mut self) {
-        if self.synced.elapsed() < SYNC_AFTER {
-            return;
-        }
-        let up = self.session.sync();
+        let up = match &self.watch {
+            Some(watch) => {
+                let cache = self.session.cache_dir().map(Path::to_path_buf);
+                let changes = watch.changes(&|p: &Path| cache.as_deref().is_some_and(|c| p.starts_with(c)));
+                if changes.all {
+                    self.session.sync()
+                } else {
+                    // Sources, and what else the index has (a file a source
+                    // includes): a build's objects and the rest are nothing to it.
+                    let files: Vec<PathBuf> = changes
+                        .files
+                        .into_iter()
+                        .filter(|p| {
+                            p.file_name().and_then(|n| n.to_str()).is_some_and(si_core::is_source)
+                                || self.session.facts_of(&si_core::rel_path(&self.root, p)).is_some()
+                        })
+                        .collect();
+                    if files.is_empty() {
+                        return;
+                    }
+                    self.session.update(&files)
+                }
+            }
+            None if self.synced.elapsed() < SYNC_AFTER => return,
+            None => {
+                let up = self.session.sync();
+                self.synced = Instant::now();
+                up
+            }
+        };
         if up.changed + up.added + up.removed > 0 {
             self.indexed();
         }
-        self.synced = Instant::now();
     }
 
     /// `file` as the index names it: relative to the root, with `/`.
@@ -598,7 +712,7 @@ fn lines(a: u32, b: u32) -> String {
 
 /// The index being made, or made.
 enum Index {
-    Opening(std::sync::mpsc::Receiver<(Session, Update)>),
+    Opening(std::sync::mpsc::Receiver<((Session, Update), Option<Watch>)>),
     Ready(Box<Server>),
     Failed,
 }
@@ -608,7 +722,7 @@ impl Index {
     fn get(&mut self, root: &Path) -> Option<&mut Server> {
         if let Index::Opening(rx) = self {
             *self = match rx.recv() {
-                Ok((session, _)) => Index::Ready(Box::new(Server::new(root.to_path_buf(), session))),
+                Ok(((session, _), watch)) => Index::Ready(Box::new(Server::new(root.to_path_buf(), session, watch))),
                 Err(_) => Index::Failed,
             };
         }
@@ -636,7 +750,9 @@ pub fn run(root: &Path, open: impl FnOnce(&Path) -> (Session, Update) + Send + '
     {
         let root = root.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(open(&root));
+            // Watched first: what changes while it is indexed is read again.
+            let watch = Watch::start(&root);
+            let _ = tx.send((open(&root), watch));
         });
     }
     let mut index = Index::Opening(rx);

@@ -191,9 +191,10 @@ norn mcp [ROOT] [--cache-dir <DIR> | --no-cache] [--rebuild] [--include-alias <F
 
 透過 stdin/stdout 的 [Model Context Protocol](https://modelcontextprotocol.io) 伺服器，給 AI agent
 用：Claude Code、VS Code 的 Copilot、Cursor，以及其他支援 MCP 伺服器的工具。根目錄是目前所在的資料夾，
-除非另外給 `ROOT`。它會立刻回應，同時在背景建索引；第一次呼叫工具時會等索引建好。每個工具回答之前，
-會重新讀取上次呼叫之後在磁碟上改過的檔案，所以 agent 改過的程式碼，下一次呼叫就看得到；索引也像
-`live` 一樣保留到下次執行。
+除非另外給 `ROOT`。它會立刻回應，同時在背景建索引；第一次呼叫工具時會等索引建好。它像 VS Code
+擴充套件一樣監看檔案：agent 改了哪個原始檔，下次回答前就只重讀那個檔；建置設定（`.norn/config.json`、
+Keil、IAR、Eclipse、Visual Studio 專案、`compile_commands.json`…）改了，或新增、刪除了資料夾，才重新
+檢查整棵樹。沒有任何變動時，什麼都不讀。索引也像 `live` 一樣保留到下次執行。
 
 工具以文字回答，讓 agent 閱讀，路徑都相對於根目錄：
 
