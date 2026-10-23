@@ -476,6 +476,8 @@ struct Table<'a> {
     parsed: Vec<Vec<Parsed>>,
     /// Some macro's body writes `__COUNTER__`.
     counts: bool,
+    /// The macros whose expansion may hold `__COUNTER__`.
+    counting: FxHashSet<&'a str>,
 }
 
 type Choice = FxHashMap<Text, usize>;
@@ -571,8 +573,25 @@ impl<'a> Table<'a> {
                 (name, out)
             })
             .collect();
-        let counts = parsed.iter().flatten().any(|p| p.body.iter().any(|t| &*t.text == "__COUNTER__"));
-        Table { files, outside: vec![false; files.len()], apart: vec![false; files.len()], thorough: false, readings: None, unit_of: Vec::new(), header_of: Vec::new(), by_name, by_text, parsed, counts }
+        // The macros whose expansion may hold `__COUNTER__`: written in
+        // their body, or through another that may. (Only C++ asks.)
+        let mut counting: FxHashSet<&'a str> = FxHashSet::default();
+        if files.iter().any(|f| f.cpp()) {
+            loop {
+                let more: Vec<&'a str> = by_name
+                    .par_iter()
+                    .filter(|(name, _)| !counting.contains(*name))
+                    .filter(|(_, defs)| defs.iter().any(|&(f, i)| parsed[f as usize][i as usize].body.iter().any(|t| &*t.text == "__COUNTER__" || counting.contains(&*t.text))))
+                    .map(|(&name, _)| name)
+                    .collect();
+                if more.is_empty() {
+                    break;
+                }
+                counting.extend(more);
+            }
+        }
+        let counts = !counting.is_empty();
+        Table { files, outside: vec![false; files.len()], apart: vec![false; files.len()], thorough: false, readings: None, unit_of: Vec::new(), header_of: Vec::new(), by_name, by_text, parsed, counts, counting }
     }
 }
 
@@ -1792,8 +1811,14 @@ fn expand_file(
     if let Some(eng) = engines.first_mut().filter(|_| f.cpp() && table.counts) {
         let mut next = 0;
         for s in &live {
+            // (A use that names no macro that counts counts nothing.)
+            let toks = site_tokens(f, s);
+            if !toks.iter().any(|t| &*t.text == "__COUNTER__" || table.counting.contains(&*t.text)) {
+                counter_at.insert(at(s), next);
+                continue;
+            }
             (eng.counter_from, eng.counter_most, eng.site) = (Some(next), next, Some((fi as u32, s.line)));
-            eng.variants(&site_tokens(f, s), &Choice::default(), false, |_| true);
+            eng.variants(&toks, &Choice::default(), false, |_| true);
             eng.counter = eng.counter_most;
             counter_at.insert(at(s), next);
             next = eng.counter;
