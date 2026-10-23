@@ -490,6 +490,7 @@ dependencies = [
  "clap",
  "mimalloc",
  "rayon",
+ "serde",
  "serde_json",
  "si-core",
  "windows-sys 0.59.0",

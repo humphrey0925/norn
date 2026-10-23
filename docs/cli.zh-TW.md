@@ -92,7 +92,7 @@ norn query <DIR> <OP> <NAME> [--depth <N>]
 |---|---|
 | `find` | `NAME` 的每個定義和宣告 |
 | `search` | 最多 50 個符合輸入的符號：任意順序的片段（`uart snd`）、字首縮寫（`us`）、依序出現的字母；最相符的在前，附 `score` |
-| `callers` | 每個呼叫 `NAME` 的地方：呼叫它的函式和呼叫所在的行，包括透過巨集、以及透過存在成員或變數裡的函式指標的呼叫 |
+| `callers` | 每個呼叫 `NAME` 的地方：呼叫它的函式和呼叫所在的行，包括透過巨集、以及透過存在成員或變數裡的函式指標的呼叫。最多列出 1,000,000 筆；`count` 是全部的數量，有省略時會帶 `"truncated": true` |
 | `callees` | `NAME` 呼叫的每個函式，方式同上 |
 | `refs` | `NAME` 的每個參考，呼叫和其他用法都算 |
 | `tree` | 從 `NAME` 沿呼叫往下 `--depth` 層（預設 3）能到達幾個函式，包含它自己 |
@@ -114,6 +114,9 @@ norn serve <DIR>
 {"op": "tree", "name": "main", "depth": 2}
 {"op": "definition", "file": "src/main.c", "line": 3, "name": "uart_send"}
 ```
+
+`callers` 也可以帶 `limit`，例如 `{"op": "callers", "name": "printk", "limit": 1000}`，
+列出比上限 1,000,000 更少的筆數。
 
 `definition` 回答那個檔案那一行寫的名稱指的是什麼（路徑相對於建索引的根目錄，第一行是 1），
 和編輯器的「移至定義」一樣：有多個定義時，回答那個檔案看得到的那一個。

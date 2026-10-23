@@ -1600,18 +1600,23 @@ impl Server {
         let edges = if incoming { si_core::callers_through_macros(g, sym) } else { si_core::callees_through_slots(g, sym) };
         let away = |s: u32| hidden[g.syms[s as usize].file as usize];
         let edges: Vec<_> = edges.into_iter().filter(|c| !away(c.caller) && !c.via.is_some_and(away)).collect();
-        // other end -> lines of the calls
+        // other end -> lines of the calls, the first LIMIT of them (`printk`
+        // in Linux has half a million)
         let mut by_other: Vec<(u32, Vec<u32>)> = Vec::new();
+        let mut at: HashMap<u32, usize> = HashMap::new();
         for c in edges {
             if !matches!(g.syms[c.caller as usize].kind, kind::FUNCTION | kind::MACRO) {
                 continue;
             }
-            match by_other.iter_mut().find(|x| x.0 == c.caller) {
-                Some(x) => x.1.push(c.line),
-                None => by_other.push((c.caller, vec![c.line])),
+            match at.get(&c.caller) {
+                Some(&i) => by_other[i].1.push(c.line),
+                None if by_other.len() < LIMIT => {
+                    at.insert(c.caller, by_other.len());
+                    by_other.push((c.caller, vec![c.line]));
+                }
+                None => {}
             }
         }
-        by_other.truncate(LIMIT);
         let mut out = Vec::new();
         for (other, mut lines) in by_other {
             lines.sort_unstable();
@@ -1755,8 +1760,10 @@ impl Server {
         let g = self.g();
         let away = |s: u32| hidden[g.syms[s as usize].file as usize];
         let edges: Vec<_> = edges.into_iter().filter(|c| !away(c.caller) && !c.via.is_some_and(away) && !c.slot.is_some_and(away)).collect();
-        // (other end, macro, member or variable, pointer) -> (lines, certain)
+        // (other end, macro, member or variable, pointer) -> (lines, certain),
+        // the first LIMIT of them
         let mut groups: Vec<((u32, Option<u32>, Option<u32>, bool), Vec<u32>, bool)> = Vec::new();
+        let mut at: HashMap<(u32, Option<u32>, Option<u32>, bool), usize> = HashMap::new();
         for c in edges {
             // A function is called from code; anything else may also be
             // mentioned by a type, or at the top of a file.
@@ -1764,15 +1771,18 @@ impl Server {
                 continue;
             }
             let key = (c.caller, c.via.filter(|v| Some(*v) != c.slot), c.slot, c.pointer);
-            match groups.iter_mut().find(|x| x.0 == key) {
-                Some(x) => {
-                    x.1.push(c.line);
-                    x.2 &= !c.ambiguous;
+            match at.get(&key) {
+                Some(&i) => {
+                    groups[i].1.push(c.line);
+                    groups[i].2 &= !c.ambiguous;
                 }
-                None => groups.push((key, vec![c.line], !c.ambiguous)),
+                None if groups.len() < LIMIT => {
+                    at.insert(key, groups.len());
+                    groups.push((key, vec![c.line], !c.ambiguous));
+                }
+                None => {}
             }
         }
-        groups.truncate(LIMIT);
         let mut entries = Vec::new();
         for ((other, via, slot, pointer), mut lines, certain) in groups {
             lines.sort_unstable();
