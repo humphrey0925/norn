@@ -2045,6 +2045,10 @@ impl Server {
                 }
             }
             "si/scope" => self.scope(),
+            // A message of the Model Context Protocol, which the editor
+            // serves to agents: answered from this index (see `crate::mcp`).
+            "si/mcp" => crate::mcp::message(params, &self.root, |tool, args| crate::mcp::Tools::new(&self.root, &self.session).call(tool, args))
+                .unwrap_or(Value::Null),
             "si/setScope" => {
                 let list = |key: &str| -> Vec<String> {
                     params[key].as_array().into_iter().flatten().filter_map(|v| v.as_str()).map(str::to_string).collect()
@@ -2217,7 +2221,8 @@ pub fn run(
             return false;
         }
         match (server, id) {
-            (Some(s), _) if s.loading && changes(&method) => s.waiting.push(msg.clone()),
+            // (An agent's tool waits for the index, as with `norn mcp`.)
+            (Some(s), _) if s.loading && (changes(&method) || method == "si/mcp" && params["method"] == "tools/call") => s.waiting.push(msg.clone()),
             (Some(s), Some(id)) => {
                 let reply = match s.request(&method, params) {
                     Some(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),

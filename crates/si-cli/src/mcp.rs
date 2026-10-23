@@ -209,7 +209,7 @@ fn instructions(root: &Path) -> String {
     )
 }
 
-/// The index, once it is made, and what is kept to answer from it.
+/// The index `norn mcp` answers from, once it is made.
 struct Server {
     root: PathBuf,
     session: Session,
@@ -218,65 +218,63 @@ struct Server {
     watch: Option<Watch>,
     /// When the tree was last looked at for changes.
     synced: Instant,
-    /// For each file of the graph: no compilation of the build reads it.
-    unread: Vec<bool>,
 }
 
 impl Server {
-    fn new(root: PathBuf, session: Session, watch: Option<Watch>) -> Server {
-        let mut s = Server { root, session, watch, synced: Instant::now(), unread: Vec::new() };
-        s.indexed();
-        s
-    }
-
-    fn g(&self) -> &Graph {
-        &self.session.graph
-    }
-
-    /// After the index changed.
-    fn indexed(&mut self) {
-        let readings = si_core::readings_of(self.session.conditions());
-        let unread: std::collections::HashSet<&str> = readings.unread.iter().map(String::as_str).collect();
-        let g = &self.session.graph;
-        self.unread = (0..g.files.len() as u32).map(|f| unread.contains(g.file_path(f))).collect();
-    }
-
     /// Bring the index in line with the disk: the files the watcher told
     /// of, or without one, the whole tree if it was not just now looked at.
     fn sync(&mut self) {
-        let up = match &self.watch {
+        match &self.watch {
             Some(watch) => {
                 let cache = self.session.cache_dir().map(Path::to_path_buf);
                 let changes = watch.changes(&|p: &Path| cache.as_deref().is_some_and(|c| p.starts_with(c)));
                 if changes.all {
-                    self.session.sync()
-                } else {
-                    // Sources, and what else the index has (a file a source
-                    // includes): a build's objects and the rest are nothing to it.
-                    let files: Vec<PathBuf> = changes
-                        .files
-                        .into_iter()
-                        .filter(|p| {
-                            p.file_name().and_then(|n| n.to_str()).is_some_and(si_core::is_source)
-                                || self.session.facts_of(&si_core::rel_path(&self.root, p)).is_some()
-                        })
-                        .collect();
-                    if files.is_empty() {
-                        return;
-                    }
-                    self.session.update(&files)
+                    self.session.sync();
+                    return;
+                }
+                // Sources, and what else the index has (a file a source
+                // includes): a build's objects and the rest are nothing to it.
+                let files: Vec<PathBuf> = changes
+                    .files
+                    .into_iter()
+                    .filter(|p| {
+                        p.file_name().and_then(|n| n.to_str()).is_some_and(si_core::is_source)
+                            || self.session.facts_of(&si_core::rel_path(&self.root, p)).is_some()
+                    })
+                    .collect();
+                if !files.is_empty() {
+                    self.session.update(&files);
                 }
             }
-            None if self.synced.elapsed() < SYNC_AFTER => return,
+            None if self.synced.elapsed() < SYNC_AFTER => {}
             None => {
-                let up = self.session.sync();
+                self.session.sync();
                 self.synced = Instant::now();
-                up
             }
-        };
-        if up.changed + up.added + up.removed > 0 {
-            self.indexed();
         }
+    }
+}
+
+/// The tools, over an index: `norn mcp`'s own, or the language server's
+/// (`si/mcp`, for an editor that serves them from the index it has).
+pub struct Tools<'a> {
+    root: &'a Path,
+    session: &'a Session,
+    /// For each file of the graph: no compilation of the build reads it.
+    unread: Vec<bool>,
+}
+
+impl<'a> Tools<'a> {
+    pub fn new(root: &'a Path, session: &'a Session) -> Tools<'a> {
+        let readings = si_core::readings_of(session.conditions());
+        let unread: std::collections::HashSet<&str> = readings.unread.iter().map(String::as_str).collect();
+        let g = &session.graph;
+        let unread = (0..g.files.len() as u32).map(|f| unread.contains(g.file_path(f))).collect();
+        Tools { root, session, unread }
+    }
+
+    fn g(&self) -> &'a Graph {
+        &self.session.graph
     }
 
     /// `file` as the index names it: relative to the root, with `/`.
@@ -287,7 +285,7 @@ impl Server {
         file.trim_start_matches("./").to_string()
     }
 
-    fn call(&mut self, tool: &str, args: &Value) -> Result<String, String> {
+    pub fn call(&self, tool: &str, args: &Value) -> Result<String, String> {
         let name = args["name"].as_str().unwrap_or("").trim();
         let limit = args["limit"].as_u64().map_or(DEFAULT_LIMIT, |n| (n as usize).clamp(1, MAX_LIMIT));
         let needs_name = !matches!(tool, "search_symbols" | "compiled_lines");
@@ -645,7 +643,7 @@ impl Server {
         let Some(facts) = self.session.facts_of(&file) else {
             return Err(format!("{file} is not indexed: not a C or C++ source or header of the project, or outside the folders it is said to be."));
         };
-        let (project, automatic) = si_core::cond::Project::load_told(&self.root);
+        let (project, automatic) = si_core::cond::Project::load_told(self.root);
         let mut out = match &project.active {
             Some(active) if automatic => format!("Configuration in force: {active} (found in the project's build files).\n"),
             Some(active) => format!("Configuration in force: {active}.\n"),
@@ -722,7 +720,7 @@ impl Index {
     fn get(&mut self, root: &Path) -> Option<&mut Server> {
         if let Index::Opening(rx) = self {
             *self = match rx.recv() {
-                Ok(((session, _), watch)) => Index::Ready(Box::new(Server::new(root.to_path_buf(), session, watch))),
+                Ok(((session, _), watch)) => Index::Ready(Box::new(Server { root: root.to_path_buf(), session, watch, synced: Instant::now() })),
                 Err(_) => Index::Failed,
             };
         }
@@ -733,12 +731,48 @@ impl Index {
     }
 }
 
-fn reply(out: &mut impl Write, id: &Value, result: Result<Value, (i64, String)>) {
-    let msg = match result {
+fn reply(id: &Value, result: Result<Value, (i64, String)>) -> Value {
+    match result {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
         Err((code, message)) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }),
+    }
+}
+
+/// The answer to one message of the protocol, if it asks for one; `call`
+/// runs a tool.
+pub fn message(msg: &Value, root: &Path, call: impl FnOnce(&str, &Value) -> Result<String, String>) -> Option<Value> {
+    // A notification (`notifications/initialized`, `…/cancelled`) asks
+    // for no answer, and none of them for anything to be done.
+    let id = msg.get("id").filter(|_| msg.get("method").is_some())?;
+    let params = &msg["params"];
+    let result = match msg["method"].as_str().unwrap_or("") {
+        "initialize" => {
+            let asked = params["protocolVersion"].as_str().unwrap_or("");
+            let version = VERSIONS.iter().find(|&&v| v == asked).unwrap_or(VERSIONS.last().unwrap());
+            Ok(json!({
+                "protocolVersion": version,
+                "capabilities": { "tools": { "listChanged": false } },
+                "serverInfo": { "name": "norn", "title": "Norn", "version": env!("CARGO_PKG_VERSION") },
+                "instructions": instructions(root),
+            }))
+        }
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({ "tools": tools() })),
+        "tools/call" => {
+            let tool = params["name"].as_str().unwrap_or("");
+            if !tools().as_array().unwrap().iter().any(|t| t["name"] == tool) {
+                Err((-32602, format!("unknown tool `{tool}`")))
+            } else {
+                let (text, is_error) = match call(tool, &params["arguments"]) {
+                    Ok(text) => (text, false),
+                    Err(text) => (text, true),
+                };
+                Ok(json!({ "content": [{ "type": "text", "text": text.trim_end() }], "isError": is_error }))
+            }
+        }
+        method => Err((-32601, format!("{method} is not supported"))),
     };
-    let _ = writeln!(out, "{msg}").and_then(|_| out.flush());
+    Some(reply(id, result))
 }
 
 pub fn run(root: &Path, open: impl FnOnce(&Path) -> (Session, Update) + Send + 'static) {
@@ -764,48 +798,19 @@ pub fn run(root: &Path, open: impl FnOnce(&Path) -> (Session, Update) + Send + '
             continue;
         }
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-            reply(&mut out, &Value::Null, Err((-32700, "not JSON".into())));
+            let _ = writeln!(out, "{}", reply(&Value::Null, Err((-32700, "not JSON".into())))).and_then(|_| out.flush());
             continue;
         };
-        // A notification (`notifications/initialized`, `…/cancelled`) asks
-        // for no answer, and none of them for anything to be done.
-        let Some(id) = msg.get("id").filter(|_| msg.get("method").is_some()) else { continue };
-        let params = &msg["params"];
-        let result = match msg["method"].as_str().unwrap_or("") {
-            "initialize" => {
-                let asked = params["protocolVersion"].as_str().unwrap_or("");
-                let version = VERSIONS.iter().find(|&&v| v == asked).unwrap_or(VERSIONS.last().unwrap());
-                Ok(json!({
-                    "protocolVersion": version,
-                    "capabilities": { "tools": { "listChanged": false } },
-                    "serverInfo": { "name": "norn", "title": "Norn", "version": env!("CARGO_PKG_VERSION") },
-                    "instructions": instructions(&root),
-                }))
+        let answer = message(&msg, &root, |tool, args| match index.get(&root) {
+            Some(server) => {
+                server.sync();
+                Tools::new(&server.root, &server.session).call(tool, args)
             }
-            "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": tools() })),
-            "tools/call" => {
-                let tool = params["name"].as_str().unwrap_or("");
-                if !tools().as_array().unwrap().iter().any(|t| t["name"] == tool) {
-                    Err((-32602, format!("unknown tool `{tool}`")))
-                } else {
-                    let answer = match index.get(&root) {
-                        Some(server) => {
-                            server.sync();
-                            server.call(tool, &params["arguments"])
-                        }
-                        None => Err("The index could not be made; see the server's error output.".into()),
-                    };
-                    let (text, is_error) = match answer {
-                        Ok(text) => (text, false),
-                        Err(text) => (text, true),
-                    };
-                    Ok(json!({ "content": [{ "type": "text", "text": text.trim_end() }], "isError": is_error }))
-                }
-            }
-            method => Err((-32601, format!("{method} is not supported"))),
-        };
-        reply(&mut out, id, result);
+            None => Err("The index could not be made; see the server's error output.".into()),
+        });
+        if let Some(answer) = answer {
+            let _ = writeln!(out, "{answer}").and_then(|_| out.flush());
+        }
     }
     // The graph as it is now, for the next start to begin with.
     if let Index::Ready(server) = &mut index {

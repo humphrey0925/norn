@@ -93,3 +93,24 @@ fn a_request_before_the_index_is_ready_does_not_break_one_after() {
     assert!(hover.to_string().contains("add_one"), "{hover}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn an_agents_tool_asked_through_the_editor_waits_for_the_index() {
+    let dir = std::env::temp_dir().join(format!("norn-lsp-mcp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.c"), "struct ops { int (*run)(void); };\nint go(void) { return 1; }\nstruct ops o = { .run = go };\nint main(void) { return o.run(); }\n").unwrap();
+
+    let mut s = Server::start(&dir);
+    s.ask(0, "initialize", json!({ "rootUri": null, "capabilities": {} })).expect("initialize");
+    s.send(json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }));
+    // Asked at once: answered once the index is there, from it.
+    let call = json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": { "name": "find_callers", "arguments": { "name": "go" } } });
+    let answer = s.ask(1, "si/mcp", call).expect("an answer");
+    assert_eq!(answer["id"], 7, "{answer}");
+    let text = answer["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("a.c:4  in main — through member `run`"), "{answer}");
+    // A notification has no answer.
+    let none = s.ask(2, "si/mcp", json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).expect("the server answers");
+    assert!(none.is_null(), "{none}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

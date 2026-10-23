@@ -18,7 +18,7 @@ is in [the command line manual](cli.md#lsp); the queries without LSP are in
   [`si/counterpart`](#sicounterpart), [`si/conditions`](#siconditions),
   [`si/setConditions`](#sisetconditions), [`si/scope`](#siscope),
   [`si/setScope`](#sisetscope), [`si/sync`](#sisync),
-  [`si/status`](#sistatus)
+  [`si/status`](#sistatus), [`si/mcp`](#simcp)
 - [Notifications from the server](#notifications-from-the-server)
 - [`.norn/config.json`](#nornconfigjson)
 - [Commands other VS Code extensions can call](#commands-other-vs-code-extensions-can-call)
@@ -516,6 +516,21 @@ What the index holds. Params: `{}`.
 | `loaded`, `parsed` | At start: files read back from the last run's save, and files parsed (both 0 until [`si/ready`](#siready)) |
 | `loading` | `true` until the index is there |
 | `cache` | Where the index is kept between runs, or `null` with `--no-cache` |
+
+### `si/mcp`
+
+One message of the [Model Context Protocol](https://modelcontextprotocol.io),
+answered from this index: what `norn mcp` answers (see
+[the command line](cli.md#mcp)), for an editor that serves the index's tools
+to agents from the server it already runs. Params: the message, as JSON-RPC
+(`initialize`, `tools/list`, `tools/call`, `ping`, or a notification). The
+result is the answer to it, as JSON-RPC, or `null` for a notification.
+
+```json
+{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "find_callers", "arguments": {"name": "uart_send"}}}
+```
+
+A `tools/call` waits while the index is still loading; the rest do not.
 
 ## Notifications from the server
 

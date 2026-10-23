@@ -212,20 +212,14 @@ Keil、IAR、Eclipse、Visual Studio 專案、`compile_commands.json`…）改�
 清單最多列出 100 筆，除非 agent 要求更多（`limit`），並會說明總共有幾筆。一個名稱有多個定義時，
 每個定義都會回答；用 `file` 可以只選其中一個。
 
+在 VS Code 裡什麼都不用設定：擴充套件會把同樣的工具提供給 VS Code 管理 MCP 伺服器的 agent（Copilot
+的 agent 模式），由它已經在執行的語言伺服器回答。所以 agent 用的就是編輯器手上的那份索引，跟編輯器一樣
+保持最新，不會多建第二份索引（需要 VS Code 1.101 以上；`norn.mcp.enabled` 可以關掉）。
+
 Claude Code，在專案的資料夾裡：
 
 ```sh
-claude mcp add norn -- norn mcp
-```
-
-VS Code（`.vscode/mcp.json`）：
-
-```json
-{
-  "servers": {
-    "norn": { "type": "stdio", "command": "norn", "args": ["mcp", "${workspaceFolder}"] }
-  }
-}
+claude mcp add norn -- norn mcp "$PWD"
 ```
 
 其他工具：指令是 `norn`，參數是 `mcp` 和專案的資料夾。

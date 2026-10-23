@@ -7,7 +7,9 @@
 // view can be locked so it stops following.
 
 import * as cp from "child_process";
+import * as crypto from "crypto";
 import * as fs from "fs";
+import * as http from "http";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
@@ -2221,7 +2223,98 @@ Norn ${version()} · server: ${serverPath() === bundledServer() ? "built in" : s
     }),
     { dispose: () => void client?.stop() },
   );
+  agentTools(context);
   await start();
+}
+
+/** The index's tools for AI agents in VS Code (Copilot's agent mode, and any
+ *  other VS Code gives MCP servers to): an MCP server that hands each message
+ *  to the language server already running (`si/mcp`), so an agent is answered
+ *  from the index the editor has, kept up to date as the editor keeps it, with
+ *  no second index and nothing to set up. It listens on this machine only, at
+ *  an address made up at each start that only VS Code is told.
+ *  (VS Code 1.101 and later; none before.) */
+function agentTools(context: vscode.ExtensionContext): void {
+  type Provider = { onDidChangeMcpServerDefinitions: vscode.Event<void>; provideMcpServerDefinitions: () => Promise<unknown[]> };
+  type Lm = { registerMcpServerDefinitionProvider?: (id: string, provider: Provider) => vscode.Disposable };
+  type HttpDefinition = new (label: string, uri: vscode.Uri, headers?: Record<string, string>, version?: string) => unknown;
+  const api = vscode as unknown as { lm?: Lm; McpHttpServerDefinition?: HttpDefinition };
+  const Definition = api.McpHttpServerDefinition;
+  if (!api.lm?.registerMcpServerDefinitionProvider || !Definition) {
+    return;
+  }
+  const secret = crypto.randomBytes(16).toString("hex");
+  const route = `/mcp/${secret}`;
+
+  type Message = { jsonrpc?: string; id?: string | number | null; method?: string };
+  /** The answer to one message, or null for a notification or a response. */
+  const forward = async (msg: Message): Promise<unknown> => {
+    const request = msg.method !== undefined && msg.id !== undefined;
+    if (!client || !client.isRunning()) {
+      return request ? { jsonrpc: "2.0", id: msg.id, error: { code: -32002, message: "Norn's language server is not running." } } : null;
+    }
+    try {
+      return await client.sendRequest<unknown>("si/mcp", msg);
+    } catch (e) {
+      return request ? { jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: String(e) } } : null;
+    }
+  };
+  const serve = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
+    if (req.url !== route) {
+      res.writeHead(404).end();
+      return;
+    }
+    // (No stream of messages from the server: it has none to send.)
+    if (req.method !== "POST") {
+      res.writeHead(405, { Allow: "POST" }).end();
+      return;
+    }
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(chunk as Buffer);
+    }
+    let body: Message | Message[];
+    try {
+      body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Message | Message[];
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "not JSON" } }));
+      return;
+    }
+    const answers = (await Promise.all((Array.isArray(body) ? body : [body]).map(forward))).filter((a) => a !== null && a !== undefined);
+    if (answers.length === 0) {
+      res.writeHead(202).end();
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(Array.isArray(body) ? answers : answers[0]));
+  };
+  let address: Promise<string> | undefined;
+  const listen = (): Promise<string> =>
+    (address ??= new Promise<string>((resolve, reject) => {
+      const server = http.createServer((req, res) => void serve(req, res).catch(() => res.writeHead(500).end()));
+      server.on("error", reject);
+      server.listen(0, "127.0.0.1", () => resolve(`http://127.0.0.1:${(server.address() as { port: number }).port}${route}`));
+      context.subscriptions.push({ dispose: () => server.close() });
+    }));
+  const changed = new vscode.EventEmitter<void>();
+  context.subscriptions.push(
+    changed,
+    api.lm.registerMcpServerDefinitionProvider("norn", {
+      onDidChangeMcpServerDefinitions: changed.event,
+      provideMcpServerDefinitions: async () => {
+        if (!vscode.workspace.getConfiguration("norn").get<boolean>("mcp.enabled", true) || !vscode.workspace.workspaceFolders?.length) {
+          return [];
+        }
+        return [new Definition("Norn", vscode.Uri.parse(await listen()), undefined, version())];
+      },
+    }),
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("norn.mcp.enabled")) {
+        changed.fire();
+      }
+    }),
+    // (For the tests: where an agent is answered.)
+    vscode.commands.registerCommand("norn.mcp.address", () => listen()),
+  );
 }
 
 export async function deactivate() {

@@ -501,6 +501,7 @@ Search for `norn` in VS Code's settings.
 | `norn.serverPath` | empty | Empty uses the indexer inside the extension. Give a full path only to use one you built |
 | `norn.cache.enabled` | on | Keep the index on disk, so that a reopened workspace only reads what changed |
 | `norn.cache.directory` | empty | Where the index is kept; empty is `.norn/cache` in the workspace |
+| `norn.mcp.enabled` | on | Offer the index's tools to AI agents in VS Code, such as Copilot's agent mode (an MCP server on this machine only, answered from the same index; VS Code 1.101 or later) |
 | `norn.codeLens.enabled` | on | The line above each function with its callers and callees |
 | `norn.relation.click` | auto | What one click on a Relation row does. auto: a reference is shown in Context, anything else opens; context: everything is shown in Context, a double click opens; editor: everything opens |
 | `norn.conditions.followBuildConfig` | on | With no set of its own, follow the first build configuration found in the workspace. Off: no compile conditions until you choose some |

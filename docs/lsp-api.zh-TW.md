@@ -17,7 +17,7 @@
   [`si/counterpart`](#sicounterpart)、[`si/conditions`](#siconditions)、
   [`si/setConditions`](#sisetconditions)、[`si/scope`](#siscope)、
   [`si/setScope`](#sisetscope)、[`si/sync`](#sisync)、
-  [`si/status`](#sistatus)
+  [`si/status`](#sistatus)、[`si/mcp`](#simcp)
 - [伺服器送出的通知](#伺服器送出的通知)
 - [`.norn/config.json`](#nornconfigjson)
 - [其他 VS Code 擴充套件可呼叫的指令](#其他-vs-code-擴充套件可呼叫的指令)
@@ -463,6 +463,19 @@ VS Code 擴充套件在已安裝 C/C++ 擴充套件、且其 IntelliSense 引擎
 | `loaded`、`parsed` | 啟動時：從上次執行的存檔讀回的檔案數，以及解析的檔案數（在 [`si/ready`](#siready) 之前兩者都是 0） |
 | `loading` | 索引就緒前為 `true` |
 | `cache` | 索引在多次執行之間存放的位置；使用 `--no-cache` 時為 `null` |
+
+### `si/mcp`
+
+一則 [Model Context Protocol](https://modelcontextprotocol.io) 訊息，用這份索引回答：回答內容與
+`norn mcp` 相同（見[命令列手冊](cli.zh-TW.md#mcp)），給已經在執行這個伺服器的編輯器，用它把索引的工具
+提供給 agent。參數：該則 JSON-RPC 訊息（`initialize`、`tools/list`、`tools/call`、`ping` 或通知）。
+結果是對它的 JSON-RPC 回應；通知則為 `null`。
+
+```json
+{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "find_callers", "arguments": {"name": "uart_send"}}}
+```
+
+索引還在載入時，`tools/call` 會等它載入完成，其他訊息則不等。
 
 ## 伺服器送出的通知
 

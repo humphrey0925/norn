@@ -414,4 +414,24 @@ export async function run(): Promise<void> {
     const s = await vscode.commands.executeCommand<vscode.SymbolInformation[]>("vscode.executeWorkspaceSymbolProvider", "si_probe");
     return s?.some((x) => x.name === "si_probe");
   });
+
+  // An agent's tools (MCP), answered by the same server from the same
+  // index: what was just saved is there.
+  const address = await vscode.commands.executeCommand<string | undefined>("norn.mcp.address");
+  assert.ok(address, "VS Code without the MCP API");
+  const post = async (body: unknown) => {
+    const r = await fetch(address, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" }, body: JSON.stringify(body) });
+    return { status: r.status, body: r.status === 200 ? ((await r.json()) as { result?: { protocolVersion?: string; tools?: unknown[]; content?: { text: string }[]; isError?: boolean } }) : undefined };
+  };
+  const init = await post({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {} } });
+  assert.strictEqual(init.body?.result?.protocolVersion, "2025-06-18", JSON.stringify(init));
+  assert.strictEqual((await post({ jsonrpc: "2.0", method: "notifications/initialized" })).status, 202);
+  const toolList = await post({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+  assert.ok((toolList.body?.result?.tools?.length ?? 0) >= 8, JSON.stringify(toolList));
+  const found = await post({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "find_definition", arguments: { name: "si_probe" } } });
+  assert.ok(/si_probe \(function, bfd\/bfdio\.c:\d+\)/.test(found.body?.result?.content?.[0].text ?? ""), JSON.stringify(found));
+  const callers = await post({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "find_callers", arguments: { name: "bfd_set_error", limit: 5 } } });
+  assert.ok(/calls? of bfd_set_error/.test(callers.body?.result?.content?.[0].text ?? ""), JSON.stringify(callers));
+  // Elsewhere on the port: nothing.
+  assert.strictEqual((await fetch(address.replace(/\/mcp\/.*/, "/mcp/x"), { method: "POST", body: "{}" })).status, 404);
 }

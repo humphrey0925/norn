@@ -239,20 +239,16 @@ Lists stop at 100 results unless the agent asks for more (`limit`), and say
 how many there are. A name with several definitions answers for each; `file`
 chooses one.
 
+In VS Code there is nothing to set up: the extension offers the same tools
+to the agents VS Code serves MCP servers to (Copilot's agent mode), from the
+language server it already runs, so an agent is answered from the index the
+editor has, kept up to date as the editor keeps it, with no second index
+(VS Code 1.101 or later; `norn.mcp.enabled` turns it off).
+
 Claude Code, in the project's folder:
 
 ```sh
-claude mcp add norn -- norn mcp
-```
-
-VS Code (`.vscode/mcp.json`):
-
-```json
-{
-  "servers": {
-    "norn": { "type": "stdio", "command": "norn", "args": ["mcp", "${workspaceFolder}"] }
-  }
-}
+claude mcp add norn -- norn mcp "$PWD"
 ```
 
 Any other client: the command `norn`, with the arguments `mcp` and the
