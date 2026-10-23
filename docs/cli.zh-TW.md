@@ -1,13 +1,13 @@
 # `norn` 命令列手冊
 
 `norn` 是 VS Code 擴充套件在背後執行的索引程式，也可以單獨使用：不用編譯就能替
-C 原始碼建索引，查詢符號和呼叫關係，提供給腳本和編輯器使用，也能把找到的全部列出來。
+C 原始碼建索引，查詢符號和呼叫關係，提供給腳本、編輯器和 AI agent 使用，也能把找到的全部列出來。
 [English](cli.md)
 
 - [安裝](#安裝)
 - [五個指令上手](#五個指令上手)
 - [指令](#指令)：[`index`](#index)、[`query`](#query)、[`serve`](#serve)、
-  [`live`](#live)、[`lsp`](#lsp)、[`symbols`](#symbols)、[`calls`](#calls)、
+  [`live`](#live)、[`lsp`](#lsp)、[`mcp`](#mcp)、[`symbols`](#symbols)、[`calls`](#calls)、
   [`sample`](#sample)、[`bench-query`](#bench-query)、[`bench-incr`](#bench-incr)
 - [結果的格式](#結果的格式)
 - [專案設定](#專案設定)
@@ -182,6 +182,52 @@ args = ["lsp"]
 name = "c"
 language-servers = ["norn"]
 ```
+
+### `mcp`
+
+```
+norn mcp [ROOT] [--cache-dir <DIR> | --no-cache] [--rebuild] [--include-alias <FROM=TO>]...
+```
+
+透過 stdin/stdout 的 [Model Context Protocol](https://modelcontextprotocol.io) 伺服器，給 AI agent
+用：Claude Code、VS Code 的 Copilot、Cursor，以及其他支援 MCP 伺服器的工具。根目錄是目前所在的資料夾，
+除非另外給 `ROOT`。它會立刻回應，同時在背景建索引；第一次呼叫工具時會等索引建好。每個工具回答之前，
+會重新讀取上次呼叫之後在磁碟上改過的檔案，所以 agent 改過的程式碼，下一次呼叫就看得到；索引也像
+`live` 一樣保留到下次執行。
+
+工具以文字回答，讓 agent 閱讀，路徑都相對於根目錄：
+
+| 工具 | 回答 |
+|---|---|
+| `search_symbols` | 名稱符合部分字串的符號：片段順序不拘、字首縮寫、依序出現的字母 |
+| `find_definition` | 名稱在哪裡定義和宣告；給了使用該名稱的檔案和行號時，只回答那個位置看到的定義 |
+| `read_symbol` | 一個定義的原始碼，連同上方的註解，附行號 |
+| `find_callers` | 一個函式的每個呼叫，並標出哪些經由巨集、經由存放它的成員或變數、經由指標，以及哪些不確定 |
+| `find_callees` | 一個函式發出的每個呼叫，包括經由成員或變數呼叫時，那個成員或變數可能存放的函式 |
+| `find_references` | 一個符號的每個使用處 |
+| `call_tree` | 一個函式往下呼叫到哪些函式，或有哪些函式呼叫到它，幾層深 |
+| `compiled_lines` | 一個檔案的哪些行在建置設定下會編譯，或某一行是否會編譯 |
+
+清單最多列出 100 筆，除非 agent 要求更多（`limit`），並會說明總共有幾筆。一個名稱有多個定義時，
+每個定義都會回答；用 `file` 可以只選其中一個。
+
+Claude Code，在專案的資料夾裡：
+
+```sh
+claude mcp add norn -- norn mcp
+```
+
+VS Code（`.vscode/mcp.json`）：
+
+```json
+{
+  "servers": {
+    "norn": { "type": "stdio", "command": "norn", "args": ["mcp", "${workspaceFolder}"] }
+  }
+}
+```
+
+其他工具：指令是 `norn`，參數是 `mcp` 和專案的資料夾。
 
 ### `symbols`
 

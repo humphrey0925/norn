@@ -1,0 +1,699 @@
+//! `norn mcp`: the index as a Model Context Protocol server, over
+//! stdin/stdout, for AI agents (Claude Code, Cursor, Copilot and others).
+//!
+//! The same answers as `live`, as tools an agent calls by name, written as
+//! text for it to read: where a name is defined, who calls a function and
+//! how (through a macro, a member or variable holding it, a pointer), what
+//! it calls, the source of a definition, and which lines the build
+//! compiles. One JSON-RPC message a line each way.
+
+use serde_json::{json, Value};
+use si_core::graph::{Graph, Qualifier};
+use si_core::model::{flag, kind, refkind};
+use si_core::session::{Session, Update};
+use std::fmt::Write as _;
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// The protocol versions this server speaks, the latest last.
+const VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+
+/// Results listed for one call unless the agent asks for more, and at most.
+const DEFAULT_LIMIT: usize = 100;
+const MAX_LIMIT: usize = 2000;
+
+/// Lines of source shown for one definition at most.
+const MAX_SOURCE_LINES: u32 = 400;
+
+/// The tree is looked at again for files changed on disk before a tool
+/// answers, unless it was this recently: an agent edits files between its
+/// calls, and nothing tells the server.
+const SYNC_AFTER: Duration = Duration::from_millis(500);
+
+fn tools() -> Value {
+    let name = json!({ "type": "string", "description": "The symbol's name as written in the code, e.g. `uart_send`." });
+    let file = json!({ "type": "string", "description": "Only the definitions in this file (path relative to the project root), when the name has several." });
+    let limit = json!({ "type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "description": format!("Most results to list (default {DEFAULT_LIMIT}).") });
+    let read_only = json!({ "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false });
+    json!([
+        {
+            "name": "search_symbols",
+            "title": "Search symbols",
+            "description": "Find functions, macros, types, variables and other symbols by part of their name: fragments in any order (`uart snd`), initials (`us`), or letters in order. Best matches first. Use it when the exact name is not known.",
+            "inputSchema": { "type": "object", "properties": {
+                "query": { "type": "string", "description": "What to look for: one or more fragments of the name." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Most results to list (default 30)." },
+            }, "required": ["query"] },
+            "annotations": read_only,
+        },
+        {
+            "name": "find_definition",
+            "title": "Find definition",
+            "description": "Where a symbol is defined and declared. Given the file and line where the name is used, only the definition that place sees (as Go to Definition does), where there are several.",
+            "inputSchema": { "type": "object", "properties": {
+                "name": name,
+                "file": { "type": "string", "description": "The file the name is used in (relative to the project root)." },
+                "line": { "type": "integer", "minimum": 1, "description": "The line of `file` the name is used on, the first being 1." },
+            }, "required": ["name"] },
+            "annotations": read_only,
+        },
+        {
+            "name": "read_symbol",
+            "title": "Read a symbol's source",
+            "description": "The source of a definition (a function's body, a struct's members, a macro's value), with the comment above it, without reading the whole file. Lines are numbered.",
+            "inputSchema": { "type": "object", "properties": { "name": name, "file": file }, "required": ["name"] },
+            "annotations": read_only,
+        },
+        {
+            "name": "find_callers",
+            "title": "Find callers",
+            "description": "Every call of a function: the calling function and the line of the call. Includes calls a macro makes and calls through function pointers stored in struct members or variables, which a text search cannot find; each says how it comes about, and calls that depend on an #if the configuration does not settle are marked uncertain.",
+            "inputSchema": { "type": "object", "properties": { "name": name, "file": file, "limit": limit }, "required": ["name"] },
+            "annotations": read_only,
+        },
+        {
+            "name": "find_callees",
+            "title": "Find callees",
+            "description": "Every call a function makes, including the functions reached through a struct member or variable that holds them (each that can be stored there), with the line of each call.",
+            "inputSchema": { "type": "object", "properties": { "name": name, "file": file, "limit": limit }, "required": ["name"] },
+            "annotations": read_only,
+        },
+        {
+            "name": "find_references",
+            "title": "Find references",
+            "description": "Every place a symbol is used: called, read or written, or a function stored in a member or variable. Each with the function (or file) it is in and the line.",
+            "inputSchema": { "type": "object", "properties": { "name": name, "file": file, "limit": limit }, "required": ["name"] },
+            "annotations": read_only,
+        },
+        {
+            "name": "call_tree",
+            "title": "Call tree",
+            "description": "The functions a function reaches through calls (`callees`), or the functions that reach it (`callers`), a few levels deep, as an indented tree. Calls through macros and function pointers included.",
+            "inputSchema": { "type": "object", "properties": {
+                "name": name,
+                "file": file,
+                "direction": { "type": "string", "enum": ["callees", "callers"], "description": "Down the calls (default) or up them." },
+                "depth": { "type": "integer", "minimum": 1, "maximum": 6, "description": "Levels to follow (default 2)." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "description": "Most functions to list (default 200)." },
+            }, "required": ["name"] },
+            "annotations": read_only,
+        },
+        {
+            "name": "compiled_lines",
+            "title": "Compiled lines",
+            "description": "Which lines of a file the build compiles, under the build configuration Norn found or was given: the stretches of #if/#ifdef branches switched off, and those under an #if the configuration does not settle. Given a line, whether that line is compiled. Check this before editing code inside #if branches.",
+            "inputSchema": { "type": "object", "properties": {
+                "file": { "type": "string", "description": "The file (relative to the project root)." },
+                "line": { "type": "integer", "minimum": 1, "description": "Only this line, the first being 1." },
+            }, "required": ["file"] },
+            "annotations": read_only,
+        },
+    ])
+}
+
+/// What an agent is told of the server when it starts.
+fn instructions(root: &Path) -> String {
+    format!(
+        "Norn indexes the C and C++ sources under {} without a build: definitions, references, and the call graph, \
+         including calls made by macros and calls through function pointers stored in struct members or variables, \
+         under the #if branches the project's build compiles. Prefer these tools to text search for finding \
+         definitions, callers and callees, and read_symbol to reading whole files. Paths are relative to that folder. \
+         The index follows the files as they change on disk.",
+        root.display()
+    )
+}
+
+/// The index, once it is made, and what is kept to answer from it.
+struct Server {
+    root: PathBuf,
+    session: Session,
+    /// When the tree was last looked at for changes.
+    synced: Instant,
+    /// For each file of the graph: no compilation of the build reads it.
+    unread: Vec<bool>,
+}
+
+impl Server {
+    fn new(root: PathBuf, session: Session) -> Server {
+        let mut s = Server { root, session, synced: Instant::now(), unread: Vec::new() };
+        s.indexed();
+        s
+    }
+
+    fn g(&self) -> &Graph {
+        &self.session.graph
+    }
+
+    /// After the index changed.
+    fn indexed(&mut self) {
+        let readings = si_core::readings_of(self.session.conditions());
+        let unread: std::collections::HashSet<&str> = readings.unread.iter().map(String::as_str).collect();
+        let g = &self.session.graph;
+        self.unread = (0..g.files.len() as u32).map(|f| unread.contains(g.file_path(f))).collect();
+    }
+
+    /// Bring the index in line with the disk, if it was not just now.
+    fn sync(&mut self) {
+        if self.synced.elapsed() < SYNC_AFTER {
+            return;
+        }
+        let up = self.session.sync();
+        if up.changed + up.added + up.removed > 0 {
+            self.indexed();
+        }
+        self.synced = Instant::now();
+    }
+
+    /// `file` as the index names it: relative to the root, with `/`.
+    fn relative(&self, file: &str) -> String {
+        let file = file.replace('\\', "/");
+        let root = self.root.to_string_lossy().replace('\\', "/");
+        let file = file.strip_prefix(root.trim_end_matches('/')).map_or(file.as_str(), |r| r.trim_start_matches('/'));
+        file.trim_start_matches("./").to_string()
+    }
+
+    fn call(&mut self, tool: &str, args: &Value) -> Result<String, String> {
+        let name = args["name"].as_str().unwrap_or("").trim();
+        let limit = args["limit"].as_u64().map_or(DEFAULT_LIMIT, |n| (n as usize).clamp(1, MAX_LIMIT));
+        let needs_name = !matches!(tool, "search_symbols" | "compiled_lines");
+        if needs_name && name.is_empty() {
+            return Err("`name` is required.".into());
+        }
+        match tool {
+            "search_symbols" => self.search(args["query"].as_str().unwrap_or(""), args["limit"].as_u64().map_or(30, |n| (n as usize).clamp(1, 200))),
+            "find_definition" => self.find_definition(name, args["file"].as_str(), args["line"].as_u64()),
+            "read_symbol" => self.read_symbol(name, args["file"].as_str()),
+            "find_callers" => self.callers(name, args["file"].as_str(), limit),
+            "find_callees" => self.callees(name, args["file"].as_str(), limit),
+            "find_references" => self.references(name, args["file"].as_str(), limit),
+            "call_tree" => {
+                let up = args["direction"].as_str() == Some("callers");
+                let depth = args["depth"].as_u64().unwrap_or(2).clamp(1, 6) as u32;
+                let limit = args["limit"].as_u64().map_or(200, |n| (n as usize).clamp(1, MAX_LIMIT));
+                self.call_tree(name, args["file"].as_str(), up, depth, limit)
+            }
+            "compiled_lines" => self.compiled_lines(args["file"].as_str().unwrap_or(""), args["line"].as_u64()),
+            other => Err(format!("No tool named `{other}`.")),
+        }
+    }
+
+    // ------------------------------------------------------------ wording
+
+    fn place(&self, sym: u32) -> String {
+        let s = &self.g().syms[sym as usize];
+        format!("{}:{}", self.g().file_path(s.file), s.line)
+    }
+
+    /// `name (function, src/uart.c:40)`, and what is to be known of it.
+    fn describe(&self, q: &Qualifier, sym: u32) -> String {
+        let g = self.g();
+        let s = &g.syms[sym as usize];
+        let mut out = format!("{} ({}", q.name(g, sym), kind::name(s.kind));
+        if s.flags & flag::DECL != 0 {
+            out.push_str(" declaration");
+        }
+        let _ = write!(out, ", {})", self.place(sym));
+        out.push_str(&self.notes(sym));
+        out
+    }
+
+    /// Whether a symbol is compiled, when that is in doubt.
+    fn notes(&self, sym: u32) -> String {
+        let s = &self.g().syms[sym as usize];
+        if self.unread.get(s.file as usize).copied().unwrap_or(false) {
+            " [in a file the build does not compile]".into()
+        } else if s.flags & flag::CONDITIONAL != 0 {
+            " [under an #if the configuration does not settle]".into()
+        } else {
+            String::new()
+        }
+    }
+
+    /// How a call comes about, when it is not by name.
+    fn how(&self, c: &si_core::Caller, macro_too: bool) -> String {
+        let g = self.g();
+        let mut out = String::new();
+        if let Some(slot) = c.slot {
+            let what = if g.syms[slot as usize].kind == kind::FIELD { "member" } else { "variable" };
+            let _ = write!(out, " — through {what} `{}`, which can hold it", g.sym_name(slot));
+        } else if c.pointer {
+            out.push_str(" — through a pointer that can hold it");
+        }
+        if macro_too {
+            if let Some(m) = c.via.filter(|&m| Some(m) != c.slot) {
+                let _ = write!(out, " — via macro `{}`", g.sym_name(m));
+            }
+        }
+        if c.ambiguous {
+            out.push_str(" [uncertain]");
+        }
+        out
+    }
+
+    /// The symbols named `name` (in `file`, if given): definitions before
+    /// declarations, those the build compiles first. Or why there are none.
+    fn named(&self, name: &str, file: Option<&str>) -> Result<Vec<u32>, String> {
+        let g = self.g();
+        let mut found: Vec<u32> = g.find(name).iter().copied().filter(|&s| g.syms[s as usize].kind != kind::FILE).collect();
+        if found.is_empty() {
+            return Err(self.not_found(name));
+        }
+        if let Some(file) = file.filter(|f| !f.is_empty()) {
+            let file = self.relative(file);
+            found.retain(|&s| g.file_path(g.syms[s as usize].file) == file);
+            if found.is_empty() {
+                return Err(format!("`{name}` is not defined or declared in {file}. It is at: {}.",
+                                   g.find(name).iter().map(|&s| self.place(s)).collect::<Vec<_>>().join(", ")));
+            }
+        }
+        found.sort_by_key(|&s| {
+            let sym = &g.syms[s as usize];
+            (sym.flags & flag::DECL != 0, self.unread[sym.file as usize], sym.flags & flag::CONDITIONAL != 0, s)
+        });
+        Ok(found)
+    }
+
+    /// The functions and the rest among `syms` that calls can be asked of.
+    fn callable(&self, syms: &[u32]) -> Vec<u32> {
+        let g = self.g();
+        let defs: Vec<u32> = syms.iter().copied().filter(|&s| g.syms[s as usize].flags & flag::DECL == 0).collect();
+        if defs.is_empty() { syms.to_vec() } else { defs }
+    }
+
+    fn not_found(&self, name: &str) -> String {
+        let g = self.g();
+        let q = Qualifier::new(g);
+        let like: Vec<String> = si_core::search::search(g, name, 8).iter().map(|&(_, s)| self.describe(&q, s)).collect();
+        if like.is_empty() {
+            format!("No symbol named `{name}` is indexed.")
+        } else {
+            format!("No symbol named `{name}` is indexed. Names like it:\n{}", like.join("\n"))
+        }
+    }
+
+    // ------------------------------------------------------------ the tools
+
+    fn search(&self, query: &str, limit: usize) -> Result<String, String> {
+        if query.trim().is_empty() {
+            return Err("`query` is required.".into());
+        }
+        let g = self.g();
+        let q = Qualifier::new(g);
+        let hits = si_core::search::search(g, query, limit);
+        if hits.is_empty() {
+            return Ok(format!("Nothing matches `{query}`."));
+        }
+        let mut out = format!("{} symbols match `{query}`, best first:\n", hits.len());
+        for &(_, s) in &hits {
+            let _ = writeln!(out, "{}", self.describe(&q, s));
+        }
+        Ok(out)
+    }
+
+    fn find_definition(&self, name: &str, file: Option<&str>, line: Option<u64>) -> Result<String, String> {
+        let g = self.g();
+        let q = Qualifier::new(g);
+        let found = match (file, line) {
+            (Some(file), Some(line)) => {
+                let file = self.relative(file);
+                let mut found = si_core::definition_at(g, &file, line as u32, name);
+                found.retain(|&s| g.syms[s as usize].kind != kind::FILE);
+                found.sort_by_key(|&s| (g.syms[s as usize].flags & flag::DECL != 0, s));
+                if found.is_empty() {
+                    return Err(self.not_found(name));
+                }
+                found
+            }
+            _ => self.named(name, file)?,
+        };
+        let mut out = String::new();
+        for &s in &found {
+            let _ = writeln!(out, "{}", self.describe(&q, s));
+        }
+        Ok(out)
+    }
+
+    fn read_symbol(&self, name: &str, file: Option<&str>) -> Result<String, String> {
+        let g = self.g();
+        let q = Qualifier::new(g);
+        let found = self.named(name, file)?;
+        let shown = self.callable(&found);
+        let mut out = String::new();
+        for &s in shown.iter().take(5) {
+            let sym = &g.syms[s as usize];
+            let path = g.file_path(sym.file);
+            let Ok(text) = std::fs::read(self.root.join(path)) else {
+                let _ = writeln!(out, "{}: the file cannot be read.\n", self.describe(&q, s));
+                continue;
+            };
+            let text = String::from_utf8_lossy(&text);
+            let lines: Vec<&str> = text.lines().collect();
+            let last = sym.end_line.max(sym.line).min(lines.len() as u32);
+            // The comment just above it, if any.
+            let mut first = sym.line;
+            while first > 1 {
+                let above = lines.get(first as usize - 2).map_or("", |l| l.trim());
+                let comment = above.starts_with("//") || above.starts_with("/*") || above.starts_with('*') || above.ends_with("*/");
+                if !comment {
+                    break;
+                }
+                first -= 1;
+            }
+            let end = last.min(first + MAX_SOURCE_LINES - 1);
+            let _ = writeln!(out, "{}:", self.describe(&q, s));
+            for n in first..=end {
+                let _ = writeln!(out, "{n:>6}  {}", lines.get(n as usize - 1).copied().unwrap_or(""));
+            }
+            if end < last {
+                let _ = writeln!(out, "        … {} lines more, to line {last}", last - end);
+            }
+            out.push('\n');
+        }
+        if shown.len() > 5 {
+            let _ = writeln!(out, "{} more definitions of `{name}`; pass `file` to choose one.", shown.len() - 5);
+        }
+        Ok(out)
+    }
+
+    fn callers(&self, name: &str, file: Option<&str>, limit: usize) -> Result<String, String> {
+        let g = self.g();
+        let q = Qualifier::new(g);
+        let targets = self.callable(&self.named(name, file)?);
+        let mut out = String::new();
+        let (mut listed, mut all) = (0, 0);
+        for &t in &targets {
+            let mut calls = si_core::callers_through_macros(g, t);
+            if calls.is_empty() && targets.len() > 1 {
+                continue;
+            }
+            calls.sort_by_key(|c| (g.file_path(g.syms[c.caller as usize].file), c.line, c.caller));
+            all += calls.len();
+            let _ = writeln!(out, "{} of {}:", count(calls.len(), "call", "calls"), self.describe(&q, t));
+            for c in &calls {
+                if listed == limit {
+                    break;
+                }
+                listed += 1;
+                let from = &g.syms[c.caller as usize];
+                let at = format!("{}:{}", g.file_path(from.file), c.line);
+                let who = if from.kind == kind::FILE { "at file level".to_string() } else { format!("in {}", q.name(g, c.caller)) };
+                let _ = writeln!(out, "  {at}  {who}{}{}", self.how(c, true), self.notes(c.caller));
+            }
+            out.push('\n');
+        }
+        self.more(&mut out, listed, limit, all);
+        Ok(out)
+    }
+
+    fn callees(&self, name: &str, file: Option<&str>, limit: usize) -> Result<String, String> {
+        let g = self.g();
+        let q = Qualifier::new(g);
+        let targets = self.callable(&self.named(name, file)?);
+        let mut out = String::new();
+        let (mut listed, mut all) = (0, 0);
+        for &t in &targets {
+            let mut calls = si_core::callees_through_slots(g, t);
+            if calls.is_empty() && targets.len() > 1 {
+                continue;
+            }
+            calls.sort_by_key(|c| (c.line, c.caller));
+            all += calls.len();
+            let _ = writeln!(out, "{} made by {}:", count(calls.len(), "call", "calls"), self.describe(&q, t));
+            let file = g.file_path(g.syms[t as usize].file);
+            for c in &calls {
+                if listed == limit {
+                    break;
+                }
+                listed += 1;
+                let _ = writeln!(out, "  {file}:{}  {}{}", c.line, self.describe(&q, c.caller), self.how(c, false));
+            }
+            out.push('\n');
+        }
+        self.more(&mut out, listed, limit, all);
+        Ok(out)
+    }
+
+    fn references(&self, name: &str, file: Option<&str>, limit: usize) -> Result<String, String> {
+        let g = self.g();
+        let q = Qualifier::new(g);
+        let targets = self.named(name, file)?;
+        let mut out = String::new();
+        let (mut listed, mut all) = (0, 0);
+        if targets.iter().all(|&t| g.refs_to(t).is_empty()) {
+            return Ok(format!("Nothing refers to {}.", self.describe(&q, targets[0])));
+        }
+        for &t in &targets {
+            let refs = g.refs_to(t);
+            if refs.is_empty() && targets.len() > 1 {
+                continue;
+            }
+            all += refs.len();
+            let _ = writeln!(out, "{} to {}:", count(refs.len(), "reference", "references"), self.describe(&q, t));
+            for e in refs {
+                if listed == limit {
+                    break;
+                }
+                listed += 1;
+                let from = &g.syms[e.other as usize];
+                let uncertain = if e.ambiguous() { " [uncertain]" } else { "" };
+                // (Where it is stored is said by the use there, listed too:
+                // this says what holds it.)
+                if e.kind() == refkind::BIND {
+                    let what = if from.kind == kind::FIELD { "member" } else { "variable" };
+                    let _ = writeln!(out, "  stored in {what} `{}` ({}){uncertain}", q.name(g, e.other), self.place(e.other));
+                    continue;
+                }
+                let what = match e.kind() {
+                    refkind::CALL => "called",
+                    refkind::ICALL => "called through it",
+                    refkind::PCALL => "called through a pointer",
+                    refkind::MEMBER => "member used",
+                    _ => "used",
+                };
+                let who = if from.kind == kind::FILE { "at file level".to_string() } else { format!("in {}", q.name(g, e.other)) };
+                let _ = writeln!(out, "  {}:{}  {who}: {what}{uncertain}", g.file_path(from.file), e.line());
+            }
+            out.push('\n');
+        }
+        self.more(&mut out, listed, limit, all);
+        Ok(out)
+    }
+
+    fn call_tree(&self, name: &str, file: Option<&str>, up: bool, depth: u32, limit: usize) -> Result<String, String> {
+        let g = self.g();
+        let q = Qualifier::new(g);
+        let roots = self.callable(&self.named(name, file)?);
+        let mut out = String::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut listed = 0;
+        let mut cut = false;
+        // Depth first, so each function is under what calls it (or what it
+        // calls); one met again is not followed again.
+        for &root in &roots {
+            let _ = writeln!(out, "{}", self.describe(&q, root));
+            seen.insert(root);
+            let mut stack: Vec<(u32, u32, si_core::Caller)> = Vec::new();
+            let next = |s: u32| {
+                let mut v = if up { si_core::callers_through_macros(g, s) } else { si_core::callees_through_slots(g, s) };
+                v.retain(|c| g.syms[c.caller as usize].kind != kind::FILE);
+                v.sort_by_key(|c| (c.line, c.caller));
+                v.dedup_by_key(|c| c.caller);
+                v
+            };
+            stack.extend(next(root).into_iter().rev().map(|c| (c.caller, 1, c)));
+            while let Some((s, level, c)) = stack.pop() {
+                if listed == limit {
+                    cut = true;
+                    break;
+                }
+                listed += 1;
+                let again = !seen.insert(s);
+                let _ = writeln!(out, "{}{} ({}){}{}", "  ".repeat(level as usize), q.name(g, s), self.place(s), self.how(&c, false),
+                                 if again { " (already listed)" } else { "" });
+                if !again && level < depth {
+                    stack.extend(next(s).into_iter().rev().map(|c| (c.caller, level + 1, c)));
+                }
+            }
+            out.push('\n');
+        }
+        if cut {
+            let _ = writeln!(out, "Stopped at {limit} functions; pass a larger `limit` or a smaller `depth`.");
+        }
+        Ok(out)
+    }
+
+    fn compiled_lines(&self, file: &str, line: Option<u64>) -> Result<String, String> {
+        if file.is_empty() {
+            return Err("`file` is required.".into());
+        }
+        let file = self.relative(file);
+        let Some(facts) = self.session.facts_of(&file) else {
+            return Err(format!("{file} is not indexed: not a C or C++ source or header of the project, or outside the folders it is said to be."));
+        };
+        let (project, automatic) = si_core::cond::Project::load_told(&self.root);
+        let mut out = match &project.active {
+            Some(active) if automatic => format!("Configuration in force: {active} (found in the project's build files).\n"),
+            Some(active) => format!("Configuration in force: {active}.\n"),
+            None => "No build configuration: only what the sources themselves #define is known.\n".into(),
+        };
+        let g = self.g();
+        if (0..g.files.len() as u32).any(|f| g.file_path(f) == file && self.unread[f as usize]) {
+            out.push_str("No compilation of the build reads this file.\n");
+        }
+        let text = std::fs::read(self.root.join(&file)).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+        let line_text = |n: u32| text.lines().nth(n as usize - 1).unwrap_or("").trim().to_string();
+        match line {
+            Some(n) => {
+                let n = n as u32;
+                if let Some(&(a, b)) = facts.inactive.iter().find(|&&(a, b)| a <= n && n <= b) {
+                    let _ = writeln!(out, "Line {n} is not compiled: {} in a branch the configuration switches off.",
+                                     if a == b { "it is".to_string() } else { format!("lines {a}–{b} are") });
+                } else if let Some(&(_, _, directive, _)) = facts.undecided.iter().rev().find(|&&(a, b, _, _)| a <= n && n <= b) {
+                    let _ = writeln!(out, "Line {n} may or may not be compiled: it is under `{}` (line {directive}), which the configuration does not settle.",
+                                     line_text(directive));
+                } else {
+                    let _ = writeln!(out, "Line {n} is compiled.");
+                }
+            }
+            None => {
+                if facts.inactive.is_empty() && facts.undecided.is_empty() {
+                    out.push_str("Every line is compiled.\n");
+                }
+                if !facts.inactive.is_empty() {
+                    let _ = writeln!(out, "Not compiled ({}):", count(facts.inactive.len(), "stretch", "stretches"));
+                    for &(a, b) in facts.inactive.iter().take(MAX_LIMIT) {
+                        let _ = writeln!(out, "  {}", lines(a, b));
+                    }
+                }
+                if !facts.undecided.is_empty() {
+                    let _ = writeln!(out, "May or may not be compiled, under an #if the configuration does not settle ({}):",
+                                     count(facts.undecided.len(), "stretch", "stretches"));
+                    for &(a, b, directive, _) in facts.undecided.iter().take(MAX_LIMIT) {
+                        let _ = writeln!(out, "  {}, under `{}` (line {directive})", lines(a, b), line_text(directive));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// A word on what was left out.
+    fn more(&self, out: &mut String, listed: usize, limit: usize, all: usize) {
+        if listed == limit && all > listed {
+            let _ = writeln!(out, "Listed {listed} of {all}; pass a larger `limit`, or `file` to choose one definition.");
+        }
+    }
+}
+
+/// `1 call`, `3 calls`.
+fn count(n: usize, one: &str, more: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { more })
+}
+
+/// `line 8`, `lines 8–12`.
+fn lines(a: u32, b: u32) -> String {
+    if a == b { format!("line {a}") } else { format!("lines {a}–{b}") }
+}
+
+/// The index being made, or made.
+enum Index {
+    Opening(std::sync::mpsc::Receiver<(Session, Update)>),
+    Ready(Box<Server>),
+    Failed,
+}
+
+impl Index {
+    /// The index, waiting for it if it is still being made.
+    fn get(&mut self, root: &Path) -> Option<&mut Server> {
+        if let Index::Opening(rx) = self {
+            *self = match rx.recv() {
+                Ok((session, _)) => Index::Ready(Box::new(Server::new(root.to_path_buf(), session))),
+                Err(_) => Index::Failed,
+            };
+        }
+        match self {
+            Index::Ready(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+fn reply(out: &mut impl Write, id: &Value, result: Result<Value, (i64, String)>) {
+    let msg = match result {
+        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+        Err((code, message)) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }),
+    };
+    let _ = writeln!(out, "{msg}").and_then(|_| out.flush());
+}
+
+pub fn run(root: &Path, open: impl FnOnce(&Path) -> (Session, Update) + Send + 'static) {
+    // (Not `canonicalize`, which on Windows writes `\\?\C:\…`.)
+    let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    // Indexing takes its time: the agent is answered at once, and its
+    // first tool call waits for the index.
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let root = root.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(open(&root));
+        });
+    }
+    let mut index = Index::Opening(rx);
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            reply(&mut out, &Value::Null, Err((-32700, "not JSON".into())));
+            continue;
+        };
+        // A notification (`notifications/initialized`, `…/cancelled`) asks
+        // for no answer, and none of them for anything to be done.
+        let Some(id) = msg.get("id").filter(|_| msg.get("method").is_some()) else { continue };
+        let params = &msg["params"];
+        let result = match msg["method"].as_str().unwrap_or("") {
+            "initialize" => {
+                let asked = params["protocolVersion"].as_str().unwrap_or("");
+                let version = VERSIONS.iter().find(|&&v| v == asked).unwrap_or(VERSIONS.last().unwrap());
+                Ok(json!({
+                    "protocolVersion": version,
+                    "capabilities": { "tools": { "listChanged": false } },
+                    "serverInfo": { "name": "norn", "title": "Norn", "version": env!("CARGO_PKG_VERSION") },
+                    "instructions": instructions(&root),
+                }))
+            }
+            "ping" => Ok(json!({})),
+            "tools/list" => Ok(json!({ "tools": tools() })),
+            "tools/call" => {
+                let tool = params["name"].as_str().unwrap_or("");
+                if !tools().as_array().unwrap().iter().any(|t| t["name"] == tool) {
+                    Err((-32602, format!("unknown tool `{tool}`")))
+                } else {
+                    let answer = match index.get(&root) {
+                        Some(server) => {
+                            server.sync();
+                            server.call(tool, &params["arguments"])
+                        }
+                        None => Err("The index could not be made; see the server's error output.".into()),
+                    };
+                    let (text, is_error) = match answer {
+                        Ok(text) => (text, false),
+                        Err(text) => (text, true),
+                    };
+                    Ok(json!({ "content": [{ "type": "text", "text": text.trim_end() }], "isError": is_error }))
+                }
+            }
+            method => Err((-32601, format!("{method} is not supported"))),
+        };
+        reply(&mut out, id, result);
+    }
+    // The graph as it is now, for the next start to begin with.
+    if let Index::Ready(server) = &mut index {
+        while server.session.save_some(4096) {}
+        server.session.save_graph();
+    }
+}

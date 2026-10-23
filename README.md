@@ -147,7 +147,8 @@ Arm64. The [user guide](docs/norn-guide.md) covers every
 view and setting.
 
 Without VS Code, the same indexer is a command of its own, `norn`, for the
-terminal, scripts, CI and other editors (as a language server): see
+terminal, scripts, CI, other editors (as a language server) and AI agents
+such as Claude Code, Copilot and Cursor (as an MCP server, `norn mcp`): see
 [the command line](docs/cli.md).
 
 ## How it works
@@ -182,7 +183,7 @@ cd vscode && npm ci && npm run compile
 | Path | |
 |---|---|
 | [`crates/si-core`](crates/si-core) | The index: parsing, preprocessor conditions, linking, the stored graph |
-| [`crates/si-cli`](crates/si-cli) | The `norn` executable: `norn lsp` (the language server), `norn index`, `norn query` |
+| [`crates/si-cli`](crates/si-cli) | The `norn` executable: `norn lsp` (the language server), `norn mcp` (for AI agents), `norn index`, `norn query` |
 | [`vscode`](vscode) | The VS Code extension |
 | [`bench`](bench) | Accuracy and speed measurements against clang and other indexers |
 

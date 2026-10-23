@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 mod lsp;
+mod mcp;
 mod mem;
 
 #[global_allocator]
@@ -123,6 +124,17 @@ enum Cmd {
     /// workspace the editor names unless one is given here.
     Lsp {
         /// The source tree (default: the workspace the editor opens).
+        root: Option<PathBuf>,
+        /// `FROM=TO`: an `#include` of a file named FROM reads TO instead. Repeatable.
+        #[arg(long, value_name = "FROM=TO")]
+        include_alias: Vec<String>,
+        #[command(flatten)]
+        keep: Keep,
+    },
+    /// Model Context Protocol server over stdin/stdout, for AI agents: the
+    /// queries as tools, over the sources, kept up to date.
+    Mcp {
+        /// The source tree (default: the current folder).
         root: Option<PathBuf>,
         /// `FROM=TO`: an `#include` of a file named FROM reads TO instead. Repeatable.
         #[arg(long, value_name = "FROM=TO")]
@@ -818,6 +830,11 @@ fn main() {
         }
         Cmd::Live { root, include_alias, keep } => {
             return live(root, keep, &si_core::link::Options { include_aliases: aliases(include_alias), ..Default::default() })
+        }
+        Cmd::Mcp { root, include_alias, keep } => {
+            let options = si_core::link::Options { include_aliases: aliases(include_alias), ..Default::default() };
+            let keep = keep.clone();
+            return mcp::run(root.as_deref().unwrap_or(Path::new(".")), move |dir: &Path| keep.open(dir, &options));
         }
         Cmd::Symbols { dir } => return symbols(dir),
         Cmd::Calls { dir } => return calls(dir),

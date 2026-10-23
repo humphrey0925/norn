@@ -2,13 +2,13 @@
 
 `norn` is the indexer the VS Code extension runs, and a tool of its own: it
 indexes a C tree without a build, answers queries about symbols and calls,
-serves them to scripts and editors, and lists everything it found.
+serves them to scripts, editors and AI agents, and lists everything it found.
 [繁體中文版](cli.zh-TW.md)
 
 - [Installing](#installing)
 - [In five commands](#in-five-commands)
 - [Commands](#commands): [`index`](#index), [`query`](#query),
-  [`serve`](#serve), [`live`](#live), [`lsp`](#lsp), [`symbols`](#symbols),
+  [`serve`](#serve), [`live`](#live), [`lsp`](#lsp), [`mcp`](#mcp), [`symbols`](#symbols),
   [`calls`](#calls), [`sample`](#sample), [`bench-query`](#bench-query),
   [`bench-incr`](#bench-incr)
 - [What a result looks like](#what-a-result-looks-like)
@@ -203,6 +203,57 @@ args = ["lsp"]
 name = "c"
 language-servers = ["norn"]
 ```
+
+### `mcp`
+
+```
+norn mcp [ROOT] [--cache-dir <DIR> | --no-cache] [--rebuild] [--include-alias <FROM=TO>]...
+```
+
+A [Model Context Protocol](https://modelcontextprotocol.io) server on
+stdin/stdout, for AI agents: Claude Code, VS Code's Copilot, Cursor and the
+others that take MCP servers. The root is the current folder, unless `ROOT`
+is given. It answers at once and indexes meanwhile; the first tool called
+waits for the index. Before each tool answers, files changed on disk since
+the last call are read again, so what the agent edits is seen by its next
+call; the index is kept between runs as `live` keeps it.
+
+Its tools answer in text, for the agent to read, with paths relative to the
+root:
+
+| Tool | Answers |
+|---|---|
+| `search_symbols` | Symbols matching part of a name: fragments in any order, initials, letters in order |
+| `find_definition` | Where a name is defined and declared; given the file and line it is used on, the definition that place sees |
+| `read_symbol` | The source of a definition, with the comment above it, numbered |
+| `find_callers` | Every call of a function, saying which come through a macro, a member or variable holding it, or a pointer, and which are uncertain |
+| `find_callees` | Every call a function makes, including the functions a member or variable it calls through can hold |
+| `find_references` | Every use of a symbol |
+| `call_tree` | What a function reaches through calls, or what reaches it, a few levels deep |
+| `compiled_lines` | Which lines of a file the build configuration compiles, or whether one line is |
+
+Lists stop at 100 results unless the agent asks for more (`limit`), and say
+how many there are. A name with several definitions answers for each; `file`
+chooses one.
+
+Claude Code, in the project's folder:
+
+```sh
+claude mcp add norn -- norn mcp
+```
+
+VS Code (`.vscode/mcp.json`):
+
+```json
+{
+  "servers": {
+    "norn": { "type": "stdio", "command": "norn", "args": ["mcp", "${workspaceFolder}"] }
+  }
+}
+```
+
+Any other client: the command `norn`, with the arguments `mcp` and the
+project's folder.
 
 ### `symbols`
 

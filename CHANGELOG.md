@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### For AI agents
+
+- `norn mcp`: a Model Context Protocol server, for Claude Code, VS Code's Copilot, Cursor and other agents. Its tools find definitions, callers and callees (through macros and function pointers stored in members or variables, as the rest of Norn), references, call trees, a definition's source, and which lines the build compiles, answered as text for the agent to read. It reads again the files changed on disk before each answer, and keeps the index between runs as `live` does. See [the command line](docs/cli.md#mcp).
+
 ## 0.25.0
 
 **Kconfig builds read as they are configured, and saving a file of the kernel in seconds**
