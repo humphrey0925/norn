@@ -134,7 +134,7 @@ configuration provider，而不是和它重複。完整功能列表見[擴充套
 說明見[使用指南](docs/norn-guide.zh-TW.md)。
 
 不用 VS Code 時，同一個索引程式也是獨立的指令 `norn`，可在終端機、腳本、CI、其他編輯器（作為
-語言伺服器），以及 Claude Code、Codex、OpenCode、Copilot 等 AI agent（作為 MCP 伺服器，`norn mcp`；`norn setup` 會設定好各個 agent）使用：
+語言伺服器），以及 Claude Code、Codex、OpenCode、Copilot 等 AI agent（作為 MCP 伺服器，`norn mcp`；`norn setup` 會設定好各個 agent，做法見[給 AI agent 用的 Norn](docs/agents.zh-TW.md)）使用：
 見[命令列手冊](docs/cli.zh-TW.md)。
 
 ## 運作原理

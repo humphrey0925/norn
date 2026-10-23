@@ -45,20 +45,36 @@ fn setup_gives_each_agent_the_server_and_takes_it_out_again() {
     assert!(toml.starts_with(codex_before) && toml.contains("[mcp_servers.norn]\ncommand = '") && toml.contains("args = [\"mcp\"]"), "{toml}");
     let json = std::fs::read_to_string(&opencode).unwrap();
     assert!(json.contains("// mine") && json.contains("\"other\"") && json.contains("\"norn\": { \"type\": \"local\""), "{json}");
+    // The skill, where Codex and OpenCode read it.
+    let shared = home.join(".agents").join("skills").join("norn").join("SKILL.md");
+    let skill = std::fs::read_to_string(&shared).unwrap_or_default();
+    assert!(skill.starts_with("---\nname: norn\n") && skill.contains("list_configurations"), "{said}");
 
     // Again: nothing more.
     let (said, ok) = setup(&home, path, &["codex", "opencode"]);
-    assert!(ok && said.matches("already set up").count() == 2, "{said}");
+    assert!(ok && said.matches("already set up").count() == 2 && said.contains("already there"), "{said}");
     assert_eq!(std::fs::read_to_string(&codex).unwrap(), toml);
 
     // Claude Code, with no `claude` to run: by hand.
     let (said, ok) = setup(&home, path, &["claude"]);
     assert!(!ok && said.contains("claude mcp add --scope user norn --"), "{said}");
+    // Its skill, where Claude Code reads it.
+    let claude_skill = home.join(".claude").join("skills").join("norn").join("SKILL.md");
+    assert_eq!(std::fs::read_to_string(&claude_skill).unwrap_or_default(), skill, "{said}");
 
     // Taken out: as they were.
     let (said, ok) = setup(&home, path, &["--remove", "codex", "opencode"]);
     assert!(ok, "{said}");
     assert_eq!(std::fs::read_to_string(&codex).unwrap(), codex_before);
     assert_eq!(std::fs::read_to_string(&opencode).unwrap(), opencode_before);
+    assert!(!shared.exists() && claude_skill.exists(), "{said}");
+
+    // A skill of the user's that happens to be named norn is left alone.
+    std::fs::create_dir_all(shared.parent().unwrap()).unwrap();
+    std::fs::write(&shared, "---\nname: norn\ndescription: the user's own\n---\nmine\n").unwrap();
+    let _ = setup(&home, path, &["codex"]);
+    assert!(std::fs::read_to_string(&shared).unwrap().contains("the user's own"));
+    let _ = setup(&home, path, &["--remove", "codex"]);
+    assert!(shared.exists());
     let _ = std::fs::remove_dir_all(&home);
 }

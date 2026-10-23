@@ -82,6 +82,48 @@ fn run(exe: &Path, args: &[&str]) -> Result<String, String> {
     if out.status.success() { Ok(text) } else { Err(text) }
 }
 
+/// The skill that tells an agent how to go about C and C++ with Norn:
+/// the build configuration first, then the tools rather than grep.
+pub const SKILL: &str = include_str!("../../../skills/norn/SKILL.md");
+
+/// Where the skill is put for `agent`: Claude Code reads `~/.claude/skills`;
+/// Codex, OpenCode and VS Code's Copilot read `~/.agents/skills` (OpenCode
+/// and Copilot read both, and take a skill of one name once).
+fn skill_dir(agent: &str) -> PathBuf {
+    let base = if agent == "claude" { home().join(".claude") } else { home().join(".agents") };
+    base.join("skills").join("norn")
+}
+
+/// Whether the skill at `dir` is Norn's own, of this version or another
+/// (not one of the user's that happens to have its name): by its title,
+/// which every version keeps.
+fn skill_is_ours(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("SKILL.md")).is_ok_and(|t| t.starts_with("---\nname: norn\n") && t.contains("\n# Navigating C and C++ with Norn\n"))
+}
+
+/// Put the skill at `dir`, or take it out (`remove`). Says what it did.
+fn skill(dir: &Path, remove: bool) -> Done {
+    let file = dir.join("SKILL.md");
+    let at = file.display().to_string();
+    let there = std::fs::read_to_string(&file).ok();
+    if remove {
+        if !skill_is_ours(dir) {
+            return Done::NotThere;
+        }
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(dir);
+        return Done::Removed(at);
+    }
+    match there {
+        Some(t) if t == SKILL => Done::Already(at),
+        Some(_) if !skill_is_ours(dir) => Done::ByHand(format!("{at} is a skill of another named norn; left as it is")),
+        _ => match std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&file, SKILL)) {
+            Ok(()) => Done::Set(at),
+            Err(e) => Done::ByHand(format!("write {at} ({e})")),
+        },
+    }
+}
+
 /// What became of one agent.
 pub enum Done {
     Set(String),
@@ -353,6 +395,14 @@ pub fn run_setup(asked: &[String], remove: bool, print: bool, refresh: bool) -> 
                 }
             }
         }
+        // And the skills put there before, as this version has them.
+        for dir in [skill_dir("claude"), skill_dir("codex")] {
+            if skill_is_ours(&dir) {
+                if let Done::Set(at) = skill(&dir, false) {
+                    println!("{at} brought up to date");
+                }
+            }
+        }
         return 0;
     }
     if let Some(other) = asked.iter().find(|a| !AGENTS.contains(&a.as_str())) {
@@ -381,10 +431,19 @@ pub fn run_setup(asked: &[String], remove: bool, print: bool, refresh: bool) -> 
     }
     let agents: Vec<&str> = if asked.is_empty() { AGENTS.to_vec() } else { asked.iter().map(String::as_str).collect() };
     let mut status = 0;
+    // The skill's folders, for the agents set up; and with none named, the
+    // shared one, which VS Code's Copilot reads too.
+    let mut skills: Vec<PathBuf> = Vec::new();
+    if asked.is_empty() {
+        skills.push(skill_dir("codex"));
+    }
     for name in agents {
         if asked.is_empty() && !present(name) {
             println!("{name:<10} not on this machine");
             continue;
+        }
+        if !skills.contains(&skill_dir(name)) {
+            skills.push(skill_dir(name));
         }
         match agent(name, &exe, remove) {
             Done::Set(where_) => println!("{name:<10} set up: {where_}"),
@@ -397,8 +456,37 @@ pub fn run_setup(asked: &[String], remove: bool, print: bool, refresh: bool) -> 
             }
         }
     }
+    for dir in skills {
+        match skill(&dir, remove) {
+            Done::Set(at) => println!("{:<10} written: {at}", "skill"),
+            Done::Already(at) => println!("{:<10} already there: {at}", "skill"),
+            Done::Removed(at) => println!("{:<10} taken out: {at}", "skill"),
+            Done::NotThere => {}
+            Done::ByHand(what) => {
+                println!("{:<10} not written: {what}", "skill");
+                status = 1;
+            }
+        }
+    }
     if !remove {
-        println!("\nAn agent started from now on has Norn's tools; one running now, once it starts again.");
+        println!("\nAn agent started from now on has Norn's tools, and the skill that says to set the build configuration first and use them rather than grep; one running now, once it starts again.");
     }
     status
+}
+
+#[cfg(test)]
+mod tests {
+    /// The skill's description is what an agent decides by whether to load
+    /// it: whole, quoted (an unquoted ` #if` would end it, YAML taking the
+    /// rest for a comment), and short: Claude Code (2.1.309) lists a skill
+    /// whose description is longer than about 125 characters by its name
+    /// alone.
+    #[test]
+    fn the_skills_description_is_read_whole() {
+        let head = super::SKILL.strip_prefix("---\n").and_then(|s| s.split_once("\n---\n")).expect("frontmatter").0;
+        let line = head.lines().find_map(|l| l.strip_prefix("description: ")).expect("a description");
+        let text = line.strip_prefix('"').and_then(|l| l.strip_suffix('"')).expect("quoted");
+        assert!(!text.contains('"') && !text.contains('\\') && text.len() <= 120, "{text}");
+        assert!(head.lines().any(|l| l == "name: norn"));
+    }
 }

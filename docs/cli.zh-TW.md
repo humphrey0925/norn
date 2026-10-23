@@ -189,6 +189,8 @@ language-servers = ["norn"]
 norn mcp [ROOT] [--cache-dir <DIR> | --no-cache] [--rebuild] [--include-alias <FROM=TO>]...
 ```
 
+怎麼設定 agent、agent 該怎麼用：見[給 AI agent 用的 Norn](agents.zh-TW.md)。
+
 透過 stdin/stdout 的 [Model Context Protocol](https://modelcontextprotocol.io) 伺服器，給 AI agent
 用：Claude Code、VS Code 的 Copilot、Cursor，以及其他支援 MCP 伺服器的工具。專案資料夾的決定順序：
 有給 `ROOT` 就用它；否則用工具告知的已開啟資料夾（MCP roots）；再否則用目前所在的資料夾，但如果那是
@@ -218,6 +220,8 @@ Keil、IAR、Eclipse、Visual Studio 專案、`compile_commands.json`…）改�
 | `find_references` | 一個符號的每個使用處 |
 | `call_tree` | 一個函式往下呼叫到哪些函式，或有哪些函式呼叫到它，幾層深 |
 | `compiled_lines` | 一個檔案的哪些行在建置設定下會編譯，或某一行是否會編譯 |
+| `list_configurations` | 有哪些設定組、目前生效的是哪個，以及它定義了什麼 |
+| `switch_configuration` | 讓另一個設定組生效（這是專案的設定，和編輯器共用），並重建索引 |
 
 清單最多列出 100 筆，除非 agent 要求更多（`limit`），並會說明總共有幾筆。一個名稱有多個定義時，
 每個定義都會回答；用 `file` 可以只選其中一個。
@@ -239,6 +243,7 @@ norn setup [claude | codex | opencode]... [--remove | --print | --refresh]
 
 1. 把這個程式放到 `~/.norn/bin/norn`（Windows 為 `norn.exe`），這是不會變動的路徑；那裡已經有同版或更新的版本時就保留它。
 2. 把指定的 agent（沒指定就是這台電腦上找得到的每一個）設定成以 `norn mcp` 啟動它。專案就是 agent 當下工作的那個資料夾。
+3. 把 skill [`norn`](../skills/norn/SKILL.md) 放到 agent 讀取 skill 的地方：`~/.claude/skills/norn/`（Claude Code）和 `~/.agents/skills/norn/`（Codex、OpenCode、VS Code 的 Copilot）。這份 skill 告訴 agent 先設定好設定組，再用這些工具，不要用 grep。使用者自己同名的 skill 不會被動到。
 
 | Agent | 寫在哪裡 |
 |---|---|
@@ -250,9 +255,9 @@ norn setup [claude | codex | opencode]... [--remove | --print | --refresh]
 
 | 選項 | |
 |---|---|
-| `--remove` | 從每個 agent 的設定中移除 Norn |
+| `--remove` | 從每個 agent 的設定中移除 Norn，以及它的 skill |
 | `--print` | 只印出每個 agent 的設定會加入什麼 |
-| `--refresh` | 只在 `~/.norn/bin` 已有副本時把它更新到最新。VS Code 擴充套件每次啟動都會做，所以擴充套件更新後 agent 也會跟著更新 |
+| `--refresh` | 只在 `~/.norn/bin` 的副本和 skill 已經存在時，把它們更新到最新。VS Code 擴充套件每次啟動都會做，所以擴充套件更新後 agent 也會跟著更新 |
 
 在 VS Code 裡：**Norn: Connect AI Agents** 做的是同一件事。Copilot 的 agent 模式不需要這些（見 [`mcp`](#mcp)）。
 

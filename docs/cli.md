@@ -210,6 +210,9 @@ language-servers = ["norn"]
 norn mcp [ROOT] [--cache-dir <DIR> | --no-cache] [--rebuild] [--include-alias <FROM=TO>]...
 ```
 
+How to set agents up and how they should use it:
+[Norn for AI agents](agents.md).
+
 A [Model Context Protocol](https://modelcontextprotocol.io) server on
 stdin/stdout, for AI agents: Claude Code, VS Code's Copilot, Cursor and the
 others that take MCP servers. The project is `ROOT` if given; else the
@@ -248,6 +251,8 @@ root:
 | `find_references` | Every use of a symbol |
 | `call_tree` | What a function reaches through calls, or what reaches it, a few levels deep |
 | `compiled_lines` | Which lines of a file the build configuration compiles, or whether one line is |
+| `list_configurations` | The build configurations, which is in force, and what it defines |
+| `switch_configuration` | Puts another configuration in force (the project's setting, shared with the editor) and re-indexes |
 
 Lists stop at 100 results unless the agent asks for more (`limit`), and say
 how many there are. A name with several definitions answers for each; `file`
@@ -277,6 +282,11 @@ to type for each:
    that does not move: one as new or newer already there is kept.
 2. Sets up each agent named, or each one found on this machine, to start
    it as `norn mcp`. Which project is then the one the agent works in.
+3. Puts the skill [`norn`](../skills/norn/SKILL.md), which tells an agent to
+   set the build configuration first and use the tools rather than grep,
+   where the agents read skills: `~/.claude/skills/norn/` (Claude Code) and
+   `~/.agents/skills/norn/` (Codex, OpenCode, VS Code's Copilot). A skill of
+   the user's own of that name is left alone.
 
 | Agent | Where |
 |---|---|
@@ -290,9 +300,9 @@ starts again.
 
 | Option | |
 |---|---|
-| `--remove` | Take Norn out of each agent's settings |
+| `--remove` | Take Norn out of each agent's settings, and its skill |
 | `--print` | Only print what each agent's settings would get |
-| `--refresh` | Only bring `~/.norn/bin`'s copy up to date, if there is one. The VS Code extension does this at each start, so its updates reach the agents |
+| `--refresh` | Only bring `~/.norn/bin`'s copy and the skills up to date, if they are there. The VS Code extension does this at each start, so its updates reach the agents |
 
 In VS Code: **Norn: Connect AI Agents** does the same. Copilot's agent mode
 needs none of it (see [`mcp`](#mcp)).

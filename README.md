@@ -149,7 +149,7 @@ view and setting.
 Without VS Code, the same indexer is a command of its own, `norn`, for the
 terminal, scripts, CI, other editors (as a language server) and AI agents
 such as Claude Code, Codex, OpenCode and Copilot (as an MCP server, `norn mcp`;
-`norn setup` sets the agents up): see
+`norn setup` sets the agents up, [Norn for AI agents](docs/agents.md) says how): see
 [the command line](docs/cli.md).
 
 ## How it works
