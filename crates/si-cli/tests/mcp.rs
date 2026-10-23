@@ -254,3 +254,41 @@ fn started_in_the_home_folder_it_indexes_only_a_project_it_is_told_of() {
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&run);
 }
+
+#[test]
+fn an_agent_sees_the_configurations_and_switches_to_the_one_its_task_is_about() {
+    let dir = std::env::temp_dir().join(format!("norn-mcp-configurations-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".norn")).unwrap();
+    std::fs::write(
+        dir.join("a.c"),
+        "int uart_a(void) { return 1; }\nint uart_b(void) { return 2; }\nint main(void)\n{\n#ifdef BOARD_A\n    return uart_a();\n#else\n    return uart_b();\n#endif\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".norn").join("config.json"),
+        r#"{"include": [], "exclude": [], "configurations": {"BoardA": {"defines": {"BOARD_A": ""}}, "Generic": {}}, "activeConfiguration": "Generic"}"#,
+    )
+    .unwrap();
+    let mut s = Server::start(&dir);
+    init(&mut s);
+
+    let (listed, _) = s.call(1, "list_configurations", json!({}));
+    assert!(listed.contains("In force: Generic.") && listed.contains("BoardA — defines BOARD_A"), "{listed}");
+    // Nothing settles BOARD_A: either call may be the one compiled, and says so.
+    let (calls, _) = s.call(2, "find_callees", json!({ "name": "main" }));
+    assert!(calls.contains("uart_a") && calls.contains("uart_b") && calls.matches("[maybe not compiled: under the #if at line").count() == 2, "{calls}");
+
+    let (switched, error) = s.call(3, "switch_configuration", json!({ "name": "BoardA" }));
+    assert!(!error && switched.contains("In force now: BoardA"), "{switched}");
+    let (calls, _) = s.call(4, "find_callees", json!({ "name": "main" }));
+    assert!(calls.contains("a.c:6  uart_a") && !calls.contains("uart_b") && !calls.contains("maybe"), "{calls}");
+    let saved = std::fs::read_to_string(dir.join(".norn").join("config.json")).unwrap();
+    assert!(saved.contains("\"activeConfiguration\": \"BoardA\""), "{saved}");
+
+    let (missing, error) = s.call(5, "switch_configuration", json!({ "name": "BoardZ" }));
+    assert!(error && missing.contains("No configuration named `BoardZ`") && missing.contains("Generic"), "{missing}");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(dir.join(".run"));
+}

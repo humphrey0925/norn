@@ -2047,8 +2047,17 @@ impl Server {
             "si/scope" => self.scope(),
             // A message of the Model Context Protocol, which the editor
             // serves to agents: answered from this index (see `crate::mcp`).
-            "si/mcp" => crate::mcp::message(params, Some(&self.root), |tool, args| crate::mcp::Tools::new(&self.root, &self.session).call(tool, args))
-                .unwrap_or(Value::Null),
+            "si/mcp" => {
+                let answer = crate::mcp::message(params, Some(&self.root), |tool, args| crate::mcp::Tools::new(&self.root, &mut self.session).call(tool, args))
+                    .unwrap_or(Value::Null);
+                // Another configuration: what was worked out of the old one goes.
+                if params["params"]["name"] == "switch_configuration" {
+                    self.lines.clear();
+                    self.listing = [None, None];
+                    self.hidden = None;
+                }
+                answer
+            }
             "si/setScope" => {
                 let list = |key: &str| -> Vec<String> {
                     params[key].as_array().into_iter().flatten().filter_map(|v| v.as_str()).map(str::to_string).collect()
@@ -2302,13 +2311,19 @@ pub fn run(
             }
         };
         // An agent's message, answered from this index.
-        let answer = |s: &Server, msg: &Value| {
-            crate::mcp::message(msg, Some(&s.root), |tool, args| crate::mcp::Tools::new(&s.root, &s.session).call(tool, args)).unwrap_or(Value::Null)
+        let answer = |s: &mut Server, msg: &Value| {
+            let answer = crate::mcp::message(msg, Some(&s.root), |tool, args| crate::mcp::Tools::new(&s.root, &mut s.session).call(tool, args)).unwrap_or(Value::Null);
+            if msg["params"]["name"] == "switch_configuration" {
+                s.lines.clear();
+                s.listing = [None, None];
+                s.hidden = None;
+            }
+            answer
         };
         match event {
             Event::Closed => break,
             Event::Held(held) => _held = Some(held),
-            Event::Agent(msg, tx) => match &server {
+            Event::Agent(msg, tx) => match &mut server {
                 Some(s) if !(s.loading && msg["method"] == "tools/call") => {
                     let _ = tx.send(answer(s, &msg));
                 }
@@ -2341,7 +2356,7 @@ pub fn run(
                 for msg in std::mem::take(&mut s.waiting) {
                     handle(&mut server, msg, &mut out);
                 }
-                if let Some(s) = &server {
+                if let Some(s) = &mut server {
                     for (msg, tx) in agents_waiting.drain(..) {
                         let _ = tx.send(answer(s, &msg));
                     }

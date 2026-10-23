@@ -194,6 +194,22 @@ fn tools() -> Value {
             }, "required": ["file"] },
             "annotations": read_only,
         },
+        {
+            "name": "list_configurations",
+            "title": "Build configurations",
+            "description": "The build configurations Norn knows for this project, which one is in force, and what it defines. A configuration decides which #if branches are compiled, and so which definitions, calls and lines the other tools see: a board, a target, Debug or Release. Call this before analysing C/C++ code that depends on such a choice, and switch if the one in force is not the one the task is about.",
+            "inputSchema": { "type": "object", "properties": {} },
+            "annotations": read_only,
+        },
+        {
+            "name": "switch_configuration",
+            "title": "Switch build configuration",
+            "description": "Put another build configuration in force: one of the project's, or one found in its build files (a Keil, IAR, Eclipse or Visual Studio project, a Makefile, CMake, Kconfig...), by the name list_configurations gives. The index is brought in line with it before this answers. It is the project's setting: the editor and other agents of the project see the same; tell the user which one you chose and why.",
+            "inputSchema": { "type": "object", "properties": {
+                "name": { "type": "string", "description": "The configuration's name, as list_configurations gives it." },
+            }, "required": ["name"] },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
+        },
     ])
 }
 
@@ -203,9 +219,13 @@ fn instructions(root: Option<&Path>) -> String {
     format!(
         "Norn indexes the C and C++ sources under {under} without a build: definitions, references, and the call graph, \
          including calls made by macros and calls through function pointers stored in struct members or variables, \
-         under the #if branches the project's build compiles. Prefer these tools to text search for finding \
-         definitions, callers and callees, and read_symbol to reading whole files. Paths are relative to that folder. \
-         The index follows the files as they change on disk."
+         under the #if branches the project's build configuration compiles. For C and C++ symbols use these tools, not \
+         text search: grep finds names, not calls through macros or function pointers, and not which #if branch is \
+         compiled. First establish the build context: list_configurations, and switch_configuration if the one in \
+         force is not the board, target or build the task is about. Then search_symbols or find_definition, read_symbol \
+         rather than reading whole files, find_callers / find_callees / call_tree for relations, and compiled_lines \
+         before editing code inside #if branches. Paths are relative to that folder. The index follows the files as \
+         they change on disk."
     )
 }
 
@@ -259,13 +279,13 @@ impl Server {
 /// (`si/mcp`, for an editor that serves them from the index it has).
 pub struct Tools<'a> {
     root: &'a Path,
-    session: &'a Session,
+    session: &'a mut Session,
     /// For each file of the graph: no compilation of the build reads it.
     unread: Vec<bool>,
 }
 
 impl<'a> Tools<'a> {
-    pub fn new(root: &'a Path, session: &'a Session) -> Tools<'a> {
+    pub fn new(root: &'a Path, session: &'a mut Session) -> Tools<'a> {
         let readings = si_core::readings_of(session.conditions());
         let unread: std::collections::HashSet<&str> = readings.unread.iter().map(String::as_str).collect();
         let g = &session.graph;
@@ -273,7 +293,7 @@ impl<'a> Tools<'a> {
         Tools { root, session, unread }
     }
 
-    fn g(&self) -> &'a Graph {
+    fn g(&self) -> &Graph {
         &self.session.graph
     }
 
@@ -285,10 +305,10 @@ impl<'a> Tools<'a> {
         file.trim_start_matches("./").to_string()
     }
 
-    pub fn call(&self, tool: &str, args: &Value) -> Result<String, String> {
+    pub fn call(&mut self, tool: &str, args: &Value) -> Result<String, String> {
         let name = args["name"].as_str().unwrap_or("").trim();
         let limit = args["limit"].as_u64().map_or(DEFAULT_LIMIT, |n| (n as usize).clamp(1, MAX_LIMIT));
-        let needs_name = !matches!(tool, "search_symbols" | "compiled_lines");
+        let needs_name = !matches!(tool, "search_symbols" | "compiled_lines" | "list_configurations");
         if needs_name && name.is_empty() {
             return Err("`name` is required.".into());
         }
@@ -306,6 +326,8 @@ impl<'a> Tools<'a> {
                 self.call_tree(name, args["file"].as_str(), up, depth, limit)
             }
             "compiled_lines" => self.compiled_lines(args["file"].as_str().unwrap_or(""), args["line"].as_u64()),
+            "list_configurations" => self.configurations(),
+            "switch_configuration" => self.switch_configuration(name),
             other => Err(format!("No tool named `{other}`.")),
         }
     }
@@ -339,6 +361,18 @@ impl<'a> Tools<'a> {
             " [under an #if the configuration does not settle]".into()
         } else {
             String::new()
+        }
+    }
+
+    /// Whether line `line` of file `file` is in doubt: under an #if the
+    /// configuration does not settle (the index has such a line as if it
+    /// were compiled).
+    fn maybe(&self, file: u32, line: u32) -> String {
+        let Some(facts) = self.session.facts_of(self.g().file_path(file)) else { return String::new() };
+        // The innermost branch around the line: the last to start.
+        match facts.undecided.iter().rev().find(|&&(a, b, _, _)| a <= line && line <= b) {
+            Some(&(_, _, directive, _)) => format!(" [maybe not compiled: under the #if at line {directive}]"),
+            None => String::new(),
         }
     }
 
@@ -510,7 +544,7 @@ impl<'a> Tools<'a> {
                 let from = &g.syms[c.caller as usize];
                 let at = format!("{}:{}", g.file_path(from.file), c.line);
                 let who = if from.kind == kind::FILE { "at file level".to_string() } else { format!("in {}", q.name(g, c.caller)) };
-                let _ = writeln!(out, "  {at}  {who}{}{}", self.how(c, true), self.notes(c.caller));
+                let _ = writeln!(out, "  {at}  {who}{}{}{}", self.how(c, true), self.notes(c.caller), self.maybe(from.file, c.line));
             }
             out.push('\n');
         }
@@ -538,7 +572,7 @@ impl<'a> Tools<'a> {
                     break;
                 }
                 listed += 1;
-                let _ = writeln!(out, "  {file}:{}  {}{}", c.line, self.describe(&q, c.caller), self.how(c, false));
+                let _ = writeln!(out, "  {file}:{}  {}{}{}", c.line, self.describe(&q, c.caller), self.how(c, false), self.maybe(g.syms[t as usize].file, c.line));
             }
             out.push('\n');
         }
@@ -584,7 +618,7 @@ impl<'a> Tools<'a> {
                     _ => "used",
                 };
                 let who = if from.kind == kind::FILE { "at file level".to_string() } else { format!("in {}", q.name(g, e.other)) };
-                let _ = writeln!(out, "  {}:{}  {who}: {what}{uncertain}", g.file_path(from.file), e.line());
+                let _ = writeln!(out, "  {}:{}  {who}: {what}{uncertain}{}", g.file_path(from.file), e.line(), self.maybe(from.file, e.line()));
             }
             out.push('\n');
         }
@@ -605,7 +639,8 @@ impl<'a> Tools<'a> {
         for &root in &roots {
             let _ = writeln!(out, "{}", self.describe(&q, root));
             seen.insert(root);
-            let mut stack: Vec<(u32, u32, si_core::Caller)> = Vec::new();
+            // (What is reached, how deep, the call, and the function the call is written in.)
+            let mut stack: Vec<(u32, u32, si_core::Caller, u32)> = Vec::new();
             let next = |s: u32| {
                 let mut v = if up { si_core::callers_through_macros(g, s) } else { si_core::callees_through_slots(g, s) };
                 v.retain(|c| g.syms[c.caller as usize].kind != kind::FILE);
@@ -613,18 +648,19 @@ impl<'a> Tools<'a> {
                 v.dedup_by_key(|c| c.caller);
                 v
             };
-            stack.extend(next(root).into_iter().rev().map(|c| (c.caller, 1, c)));
-            while let Some((s, level, c)) = stack.pop() {
+            let written_in = |reached: u32, from: u32| if up { reached } else { from };
+            stack.extend(next(root).into_iter().rev().map(|c| (c.caller, 1, c, written_in(c.caller, root))));
+            while let Some((s, level, c, site)) = stack.pop() {
                 if listed == limit {
                     cut = true;
                     break;
                 }
                 listed += 1;
                 let again = !seen.insert(s);
-                let _ = writeln!(out, "{}{} ({}){}{}", "  ".repeat(level as usize), q.name(g, s), self.place(s), self.how(&c, false),
-                                 if again { " (already listed)" } else { "" });
+                let _ = writeln!(out, "{}{} ({}){}{}{}", "  ".repeat(level as usize), q.name(g, s), self.place(s), self.how(&c, false),
+                                 self.maybe(g.syms[site as usize].file, c.line), if again { " (already listed)" } else { "" });
                 if !again && level < depth {
-                    stack.extend(next(s).into_iter().rev().map(|c| (c.caller, level + 1, c)));
+                    stack.extend(next(s).into_iter().rev().map(|c| (c.caller, level + 1, c, written_in(c.caller, s))));
                 }
             }
             out.push('\n');
@@ -633,6 +669,106 @@ impl<'a> Tools<'a> {
             let _ = writeln!(out, "Stopped at {limit} functions; pass a larger `limit` or a smaller `depth`.");
         }
         Ok(out)
+    }
+
+    /// The build configurations: which is in force, the project's, those
+    /// found in its build files, and what the one in force defines.
+    fn configurations(&self) -> Result<String, String> {
+        use si_core::cond;
+        let (project, automatic) = cond::Project::load_told(self.root);
+        let mut out = match &project.active {
+            Some(active) if automatic => format!("In force: {active} (followed from the project's build files, as nothing else is set).\n"),
+            Some(active) => format!("In force: {active}.\n"),
+            None => "In force: none. Only what the sources themselves #define is known: a branch nothing settles is indexed both ways, and what is in it is marked as maybe not compiled.\n".into(),
+        };
+        let few = |items: Vec<String>| {
+            let more = items.len().saturating_sub(8);
+            let mut shown = items.into_iter().take(8).collect::<Vec<_>>().join(" ");
+            if more > 0 {
+                let _ = write!(shown, " (+{more} more)");
+            }
+            shown
+        };
+        if !project.configurations.is_empty() {
+            out.push_str("\nThe project's configurations:\n");
+            for (name, s) in &project.configurations {
+                let mut what = Vec::new();
+                if !s.condition_files.is_empty() {
+                    what.push(format!("follows {}", s.condition_files.join(", ")));
+                }
+                if !s.defines.is_empty() {
+                    what.push(format!("defines {}", few(s.defines.iter().map(|(n, v)| if v.is_empty() { n.clone() } else { format!("{n}={v}") }).collect())));
+                }
+                if !s.undefines.is_empty() {
+                    what.push(format!("undefines {}", few(s.undefines.clone())));
+                }
+                let mark = if project.active.as_ref() == Some(name) { "*" } else { " " };
+                let _ = writeln!(out, "  {mark} {name}{}", if what.is_empty() { String::new() } else { format!(" — {}", what.join("; ")) });
+            }
+        }
+        let found: Vec<(String, String)> = cond::discover(self.root)
+            .into_iter()
+            .filter(|(_, source)| !project.configurations.values().any(|s| s.condition_files.contains(source)))
+            .collect();
+        if !found.is_empty() {
+            out.push_str("\nFound in the project's build files, not yet one of its configurations (switch_configuration takes these names too):\n");
+            for (name, source) in found.iter().take(200) {
+                let _ = writeln!(out, "  - {name} ({source})");
+            }
+        }
+        let effective = cond::effective(&project.current(), self.root);
+        if !effective.is_empty() {
+            let shown: Vec<String> = effective
+                .iter()
+                .take(60)
+                .map(|e| match &e.value {
+                    Some(v) if v.is_empty() => e.name.clone(),
+                    Some(v) => format!("{}={v}", e.name),
+                    None => format!("!{}", e.name),
+                })
+                .collect();
+            let first = if effective.len() > 60 { ", the first 60" } else { "" };
+            let _ = writeln!(out, "\nWhat the one in force sets ({} macros{first}; ! is not defined): {}", effective.len(), shown.join(" "));
+        }
+        out.push_str("\nAnother is put in force with switch_configuration and its name; it is the project's setting, the editor's included.\n");
+        Ok(out)
+    }
+
+    /// Put the configuration `name` in force: one of the project's, or one
+    /// found in its build files (then made one of the project's, as the
+    /// editor's Switch Compile Configuration does).
+    fn switch_configuration(&mut self, name: &str) -> Result<String, String> {
+        use si_core::cond;
+        let (mut project, _) = cond::Project::load_told(self.root);
+        if project.configurations.contains_key(name) {
+            if project.active.as_deref() == Some(name) {
+                return Ok(format!("{name} is in force already."));
+            }
+            project.active = Some(name.to_string());
+        } else if let Some((found, source)) = cond::discover(self.root).into_iter().find(|(n, s)| n == name || s == name) {
+            let mut new = found.clone();
+            for n in 2.. {
+                if !project.configurations.contains_key(&new) {
+                    break;
+                }
+                new = format!("{found} {n}");
+            }
+            project.configurations.insert(new.clone(), cond::Settings { condition_files: vec![source], ..Default::default() });
+            project.active = Some(new);
+        } else {
+            return Err(format!("No configuration named `{name}`.\n\n{}", self.configurations()?));
+        }
+        let t = Instant::now();
+        let up = self
+            .session
+            .set_condition_project(&project)
+            .map_err(|e| format!("The configuration could not be saved in {}: {e}", si_core::scope::Scope::config_path(self.root).display()))?;
+        Ok(format!(
+            "In force now: {}. The index is in line with it ({} files read again, {:.1} s).",
+            project.active.unwrap_or_default(),
+            up.extracted,
+            t.elapsed().as_secs_f64()
+        ))
     }
 
     fn compiled_lines(&self, file: &str, line: Option<u64>) -> Result<String, String> {
@@ -898,7 +1034,7 @@ impl Agent {
             }
             Mode::Own { server: Some(server), .. } => {
                 server.sync();
-                let answer = message(&msg, Some(&server.root), |tool, args| Tools::new(&server.root, &server.session).call(tool, args)).unwrap_or(Value::Null);
+                let answer = message(&msg, Some(&server.root), |tool, args| Tools::new(&server.root, &mut server.session).call(tool, args)).unwrap_or(Value::Null);
                 self.send(to, answer);
             }
             Mode::Forward(line) => match line.ask(&msg) {
@@ -1018,10 +1154,13 @@ pub fn run(root: Option<&Path>, open: impl Fn(&Path) -> (Session, Update) + Send
     if let Some(root) = root {
         agent.start(std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf()));
     }
+    // The client gone: what it asked is still answered, once the index is
+    // there to answer it.
+    let mut closed = false;
     for event in inbox {
         match event {
             Ev::Line(line) => agent.line(&line),
-            Ev::Closed => break,
+            Ev::Closed => closed = true,
             Ev::Opened(start, opened) => {
                 let ((session, _), watch) = *opened;
                 if start != agent.starts {
@@ -1036,6 +1175,10 @@ pub fn run(root: Option<&Path>, open: impl Fn(&Path) -> (Session, Update) + Send
             }
             Ev::Asked(crate::share::Asked::Message(msg, tx)) => agent.call(msg, To::Other(tx)),
             Ev::Asked(crate::share::Asked::Yield) => agent.yield_project(),
+        }
+        // (Waiting on the client's roots, nothing more is to come.)
+        if closed && (agent.waiting.is_empty() || matches!(agent.mode, Mode::Unknown) && agent.root.is_none()) {
+            break;
         }
     }
     // The graph as it is now, for the next start to begin with.
