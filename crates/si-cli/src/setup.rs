@@ -98,7 +98,10 @@ fn skill_dir(agent: &str) -> PathBuf {
 /// (not one of the user's that happens to have its name): by its title,
 /// which every version keeps.
 fn skill_is_ours(dir: &Path) -> bool {
-    std::fs::read_to_string(dir.join("SKILL.md")).is_ok_and(|t| t.starts_with("---\nname: norn\n") && t.contains("\n# Navigating C and C++ with Norn\n"))
+    // (Saved with either line ending: an editor on Windows may have.)
+    std::fs::read_to_string(dir.join("SKILL.md"))
+        .map(|t| t.replace("\r\n", "\n"))
+        .is_ok_and(|t| t.starts_with("---\nname: norn\n") && t.contains("\n# Navigating C and C++ with Norn\n"))
 }
 
 /// Put the skill at `dir`, or take it out (`remove`). Says what it did.
@@ -483,6 +486,7 @@ mod tests {
     /// alone.
     #[test]
     fn the_skills_description_is_read_whole() {
+        assert!(!super::SKILL.contains('\r'), "LF only, as .gitattributes has it");
         let head = super::SKILL.strip_prefix("---\n").and_then(|s| s.split_once("\n---\n")).expect("frontmatter").0;
         let line = head.lines().find_map(|l| l.strip_prefix("description: ")).expect("a description");
         let text = line.strip_prefix('"').and_then(|l| l.strip_suffix('"')).expect("quoted");

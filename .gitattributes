@@ -1,2 +1,5 @@
 # Shell scripts run in bash on Windows too (CI): LF however checked out.
 *.sh text eol=lf
+# The skill is built into `norn` and written out as it is: the same bytes
+# from every checkout.
+skills/** text eol=lf

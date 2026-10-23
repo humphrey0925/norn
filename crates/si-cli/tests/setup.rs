@@ -69,6 +69,12 @@ fn setup_gives_each_agent_the_server_and_takes_it_out_again() {
     assert_eq!(std::fs::read_to_string(&opencode).unwrap(), opencode_before);
     assert!(!shared.exists() && claude_skill.exists(), "{said}");
 
+    // Norn's own, saved again with Windows line endings, is still known as Norn's.
+    std::fs::create_dir_all(shared.parent().unwrap()).unwrap();
+    std::fs::write(&shared, skill.replace('\n', "\r\n")).unwrap();
+    let (said, _) = setup(&home, path, &["--remove", "codex"]);
+    assert!(!shared.exists(), "{said}");
+
     // A skill of the user's that happens to be named norn is left alone.
     std::fs::create_dir_all(shared.parent().unwrap()).unwrap();
     std::fs::write(&shared, "---\nname: norn\ndescription: the user's own\n---\nmine\n").unwrap();
