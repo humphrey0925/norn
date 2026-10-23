@@ -2,12 +2,13 @@
 //! the listings prints one JSON object, for scripts to read.
 
 use clap::{Parser, Subcommand};
+use serde::ser::{Serialize, SerializeMap, Serializer};
 use serde_json::{json, Value};
 use si_core::graph::Graph;
 use si_core::model::{flag, kind, refkind, EdgeHalf, FileFacts};
 use si_core::packed::PackedGraph;
 use si_core::sqlite::{self, Flavor, SqliteStore};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -352,14 +353,119 @@ fn load_index(dir: &Path) -> Graph {
     })
 }
 
-fn query(dir: &Path, op: &str, name: &str, depth: u32) -> Value {
+fn query(dir: &Path, op: &str, name: &str, depth: u32) {
     let g = load_index(dir);
-    run_query(&g, op, name, depth)
+    let reply = run_query(&g, op, name, depth, MOST_CALLERS);
+    let mut out = BufWriter::new(std::io::stdout().lock());
+    serde_json::to_writer_pretty(&mut out, &reply).expect("write answer");
+    writeln!(out).and_then(|_| out.flush()).expect("write answer");
 }
 
-fn run_query(g: &Graph, op: &str, name: &str, depth: u32) -> Value {
+/// Most callers one answer lists; `count` is of all of them. A name that
+/// most of a tree reaches through macros has millions: `printk` in Linux,
+/// where each of its nine definitions is reached through the same uses.
+const MOST_CALLERS: usize = 1_000_000;
+
+/// An answer, written out as it is serialized.
+enum Reply<'g> {
+    Value(Value),
+    Callers(CallersReply<'g>),
+}
+
+impl From<Value> for Reply<'_> {
+    fn from(v: Value) -> Self {
+        Reply::Value(v)
+    }
+}
+
+impl Serialize for Reply<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Reply::Value(v) => v.serialize(s),
+            Reply::Callers(c) => c.serialize(s),
+        }
+    }
+}
+
+/// `{"count", "results", "truncated"}` of `callers`, with no `Value` built
+/// for each caller: that took a kilobyte or two apiece.
+struct CallersReply<'g> {
+    g: &'g Graph,
+    found: Vec<si_core::Caller>,
+    count: usize,
+}
+
+impl<'g> CallersReply<'g> {
+    fn new(g: &'g Graph, syms: &[u32], most: usize) -> Self {
+        let (mut found, mut count) = (Vec::new(), 0);
+        for &s in syms {
+            let callers = si_core::callers_through_macros(g, s);
+            count += callers.len();
+            let room = most.saturating_sub(found.len());
+            found.extend(callers.into_iter().take(room));
+        }
+        CallersReply { g, found, count }
+    }
+}
+
+/// One caller, its fields in the order a `Value` prints them.
+#[derive(serde::Serialize)]
+struct CallerRow<'a> {
+    at_line: u32,
+    certain: bool,
+    decl: bool,
+    file: &'a str,
+    kind: &'static str,
+    line: u32,
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    through: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    via_macro: Option<&'a str>,
+}
+
+struct CallerRows<'a, 'g>(&'a CallersReply<'g>);
+
+impl Serialize for CallerRows<'_, '_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let g = self.0.g;
+        s.collect_seq(self.0.found.iter().map(|c| {
+            let sym = &g.syms[c.caller as usize];
+            CallerRow {
+                at_line: c.line,
+                certain: !c.ambiguous,
+                decl: sym.flags & flag::DECL != 0,
+                file: g.file_path(sym.file),
+                kind: kind::name(sym.kind),
+                line: sym.line,
+                name: g.sym_name(c.caller),
+                through: c.slot.map(|x| g.sym_name(x)),
+                via_macro: c.via.map(|x| g.sym_name(x)),
+            }
+        }))
+    }
+}
+
+impl Serialize for CallersReply<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let truncated = self.count > self.found.len();
+        let mut map = s.serialize_map(Some(2 + truncated as usize))?;
+        map.serialize_entry("count", &self.count)?;
+        map.serialize_entry("results", &CallerRows(self))?;
+        if truncated {
+            map.serialize_entry("truncated", &true)?;
+        }
+        map.end()
+    }
+}
+
+/// `most`: how many callers `callers` lists.
+fn run_query<'g>(g: &'g Graph, op: &str, name: &str, depth: u32, most: usize) -> Reply<'g> {
     let syms = g.find(name);
-    match op {
+    if op == "callers" {
+        return Reply::Callers(CallersReply::new(g, syms, most));
+    }
+    let v = match op {
         "find" => json!({ "results": syms.iter().map(|&s| sym_json(g, s)).collect::<Vec<_>>() }),
         // Fragments in any order, initials, letters in order: see si_core::search.
         "search" => {
@@ -374,24 +480,6 @@ fn run_query(g: &Graph, op: &str, name: &str, depth: u32) -> Value {
                 })
                 .collect();
             json!({ "count": results.len(), "ms": ms(t), "results": results })
-        }
-        "callers" => {
-            let mut results = Vec::new();
-            for &s in syms {
-                for c in si_core::callers_through_macros(g, s) {
-                    let mut v = sym_json(g, c.caller);
-                    v["at_line"] = json!(c.line);
-                    v["certain"] = json!(!c.ambiguous);
-                    if let Some(m) = c.via {
-                        v["via_macro"] = json!(g.sym_name(m));
-                    }
-                    if let Some(slot) = c.slot {
-                        v["through"] = json!(g.sym_name(slot));
-                    }
-                    results.push(v);
-                }
-            }
-            json!({ "count": results.len(), "results": results })
         }
         "callees" => {
             let mut results = Vec::new();
@@ -429,7 +517,8 @@ fn run_query(g: &Graph, op: &str, name: &str, depth: u32) -> Value {
             json!({ "reached": reached })
         }
         other => json!({ "error": format!("unknown op {other}") }),
-    }
+    };
+    v.into()
 }
 
 /// `n` function definitions drawn uniformly (with replacement), plus the population size.
@@ -589,12 +678,20 @@ fn definition(g: &Graph, req: &Value) -> Value {
     json!({ "results": found.iter().map(|&s| sym_json(g, s)).collect::<Vec<_>>() })
 }
 
-fn answer(g: &Graph, req: &Value) -> Value {
+fn answer<'g>(g: &'g Graph, req: &Value) -> Reply<'g> {
     let op = req["op"].as_str().unwrap_or("");
     if op == "definition" {
-        return definition(g, req);
+        return definition(g, req).into();
     }
-    run_query(g, op, req["name"].as_str().unwrap_or(""), req["depth"].as_u64().unwrap_or(3) as u32)
+    let most = req["limit"].as_u64().map_or(MOST_CALLERS, |n| n as usize);
+    run_query(g, op, req["name"].as_str().unwrap_or(""), req["depth"].as_u64().unwrap_or(3) as u32, most)
+}
+
+/// One answer, on a line of its own.
+fn reply(out: &mut impl Write, r: &Reply) {
+    let mut out = BufWriter::new(out);
+    serde_json::to_writer(&mut out, r).expect("write response");
+    writeln!(out).and_then(|_| out.flush()).expect("write response");
 }
 
 fn live(root: &Path, keep: &Keep, options: &si_core::link::Options) {
@@ -625,16 +722,18 @@ fn live(root: &Path, keep: &Keep, options: &si_core::link::Options) {
                     "files": session.files(), "symbols": session.graph.syms.len(),
                     "include": session.scope().include, "exclude": session.scope().exclude,
                     "extract_ms": up.extract_ms, "link_ms": up.link_ms })
+            .into()
         } else if req["op"] == "update" {
             let files: Vec<PathBuf> = req["files"].as_array().into_iter().flatten().filter_map(|f| f.as_str()).map(PathBuf::from).collect();
             let up = session.update(&files);
             json!({ "changed": up.changed, "added": up.added, "removed": up.removed, "extracted": up.extracted,
                     "macros_reclassified": up.macros_reclassified, "extract_ms": up.extract_ms, "link_ms": up.link_ms,
                     "symbols": session.graph.syms.len() })
+            .into()
         } else {
             answer(&session.graph, &req)
         };
-        writeln!(out, "{resp}").and_then(|_| out.flush()).expect("write response");
+        reply(&mut out, &resp);
     }
 }
 
@@ -645,8 +744,7 @@ fn serve(dir: &Path) {
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         let req: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
-        let resp = answer(&g, &req);
-        writeln!(out, "{resp}").and_then(|_| out.flush()).expect("write response");
+        reply(&mut out, &answer(&g, &req));
     }
 }
 
@@ -702,7 +800,7 @@ fn main() {
         Cmd::Index { root, out, stores, stride, include_alias, dump_binds } => {
             index(root, out, stores, *stride, &si_core::link::Options { include_aliases: aliases(include_alias), ..Default::default() }, *dump_binds)
         }
-        Cmd::Query { dir, op, name, depth } => query(dir, op, name, *depth),
+        Cmd::Query { dir, op, name, depth } => return query(dir, op, name, *depth),
         Cmd::BenchQuery { dir, n, seed } => bench_query(dir, *n, *seed),
         Cmd::BenchIncr { root, n, seed } => bench_incr(root, *n, *seed),
         Cmd::Sample { dir, n, seed } => sample(dir, *n, *seed),
