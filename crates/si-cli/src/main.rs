@@ -735,6 +735,11 @@ fn live(root: &Path, keep: &Keep, options: &si_core::link::Options) {
         };
         reply(&mut out, &resp);
     }
+    // What updates left unsaved, and the graph: a large one is written only
+    // at the end (as the language server does at shutdown), and the next
+    // start relinks from it.
+    while session.save_some(usize::MAX) {}
+    session.save_graph();
 }
 
 fn serve(dir: &Path) {
