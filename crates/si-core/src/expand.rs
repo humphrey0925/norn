@@ -35,8 +35,12 @@ const MAX_STEPS: u32 = 500;
 /// Expansions in a row that may bring no new name before the rest are left untried.
 const BLIND_RUNS: usize = 3;
 /// Where thorough: other definitions of one name read in a row that bring
-/// nothing, after which the rest of that name's are not read.
+/// nothing, after which the rest of that name's are not read; and uses of a
+/// file in a row where that name's brought nothing, after which they are not
+/// read at its uses that follow (Catch2's warning pragmas, one definition
+/// per compiler, read again at every assertion of a test file).
 const BLIND_ALTERNATIVES: usize = 2;
+const BLIND_USES: usize = 20;
 /// Uses of one macro in one file that may come to nothing before the rest
 /// are skipped.
 const BARREN_USES: u32 = 16;
@@ -508,6 +512,11 @@ struct Engine<'a> {
     /// Files this unit reads whatever the configuration (no `#include`
     /// under an `#if` on the way). Empty: all of them.
     sure: Vec<bool>,
+    /// Where thorough: for each name, how many uses in a row its other
+    /// definitions, read, brought nothing (see `BLIND_USES`).
+    blind_uses: FxHashMap<Text, usize>,
+    /// Expansions run, all told.
+    runs: u64,
     /// The compilation it stands for, as the readings number them, or
     /// `NONE`.
     unit: u32,
@@ -583,6 +592,8 @@ impl<'a> Engine<'a> {
             merged: None,
             max_variants: if table.thorough { MAX_VARIANTS_READ } else { MAX_VARIANTS },
             sure: Vec::new(),
+            blind_uses: FxHashMap::default(),
+            runs: 0,
             unit: NONE,
             asked: Asked::default(),
             counter_from: None,
@@ -942,7 +953,10 @@ impl<'a> Engine<'a> {
         // U-Boot's `__swab32` of every architecture, are read no further.)
         let mut single: Option<Text> = None;
         let mut blind_of: FxHashMap<Text, usize> = FxHashMap::default();
-        for _ in 0..self.max_variants * 2 {
+        // (Whether each name's other definitions brought something at this
+        // use, for `blind_uses`.)
+        let mut brought_by: FxHashMap<Text, bool> = FxHashMap::default();
+        'reading: for _ in 0..self.max_variants * 2 {
             if stale >= BLIND_RUNS {
                 break;
             }
@@ -962,6 +976,7 @@ impl<'a> Engine<'a> {
             self.counter_most = self.counter_most.max(self.counter);
             spend(0, t);
             SPENT[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.runs += 1;
             SPENT[5].fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let under = self.choice.clone();
             for m in self.met.drain(..) {
@@ -993,12 +1008,15 @@ impl<'a> Engine<'a> {
             if let Some(name) = single.take() {
                 let blind = blind_of.entry(name).or_default();
                 *blind = if brought { 0 } else { *blind + 1 };
+                *brought_by.entry(name).or_default() |= brought;
             }
             if read.len() >= self.max_variants {
                 break;
             }
             if !combining {
-                while self.table.thorough && singles.front().is_some_and(|s| blind_of.get(&s.0).is_some_and(|&b| b >= BLIND_ALTERNATIVES)) {
+                while self.table.thorough
+                    && singles.front().is_some_and(|s| blind_of.get(&s.0).is_some_and(|&b| b >= BLIND_ALTERNATIVES) || self.blind_uses.get(&s.0).is_some_and(|&b| b >= BLIND_USES))
+                {
                     singles.pop_front();
                 }
                 if let Some((name, i, under)) = singles.pop_front() {
@@ -1015,7 +1033,7 @@ impl<'a> Engine<'a> {
             let mut k = free.len();
             loop {
                 if k == 0 {
-                    return results;
+                    break 'reading;
                 }
                 k -= 1;
                 let c = choice.get(&free[k].0).copied().unwrap_or(0) + 1;
@@ -1026,6 +1044,12 @@ impl<'a> Engine<'a> {
                     }
                     break;
                 }
+            }
+        }
+        if self.table.thorough {
+            for (name, brought) in brought_by {
+                let blind = self.blind_uses.entry(name).or_default();
+                *blind = if brought { 0 } else { *blind + 1 };
             }
         }
         results
@@ -2853,6 +2877,38 @@ mod tests {
         // of one name in a row bring nothing (see `BLIND_ALTERNATIVES`).
         table.thorough = true;
         assert!(made(&table));
+    }
+
+    #[test]
+    fn alternatives_that_brought_nothing_at_uses_in_a_row_are_not_read_at_the_next() {
+        // WARN has a definition per compiler, which makes nothing new.
+        let defs: &[(&str, &str)] = &[("WARN", "(n) n"), ("WARN", "(n) _Pragma (\"x\") n")];
+        let files: Vec<FileFacts> = defs
+            .iter()
+            .enumerate()
+            .map(|(i, (name, text))| {
+                let mut f = FileFacts::new(format!("w{i}.h"));
+                let (name, text) = (f.push_name(name), f.push_text(text));
+                f.macros.push(crate::model::MacroBody { name, text, function_like: true, guard: NONE, conditional: false, fallback: false, line: 0 });
+                f
+            })
+            .collect();
+        let parsed: Vec<Vec<Parsed>> = files.iter().enumerate().map(|(fi, f)| vec![Parsed { file: fi as u32, ..parse(f.name(f.macros[0].text as usize), true, "") }]).collect();
+        let by_name: FxHashMap<&str, Vec<(u32, u32)>> = [("WARN", vec![(0, 0), (1, 0)])].into_iter().collect();
+        let mut table = Table::new(&files, by_name, parsed);
+        table.thorough = true;
+        let mut eng = Engine::new(&table, vec![true; 2]);
+        let runs: Vec<u64> = (0..BLIND_USES + 1)
+            .map(|_| {
+                let before = eng.runs;
+                eng.variants(&tokenize(b"WARN (x)", Origin::Site), &Choice::default(), true, |_| false);
+                eng.runs - before
+            })
+            .collect();
+        // Each read on its own at each use, until they brought nothing at
+        // that many: then only as the readings together come to them.
+        assert!(runs[..BLIND_USES].iter().all(|&n| n == runs[0]), "{runs:?}");
+        assert!(runs[BLIND_USES] < runs[0], "{runs:?}");
     }
 
     fn texts_of(t: &[T]) -> String {
