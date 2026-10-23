@@ -330,7 +330,15 @@ fn index(root: &Path, out: &Path, stores: &str, stride: usize, options: &si_core
                 "cpu_walk": facts.iter().map(|f| f.walk_ns).sum::<u64>() as f64 / 1e6,
                 "slowest_file": (slowest.parse_ns + slowest.walk_ns) as f64 / 1e6 },
         "slowest_file": slowest.path,
-        "mem": { "facts_heap_bytes": facts_bytes, "graph_heap_bytes": g.heap_bytes(), "rss_bytes": rss, "peak_rss_bytes": peak_rss },
+        "mem": { "facts_heap_bytes": facts_bytes,
+                 "facts_parts": facts.iter().fold(serde_json::Map::new(), |mut m, f| {
+                     for (what, bytes) in f.parts() {
+                         let e = m.entry(what).or_insert(json!(0));
+                         *e = json!(e.as_u64().unwrap_or(0) + bytes as u64);
+                     }
+                     m
+                 }),
+                 "graph_heap_bytes": g.heap_bytes(), "rss_bytes": rss, "peak_rss_bytes": peak_rss },
         "stores": store_stats,
     })
 }
@@ -532,6 +540,7 @@ fn bench_incr(root: &Path, n: usize, seed: u64) -> Value {
     let mut facts = si_core::extract_all(root, &files, &transparent);
     let options = si_core::link::Options::default();
     let mut cache = si_core::expand::Cache::default();
+    cache.relinking();
     // The graph is held from one link to the next, as a session holds it:
     // the memory reported at the end is that of an index in use.
     let (mut g, _) = si_core::link::link_cached(&facts, &options, &mut cache);
@@ -549,11 +558,11 @@ fn bench_incr(root: &Path, n: usize, seed: u64) -> Value {
         let t1 = Instant::now();
         // The content is the same, but an edit would not be: expand it again.
         cache.forget(i, &facts[i]);
-        drop(std::mem::take(&mut g));
+        cache.keep(std::mem::take(&mut g));
         let stats;
         (g, stats) = si_core::link::link_cached(&facts, &options, &mut cache);
         let t2 = Instant::now();
-        steps = json!({ "includes": stats.include_ms, "expand": stats.expand_ms, "intern": stats.intern_ms, "syms": stats.syms_ms,
+        steps = json!({ "files_resolved": stats.resolved_files, "includes": stats.include_ms, "expand": stats.expand_ms, "intern": stats.intern_ms, "syms": stats.syms_ms,
                         "resolve": stats.resolve_ms, "csr": stats.csr_ms });
         assert_eq!(g.out.len(), edges, "relink of unchanged content must be stable");
         extract_ns.push((t1 - t0).as_nanos() as u64);

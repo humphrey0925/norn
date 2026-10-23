@@ -10,5 +10,8 @@
   "assets": {
     "directory": "./out/site",
     "not_found_handling": "404-page"
-  }
+  },
+  // Builds of branches other than the production one run `wrangler preview`,
+  // which wants this block; empty, the preview is set up as above.
+  "previews": {}
 }

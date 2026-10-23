@@ -1803,7 +1803,7 @@ fn expand_file(
     for (i, r) in f.refs.iter().enumerate() {
         if let Some(v) = variants.get(&r.scope) {
             for &(scope, _) in &v[1..] {
-                out.refs.push(Ref { scope, ..*r });
+                out.refs.push(Ref { scope, ..r });
                 if let Some(&h) = hinted.get(&(i as u32)) {
                     out.ref_hints.push((out.refs.len() as u32 - 1, h));
                 }
@@ -2075,20 +2075,27 @@ fn expand_file(
         defs.push(out.defs[old as usize]);
     }
     out.defs = defs;
-    for r in &mut out.refs {
-        r.scope = new_index[r.scope as usize];
-    }
+    out.refs.map_scopes(|scope| new_index[scope as usize]);
     for b in &mut out.binds {
         b.scope = new_index[b.scope as usize];
     }
-    for t in &mut out.field_types {
-        t.0 = new_index[t.0 as usize];
+    // What these say is shared with the file's own facts until it is
+    // written to: written to only where the order changed what it says.
+    let moved = |d: u32| new_index[d as usize] != d;
+    if out.field_types.iter().any(|t| moved(t.0)) {
+        for t in out.field_types.iter_mut() {
+            t.0 = new_index[t.0 as usize];
+        }
     }
-    for c in &mut out.param_calls {
-        c.scope = new_index[c.scope as usize];
+    if out.param_calls.iter().any(|c| moved(c.scope)) {
+        for c in out.param_calls.iter_mut() {
+            c.scope = new_index[c.scope as usize];
+        }
     }
-    for t in &mut out.typed {
-        t.0 = new_index[t.0 as usize];
+    if out.typed.iter().any(|t| moved(t.0)) {
+        for t in out.typed.iter_mut() {
+            t.0 = new_index[t.0 as usize];
+        }
     }
     if let Some(c) = out.cxx.as_mut() {
         for o in &mut c.owners {
@@ -2110,8 +2117,10 @@ fn expand_file(
             f.def = new_index[f.def as usize];
         }
     }
-    for d in out.records.iter_mut().flat_map(|r| r.defs.iter_mut()).filter(|d| **d != NONE) {
-        *d = new_index[*d as usize];
+    if out.records.iter().flat_map(|r| &r.defs).any(|&d| d != NONE && moved(d)) {
+        for d in out.records.iter_mut().flat_map(|r| r.defs.iter_mut()).filter(|d| **d != NONE) {
+            *d = new_index[*d as usize];
+        }
     }
     // The uses are expanded: the link has no use for them, nor for the
     // initializers that were read.
@@ -2163,6 +2172,15 @@ pub struct Cache {
     pub(crate) made: Vec<u64>,
     /// The link's table of names, kept from one link to the next.
     pub(crate) names: NameCache,
+    /// Links are made again of these files after edits (a session's):
+    /// each leaves what the next can start from (`last`), and is handed
+    /// the graph before (`previous`).
+    pub(crate) relinks: bool,
+    pub(crate) last: Option<Box<crate::link::Last>>,
+    pub(crate) previous: Option<crate::graph::Graph>,
+    /// Of the files read again since the last link, what that link saw
+    /// of them (`forget`): what they defined then.
+    pub(crate) was: FxHashMap<usize, FileFacts>,
 }
 
 /// The names in use, in order, kept between links: an edit seldom brings
@@ -2182,6 +2200,12 @@ impl NameCache {
     /// in the graph of each of its names, a name's number being its
     /// lexicographic rank among the names in use (`NONE` for what is the
     /// file's own text, which is no name); and the names in that order.
+    /// The number a name (by its number among all files') has in the
+    /// table last made, if it is in use.
+    pub(crate) fn rank_of(&self, id: u32) -> Option<u32> {
+        self.rank.get(id as usize).copied().filter(|&r| r != NONE)
+    }
+
     pub(crate) fn table(&mut self, files: &[&FileFacts]) -> (Vec<Vec<u32>>, Vec<&'static str>) {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         let n = crate::names::count() as usize;
@@ -2286,7 +2310,24 @@ impl Cache {
             epoch: 1,
             made,
             names: NameCache::default(),
+            relinks: false,
+            last: None,
+            previous: None,
+            was: FxHashMap::default(),
         }
+    }
+
+    /// Keep what a link leaves for the next (see `link::Last`).
+    pub fn relinking(&mut self) {
+        self.relinks = true;
+    }
+
+    /// The graph the last link made, given back as the files change: the
+    /// next link takes from it what still holds, which is the edges from
+    /// each symbol. The rest is let go at once: the link makes the new
+    /// graph beside what is kept.
+    pub fn keep(&mut self, g: crate::graph::Graph) {
+        self.previous = (self.relinks && self.last.is_some()).then(|| crate::graph::Graph { out_off: g.out_off, out: g.out, ..Default::default() });
     }
 
     /// The files expanded anew since the last call, for saving.
@@ -2303,6 +2344,11 @@ impl Cache {
     pub fn forget(&mut self, i: usize, was: &FileFacts) {
         if let Some(h) = self.hashes.get_mut(i) {
             *h = !*h;
+        }
+        // (What the link saw: the expansion, if the file had one.)
+        if self.relinks && self.last.is_some() && !self.was.contains_key(&i) {
+            let seen = self.expanded.get(i).and_then(Option::as_ref).unwrap_or(was);
+            self.was.insert(i, seen.clone());
         }
         self.gone.insert(i, macro_pairs(was, None));
     }
@@ -2497,6 +2543,10 @@ pub fn expand(
             epoch: cache.epoch,
             made: vec![0; files.len()],
             names: std::mem::take(&mut cache.names),
+            relinks: cache.relinks,
+            last: cache.last.take(),
+            previous: cache.previous.take(),
+            was: std::mem::take(&mut cache.was),
         };
     }
     cache.macros = macros;

@@ -7,7 +7,7 @@ use crate::model::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::num::NonZeroU16;
-use tree_sitter::{Language, Node, Parser};
+use tree_sitter::{Language, Node, Parser, Point, Range};
 
 struct Ids {
     identifier: u16,
@@ -491,15 +491,7 @@ impl Extractor {
             (&mut self.parser, &self.ids)
         };
         let t = std::time::Instant::now();
-        let Some(tree) = parser.parse(&lexed.masked, None) else {
-            out.has_error = true;
-            return (out, false);
-        };
-        out.parse_ns = t.elapsed().as_nanos() as u64;
-        let t = std::time::Instant::now();
-        let root = tree.root_node();
-        out.has_error = root.has_error();
-        out.defs[0].end_line = root.end_position().row as u32 + 1;
+        out.defs[0].end_line = src.iter().filter(|&&b| b == b'\n').count() as u32 + 1;
 
         let mut events = lexed.events.iter();
         let mut w = Walk {
@@ -555,20 +547,43 @@ impl Extractor {
         };
         w.site_starts = w.site_defs.keys().copied().collect();
         w.site_starts.sort_unstable();
-        let mut cursor = root.walk();
-        'outer: loop {
-            if w.visit(cursor.node()) && cursor.goto_first_child() {
-                continue;
+        // A piece at a time, each tree dropped once walked: what is held is
+        // the largest piece's tree rather than the file's.
+        let mut parse_ns = 0;
+        let pieces = pieces(&lexed.masked, chunk_min());
+        let cut = pieces.len() > 1;
+        for range in pieces {
+            let tp = std::time::Instant::now();
+            if cut {
+                parser.set_included_ranges(&[range]).expect("ranges in order");
             }
-            loop {
-                if cursor.goto_next_sibling() {
-                    break;
+            let tree = parser.parse(&lexed.masked, None);
+            parse_ns += tp.elapsed().as_nanos() as u64;
+            let Some(tree) = tree else {
+                w.out.has_error = true;
+                continue;
+            };
+            let root = tree.root_node();
+            w.out.has_error |= root.has_error();
+            let mut cursor = root.walk();
+            'outer: loop {
+                if w.visit(cursor.node()) && cursor.goto_first_child() {
+                    continue;
                 }
-                if !cursor.goto_parent() {
-                    break 'outer;
+                loop {
+                    if cursor.goto_next_sibling() {
+                        break;
+                    }
+                    if !cursor.goto_parent() {
+                        break 'outer;
+                    }
                 }
             }
         }
+        if cut {
+            parser.set_included_ranges(&[]).expect("whole text");
+        }
+        w.out.parse_ns = parse_ns;
         w.flush_events(usize::MAX);
         w.flush_local_calls();
         let mut names: Vec<String> = w.namespaces.iter().flat_map(|n| n.2.split("::").map(str::to_string)).filter(|n| !n.is_empty()).collect();
@@ -584,7 +599,7 @@ impl Extractor {
             let (alias, target) = (w.intern_str(&alias), w.intern_str(&target));
             w.out.cxx_mut().namespace_aliases.push((alias, target));
         }
-        w.out.walk_ns = t.elapsed().as_nanos() as u64;
+        w.out.walk_ns = (t.elapsed().as_nanos() as u64).saturating_sub(w.out.parse_ns);
         let mut out = w.out;
         out.discards_asked.sort_unstable();
         out.discards_asked.dedup();
@@ -600,9 +615,9 @@ impl Extractor {
     }
 }
 
-impl<'a> Walk<'a> {
+impl<'a, 't> Walk<'a> {
     /// A parameter or local variable is declared at `name`.
-    fn note_local(&mut self, name: Node<'a>, param: bool) {
+    fn note_local(&mut self, name: Node<'t>, param: bool) {
         let text = self.text(name);
         self.locals.insert(text);
         let Some(scope) = self.scope.filter(|s| s.is_fn) else { return };
@@ -613,7 +628,7 @@ impl<'a> Walk<'a> {
     }
 
     /// The local `name` is used here.
-    fn use_local(&mut self, name: Node<'a>) {
+    fn use_local(&mut self, name: Node<'t>) {
         if let Some(&id) = self.local_ids.get(self.text(name)) {
             self.out.local_uses.push((id, name.start_position().row as u32 + 1));
         }
@@ -644,7 +659,7 @@ impl<'a> Walk<'a> {
 
     /// The name a definition is known by: its text, but a C++ operator's or
     /// destructor's without spaces.
-    fn def_name(&mut self, name: Node<'a>) -> u32 {
+    fn def_name(&mut self, name: Node<'t>) -> u32 {
         let k = name.kind_id();
         if self.cpp && (k == self.ids.operator_name || k == self.ids.destructor_name) {
             // One space between words (`operator bool`), none elsewhere
@@ -666,7 +681,7 @@ impl<'a> Walk<'a> {
     /// C++: the parts of the scope a qualified name is written with (`A`
     /// and `B` of `A::B<T>::f`, without template arguments), and the name.
     /// `::f` has one empty part.
-    fn qualified_parts(&self, mut n: Node<'a>) -> (Vec<&'a [u8]>, Node<'a>) {
+    fn qualified_parts(&self, mut n: Node<'t>) -> (Vec<&'a [u8]>, Node<'t>) {
         let ids = self.ids;
         let mut parts = Vec::new();
         for _ in 0..16 {
@@ -706,7 +721,7 @@ impl<'a> Walk<'a> {
 
     /// C++: the scope written in a declarator's name (`A::B` of
     /// `A::B::f (...)`), as its parts.
-    fn declared_scope(&self, mut n: Node<'a>) -> Vec<&'a [u8]> {
+    fn declared_scope(&self, mut n: Node<'t>) -> Vec<&'a [u8]> {
         let ids = self.ids;
         for _ in 0..32 {
             let k = n.kind_id();
@@ -770,7 +785,7 @@ impl<'a> Walk<'a> {
     /// derives from (the fixture). `TEST_F (Suite, Name) { ... }` is
     /// `Suite_Name_Test::TestBody`, `BOOST_AUTO_TEST_CASE (name) { ... }`
     /// is `name::test_method`, of the fixture of the suite it is in.
-    fn test_case(&self, name: Node<'a>, def: Node<'a>) -> Option<(String, &'static str, Option<String>)> {
+    fn test_case(&self, name: Node<'t>, def: Node<'t>) -> Option<(String, &'static str, Option<String>)> {
         if self.site_defs.contains_key(&name.start_byte()) {
             // (The macro is the corpus's own, and is expanded.)
             return None;
@@ -813,7 +828,7 @@ impl<'a> Walk<'a> {
 
 
     /// C++: is the function declared `virtual`, `override` or `final`?
-    fn is_virtual(&self, decl: Node<'a>) -> bool {
+    fn is_virtual(&self, decl: Node<'t>) -> bool {
         let ids = self.ids;
         let mut c = decl.walk();
         if decl.children(&mut c).any(|ch| !ch.is_named() && self.text(ch) == b"virtual") {
@@ -846,7 +861,7 @@ impl<'a> Walk<'a> {
         }
     }
 
-    fn push_def(&mut self, name: Node<'a>, span: Node, kind: u8, flags: u8) -> u32 {
+    fn push_def(&mut self, name: Node<'t>, span: Node, kind: u8, flags: u8) -> u32 {
         self.skip.insert(name.start_byte());
         if let Some(slot) = self.site_defs.get_mut(&name.start_byte()) {
             *slot = self.out.defs.len() as u32;
@@ -869,7 +884,7 @@ impl<'a> Walk<'a> {
 
     /// C++: how many arguments the function whose name is at `name` takes,
     /// from its parameter list (defaults and `...` counted as such).
-    fn note_arity(&mut self, def: u32, name: Node<'a>) {
+    fn note_arity(&mut self, def: u32, name: Node<'t>) {
         let ids = self.ids;
         let mut n = name;
         for _ in 0..4 {
@@ -878,7 +893,7 @@ impl<'a> Walk<'a> {
                     let Some(list) = p.child_by_field_id(ids.f_parameters) else { return };
                     let (mut least, mut most) = (0u8, 0u8);
                     let mut c = list.walk();
-                    let params: Vec<Node<'a>> = list.named_children(&mut c).filter(|q| !q.is_extra()).collect();
+                    let params: Vec<Node<'t>> = list.named_children(&mut c).filter(|q| !q.is_extra()).collect();
                     for q in params {
                         let at = most;
                         match q.kind() {
@@ -929,7 +944,7 @@ impl<'a> Walk<'a> {
 
     /// C++: is what a declaration of type `ty` declares with `declarator` a
     /// `std::string` (or a reference to one), not a pointer?
-    fn is_string(&self, ty: Option<Node<'a>>, declarator: Option<Node<'a>>) -> bool {
+    fn is_string(&self, ty: Option<Node<'t>>, declarator: Option<Node<'t>>) -> bool {
         ty.is_some_and(|t| matches!(self.text(t), b"std::string" | b"::std::string" | b"string"))
             && declarator.is_none_or(|d| {
                 let d = if d.kind_id() == self.ids.init_declarator { d.child_by_field_id(self.ids.f_declarator.get()) } else { Some(d) };
@@ -939,7 +954,7 @@ impl<'a> Walk<'a> {
 
     /// C++: how many arguments the reference just pushed was given, from the
     /// list in parentheses at `list`.
-    fn note_args(&mut self, list: Option<Node<'a>>) {
+    fn note_args(&mut self, list: Option<Node<'t>>) {
         if let Some(n) = self.count_args(list) {
             let r = self.out.refs.len() as u32 - 1;
             self.out.cxx_mut().args.push((r, n));
@@ -951,11 +966,11 @@ impl<'a> Walk<'a> {
     /// their types: a string or a number written (`""`, `0`), or a local
     /// object's class. An argument of another type than its parameter's
     /// class is made into one by a constructor of that class.
-    fn note_arg_types(&mut self, list: Option<Node<'a>>) {
+    fn note_arg_types(&mut self, list: Option<Node<'t>>) {
         let Some(list) = list.filter(|l| l.kind() == "argument_list") else { return };
         let r = self.out.refs.len() as u32 - 1;
         let mut c = list.walk();
-        let args: Vec<Node<'a>> = list.named_children(&mut c).filter(|a| !a.is_extra()).collect();
+        let args: Vec<Node<'t>> = list.named_children(&mut c).filter(|a| !a.is_extra()).collect();
         for (i, a) in args.into_iter().enumerate() {
             let a = self.strip(a);
             let t = match a.kind() {
@@ -974,7 +989,7 @@ impl<'a> Walk<'a> {
 
     /// How many arguments a list in parentheses holds (not one in braces,
     /// which may be one `std::initializer_list`).
-    fn count_args(&self, list: Option<Node<'a>>) -> Option<u8> {
+    fn count_args(&self, list: Option<Node<'t>>) -> Option<u8> {
         let list = list.filter(|l| matches!(l.kind(), "argument_list" | "parameter_list"))?;
         let mut c = list.walk();
         let n = list.named_children(&mut c).filter(|a| !a.is_extra()).count();
@@ -1016,14 +1031,14 @@ impl<'a> Walk<'a> {
 
     /// The name of a declaration's type when it is a struct, a union or a
     /// typedef: what a member access on the declared thing is looked up in.
-    fn type_name_of(&mut self, decl: Node<'a>) -> u32 {
+    fn type_name_of(&mut self, decl: Node<'t>) -> u32 {
         match decl.child_by_field_id(self.ids.f_type) {
             Some(t) => self.type_name(t),
             None => NONE,
         }
     }
 
-    fn type_name(&mut self, t: Node<'a>) -> u32 {
+    fn type_name(&mut self, t: Node<'t>) -> u32 {
         let ids = self.ids;
         let k = t.kind_id();
         if k == ids.type_identifier {
@@ -1065,14 +1080,14 @@ impl<'a> Walk<'a> {
 
     /// A name for a struct or union that has none, the same wherever it is
     /// asked for: by where it is written.
-    fn unnamed(&mut self, t: Node<'a>) -> u32 {
+    fn unnamed(&mut self, t: Node<'t>) -> u32 {
         let name = format!("@{}:{}", self.out.name(0), t.start_byte());
         self.out.push_name(&name)
     }
 
     /// What `object` in `object.member` is: its root (a type, a variable or
     /// a call) and the members followed from there, appended to `path`.
-    fn object_root(&mut self, mut n: Node<'a>, path: &mut Vec<u32>) -> Option<(u8, u32)> {
+    fn object_root(&mut self, mut n: Node<'t>, path: &mut Vec<u32>) -> Option<(u8, u32)> {
         let ids = self.ids;
         for _ in 0..32 {
             let k = n.kind_id();
@@ -1155,7 +1170,7 @@ impl<'a> Walk<'a> {
     /// C++: what an `auto` variable is made from, as where a member access on
     /// it starts: `new T`, `T {...}`, `std::make_unique<T> (...)` a T; a
     /// call, a variable or a member, as a member access on them would.
-    fn value_root(&mut self, v: Node<'a>) -> Option<(u8, u32, Vec<u32>)> {
+    fn value_root(&mut self, v: Node<'t>) -> Option<(u8, u32, Vec<u32>)> {
         let ids = self.ids;
         let v = self.strip(v);
         match v.kind() {
@@ -1186,7 +1201,7 @@ impl<'a> Walk<'a> {
 
     /// C++: where a member access on an operand would start, as a hint, or
     /// `NONE` (a literal, an expression of no known type).
-    fn operand_hint(&mut self, n: Node<'a>) -> u32 {
+    fn operand_hint(&mut self, n: Node<'t>) -> u32 {
         let mut path = Vec::new();
         match self.object_root(n, &mut path) {
             Some((kind, root)) => self.push_hint(kind, root, &path),
@@ -1198,7 +1213,7 @@ impl<'a> Walk<'a> {
     /// the class's member of that name, or of a function of no class taking
     /// operands of their types; which, the link tells. Nothing is noted of
     /// operands of no known type: nothing would tell.
-    fn push_operator(&mut self, op: &[u8], left: Node<'a>, right: Option<Node<'a>>, at: Node<'a>) {
+    fn push_operator(&mut self, op: &[u8], left: Node<'t>, right: Option<Node<'t>>, at: Node<'t>) {
         let (l, r) = (self.operand_hint(left), right.map_or(NONE, |r| self.operand_hint(r)));
         if l == NONE && r == NONE {
             return;
@@ -1212,7 +1227,7 @@ impl<'a> Walk<'a> {
 
     /// C++: of a function named `operator...` of no class, its parameters'
     /// types (`NONE` where not known), for which operands it takes.
-    fn note_operator_params(&mut self, def: u32, declarator: Option<Node<'a>>) {
+    fn note_operator_params(&mut self, def: u32, declarator: Option<Node<'t>>) {
         let ids = self.ids;
         let Some(mut n) = declarator else { return };
         for _ in 0..8 {
@@ -1227,7 +1242,7 @@ impl<'a> Walk<'a> {
         }
         let Some(list) = n.child_by_field_id(ids.f_parameters) else { return };
         let mut c = list.walk();
-        let params: Vec<Node<'a>> = list.named_children(&mut c).filter(|p| p.kind_id() == ids.parameter_declaration).collect();
+        let params: Vec<Node<'t>> = list.named_children(&mut c).filter(|p| p.kind_id() == ids.parameter_declaration).collect();
         let p0 = params.first().map_or(NONE, |&p| self.type_name_of(p));
         let p1 = params.get(1).map_or(NONE, |&p| self.type_name_of(p));
         if p0 != NONE || p1 != NONE {
@@ -1238,7 +1253,7 @@ impl<'a> Walk<'a> {
     /// C++: the class an object of type `t` is made of, for its constructor:
     /// its name, through scopes, not into a template's arguments (a
     /// `std::unique_ptr<T>` is no `T`), or `NONE`.
-    fn constructed_class(&mut self, t: Node<'a>) -> u32 {
+    fn constructed_class(&mut self, t: Node<'t>) -> u32 {
         let ids = self.ids;
         let mut t = t;
         for _ in 0..4 {
@@ -1259,7 +1274,7 @@ impl<'a> Walk<'a> {
 
     /// C++: a call of a constructor of `class` (or of the type of the member
     /// so named, with `hint` saying whose) made at `at`.
-    fn push_construction(&mut self, class: u32, at: Node<'a>, hint: u32, args: Option<u8>) {
+    fn push_construction(&mut self, class: u32, at: Node<'t>, hint: u32, args: Option<u8>) {
         let scope = self.scope.map_or(0, |s| s.def);
         self.out.refs.push(Ref { name: class, line: at.start_position().row as u32 + 1, scope, kind: refkind::CALL });
         let r = self.out.refs.len() as u32 - 1;
@@ -1276,7 +1291,7 @@ impl<'a> Walk<'a> {
     /// `T`; a map's: its values'), or `NONE`.
     /// C++: the first of the template arguments of a template type, a type
     /// (`StrictMock<MockHandler>`: `MockHandler`), or `NONE`.
-    fn first_template_arg(&mut self, t: Node<'a>) -> u32 {
+    fn first_template_arg(&mut self, t: Node<'t>) -> u32 {
         let ids = self.ids;
         let t = if t.kind_id() == ids.qualified_identifier { self.qualified_parts(t).1 } else { t };
         if t.kind_id() != ids.template_type {
@@ -1289,7 +1304,7 @@ impl<'a> Walk<'a> {
         }
     }
 
-    fn element_type(&mut self, t: Node<'a>) -> u32 {
+    fn element_type(&mut self, t: Node<'t>) -> u32 {
         let ids = self.ids;
         let t = if t.kind_id() == ids.qualified_identifier { self.qualified_parts(t).1 } else { t };
         if t.kind_id() != ids.template_type {
@@ -1312,7 +1327,7 @@ impl<'a> Walk<'a> {
 
     /// C++: the type of the keys of a map type (`std::map<K, V>`: `K`), or
     /// `NONE`.
-    fn key_type(&mut self, t: Node<'a>) -> u32 {
+    fn key_type(&mut self, t: Node<'t>) -> u32 {
         let ids = self.ids;
         let t = if t.kind_id() == ids.qualified_identifier { self.qualified_parts(t).1 } else { t };
         if t.kind_id() != ids.template_type || !t.child_by_field_id(ids.f_name).is_some_and(|n| MAPS.contains(&self.text(n))) {
@@ -1327,7 +1342,7 @@ impl<'a> Walk<'a> {
 
     /// C++: the names a structured binding declares (`auto& [k, v]`), if
     /// `d` is one.
-    fn binding_names(&self, d: Node<'a>) -> Option<Vec<Node<'a>>> {
+    fn binding_names(&self, d: Node<'t>) -> Option<Vec<Node<'t>>> {
         let mut n = d;
         for _ in 0..4 {
             if n.kind() == "structured_binding_declarator" {
@@ -1350,7 +1365,7 @@ impl<'a> Walk<'a> {
     /// C++: where a member access on an element of `container` starts: of a
     /// local container, its elements' type; else the container's own root
     /// and path, and the mark of an element (`[]`).
-    fn element_of(&mut self, container: Node<'a>) -> Option<(u8, u32, Vec<u32>)> {
+    fn element_of(&mut self, container: Node<'t>) -> Option<(u8, u32, Vec<u32>)> {
         let c = self.strip(container);
         if c.kind_id() == self.ids.identifier && self.in_fn() && self.locals.contains(self.text(c)) {
             return self.local_elems.get(self.text(c)).map(|&e| (root::TYPE, e, Vec::new()));
@@ -1362,7 +1377,7 @@ impl<'a> Walk<'a> {
     }
 
     /// The hint for the member of a member access, or `NONE`.
-    fn member_hint(&mut self, access: Node<'a>) -> u32 {
+    fn member_hint(&mut self, access: Node<'t>) -> u32 {
         let mut path = Vec::new();
         let Some(object) = access.child_by_field_id(self.ids.f_argument) else { return NONE };
         match self.object_root(object, &mut path) {
@@ -1379,7 +1394,7 @@ impl<'a> Walk<'a> {
     }
 
     /// The names of a function's own parameters, in order.
-    fn note_params(&mut self, declarator: Node<'a>) {
+    fn note_params(&mut self, declarator: Node<'t>) {
         let ids = self.ids;
         // Down to the declarator that holds the parameter list of the
         // function itself: the one whose own declarator is the name.
@@ -1398,7 +1413,7 @@ impl<'a> Walk<'a> {
         }
         let Some(list) = n.child_by_field_id(ids.f_parameters) else { return };
         let mut c = list.walk();
-        let params: Vec<Node<'a>> = list.named_children(&mut c).filter(|p| p.kind_id() == ids.parameter_declaration).collect();
+        let params: Vec<Node<'t>> = list.named_children(&mut c).filter(|p| p.kind_id() == ids.parameter_declaration).collect();
         for (i, p) in params.into_iter().enumerate() {
             if let Some((name, _)) = p.child_by_field_id(ids.f_declarator.get()).and_then(|d| self.decl_name(d)) {
                 self.params.insert(self.text(name), i as u32);
@@ -1411,7 +1426,7 @@ impl<'a> Walk<'a> {
     }
 
     /// Note what `value` is, as something assigned to the local `local`.
-    fn local_source(&mut self, local: &'a [u8], value: Node<'a>) {
+    fn local_source(&mut self, local: &'a [u8], value: Node<'t>) {
         let value = self.strip(value);
         let k = value.kind_id();
         if k == self.ids.field_expression {
@@ -2006,7 +2021,7 @@ impl<'a> Walk<'a> {
     /// Follow a declarator chain down to the declared name. The bool tells
     /// whether the name itself is declared as a function (`f(...)`, as opposed
     /// to a function pointer `(*f)(...)`).
-    fn decl_name(&self, mut n: Node<'a>) -> Option<(Node<'a>, bool)> {
+    fn decl_name(&self, mut n: Node<'t>) -> Option<(Node<'t>, bool)> {
         let ids = self.ids;
         let mut is_fn = false;
         for _ in 0..32 {
@@ -2052,7 +2067,7 @@ impl<'a> Walk<'a> {
         flags
     }
 
-    fn declarators(&self, n: Node<'a>) -> Vec<Node<'a>> {
+    fn declarators(&self, n: Node<'t>) -> Vec<Node<'t>> {
         let mut c = n.walk();
         n.children_by_field_id(self.ids.f_declarator, &mut c).collect()
     }
@@ -2061,16 +2076,16 @@ impl<'a> Walk<'a> {
     /// which the parser reads as a function's declaration: an object made,
     /// its arguments taken for parameters with a type and no name. (With no
     /// arguments, `T x ();` declares a function, as the compiler has it.)
-    fn object_not_function(&self, d: Node<'a>) -> bool {
+    fn object_not_function(&self, d: Node<'t>) -> bool {
         let ids = self.ids;
         if d.kind_id() != ids.function_declarator || d.child_by_field_id(ids.f_declarator.get()).is_none_or(|n| n.kind_id() != ids.identifier) {
             return false;
         }
         let Some(list) = d.child_by_field_id(ids.f_parameters) else { return false };
         let mut c = list.walk();
-        let params: Vec<Node<'a>> = list.named_children(&mut c).filter(|p| p.kind() != "comment").collect();
+        let params: Vec<Node<'t>> = list.named_children(&mut c).filter(|p| p.kind() != "comment").collect();
         // (`CPubKey pubKey (vSolutions[0]);`: an element taken for an array.)
-        let element = |p: &Node<'a>| p.named_child_count() == 2 && p.child_by_field_id(ids.f_declarator.get()).is_some_and(|d| d.kind() == "abstract_array_declarator" && d.named_child_count() == 1);
+        let element = |p: &Node<'t>| p.named_child_count() == 2 && p.child_by_field_id(ids.f_declarator.get()).is_some_and(|d| d.kind() == "abstract_array_declarator" && d.named_child_count() == 1);
         !params.is_empty()
             && params.iter().all(|p| {
                 let ty = p.child_by_field_id(ids.f_type);
@@ -2081,7 +2096,7 @@ impl<'a> Walk<'a> {
     }
 
     /// Does the declarator declare a function or a pointer to one?
-    fn declares_function(&self, mut n: Node<'a>) -> bool {
+    fn declares_function(&self, mut n: Node<'t>) -> bool {
         for _ in 0..32 {
             if n.kind_id() == self.ids.function_declarator {
                 return true;
@@ -2096,7 +2111,7 @@ impl<'a> Walk<'a> {
 
     /// Through parentheses, `*`, `&`, casts and subscripts to what is called
     /// or assigned.
-    fn strip(&self, mut n: Node<'a>) -> Node<'a> {
+    fn strip(&self, mut n: Node<'t>) -> Node<'t> {
         let ids = self.ids;
         for _ in 0..16 {
             let k = n.kind_id();
@@ -2118,7 +2133,7 @@ impl<'a> Walk<'a> {
     }
 
     /// Names in `n` that may be functions whose address is taken.
-    fn function_names(&self, n: Node<'a>, out: &mut Vec<Node<'a>>) {
+    fn function_names(&self, n: Node<'t>, out: &mut Vec<Node<'t>>) {
         let n = self.strip(n);
         let k = n.kind_id();
         if k == self.ids.identifier {
@@ -2139,7 +2154,7 @@ impl<'a> Walk<'a> {
         }
     }
 
-    fn bind(&mut self, value: Node<'a>, slot: u32, index: u32, var: bool, scope: u32, hint: u32) {
+    fn bind(&mut self, value: Node<'t>, slot: u32, index: u32, var: bool, scope: u32, hint: u32) {
         // Stored in something without a name (a declarator the parser made
         // up past an error): nothing can be called through that.
         if slot == NONE {
@@ -2157,13 +2172,13 @@ impl<'a> Walk<'a> {
     /// The members of a struct body in order, each with its type's name
     /// (see `type_name_of`). The members of an unnamed struct or union
     /// member are members of this one.
-    fn member_names(&mut self, body: Node<'a>, names: &mut Vec<u32>, types: &mut Vec<u32>, elems: &mut Vec<(u32, u32, u32)>) {
+    fn member_names(&mut self, body: Node<'t>, names: &mut Vec<u32>, types: &mut Vec<u32>, elems: &mut Vec<(u32, u32, u32)>) {
         let ids = self.ids;
         let mut c = body.walk();
         // (A C++ class's methods are members too, declared or defined in it,
         // templates or not.)
         let cpp = self.cpp;
-        let decls: Vec<Node<'a>> = body
+        let decls: Vec<Node<'t>> = body
             .named_children(&mut c)
             .map(|d| if cpp && d.kind() == "template_declaration" { d.named_child(d.named_child_count().saturating_sub(1)).unwrap_or(d) } else { d })
             .filter(|d| {
@@ -2205,7 +2220,7 @@ impl<'a> Walk<'a> {
         }
     }
 
-    fn push_record(&mut self, name: u32, node: Node<'a>, body: Node<'a>) {
+    fn push_record(&mut self, name: u32, node: Node<'t>, body: Node<'t>) {
         let (mut fields, mut types, mut elems) = (Vec::new(), Vec::new(), Vec::new());
         self.member_names(body, &mut fields, &mut types, &mut elems);
         let defs = vec![NONE; fields.len()];
@@ -2228,11 +2243,11 @@ impl<'a> Walk<'a> {
     /// A braced initializer of an object of struct type `type_name` (or of
     /// an array of them): bind the functions in it to the members they
     /// initialize.
-    fn init_list(&mut self, list: Node<'a>, type_name: u32, array: bool, var: u32, scope: u32) {
+    fn init_list(&mut self, list: Node<'t>, type_name: u32, array: bool, var: u32, scope: u32) {
         let ids = self.ids;
         let mut index = 0u32;
         let mut c = list.walk();
-        let elements: Vec<Node<'a>> = list.named_children(&mut c).collect();
+        let elements: Vec<Node<'t>> = list.named_children(&mut c).collect();
         for el in elements {
             let k = el.kind_id();
             if k == ids.initializer_pair {
@@ -2272,7 +2287,7 @@ impl<'a> Walk<'a> {
 
     /// The declared objects of a declaration and what they are initialized
     /// with.
-    fn initializers(&mut self, decl: Node<'a>, scope: u32) {
+    fn initializers(&mut self, decl: Node<'t>, scope: u32) {
         let ids = self.ids;
         let type_name = match decl.child_by_field_id(ids.f_type) {
             Some(t) if t.kind_id() == ids.type_identifier => self.intern(self.text(t)),
@@ -2323,7 +2338,7 @@ impl<'a> Walk<'a> {
                     // A table too long to expand as one text (a generated
                     // list of commands): row by row, each a struct of its own.
                     let mut c = value.walk();
-                    let rows: Vec<Node<'a>> = value.named_children(&mut c).filter(|r| !r.is_extra()).collect();
+                    let rows: Vec<Node<'t>> = value.named_children(&mut c).filter(|r| !r.is_extra()).collect();
                     for row in rows {
                         let (a, e) = (row.start_byte(), row.end_byte());
                         let at = self.site_starts.partition_point(|&p| p < a);
@@ -2360,7 +2375,7 @@ impl<'a> Walk<'a> {
     }
 
     /// Returns whether to descend into the node's children.
-    fn visit(&mut self, node: Node<'a>) -> bool {
+    fn visit(&mut self, node: Node<'t>) -> bool {
         self.flush_events(node.start_byte());
         self.leave_scope(node.start_byte());
         let k = node.kind_id();
@@ -2447,7 +2462,7 @@ impl<'a> Walk<'a> {
                         if discards | pasted != 0 {
                             if let Some(args) = node.child_by_field_id(ids.f_arguments) {
                                 let mut c = args.walk();
-                                let list: Vec<Node<'a>> = args.named_children(&mut c).filter(|a| !a.is_extra()).collect();
+                                let list: Vec<Node<'t>> = args.named_children(&mut c).filter(|a| !a.is_extra()).collect();
                                 for (i, a) in list.into_iter().enumerate().filter(|(i, _)| *i < 64) {
                                     if discards & 1 << i != 0 {
                                         self.quiet.push((a.start_byte(), a.end_byte()));
@@ -2468,7 +2483,7 @@ impl<'a> Walk<'a> {
                         let callee = self.intern(self.text(f));
                         if let Some(args) = node.child_by_field_id(ids.f_arguments) {
                             let mut c = args.walk();
-                            let list: Vec<Node<'a>> = args.named_children(&mut c).filter(|a| !a.is_extra()).collect();
+                            let list: Vec<Node<'t>> = args.named_children(&mut c).filter(|a| !a.is_extra()).collect();
                             for (i, a) in list.into_iter().enumerate() {
                                 let a = self.strip(a);
                                 if a.kind_id() == ids.identifier && !(self.in_fn() && self.locals.contains(self.text(a))) {
@@ -3106,7 +3121,7 @@ impl<'a> Walk<'a> {
                                 chain.push_str(&String::from_utf8_lossy(part));
                             }
                             let mut c = node.walk();
-                            let clause: Vec<Node<'a>> = node.children(&mut c).filter(|ch| ch.kind_id() == ids.base_class_clause).collect();
+                            let clause: Vec<Node<'t>> = node.children(&mut c).filter(|ch| ch.kind_id() == ids.base_class_clause).collect();
                             // (A class template's own parameters, which a base may be.)
                             let params: Vec<&[u8]> = node
                                 .parent()
@@ -3126,7 +3141,7 @@ impl<'a> Walk<'a> {
                                 .unwrap_or_default();
                             for clause in clause {
                                 let mut c = clause.walk();
-                                let named: Vec<Node<'a>> = clause.named_children(&mut c).collect();
+                                let named: Vec<Node<'t>> = clause.named_children(&mut c).collect();
                                 for b in named {
                                     if params.contains(&self.text(b)) && !self.out.cxx().param_bases.contains(&record) {
                                         self.out.cxx_mut().param_bases.push(record);
@@ -3217,6 +3232,116 @@ pub(crate) fn undecided_lines(src: &[u8], undecided: &[(u32, u32, u32, u64)]) ->
 /// each closed where bracket matching closes its brace: (start, end, name),
 /// in order of where they start. The parser's tree can lose one to error
 /// recovery (in a header full of macros and `#if`s); the text does not.
+/// The least size of a piece the parser reads alone (`NORN_CHUNK`, bytes;
+/// 0, the default, reads every file whole). An experiment: on the Linux
+/// kernel, pieces of 16 KiB neither parse faster nor lower the peak memory,
+/// which the facts and the graph decide rather than the trees.
+fn chunk_min() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| std::env::var("NORN_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// Where the masked text can be cut into pieces the parser reads alone, one
+/// after another: at the end of a line that ends a top-level declaration
+/// (a `;` at depth 0) or a function body (a `}` back to depth 0 whose `{`
+/// followed a `)`), outside every `#if` group. Pieces are joined until each
+/// is at least `min` bytes; `min == 0` gives the whole text.
+fn pieces(src: &[u8], min: usize) -> Vec<Range> {
+    let n = src.len();
+    let whole = |start: usize, row: usize| Range {
+        start_byte: start,
+        end_byte: n,
+        start_point: Point { row, column: 0 },
+        end_point: Point { row: usize::MAX, column: usize::MAX },
+    };
+    if min == 0 || n < 2 * min {
+        return vec![whole(0, 0)];
+    }
+    let mut out = Vec::new();
+    let (mut start, mut start_row) = (0, 0);
+    let (mut depth, mut pp) = (0usize, 0usize);
+    let (mut last, mut body, mut line_start) = (0u8, false, true);
+    let mut i = 0;
+    while i < n {
+        let c = src[i];
+        if line_start {
+            let j = i + src[i..].iter().take_while(|b| matches!(b, b' ' | b'\t')).count();
+            if src.get(j) == Some(&b'#') {
+                // A directive: to the end of its (continued) line.
+                let mut e = j;
+                while e < n && !(src[e] == b'\n' && src[e - 1] != b'\\') {
+                    e += 1;
+                }
+                let word: Vec<u8> = src[j + 1..e].iter().copied().skip_while(|b| b.is_ascii_whitespace()).take_while(|b| b.is_ascii_alphabetic()).collect();
+                match word.as_slice() {
+                    b"if" | b"ifdef" | b"ifndef" => pp += 1,
+                    b"endif" => pp = pp.saturating_sub(1),
+                    _ => {}
+                }
+                i = e;
+                continue;
+            }
+        }
+        line_start = false;
+        match c {
+            b'\n' => line_start = true,
+            b'/' if src.get(i + 1) == Some(&b'*') => {
+                let e = src[i + 2..].windows(2).position(|w| w == b"*/").map_or(n, |p| i + 4 + p);
+                i = e;
+                continue;
+            }
+            b'/' if src.get(i + 1) == Some(&b'/') => {
+                i += src[i..].iter().position(|&b| b == b'\n').unwrap_or(n - i);
+                continue;
+            }
+            b'"' | b'\'' => {
+                let mut j = i + 1;
+                while j < n && src[j] != c && src[j] != b'\n' {
+                    j += if src[j] == b'\\' { 2 } else { 1 };
+                }
+                i = (j + 1).min(n);
+                last = c;
+                continue;
+            }
+            b'(' | b'[' => depth += 1,
+            b'{' => {
+                if depth == 0 {
+                    body = last == b')';
+                }
+                depth += 1;
+            }
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if !c.is_ascii_whitespace() {
+            last = c;
+        }
+        let ends = depth == 0 && pp == 0 && (c == b';' || (c == b'}' && body));
+        i += 1;
+        if ends {
+            // Only blanks or a line comment may follow on the line.
+            let rest = src[i..].iter().position(|&b| b == b'\n').map_or(n, |p| i + p);
+            let tail = src[i..rest].trim_ascii_start();
+            if (tail.is_empty() || tail.starts_with(b"//")) && rest < n && rest + 1 - start >= min && n - (rest + 1) >= min {
+                let row = start_row + src[start..=rest].iter().filter(|&&b| b == b'\n').count();
+                out.push(Range {
+                    start_byte: start,
+                    end_byte: rest + 1,
+                    start_point: Point { row: start_row, column: 0 },
+                    end_point: Point { row, column: 0 },
+                });
+                start = rest + 1;
+                start_row = row;
+                i = rest + 1;
+                line_start = true;
+            }
+        }
+    }
+    out.push(whole(start, start_row));
+    out
+}
+
 fn namespace_spans(src: &[u8], blocks: &[(u32, u32, u32)]) -> Vec<(usize, usize, String)> {
     let mut out = Vec::new();
     let n = src.len();

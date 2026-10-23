@@ -15,6 +15,9 @@ const MAX_CANDIDATES: usize = 128;
 
 #[derive(Clone, Debug, Default)]
 pub struct LinkStats {
+    /// The files whose references were resolved (every file, unless the
+    /// link before left what holds: see `Last`).
+    pub resolved_files: u64,
     pub refs: u64,
     pub resolved: u64,
     pub ambiguous: u64,
@@ -1253,9 +1256,222 @@ pub fn link_cached(files: &[FileFacts], options: &Options, cache: &mut crate::ex
     linked
 }
 
+/// What resolving a file's references makes: its edges, how many were
+/// resolved, ambiguous, unresolved and capped, where functions are stored
+/// (`LinkStats::bind_sites`), and the callbacks it hands over.
+type PerFile = (Vec<[u32; 3]>, [u64; 4], Vec<[u32; 4]>, Vec<[u32; 3]>);
+
+/// What a link leaves for the next, made of the same files after an edit,
+/// to take what still holds from: resolving a file reads, of every other
+/// file, its definitions, records, types, macros and calls through
+/// parameters, as the names they are, and of a definition's line only
+/// which of the file's `#if`s it is in (see `seen`). When the files that
+/// changed say the same of those, and nothing else that resolving reads
+/// changed, only they are resolved again; and if the lines of their calls
+/// through parameters moved, the files that name those functions.
+pub(crate) struct Last {
+    /// Per file: its hash, and when it was last expanded (`Cache::made`).
+    keys: Vec<(u64, u64)>,
+    /// Per file: `seen`, and `handing`.
+    seen: Vec<u64>,
+    handing: Vec<u64>,
+    /// The paths, the includes, the options.
+    environment: u64,
+    /// The macros that wrap functions, in order.
+    wrappers: Vec<u32>,
+    /// Where each file's symbols start, and how many there are in all.
+    starts: Vec<u32>,
+    readings: std::sync::Arc<crate::units::Readings>,
+    /// The callbacks handed over, as the graph has them first in each list.
+    handed: Vec<[u32; 3]>,
+    /// Per file: what resolving it made besides its references' edges.
+    files: Vec<Resolved>,
+    /// The graph the link made (`graph_id`), which the next is handed.
+    graph: (usize, u64),
+}
+
+struct Resolved {
+    /// The edges from where a function is stored to it, some of which
+    /// start in other files.
+    binds: Vec<[u32; 3]>,
+    counts: [u64; 4],
+    sites: Vec<[u32; 4]>,
+    handed: Vec<[u32; 3]>,
+}
+
+/// The edges of a file whose references the link before resolved as this
+/// one would (see `Last`), read from the graph it made: of the lists of the
+/// file's symbols there, those of its references (after the callbacks
+/// handed over, which come first, and but for binds, which are kept
+/// apart); then its binds.
+fn kept_edges<'a>(previous: &'a Graph, handed_from: &'a FxHashMap<u32, usize>, syms: std::ops::Range<u32>, binds: &'a [[u32; 3]]) -> impl Iterator<Item = [u32; 3]> + 'a {
+    syms.flat_map(move |s| {
+        let list = &previous.out[previous.out_off[s as usize] as usize..previous.out_off[s as usize + 1] as usize];
+        let skip = handed_from.get(&s).copied().unwrap_or(0);
+        list[skip..].iter().filter(|e| e.meta & 7 != refkind::BIND as u32).map(move |e| [s, e.other, e.meta])
+    })
+    .chain(binds.iter().copied())
+}
+
+fn graph_id(g: &Graph) -> (usize, u64) {
+    (g.out.len(), xxhash_rust::xxh3::xxh3_64(bytemuck::cast_slice(&g.out_off)))
+}
+
+/// A digest of what resolving another file reads of `f` (by its names'
+/// numbers among all files', which a link's table does not change). Of
+/// where a definition is, only what is read: the undecided `#if` groups it
+/// is in, and of a header read more than one way (`directives`: the lines
+/// of its `#if`s and the like), which stretch between them.
+fn seen(f: &FileFacts, directives: Option<&[u32]>) -> u64 {
+    digest(f, directives, true)
+}
+
+/// The same but for its functions and variables, and with the definitions
+/// the rest refers to by what they are rather than where in the list: what
+/// stays the same when a function is put in, taken out or changed.
+fn shape(f: &FileFacts, directives: Option<&[u32]>) -> u64 {
+    digest(f, directives, false)
+}
+
+fn movable(kind: u8) -> bool {
+    kind == kind::FUNCTION || kind == kind::GLOBAL
+}
+
+/// Of each definition, what it is: its name, kind, and the how-manyth of
+/// that name and kind in the file.
+fn identities(f: &FileFacts) -> Vec<(u32, u8, u32)> {
+    let ids: Vec<u32> = f.shared_names().collect();
+    let mut seen: FxHashMap<(u32, u8), u32> = FxHashMap::default();
+    f.defs
+        .iter()
+        .map(|d| {
+            let id = (ids[d.name as usize], d.kind);
+            let n = seen.entry(id).or_default();
+            *n += 1;
+            (id.0, id.1, *n - 1)
+        })
+        .collect()
+}
+
+/// Where a definition is, as far as resolving reads it (see `seen`).
+fn place(f: &FileFacts, line: u32, directives: Option<&[u32]>, put: &mut impl FnMut(u32)) {
+    for u in f.undecided.iter().filter(|u| u.0 <= line && line <= u.1) {
+        put(u.3 as u32);
+        put((u.3 >> 32) as u32);
+    }
+    put(directives.map_or(NONE, |lines| lines.partition_point(|&l| l < line) as u32));
+}
+
+fn digest(f: &FileFacts, directives: Option<&[u32]>, all: bool) -> u64 {
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    let mut put = |v: u32| h.update(&v.to_le_bytes());
+    let ids: Vec<u32> = f.shared_names().collect();
+    let name = |n: u32| if n == NONE { NONE } else { ids[n as usize] };
+    let identity = if all { Vec::new() } else { identities(f) };
+    let def = |d: u32, put: &mut dyn FnMut(u32)| match identity.get(d as usize) {
+        Some(&(n, k, i)) => {
+            put(n);
+            put(k as u32);
+            put(i);
+        }
+        None => put(d),
+    };
+    let defs: Vec<&crate::model::Def> = f.defs.iter().filter(|d| all || !movable(d.kind)).collect();
+    put(defs.len() as u32);
+    for d in defs {
+        put(name(d.name));
+        put(d.kind as u32 | (d.flags as u32) << 8);
+        place(f, d.line, directives, &mut put);
+    }
+    put(f.records.len() as u32);
+    for r in f.records.iter() {
+        put(name(r.name));
+        put(r.fields.len() as u32);
+        r.fields.iter().chain(&r.types).for_each(|&n| put(name(n)));
+        r.defs.iter().for_each(|&d| def(d, &mut put));
+    }
+    put(f.aliases.len() as u32);
+    for &(alias, tag) in f.aliases.iter() {
+        put(name(alias));
+        put(name(tag));
+    }
+    // (A definition of this file, and a type's name.)
+    for list in [&f.typed, &f.field_types] {
+        put(list.len() as u32);
+        for &(d, t) in list.iter() {
+            def(d, &mut put);
+            put(name(t));
+        }
+    }
+    put(f.param_calls.len() as u32);
+    for c in f.param_calls.iter() {
+        def(c.scope, &mut put);
+        put(c.index);
+    }
+    put(f.macros.len() as u32);
+    for m in &f.macros {
+        put(name(m.name));
+        put(m.function_like as u32);
+        let text = xxhash_rust::xxh3::xxh3_64(f.name(m.text as usize).as_bytes());
+        put(text as u32);
+        put((text >> 32) as u32);
+    }
+    put(f.undecided.len() as u32);
+    for u in &f.undecided {
+        put(u.3 as u32);
+        put((u.3 >> 32) as u32);
+    }
+    let path = xxhash_rust::xxh3::xxh3_64(f.path.as_bytes());
+    put(path as u32);
+    put((path >> 32) as u32);
+    h.digest()
+}
+
+/// The names of the functions and variables `was` and `now` (the same
+/// file before and after an edit) do not define alike: as they are, where
+/// they are (see `seen`); and where each definition of `was` is in `now`
+/// (`NONE`: gone).
+fn redefined(was: &FileFacts, now: &FileFacts, directives: Option<&[u32]>) -> (Vec<u32>, Vec<u32>) {
+    let signatures = |f: &FileFacts| -> FxHashMap<(u32, u64), i32> {
+        let ids: Vec<u32> = f.shared_names().collect();
+        let mut m: FxHashMap<(u32, u64), i32> = FxHashMap::default();
+        for d in f.defs.iter().filter(|d| movable(d.kind)) {
+            let mut h = xxhash_rust::xxh3::Xxh3::new();
+            let mut put = |v: u32| h.update(&v.to_le_bytes());
+            put(d.kind as u32 | (d.flags as u32) << 8);
+            place(f, d.line, directives, &mut put);
+            *m.entry((ids[d.name as usize], h.digest())).or_default() += 1;
+        }
+        m
+    };
+    let mut both = signatures(now);
+    for (k, n) in signatures(was) {
+        *both.entry(k).or_default() -= n;
+    }
+    let mut names: Vec<u32> = both.into_iter().filter(|e| e.1 != 0).map(|e| e.0 .0).collect();
+    names.sort_unstable();
+    names.dedup();
+    let at: FxHashMap<(u32, u8, u32), u32> = identities(now).into_iter().enumerate().map(|(i, id)| (id, i as u32)).collect();
+    let map = identities(was).into_iter().map(|id| at.get(&id).copied().unwrap_or(NONE)).collect();
+    (names, map)
+}
+
+/// The lines of a file's calls through parameters: what the callbacks
+/// handed to its functions are called at.
+fn handing(f: &FileFacts) -> u64 {
+    let lines: Vec<u32> = f.param_calls.iter().map(|c| c.line).collect();
+    xxhash_rust::xxh3::xxh3_64(bytemuck::cast_slice(&lines))
+}
+
 fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::Cache) -> (Graph, LinkStats) {
     crate::progress::linking();
     let mut stats = LinkStats::default();
+    let lt = Instant::now();
+    let lp = |what: &str| {
+        if std::env::var_os("SI_LINK_PROFILE").is_some() {
+            eprintln!("link      {what}: {:.0} ms", ms(lt));
+        }
+    };
 
     // 0. Which file includes which, then macro expansion: it needs the
     //    definitions other files give, and adds definitions and references.
@@ -1298,7 +1514,12 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         eprintln!("facts     {}", part(&mut files.iter()));
         eprintln!("expanded  {}", part(&mut cache.expanded.iter().flatten()));
     }
-    let crate::expand::Cache { expanded, names: name_cache, .. } = cache;
+    let crate::expand::Cache { expanded, names: name_cache, made, relinks, last: left, previous, was, .. } = cache;
+    let was = std::mem::take(was);
+    // What the link sees of each file: its content, and when it was last
+    // expanded (see `Last`).
+    let keys: Vec<(u64, u64)> = files.iter().zip(made.iter()).map(|(f, &m)| (f.hash, m)).collect();
+    let (relinks, last, previous) = (*relinks, left.take(), previous.take());
     let files: Vec<&FileFacts> = files.iter().zip(expanded.iter()).map(|(f, e)| e.as_ref().unwrap_or(f)).collect();
     let files = &files[..];
 
@@ -1353,11 +1574,13 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     }
     stats.syms_ms = ms(t);
     crate::mem_mark("symbols");
+    lp("syms done");
     let cpp = Cpp::new(files, &remap, &mut g);
 
     // Which members can hold a function: those declared as function
     // pointers, and those of a typedef type that is one (or that is not
     // defined anywhere here, so cannot be ruled out).
+    lp("cpp");
     let callable: Vec<u32> = files
         .iter()
         .enumerate()
@@ -1374,6 +1597,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     }
 
     // Struct layouts by name, and typedef names for struct tags.
+    lp("callable");
     let mut records: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
     let mut aliases: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let mut renames: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
@@ -1404,6 +1628,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         records.entry(name).or_insert(list);
     }
 
+    lp("records");
     let mut of_symbol: FxHashMap<u32, u32> = FxHashMap::default();
     for (fi, f) in files.iter().enumerate() {
         for &(def, t) in &f.typed {
@@ -1422,6 +1647,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
 
     // Per file, the compilation it starts and the header it is, as the
     // readings number them.
+    lp("typed, through_param");
     let readings = &*options.readings;
     let numbered = |list: Vec<&str>| -> Vec<u32> {
         let at: FxHashMap<&str, u32> = list.into_iter().enumerate().map(|(i, p)| (p, i as u32)).collect();
@@ -1454,27 +1680,41 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     // whose body calls another macro: the name may come back expanded, as
     // it does there. (Not one whose body only does without the function,
     // `#define htab_size(h) ((h)->size)`.)
-    let macro_names: FxHashSet<&str> = files.iter().flat_map(|f| f.defs.iter().filter(|d| d.kind == kind::MACRO).map(move |d| f.name(d.name as usize))).collect();
-    let macro_names = &macro_names;
+    lp("unread");
+    // (By their numbers in the graph: the same text, the same number.)
+    let mut is_macro = vec![false; names.len()];
+    for (fi, f) in files.iter().enumerate() {
+        for d in f.defs.iter().filter(|d| d.kind == kind::MACRO) {
+            if let Some(n) = remap[fi].get(d.name as usize).filter(|&&n| n != NONE) {
+                is_macro[*n as usize] = true;
+            }
+        }
+    }
+    let is_macro = &is_macro;
     let wrappers: FxHashSet<u32> = files
-        .iter()
+        .par_iter()
         .enumerate()
-        .flat_map(|(fi, f)| {
+        .map(|(fi, f)| {
             let base = g.files[fi].sym_start;
+            let remap = &remap[fi];
             f.refs
                 .iter()
-                .filter(move |r| {
+                .filter(|r| {
                     f.defs.get(r.scope as usize).is_some_and(|d| {
                         d.kind == kind::MACRO
                             && (d.name == r.name
                                 || d.flags & (flag::CONDITIONAL | flag::CALLABLE) == flag::CALLABLE
                                     && r.kind & !refkind::MAYBE == refkind::CALL
-                                    && macro_names.contains(f.name(r.name as usize)))
+                                    && remap[r.name as usize] != NONE
+                                    && is_macro[remap[r.name as usize] as usize])
                     })
                 })
-                .map(move |r| base + r.scope)
+                .map(|r| base + r.scope)
+                .collect::<Vec<u32>>()
         })
+        .flatten_iter()
         .collect();
+    lp("macro names, wrappers");
     let who = Readers::new(readings);
     let all: Vec<u64> = vec![u64::MAX; readings.units.len().div_ceil(64)];
     let (unit_of, header_of, path_of) = if readings.is_empty() {
@@ -1496,820 +1736,1038 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     // 3. Resolve references. Each file is independent given the symbol table.
     //    A name means, in order: a definition in this file; one in a file it
     //    includes; anything with external visibility.
+    lp("readers, included");
     let t = Instant::now();
     let syms = &g.syms;
     // (What the facts call a string and a number passed.)
     let literals = ["\"\"", "0", "std::string"].map(|n| g.name_id(n).unwrap_or(NONE));
-    let per_file: Vec<(Vec<[u32; 3]>, [u64; 4], Vec<[u32; 4]>, Vec<[u32; 3]>)> = files
-        .par_iter()
-        .enumerate()
-        .map_init(|| (Closure::new(files.len()), Closure::new(files.len())), |(closure, sure), (fi, f)| {
-            closure.fill(fi as u32, &includes);
-            closure.unit = crate::is_unit(&f.path) && !included[fi];
-            // What the file reads in every configuration.
-            sure.fill(fi as u32, &sure_includes);
-            let base = g.files[fi].sym_start;
-            let end = base + f.defs.len() as u32;
-            let mut edges = Vec::with_capacity(f.refs.len());
-            let mut counts = [0u64; 4]; // resolved, ambiguous, unresolved, capped
-            let mut tmp: Vec<u32> = Vec::new();
-            let mut scratch: Vec<u32> = Vec::new();
-            let mut hint_of = vec![NONE; f.refs.len()];
-            for &(r, h) in &f.ref_hints {
-                hint_of[r as usize] = h;
+    let resolve = |(closure, sure): &mut (Closure, Closure), fi: usize| -> PerFile {
+        let f = files[fi];
+        closure.fill(fi as u32, &includes);
+        closure.unit = crate::is_unit(&f.path) && !included[fi];
+        // What the file reads in every configuration.
+        sure.fill(fi as u32, &sure_includes);
+        let base = g.files[fi].sym_start;
+        let end = base + f.defs.len() as u32;
+        let mut edges = Vec::with_capacity(f.refs.len());
+        let mut counts = [0u64; 4]; // resolved, ambiguous, unresolved, capped
+        let mut tmp: Vec<u32> = Vec::new();
+        let mut scratch: Vec<u32> = Vec::new();
+        let mut hint_of = vec![NONE; f.refs.len()];
+        for &(r, h) in &f.ref_hints {
+            hint_of[r as usize] = h;
+        }
+        // C++: what each name was called with (`X::f`).
+        let in_cpp = f.cpp() && cpp.on();
+        let mut qual_of = Vec::new();
+        if in_cpp {
+            qual_of = vec![NONE; f.refs.len()];
+            for &(r, q) in &f.cxx().ref_quals {
+                qual_of[r as usize] = remap[fi][q as usize];
             }
-            // C++: what each name was called with (`X::f`).
-            let in_cpp = f.cpp() && cpp.on();
-            let mut qual_of = Vec::new();
-            if in_cpp {
-                qual_of = vec![NONE; f.refs.len()];
-                for &(r, q) in &f.cxx().ref_quals {
-                    qual_of[r as usize] = remap[fi][q as usize];
-                }
+        }
+        let (mut pick, mut lineage, mut overrides, mut descendants) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        // In a header: the compilations that read it (worked out when first needed).
+        let readers: std::cell::OnceCell<Vec<u32>> = std::cell::OnceCell::new();
+        let reader_bits: std::cell::OnceCell<Vec<u64>> = std::cell::OnceCell::new();
+        // What they compile of a callee's file, per (file, stretch of
+        // lines between its directives): asked once, not once a call.
+        let known: std::cell::RefCell<FxHashMap<(u32, u32), crate::cond::Tri>> = Default::default();
+        let constructs: FxHashSet<u32> = f.cxx().constructs.iter().copied().collect();
+        let operands: FxHashMap<u32, (u32, u32, bool)> = f.cxx().operators.iter().map(|&(r, l, rr, binary)| (r, (l, rr, binary))).collect();
+        let args_of: FxHashMap<u32, u8> = f.cxx().args.iter().copied().collect();
+        let copies: FxHashSet<u32> = f.cxx().copies.iter().copied().collect();
+        let mut arg_types: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+        for &(r, at, t) in &f.cxx().arg_types {
+            arg_types.entry(r).or_default().push((at, remap[fi][t as usize]));
+        }
+        let mut made: Vec<(u32, u32)> = Vec::new();
+        // The objects a call's arguments are made into (see `Cpp::conversions`).
+        let mut convert = |ri: usize, r: &crate::model::Ref, targets: &[u32], ambiguous: bool, lineage: &mut Vec<u32>, edges: &mut Vec<[u32; 3]>| {
+            let Some(given) = arg_types.get(&(ri as u32)) else { return };
+            made.clear();
+            cpp.conversions(&g, &aliases, given, targets, literals, lineage, &mut made);
+            for &(c, class) in &made {
+                let several = made.iter().any(|&(o, k)| k == class && syms[o as usize].file != syms[c as usize].file);
+                edges.push([base + r.scope, c, pack_meta(r.line, ambiguous || several || aliased_class(&g, &cpp, c), refkind::CALL)]);
             }
-            let (mut pick, mut lineage, mut overrides, mut descendants) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-            // In a header: the compilations that read it (worked out when first needed).
-            let readers: std::cell::OnceCell<Vec<u32>> = std::cell::OnceCell::new();
-            let reader_bits: std::cell::OnceCell<Vec<u64>> = std::cell::OnceCell::new();
-            // What they compile of a callee's file, per (file, stretch of
-            // lines between its directives): asked once, not once a call.
-            let known: std::cell::RefCell<FxHashMap<(u32, u32), crate::cond::Tri>> = Default::default();
-            let constructs: FxHashSet<u32> = f.cxx().constructs.iter().copied().collect();
-            let operands: FxHashMap<u32, (u32, u32, bool)> = f.cxx().operators.iter().map(|&(r, l, rr, binary)| (r, (l, rr, binary))).collect();
-            let args_of: FxHashMap<u32, u8> = f.cxx().args.iter().copied().collect();
-            let copies: FxHashSet<u32> = f.cxx().copies.iter().copied().collect();
-            let mut arg_types: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
-            for &(r, at, t) in &f.cxx().arg_types {
-                arg_types.entry(r).or_default().push((at, remap[fi][t as usize]));
-            }
-            let mut made: Vec<(u32, u32)> = Vec::new();
-            // The objects a call's arguments are made into (see `Cpp::conversions`).
-            let mut convert = |ri: usize, r: &crate::model::Ref, targets: &[u32], ambiguous: bool, lineage: &mut Vec<u32>, edges: &mut Vec<[u32; 3]>| {
-                let Some(given) = arg_types.get(&(ri as u32)) else { return };
-                made.clear();
-                cpp.conversions(&g, &aliases, given, targets, literals, lineage, &mut made);
-                for &(c, class) in &made {
-                    let several = made.iter().any(|&(o, k)| k == class && syms[o as usize].file != syms[c as usize].file);
-                    edges.push([base + r.scope, c, pack_meta(r.line, ambiguous || several || aliased_class(&g, &cpp, c), refkind::CALL)]);
-                }
-            };
-            for (ri, r) in f.refs.iter().enumerate() {
-                if let Some(&(lh, rh, binary)) = operands.get(&(ri as u32)).filter(|_| in_cpp) {
-                    // An operator used on objects: the left operand's
-                    // class's (or a base's) member of that name, else a
-                    // function of no class taking operands of their types.
-                    // (C++20: `a < b` may be `a <=> b`, `a != b` `a == b`.)
-                    let type_of = |h: u32, scratch: &mut Vec<u32>| {
-                        (h != NONE).then(|| types.type_of(&f.hints[h as usize], fi, &g, base..end, closure, scratch)).flatten()
-                    };
-                    let (lt, rt) = (type_of(lh, &mut scratch), type_of(rh, &mut scratch));
-                    let name = remap[fi][r.name as usize];
-                    let assign = g.name(name) == "operator=";
-                    let rewritten = match g.name(name) {
-                        "operator<" | "operator>" | "operator<=" | "operator>=" => g.name_id("operator<=>"),
-                        "operator!=" => g.name_id("operator=="),
-                        _ => None,
-                    };
-                    // How well a parameter of type `p` takes an operand of
-                    // type `t`: not (`None`); as a template's `T`, or an operand
-                    // of no known type, does (1); as its type or a base (2).
-                    // Of the overloads, those that fit best are the ones.
-                    let fit = |p: u32, t: Option<u32>, lineage: &mut Vec<u32>| -> Option<u8> {
-                        let Some(t) = t else { return Some(1) };
-                        if p == NONE {
-                            return None;
-                        }
-                        if !cpp.types.contains(&p) {
-                            return Some(1);
-                        }
-                        cpp.lineage(t, lineage);
-                        (lineage.contains(&p) || aliases.get(&p).is_some_and(|a| a.iter().any(|x| lineage.contains(x)))).then_some(2)
-                    };
-                    // `a = b` of one type: the copy (or move) its class has
-                    // written, or else the compiler's, which is no call here.
-                    let right = if assign && (rt.is_none() || rt == lt) { lt } else { rt };
-                    tmp.clear();
-                    let mut best = 0u8;
-                    let mut keep = |c: u32, score: u8, tmp: &mut Vec<u32>| {
-                        if score > best {
-                            best = score;
-                            tmp.clear();
-                        }
-                        if score == best {
-                            tmp.push(c);
-                        }
-                    };
-                    // (A class's own `operator=`, written or the compiler's,
-                    // hides its bases'.)
-                    let own = |l: u32, s: u32| {
-                        !assign || types.layout_of(l, fi, closure).is_some_and(|(rf, ri)| remap[rf as usize][files[rf as usize].records[ri as usize].name as usize] == cpp.class(s))
-                    };
-                    for name in std::iter::once(name).chain(rewritten) {
-                        if let Some(sym) = lt.and_then(|l| types.class_member(l, name, fi, &g, closure).filter(|&s| own(l, s))).filter(|&s| syms[s as usize].kind == kind::FUNCTION) {
-                            // The class's: its overloads, of a binary one those
-                            // taking the right operand best.
-                            let class = cpp.class(sym);
-                            for &c in g.syms_named(name) {
-                                if syms[c as usize].kind != kind::FUNCTION || cpp.class(c) != class {
-                                    continue;
-                                }
-                                let score = if !binary {
-                                    Some(1)
-                                } else {
-                                    match cpp.operator_params.get(&c) {
-                                        Some(_) if assign && right.is_none() => None,
-                                        Some(&(p0, _)) => fit(p0, right, &mut lineage),
-                                        None if assign => None,
-                                        None => Some(1),
-                                    }
-                                };
-                                if let Some(score) = score {
-                                    keep(c, score, &mut tmp);
-                                }
-                            }
-                        } else if binary && !assign && (lt.is_some() || rt.is_some()) {
-                            // (A unary one on an object of no class with it is
-                            // a built-in: `*p` of a pointer.)
-                            // (From a source file, only one it sees: written
-                            // in what it includes, or declared there, of the
-                            // same parameters.)
-                            let seen = |c: u32| {
-                                let at = |file: u32| file == fi as u32 || closure.member[file as usize];
-                                let s = &syms[c as usize];
-                                !closure.unit
-                                    || at(s.file)
-                                    || s.flags & flag::HEADER == 0
-                                        && g.syms_named(s.name).iter().any(|&d| at(syms[d as usize].file) && cpp.class(d) == NONE && cpp.operator_params.get(&d) == cpp.operator_params.get(&c))
-                            };
-                            for &c in g.syms_named(name) {
-                                if syms[c as usize].kind != kind::FUNCTION || cpp.class(c) != NONE || !seen(c) {
-                                    continue;
-                                }
-                                let Some(&(p0, p1)) = cpp.operator_params.get(&c) else { continue };
-                                if let (Some(a), Some(b)) = (fit(p0, lt, &mut lineage), fit(p1, rt, &mut lineage)) {
-                                    keep(c, a + b, &mut tmp);
-                                }
-                            }
-                        }
-                        if !tmp.is_empty() {
-                            break;
-                        }
+        };
+        for (ri, r) in f.refs.iter().enumerate() {
+            if let Some(&(lh, rh, binary)) = operands.get(&(ri as u32)).filter(|_| in_cpp) {
+                // An operator used on objects: the left operand's
+                // class's (or a base's) member of that name, else a
+                // function of no class taking operands of their types.
+                // (C++20: `a < b` may be `a <=> b`, `a != b` `a == b`.)
+                let type_of = |h: u32, scratch: &mut Vec<u32>| {
+                    (h != NONE).then(|| types.type_of(&f.hints[h as usize], fi, &g, base..end, closure, scratch)).flatten()
+                };
+                let (lt, rt) = (type_of(lh, &mut scratch), type_of(rh, &mut scratch));
+                let name = remap[fi][r.name as usize];
+                let assign = g.name(name) == "operator=";
+                let rewritten = match g.name(name) {
+                    "operator<" | "operator>" | "operator<=" | "operator>=" => g.name_id("operator<=>"),
+                    "operator!=" => g.name_id("operator=="),
+                    _ => None,
+                };
+                // How well a parameter of type `p` takes an operand of
+                // type `t`: not (`None`); as a template's `T`, or an operand
+                // of no known type, does (1); as its type or a base (2).
+                // Of the overloads, those that fit best are the ones.
+                let fit = |p: u32, t: Option<u32>, lineage: &mut Vec<u32>| -> Option<u8> {
+                    let Some(t) = t else { return Some(1) };
+                    if p == NONE {
+                        return None;
                     }
-                    let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
-                    if tmp.iter().any(is_def) {
-                        tmp.retain(is_def);
+                    if !cpp.types.contains(&p) {
+                        return Some(1);
                     }
-                    if tmp.is_empty() {
-                        counts[2] += 1;
-                        continue;
+                    cpp.lineage(t, lineage);
+                    (lineage.contains(&p) || aliases.get(&p).is_some_and(|a| a.iter().any(|x| lineage.contains(x)))).then_some(2)
+                };
+                // `a = b` of one type: the copy (or move) its class has
+                // written, or else the compiler's, which is no call here.
+                let right = if assign && (rt.is_none() || rt == lt) { lt } else { rt };
+                tmp.clear();
+                let mut best = 0u8;
+                let mut keep = |c: u32, score: u8, tmp: &mut Vec<u32>| {
+                    if score > best {
+                        best = score;
+                        tmp.clear();
                     }
-                    let first = (syms[tmp[0] as usize].file, cpp.class(tmp[0]));
-                    let ambiguous = tmp.iter().any(|&c| (syms[c as usize].file, cpp.class(c)) != first);
-                    counts[ambiguous as usize] += 1;
-                    let meta = pack_meta(r.line, ambiguous, refkind::CALL);
-                    edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta]));
-                    continue;
-                }
-                // (`T (a)`, `fmt::string_view (p, n)`: a type called, of
-                // which no function but its constructors has the name, is
-                // one made.)
-                let type_called = in_cpp
-                    && r.kind == refkind::CALL
-                    && cpp.types.contains(&remap[fi][r.name as usize])
-                    && !g.syms_named(remap[fi][r.name as usize]).iter().any(|&c| syms[c as usize].kind == kind::FUNCTION && cpp.class(c) != syms[c as usize].name);
-                if in_cpp && (type_called || constructs.contains(&(ri as u32))) {
-                    // An object made: a constructor of the class named, or
-                    // of the type of the member of the class so named
-                    // (`: member_ (a)`), or of what a type's alias names.
-                    let name = remap[fi][r.name as usize];
-                    let mut class = if cpp.types.contains(&name) {
-                        name
-                    } else if hint_of[ri] != NONE {
-                        let h = &f.hints[hint_of[ri] as usize];
-                        types.member_type(remap[fi][h.root as usize], name, fi, closure).unwrap_or(NONE)
-                    } else {
-                        NONE
-                    };
-                    let ctor_of = |c: u32, class: u32| syms[c as usize].kind == kind::FUNCTION && cpp.class(c) == class;
-                    let has_ctor = |class: u32| g.syms_named(class).iter().any(|&c| ctor_of(c, class));
-                    // (An alias only where it is seen: a function's own
-                    // `using set = absl::btree_set<int>` is not `std::set`.)
-                    let alias_seen = |class: u32| {
-                        g.syms_named(class).iter().any(|&t| syms[t as usize].kind == kind::TYPEDEF && (syms[t as usize].file == fi as u32 || closure.member[syms[t as usize].file as usize]))
-                    };
-                    if class != NONE && !has_ctor(class) && (!closure.unit || alias_seen(class)) {
-                        if let Some(tag) = aliases.get(&class).into_iter().flatten().copied().find(|&t| has_ctor(t)) {
-                            class = tag;
-                        }
-                    }
-                    tmp.clear();
-                    if class != NONE {
-                        tmp.extend(g.syms_named(class).iter().copied().filter(|&c| ctor_of(c, class)));
-                    }
-                    cpp.by_arity(args_of.get(&(ri as u32)).copied(), &mut tmp, &[], syms);
-                    if copies.contains(&(ri as u32)) {
-                        // A copy: by the constructor taking one of its class,
-                        // or by the compiler's, which is no call here.
-                        tmp.retain(|c| cpp.params.get(&(*c, 0)) == Some(&class));
-                    }
-                    let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
-                    if tmp.iter().any(is_def) {
-                        tmp.retain(is_def);
-                    }
-                    if tmp.is_empty() {
-                        counts[2] += 1;
-                        continue;
-                    }
-                    let first = syms[tmp[0] as usize].file;
-                    let ambiguous = tmp.iter().any(|&c| syms[c as usize].file != first) || tmp.iter().all(|&c| aliased_class(&g, &cpp, c));
-                    counts[ambiguous as usize] += 1;
-                    let meta = pack_meta(r.line, ambiguous, refkind::CALL);
-                    edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta]));
-                    convert(ri, r, &tmp, ambiguous, &mut lineage, &mut edges);
-                    continue;
-                }
-                let (kind, maybe) = (r.kind & !refkind::MAYBE, r.kind & refkind::MAYBE != 0);
-                let cands = g.syms_named(remap[fi][r.name as usize]);
-                // `_Pragma ("...")`, `__asm__ __volatile__ (...)`: no call,
-                // whatever a parse in a macro's body took for a function.
-                if !cands.is_empty() && crate::mask::is_keyword(g.name(remap[fi][r.name as usize]).as_bytes()) {
-                    counts[2] += 1;
-                    continue;
-                }
-                // A member name can only mean a member, and nothing else can.
-                let member = matches!(kind, refkind::MEMBER | refkind::ICALL);
-                let through = kind == refkind::ICALL;
-                // `#define error(...) (error (__VA_ARGS__), flag ())`: a macro
-                // is not expanded inside itself, so there the name is the
-                // function.
-                let from = &syms[(base + r.scope) as usize];
-                let own_name = from.kind == kind::MACRO && from.name == remap[fi][r.name as usize];
-                let want = |s: &Sym| {
-                    if member {
-                        s.kind == kind::FIELD && (!through || s.flags & flag::CALLABLE != 0)
-                    } else {
-                        s.kind != kind::FILE && s.kind != kind::FIELD && !(own_name && s.kind == kind::MACRO)
+                    if score == best {
+                        tmp.push(c);
                     }
                 };
-                // With the type of what the member is taken from, the member
-                // is one symbol and no guess.
-                let typed = (member && hint_of[ri] != NONE)
-                    .then(|| types.member(&f.hints[hint_of[ri] as usize], remap[fi][r.name as usize], fi, &g, base..end, closure, &mut scratch))
-                    .flatten();
-                // (`tfm::format`, with `namespace tfm = tinyformat;`: `tinyformat`.)
-                let qual = if in_cpp { qual_of[ri] } else { NONE };
-                let qual = cpp.namespace_aliases.get(&qual).copied().unwrap_or(qual);
-                let mut edge_kind = kind;
-                // A method chosen by its name alone, the object's type not
-                // known (or not one of the corpus's: `name.c_str ()` of a
-                // `std::string`), is a guess, however few there are.
-                let mut guessed = false;
-                match typed {
-                    Some(sym) if in_cpp && syms[sym as usize].kind == kind::FUNCTION => {
-                        // A method: wherever its class defines it.
+                // (A class's own `operator=`, written or the compiler's,
+                // hides its bases'.)
+                let own = |l: u32, s: u32| {
+                    !assign || types.layout_of(l, fi, closure).is_some_and(|(rf, ri)| remap[rf as usize][files[rf as usize].records[ri as usize].name as usize] == cpp.class(s))
+                };
+                for name in std::iter::once(name).chain(rewritten) {
+                    if let Some(sym) = lt.and_then(|l| types.class_member(l, name, fi, &g, closure).filter(|&s| own(l, s))).filter(|&s| syms[s as usize].kind == kind::FUNCTION) {
+                        // The class's: its overloads, of a binary one those
+                        // taking the right operand best.
                         let class = cpp.class(sym);
-                        tmp.clear();
-                        tmp.extend(cands.iter().filter(|&&c| syms[c as usize].kind == kind::FUNCTION && cpp.class(c) == class));
-                        if tmp.is_empty() {
-                            tmp.push(sym);
+                        for &c in g.syms_named(name) {
+                            if syms[c as usize].kind != kind::FUNCTION || cpp.class(c) != class {
+                                continue;
+                            }
+                            let score = if !binary {
+                                Some(1)
+                            } else {
+                                match cpp.operator_params.get(&c) {
+                                    Some(_) if assign && right.is_none() => None,
+                                    Some(&(p0, _)) => fit(p0, right, &mut lineage),
+                                    None if assign => None,
+                                    None => Some(1),
+                                }
+                            };
+                            if let Some(score) = score {
+                                keep(c, score, &mut tmp);
+                            }
                         }
-                    }
-                    Some(sym) => {
-                        tmp.clear();
-                        tmp.push(sym);
-                    }
-                    None if in_cpp && through => {
-                        // `x.f ()` of a type not known: any method of that
-                        // name (of the class written, `p->Base::f ()`), and
-                        // any member that holds a function.
-                        pick.clear();
-                        if qual != NONE && !g.name(qual).is_empty() {
-                            cpp.nearest(cands, qual, &mut lineage, &mut pick);
-                        }
-                        if pick.is_empty() {
-                            pick.extend(cands.iter().filter(|&&c| syms[c as usize].kind == kind::FUNCTION && cpp.class(c) != NONE));
-                        }
-                        pick.extend(cands.iter().filter(|&&c| want(&syms[c as usize])));
-                        let seen = |c: &&u32| {
-                            let s = &syms[**c as usize];
-                            s.file == fi as u32 || closure.member[s.file as usize] || s.flags & flag::STATIC == 0 || s.flags & flag::HEADER != 0
+                    } else if binary && !assign && (lt.is_some() || rt.is_some()) {
+                        // (A unary one on an object of no class with it is
+                        // a built-in: `*p` of a pointer.)
+                        // (From a source file, only one it sees: written
+                        // in what it includes, or declared there, of the
+                        // same parameters.)
+                        let seen = |c: u32| {
+                            let at = |file: u32| file == fi as u32 || closure.member[file as usize];
+                            let s = &syms[c as usize];
+                            !closure.unit
+                                || at(s.file)
+                                || s.flags & flag::HEADER == 0
+                                    && g.syms_named(s.name).iter().any(|&d| at(syms[d as usize].file) && cpp.class(d) == NONE && cpp.operator_params.get(&d) == cpp.operator_params.get(&c))
                         };
-                        tmp.clear();
-                        tmp.extend(pick.iter().filter(seen));
-                        guessed = true;
-                    }
-                    None if in_cpp && !member => {
-                        // `f ()` in a method: its class's, or a base's, before
-                        // anything else; `X::f ()`: X's (a namespace's, or
-                        // `::f`: one of no class); elsewhere, one of no class.
-                        let caller_class = cpp.class(base + r.scope);
-                        let caller_ns = cpp.ns(base + r.scope);
-                        if qual != NONE && g.name(qual).is_empty() {
-                            // `::f`: one of the global namespace.
-                            cpp.nearest(cands, NONE, &mut lineage, &mut pick);
-                            pick.retain(|&c| cpp.ns(c) == NONE);
-                        } else if qual != NONE && cpp.namespaces.contains(&qual) {
-                            // `ns::f`: one of that namespace (or, where the
-                            // namespace is opened by a macro the parser did
-                            // not see through, one of no class).
-                            cpp.nearest(cands, NONE, &mut lineage, &mut pick);
-                            if pick.iter().any(|&c| cpp.ns(c) == qual) {
-                                pick.retain(|&c| cpp.ns(c) == qual);
-                            } else {
-                                pick.retain(|&c| cpp.ns(c) == NONE);
+                        for &c in g.syms_named(name) {
+                            if syms[c as usize].kind != kind::FUNCTION || cpp.class(c) != NONE || !seen(c) {
+                                continue;
                             }
-                        } else if qual != NONE && cpp.types.contains(&qual) {
-                            cpp.nearest(cands, qual, &mut lineage, &mut pick);
-                            if pick.is_empty() {
-                                cpp.nearest(cands, NONE, &mut lineage, &mut pick);
-                            }
-                        } else if qual != NONE && cands.iter().any(|&c| cpp.class(c) == qual) {
-                            // A class known by its members alone, one a macro
-                            // makes (Boost.Test's case): its.
-                            cpp.nearest(cands, qual, &mut lineage, &mut pick);
-                        } else if qual != NONE {
-                            // A scope the corpus does not have (`std::max`):
-                            // only a function of no class, and only a guess.
-                            cpp.nearest(cands, NONE, &mut lineage, &mut pick);
-                            guessed = true;
-                        } else {
-                            cpp.nearest(cands, caller_class, &mut lineage, &mut pick);
-                            if pick.is_empty() && caller_class != NONE {
-                                cpp.nearest(cands, NONE, &mut lineage, &mut pick);
-                            }
-                            // A function of the caller's own namespace hides
-                            // those of others.
-                            if caller_ns != NONE && pick.iter().any(|&c| cpp.class(c) == NONE && cpp.ns(c) == caller_ns) {
-                                pick.retain(|&c| cpp.class(c) != NONE || cpp.ns(c) == caller_ns);
-                            }
-                        }
-                        // (Qualified with a scope the corpus does not have,
-                        // `std::max`: nothing of the corpus, not anything of
-                        // that name.)
-                        if pick.is_empty() && qual == NONE {
-                            pick.extend_from_slice(cands);
-                            // (In a method, not one of another class; unless
-                            // `static`, called by its class's name in a way
-                            // not read, in what a macro there writes, where
-                            // the method is too: `X<T>::f ()`.)
-                            if cpp.class(base + r.scope) != NONE {
-                                let written = syms[(base + r.scope) as usize].line == r.line;
-                                let class_static = |c: u32| {
-                                    let class = cpp.class(c);
-                                    g.syms_named(syms[c as usize].name).iter().any(|&d| syms[d as usize].flags & flag::CLASS_STATIC != 0 && cpp.class(d) == class)
-                                };
-                                pick.retain(|&c| cpp.class(c) == NONE || written && class_static(c));
-                            }
-                        }
-                        in_sight(&pick, syms, base..end, closure, &sure.member, want, &mut tmp);
-                        // `T (a)`, `T x (a)`: a class named is made, by its
-                        // constructor if it has one written; else the class
-                        // is only used.
-                        let class_kind = |c: &u32| matches!(syms[*c as usize].kind, kind::CLASS | kind::STRUCT | kind::UNION);
-                        if kind == refkind::CALL && !tmp.is_empty() && tmp.iter().all(class_kind) {
-                            let name = remap[fi][r.name as usize];
-                            let ctors = cands.iter().filter(|&&c| syms[c as usize].kind == kind::FUNCTION && cpp.class(c) == name);
-                            pick.clear();
-                            pick.extend(ctors);
-                            if pick.is_empty() {
-                                edge_kind = refkind::USE;
-                            } else {
-                                std::mem::swap(&mut tmp, &mut pick);
+                            let Some(&(p0, p1)) = cpp.operator_params.get(&c) else { continue };
+                            if let (Some(a), Some(b)) = (fit(p0, lt, &mut lineage), fit(p1, rt, &mut lineage)) {
+                                keep(c, a + b, &mut tmp);
                             }
                         }
                     }
-                    None => in_sight(cands, syms, base..end, closure, &sure.member, want, &mut tmp),
-                }
-                // C names no member of a C++ class (`write` is not
-                // `RedisQtAdapter::write`).
-                if !in_cpp && !cpp.class_of.is_empty() {
-                    tmp.retain(|&c| cpp.class(c) == NONE);
-                }
-                // Nor, from a source file, only methods of classes other
-                // source files have all to themselves (a test's fixture):
-                // no name of them is in sight here. (`GetParam ()` in a test
-                // is gtest's.) (Beside others, one may be an override of
-                // them, through a base the file sees.)
-                if in_cpp && closure.unit && !member && tmp.iter().all(|&c| unseen_class(&g, &cpp, c, fi as u32, closure)) {
-                    tmp.clear();
-                }
-                if tmp.is_empty() {
-                    counts[2] += 1;
-                    continue;
-                }
-                let callable = |c: &u32| matches!(syms[*c as usize].kind, kind::FUNCTION | kind::MACRO);
-                if matches!(kind, refkind::CALL | refkind::PCALL) && tmp.iter().any(callable) {
-                    tmp.retain(callable);
-                }
-                if in_cpp {
-                    cpp.by_arity(args_of.get(&(ri as u32)).copied(), &mut tmp, cands, syms);
+                    if !tmp.is_empty() {
+                        break;
+                    }
                 }
                 let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
                 if tmp.iter().any(is_def) {
                     tmp.retain(is_def);
                 }
-                let built = |c: &u32| !unread.get(syms[*c as usize].file as usize).copied().unwrap_or(false);
-                if !apart.get(fi).copied().unwrap_or(false) {
-                    // (None built, as x86-64's `memcpy`, written in assembly:
-                    // this program's before another's.)
-                    let own = |c: &u32| !apart.get(syms[*c as usize].file as usize).copied().unwrap_or(false);
-                    if tmp.iter().any(built) {
-                        tmp.retain(built);
-                    } else if tmp.iter().any(own) {
-                        tmp.retain(own);
+                if tmp.is_empty() {
+                    counts[2] += 1;
+                    continue;
+                }
+                let first = (syms[tmp[0] as usize].file, cpp.class(tmp[0]));
+                let ambiguous = tmp.iter().any(|&c| (syms[c as usize].file, cpp.class(c)) != first);
+                counts[ambiguous as usize] += 1;
+                let meta = pack_meta(r.line, ambiguous, refkind::CALL);
+                edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta]));
+                continue;
+            }
+            // (`T (a)`, `fmt::string_view (p, n)`: a type called, of
+            // which no function but its constructors has the name, is
+            // one made.)
+            let type_called = in_cpp
+                && r.kind == refkind::CALL
+                && cpp.types.contains(&remap[fi][r.name as usize])
+                && !g.syms_named(remap[fi][r.name as usize]).iter().any(|&c| syms[c as usize].kind == kind::FUNCTION && cpp.class(c) != syms[c as usize].name);
+            if in_cpp && (type_called || constructs.contains(&(ri as u32))) {
+                // An object made: a constructor of the class named, or
+                // of the type of the member of the class so named
+                // (`: member_ (a)`), or of what a type's alias names.
+                let name = remap[fi][r.name as usize];
+                let mut class = if cpp.types.contains(&name) {
+                    name
+                } else if hint_of[ri] != NONE {
+                    let h = &f.hints[hint_of[ri] as usize];
+                    types.member_type(remap[fi][h.root as usize], name, fi, closure).unwrap_or(NONE)
+                } else {
+                    NONE
+                };
+                let ctor_of = |c: u32, class: u32| syms[c as usize].kind == kind::FUNCTION && cpp.class(c) == class;
+                let has_ctor = |class: u32| g.syms_named(class).iter().any(|&c| ctor_of(c, class));
+                // (An alias only where it is seen: a function's own
+                // `using set = absl::btree_set<int>` is not `std::set`.)
+                let alias_seen = |class: u32| {
+                    g.syms_named(class).iter().any(|&t| syms[t as usize].kind == kind::TYPEDEF && (syms[t as usize].file == fi as u32 || closure.member[syms[t as usize].file as usize]))
+                };
+                if class != NONE && !has_ctor(class) && (!closure.unit || alias_seen(class)) {
+                    if let Some(tag) = aliases.get(&class).into_iter().flatten().copied().find(|&t| has_ctor(t)) {
+                        class = tag;
                     }
                 }
-                // A macro, or a function defined in a header, is there only
-                // where its file is read: in a source file, not one its own
-                // compilation does not read (`core_cm7.h`'s, beside the
-                // `core_cm4.h` it does).
-                let unit_here = unit_of.get(fi).copied().unwrap_or(NONE);
-                if unit_here != NONE {
-                    let local = |c: &u32| {
-                        let s = &syms[*c as usize];
-                        s.kind == kind::MACRO || s.kind == kind::FUNCTION && s.flags & flag::DECL == 0 && s.flags & flag::HEADER != 0
-                    };
-                    let read_here = |c: &u32| {
-                        let s = &syms[*c as usize];
-                        let p = path_of.get(s.file as usize).copied().unwrap_or(NONE);
-                        p == NONE || s.file as usize == fi || readings.reads(unit_here, p)
-                    };
-                    // (But for a header nothing here includes, or no
-                    // compilation reads, where the compilation includes one
-                    // the build makes, which may bring it in.)
-                    let generated = readings.generated.get(unit_here as usize).copied().unwrap_or(true);
-                    let may = |c: &u32| {
-                        let p = path_of.get(syms[*c as usize].file as usize).copied().unwrap_or(NONE);
-                        let elsewhere = readings.orphans.binary_search(&p).is_ok() || unread.get(syms[*c as usize].file as usize).copied().unwrap_or(false);
-                        !local(c) || read_here(c) || generated && elsewhere
-                    };
-                    // Where the compilation reads one of those, or a
-                    // prototype of the name: it means that, not a macro of
-                    // a header it does not read.
-                    let declared = cands.iter().any(|c| syms[*c as usize].flags & flag::DECL != 0 && read_here(c));
-                    if (declared || tmp.iter().any(|c| local(c) && read_here(c)))
-                        && tmp.iter().any(may) && !tmp.iter().all(may) {
-                            tmp.retain(may);
-                        }
+                tmp.clear();
+                if class != NONE {
+                    tmp.extend(g.syms_named(class).iter().copied().filter(|&c| ctor_of(c, class)));
                 }
-                // In a source file: what its own compilation compiles of a
-                // header read one way here and another elsewhere.
-                // In a header: what every compilation that reads it compiles.
-                let unit = unit_of.get(fi).copied().unwrap_or(NONE);
-                let compiled = |c: u32| {
+                cpp.by_arity(args_of.get(&(ri as u32)).copied(), &mut tmp, &[], syms);
+                if copies.contains(&(ri as u32)) {
+                    // A copy: by the constructor taking one of its class,
+                    // or by the compiler's, which is no call here.
+                    tmp.retain(|c| cpp.params.get(&(*c, 0)) == Some(&class));
+                }
+                let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
+                if tmp.iter().any(is_def) {
+                    tmp.retain(is_def);
+                }
+                if tmp.is_empty() {
+                    counts[2] += 1;
+                    continue;
+                }
+                let first = syms[tmp[0] as usize].file;
+                let ambiguous = tmp.iter().any(|&c| syms[c as usize].file != first) || tmp.iter().all(|&c| aliased_class(&g, &cpp, c));
+                counts[ambiguous as usize] += 1;
+                let meta = pack_meta(r.line, ambiguous, refkind::CALL);
+                edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta]));
+                convert(ri, &r, &tmp, ambiguous, &mut lineage, &mut edges);
+                continue;
+            }
+            let (kind, maybe) = (r.kind & !refkind::MAYBE, r.kind & refkind::MAYBE != 0);
+            let cands = g.syms_named(remap[fi][r.name as usize]);
+            // `_Pragma ("...")`, `__asm__ __volatile__ (...)`: no call,
+            // whatever a parse in a macro's body took for a function.
+            if !cands.is_empty() && crate::mask::is_keyword(g.name(remap[fi][r.name as usize]).as_bytes()) {
+                counts[2] += 1;
+                continue;
+            }
+            // A member name can only mean a member, and nothing else can.
+            let member = matches!(kind, refkind::MEMBER | refkind::ICALL);
+            let through = kind == refkind::ICALL;
+            // `#define error(...) (error (__VA_ARGS__), flag ())`: a macro
+            // is not expanded inside itself, so there the name is the
+            // function.
+            let from = &syms[(base + r.scope) as usize];
+            let own_name = from.kind == kind::MACRO && from.name == remap[fi][r.name as usize];
+            let want = |s: &Sym| {
+                if member {
+                    s.kind == kind::FIELD && (!through || s.flags & flag::CALLABLE != 0)
+                } else {
+                    s.kind != kind::FILE && s.kind != kind::FIELD && !(own_name && s.kind == kind::MACRO)
+                }
+            };
+            // With the type of what the member is taken from, the member
+            // is one symbol and no guess.
+            let typed = (member && hint_of[ri] != NONE)
+                .then(|| types.member(&f.hints[hint_of[ri] as usize], remap[fi][r.name as usize], fi, &g, base..end, closure, &mut scratch))
+                .flatten();
+            // (`tfm::format`, with `namespace tfm = tinyformat;`: `tinyformat`.)
+            let qual = if in_cpp { qual_of[ri] } else { NONE };
+            let qual = cpp.namespace_aliases.get(&qual).copied().unwrap_or(qual);
+            let mut edge_kind = kind;
+            // A method chosen by its name alone, the object's type not
+            // known (or not one of the corpus's: `name.c_str ()` of a
+            // `std::string`), is a guess, however few there are.
+            let mut guessed = false;
+            match typed {
+                Some(sym) if in_cpp && syms[sym as usize].kind == kind::FUNCTION => {
+                    // A method: wherever its class defines it.
+                    let class = cpp.class(sym);
+                    tmp.clear();
+                    tmp.extend(cands.iter().filter(|&&c| syms[c as usize].kind == kind::FUNCTION && cpp.class(c) == class));
+                    if tmp.is_empty() {
+                        tmp.push(sym);
+                    }
+                }
+                Some(sym) => {
+                    tmp.clear();
+                    tmp.push(sym);
+                }
+                None if in_cpp && through => {
+                    // `x.f ()` of a type not known: any method of that
+                    // name (of the class written, `p->Base::f ()`), and
+                    // any member that holds a function.
+                    pick.clear();
+                    if qual != NONE && !g.name(qual).is_empty() {
+                        cpp.nearest(cands, qual, &mut lineage, &mut pick);
+                    }
+                    if pick.is_empty() {
+                        pick.extend(cands.iter().filter(|&&c| syms[c as usize].kind == kind::FUNCTION && cpp.class(c) != NONE));
+                    }
+                    pick.extend(cands.iter().filter(|&&c| want(&syms[c as usize])));
+                    let seen = |c: &&u32| {
+                        let s = &syms[**c as usize];
+                        s.file == fi as u32 || closure.member[s.file as usize] || s.flags & flag::STATIC == 0 || s.flags & flag::HEADER != 0
+                    };
+                    tmp.clear();
+                    tmp.extend(pick.iter().filter(seen));
+                    guessed = true;
+                }
+                None if in_cpp && !member => {
+                    // `f ()` in a method: its class's, or a base's, before
+                    // anything else; `X::f ()`: X's (a namespace's, or
+                    // `::f`: one of no class); elsewhere, one of no class.
+                    let caller_class = cpp.class(base + r.scope);
+                    let caller_ns = cpp.ns(base + r.scope);
+                    if qual != NONE && g.name(qual).is_empty() {
+                        // `::f`: one of the global namespace.
+                        cpp.nearest(cands, NONE, &mut lineage, &mut pick);
+                        pick.retain(|&c| cpp.ns(c) == NONE);
+                    } else if qual != NONE && cpp.namespaces.contains(&qual) {
+                        // `ns::f`: one of that namespace (or, where the
+                        // namespace is opened by a macro the parser did
+                        // not see through, one of no class).
+                        cpp.nearest(cands, NONE, &mut lineage, &mut pick);
+                        if pick.iter().any(|&c| cpp.ns(c) == qual) {
+                            pick.retain(|&c| cpp.ns(c) == qual);
+                        } else {
+                            pick.retain(|&c| cpp.ns(c) == NONE);
+                        }
+                    } else if qual != NONE && cpp.types.contains(&qual) {
+                        cpp.nearest(cands, qual, &mut lineage, &mut pick);
+                        if pick.is_empty() {
+                            cpp.nearest(cands, NONE, &mut lineage, &mut pick);
+                        }
+                    } else if qual != NONE && cands.iter().any(|&c| cpp.class(c) == qual) {
+                        // A class known by its members alone, one a macro
+                        // makes (Boost.Test's case): its.
+                        cpp.nearest(cands, qual, &mut lineage, &mut pick);
+                    } else if qual != NONE {
+                        // A scope the corpus does not have (`std::max`):
+                        // only a function of no class, and only a guess.
+                        cpp.nearest(cands, NONE, &mut lineage, &mut pick);
+                        guessed = true;
+                    } else {
+                        cpp.nearest(cands, caller_class, &mut lineage, &mut pick);
+                        if pick.is_empty() && caller_class != NONE {
+                            cpp.nearest(cands, NONE, &mut lineage, &mut pick);
+                        }
+                        // A function of the caller's own namespace hides
+                        // those of others.
+                        if caller_ns != NONE && pick.iter().any(|&c| cpp.class(c) == NONE && cpp.ns(c) == caller_ns) {
+                            pick.retain(|&c| cpp.class(c) != NONE || cpp.ns(c) == caller_ns);
+                        }
+                    }
+                    // (Qualified with a scope the corpus does not have,
+                    // `std::max`: nothing of the corpus, not anything of
+                    // that name.)
+                    if pick.is_empty() && qual == NONE {
+                        pick.extend_from_slice(cands);
+                        // (In a method, not one of another class; unless
+                        // `static`, called by its class's name in a way
+                        // not read, in what a macro there writes, where
+                        // the method is too: `X<T>::f ()`.)
+                        if cpp.class(base + r.scope) != NONE {
+                            let written = syms[(base + r.scope) as usize].line == r.line;
+                            let class_static = |c: u32| {
+                                let class = cpp.class(c);
+                                g.syms_named(syms[c as usize].name).iter().any(|&d| syms[d as usize].flags & flag::CLASS_STATIC != 0 && cpp.class(d) == class)
+                            };
+                            pick.retain(|&c| cpp.class(c) == NONE || written && class_static(c));
+                        }
+                    }
+                    in_sight(&pick, syms, base..end, closure, &sure.member, want, &mut tmp);
+                    // `T (a)`, `T x (a)`: a class named is made, by its
+                    // constructor if it has one written; else the class
+                    // is only used.
+                    let class_kind = |c: &u32| matches!(syms[*c as usize].kind, kind::CLASS | kind::STRUCT | kind::UNION);
+                    if kind == refkind::CALL && !tmp.is_empty() && tmp.iter().all(class_kind) {
+                        let name = remap[fi][r.name as usize];
+                        let ctors = cands.iter().filter(|&&c| syms[c as usize].kind == kind::FUNCTION && cpp.class(c) == name);
+                        pick.clear();
+                        pick.extend(ctors);
+                        if pick.is_empty() {
+                            edge_kind = refkind::USE;
+                        } else {
+                            std::mem::swap(&mut tmp, &mut pick);
+                        }
+                    }
+                }
+                None => in_sight(cands, syms, base..end, closure, &sure.member, want, &mut tmp),
+            }
+            // C names no member of a C++ class (`write` is not
+            // `RedisQtAdapter::write`).
+            if !in_cpp && !cpp.class_of.is_empty() {
+                tmp.retain(|&c| cpp.class(c) == NONE);
+            }
+            // Nor, from a source file, only methods of classes other
+            // source files have all to themselves (a test's fixture):
+            // no name of them is in sight here. (`GetParam ()` in a test
+            // is gtest's.) (Beside others, one may be an override of
+            // them, through a base the file sees.)
+            if in_cpp && closure.unit && !member && tmp.iter().all(|&c| unseen_class(&g, &cpp, c, fi as u32, closure)) {
+                tmp.clear();
+            }
+            if tmp.is_empty() {
+                counts[2] += 1;
+                continue;
+            }
+            let callable = |c: &u32| matches!(syms[*c as usize].kind, kind::FUNCTION | kind::MACRO);
+            if matches!(kind, refkind::CALL | refkind::PCALL) && tmp.iter().any(callable) {
+                tmp.retain(callable);
+            }
+            if in_cpp {
+                cpp.by_arity(args_of.get(&(ri as u32)).copied(), &mut tmp, cands, syms);
+            }
+            let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
+            if tmp.iter().any(is_def) {
+                tmp.retain(is_def);
+            }
+            let built = |c: &u32| !unread.get(syms[*c as usize].file as usize).copied().unwrap_or(false);
+            if !apart.get(fi).copied().unwrap_or(false) {
+                // (None built, as x86-64's `memcpy`, written in assembly:
+                // this program's before another's.)
+                let own = |c: &u32| !apart.get(syms[*c as usize].file as usize).copied().unwrap_or(false);
+                if tmp.iter().any(built) {
+                    tmp.retain(built);
+                } else if tmp.iter().any(own) {
+                    tmp.retain(own);
+                }
+            }
+            // A macro, or a function defined in a header, is there only
+            // where its file is read: in a source file, not one its own
+            // compilation does not read (`core_cm7.h`'s, beside the
+            // `core_cm4.h` it does).
+            let unit_here = unit_of.get(fi).copied().unwrap_or(NONE);
+            if unit_here != NONE {
+                let local = |c: &u32| {
+                    let s = &syms[*c as usize];
+                    s.kind == kind::MACRO || s.kind == kind::FUNCTION && s.flags & flag::DECL == 0 && s.flags & flag::HEADER != 0
+                };
+                let read_here = |c: &u32| {
+                    let s = &syms[*c as usize];
+                    let p = path_of.get(s.file as usize).copied().unwrap_or(NONE);
+                    p == NONE || s.file as usize == fi || readings.reads(unit_here, p)
+                };
+                // (But for a header nothing here includes, or no
+                // compilation reads, where the compilation includes one
+                // the build makes, which may bring it in.)
+                let generated = readings.generated.get(unit_here as usize).copied().unwrap_or(true);
+                let may = |c: &u32| {
+                    let p = path_of.get(syms[*c as usize].file as usize).copied().unwrap_or(NONE);
+                    let elsewhere = readings.orphans.binary_search(&p).is_ok() || unread.get(syms[*c as usize].file as usize).copied().unwrap_or(false);
+                    !local(c) || read_here(c) || generated && elsewhere
+                };
+                // Where the compilation reads one of those, or a
+                // prototype of the name: it means that, not a macro of
+                // a header it does not read.
+                let declared = cands.iter().any(|c| syms[*c as usize].flags & flag::DECL != 0 && read_here(c));
+                if (declared || tmp.iter().any(|c| local(c) && read_here(c)))
+                    && tmp.iter().any(may) && !tmp.iter().all(may) {
+                        tmp.retain(may);
+                    }
+            }
+            // In a source file: what its own compilation compiles of a
+            // header read one way here and another elsewhere.
+            // In a header: what every compilation that reads it compiles.
+            let unit = unit_of.get(fi).copied().unwrap_or(NONE);
+            let compiled = |c: u32| {
+                use crate::cond::Tri;
+                let s = &syms[c as usize];
+                let h = header_of.get(s.file as usize).copied().unwrap_or(NONE);
+                let p = path_of.get(s.file as usize).copied().unwrap_or(NONE);
+                // In a file every compilation reads one way: compiled
+                // where it is read for certain, unless under an `#if`
+                // not known. (None: a compilation that does not read
+                // it has no say.)
+                let in_unit = |u: u32| -> Option<Tri> {
+                    if h != NONE {
+                        return readings.units[u as usize].1.binary_search_by_key(&h, |w| w.0).is_ok().then(|| readings.compiled(u, h, s.line));
+                    }
+                    if p == NONE || !readings.reads(u, p) {
+                        return None;
+                    }
+                    // (Its own compilation: read wherever the call is,
+                    // the call under the branches it is included in.)
+                    let along = || {
+                        u == unit
+                            && readings.read_under(u, p).is_some_and(|ways| {
+                                ways.iter().any(|lines| lines.iter().all(|&l| files[fi].undecided.iter().any(|b| b.0 <= r.line && r.line <= b.1 && b.2 == l)))
+                            })
+                    };
+                    Some(if s.flags & flag::CONDITIONAL == 0 && (readings.reads_surely(u, p) || along()) { Tri::True } else { Tri::Unknown })
+                };
+                if h == NONE && p == NONE {
+                    return Tri::Unknown;
+                }
+                if unit != NONE {
+                    return in_unit(unit).unwrap_or(Tri::Unknown);
+                }
+                // (Here every compilation reading the callee's file reads
+                // it one way per stretch: one answer for all of it.)
+                let stretch = if h != NONE { readings.files[h as usize].1.partition_point(|&l| l < s.line) as u32 } else { u32::MAX - (s.flags & flag::CONDITIONAL != 0) as u32 };
+                if let Some(&t) = known.borrow().get(&(s.file, stretch)) {
+                    return t;
+                }
+                let at = path_of.get(fi).copied().unwrap_or(NONE);
+                let among = reader_bits.get_or_init(|| {
+                    if at == NONE { vec![0u64; readings.units.len().div_ceil(64)] } else { who.path(at).0.bits(readings.units.len()) }
+                });
+                // (A compilation that does not read the callee's file
+                // has no say: what it calls is not that.)
+                // (What every compilation compiles of it is the same
+                // from any file: worked out once for them all.)
+                let conditional = s.flags & flag::CONDITIONAL != 0;
+                let t = who.compile(among, h, stretch, p, conditional).unwrap_or_else(|| {
+                    let key = (s.file, stretch);
+                    if let Some(&t) = everywhere.lock().unwrap().get(&key) {
+                        return t;
+                    }
+                    let t = who.compile(&all, h, stretch, p, conditional).unwrap_or(Tri::Unknown);
+                    everywhere.lock().unwrap().insert(key, t);
+                    t
+                });
+                known.borrow_mut().insert((s.file, stretch), t);
+                t
+            };
+            if !header_of.is_empty() && tmp.iter().any(|&c| compiled(c) == crate::cond::Tri::False) && tmp.iter().any(|&c| compiled(c) != crate::cond::Tri::False) {
+                tmp.retain(|&c| compiled(c) != crate::cond::Tri::False);
+            }
+            // Without types, a member name shared by many structs says
+            // nothing about which one is meant.
+            if kind == refkind::MEMBER && tmp.len() > MAX_MEMBER_CANDIDATES {
+                counts[2] += 1;
+                continue;
+            }
+            if tmp.len() > MAX_CANDIDATES {
+                tmp.truncate(MAX_CANDIDATES);
+                counts[3] += 1;
+            }
+            // A macro that is not there in every configuration is one
+            // reading of the name; so is what a call through it reaches.
+            // (Not where the call is under the same branches as the
+            // macro: compiled, it finds the macro there.)
+            let optional = |c: &u32| {
+                let s = &syms[*c as usize];
+                let branches = |file: usize, line: u32| files[file].undecided.iter().filter(move |u| u.0 <= line && line <= u.1).map(|u| u.3);
+                let along = || branches(s.file as usize, s.line).all(|k| branches(fi, r.line).any(|h| h == k));
+                s.kind == kind::MACRO
+                    && (s.flags & flag::CONDITIONAL != 0 && !along() || s.file != fi as u32 && !sure.member[s.file as usize])
+                    && compiled(*c) != crate::cond::Tri::True
+            };
+            // C++: a name called that only a macro the corpus defines
+            // once can mean is that macro, defined or not where it is
+            // tested (`#if !GTEST_DONT_DEFINE_ASSERT_EQ`): without it
+            // the call would not compile.
+            let sole_macro = in_cpp
+                && kind == refkind::CALL
+                && tmp.len() == 1
+                && syms[tmp[0] as usize].kind == kind::MACRO
+                && cands.iter().all(|&c| c == tmp[0] || !matches!(syms[c as usize].kind, kind::FUNCTION | kind::MACRO));
+            let optional = |c: &u32| !sole_macro && optional(c);
+            // (C++: overloads are one function, of one class in one file.)
+            let several = if in_cpp {
+                let first = (syms[tmp[0] as usize].file, cpp.class(tmp[0]));
+                tmp.iter().any(|&c| (syms[c as usize].file, cpp.class(c)) != first)
+            } else {
+                // (A macro that wraps the function of its name is the
+                // way to it, not another reading of the call.)
+                let function = |c: &u32| syms[*c as usize].kind == kind::FUNCTION;
+                let wraps = tmp.iter().any(function);
+                tmp.iter().filter(|c| !(wraps && wrappers.contains(c))).count() > 1
+            };
+            let twin = in_cpp && tmp.iter().all(|&c| aliased_class(&g, &cpp, c));
+            let ambiguous = several || maybe || guessed || twin || tmp.iter().any(optional);
+            counts[ambiguous as usize] += 1;
+            // `SI_EDGE_WHY=<name>[,<name>...]`: why each call of those names that is
+            // not certain is not.
+            if ambiguous && edge_why.as_deref().is_some_and(|w| w.split(',').any(|w| g.name(remap[fi][r.name as usize]) == w)) {
+                let at = path_of.get(fi).and_then(|&p| readings.paths.get(p as usize)).map_or(files[fi].path.as_str(), |p| p.as_str());
+                let c = tmp[0];
+                // (Here worked out only to say: the link asks the turned-over table.)
+                let readers = readers.get_or_init(|| {
+                    let p = path_of.get(fi).copied().unwrap_or(NONE);
+                    if p == NONE { Vec::new() } else { (0..readings.units.len() as u32).filter(|&u| readings.reads(u, p)).collect() }
+                });
+                let n_readers = readers.len();
+                eprintln!(
+                    "edgewhy   {at}:{}: {} {} target(s) {:?}, maybe {maybe}, guessed {guessed}, optional {}, conditional {}, compiled {:?}, in its unit {}, readers {n_readers}",
+                    r.line,
+                    g.name(remap[fi][r.name as usize]),
+                    tmp.len(),
+                    tmp.iter().map(|&t| format!("{}{}", files[syms[t as usize].file as usize].path, if optional(&t) { " (optional)" } else { "" })).collect::<Vec<_>>(),
+                    tmp.iter().any(optional),
+                    syms[c as usize].flags & flag::CONDITIONAL != 0,
+                    compiled(c),
+                    unit != NONE,
+                );
+                // How its own compilation reads the macro's file.
+                let s = &syms[c as usize];
+                {
+                    // In a header: what each compilation reading it says
+                    // (yes, no, not known, does not read the macro's file).
                     use crate::cond::Tri;
-                    let s = &syms[c as usize];
                     let h = header_of.get(s.file as usize).copied().unwrap_or(NONE);
                     let p = path_of.get(s.file as usize).copied().unwrap_or(NONE);
-                    // In a file every compilation reads one way: compiled
-                    // where it is read for certain, unless under an `#if`
-                    // not known. (None: a compilation that does not read
-                    // it has no say.)
-                    let in_unit = |u: u32| -> Option<Tri> {
+                    let say = |u: u32| -> Option<Tri> {
                         if h != NONE {
                             return readings.units[u as usize].1.binary_search_by_key(&h, |w| w.0).is_ok().then(|| readings.compiled(u, h, s.line));
                         }
                         if p == NONE || !readings.reads(u, p) {
                             return None;
                         }
-                        // (Its own compilation: read wherever the call is,
-                        // the call under the branches it is included in.)
-                        let along = || {
-                            u == unit
-                                && readings.read_under(u, p).is_some_and(|ways| {
-                                    ways.iter().any(|lines| lines.iter().all(|&l| files[fi].undecided.iter().any(|b| b.0 <= r.line && r.line <= b.1 && b.2 == l)))
-                                })
-                        };
-                        Some(if s.flags & flag::CONDITIONAL == 0 && (readings.reads_surely(u, p) || along()) { Tri::True } else { Tri::Unknown })
+                        Some(if s.flags & flag::CONDITIONAL == 0 && readings.reads_surely(u, p) { Tri::True } else { Tri::Unknown })
                     };
-                    if h == NONE && p == NONE {
-                        return Tri::Unknown;
-                    }
-                    if unit != NONE {
-                        return in_unit(unit).unwrap_or(Tri::Unknown);
-                    }
-                    // (Here every compilation reading the callee's file reads
-                    // it one way per stretch: one answer for all of it.)
-                    let stretch = if h != NONE { readings.files[h as usize].1.partition_point(|&l| l < s.line) as u32 } else { u32::MAX - (s.flags & flag::CONDITIONAL != 0) as u32 };
-                    if let Some(&t) = known.borrow().get(&(s.file, stretch)) {
-                        return t;
-                    }
-                    let at = path_of.get(fi).copied().unwrap_or(NONE);
-                    let among = reader_bits.get_or_init(|| {
-                        if at == NONE { vec![0u64; readings.units.len().div_ceil(64)] } else { who.path(at).0.bits(readings.units.len()) }
-                    });
-                    // (A compilation that does not read the callee's file
-                    // has no say: what it calls is not that.)
-                    // (What every compilation compiles of it is the same
-                    // from any file: worked out once for them all.)
-                    let conditional = s.flags & flag::CONDITIONAL != 0;
-                    let t = who.compile(among, h, stretch, p, conditional).unwrap_or_else(|| {
-                        let key = (s.file, stretch);
-                        if let Some(&t) = everywhere.lock().unwrap().get(&key) {
-                            return t;
+                    let mut n = [0u32; 4];
+                    let mut odd: Vec<&str> = Vec::new();
+                    for &u in readers {
+                        let k = match say(u) { Some(Tri::True) => 0, Some(Tri::False) => 1, Some(Tri::Unknown) => 2, None => 3 };
+                        n[k] += 1;
+                        if (k == 1 || k == 2) && odd.len() < 4 {
+                            odd.push(readings.units[u as usize].0.as_str());
                         }
-                        let t = who.compile(&all, h, stretch, p, conditional).unwrap_or(Tri::Unknown);
-                        everywhere.lock().unwrap().insert(key, t);
-                        t
-                    });
-                    known.borrow_mut().insert((s.file, stretch), t);
-                    t
-                };
-                if !header_of.is_empty() && tmp.iter().any(|&c| compiled(c) == crate::cond::Tri::False) && tmp.iter().any(|&c| compiled(c) != crate::cond::Tri::False) {
-                    tmp.retain(|&c| compiled(c) != crate::cond::Tri::False);
+                    }
+                    eprintln!("edgewhy     readers say: yes {}, no {}, not known {}, do not read it {}; e.g. {}", n[0], n[1], n[2], n[3], odd.join(" "));
                 }
-                // Without types, a member name shared by many structs says
-                // nothing about which one is meant.
-                if kind == refkind::MEMBER && tmp.len() > MAX_MEMBER_CANDIDATES {
-                    counts[2] += 1;
-                    continue;
-                }
-                if tmp.len() > MAX_CANDIDATES {
-                    tmp.truncate(MAX_CANDIDATES);
-                    counts[3] += 1;
-                }
-                // A macro that is not there in every configuration is one
-                // reading of the name; so is what a call through it reaches.
-                // (Not where the call is under the same branches as the
-                // macro: compiled, it finds the macro there.)
-                let optional = |c: &u32| {
-                    let s = &syms[*c as usize];
-                    let branches = |file: usize, line: u32| files[file].undecided.iter().filter(move |u| u.0 <= line && line <= u.1).map(|u| u.3);
-                    let along = || branches(s.file as usize, s.line).all(|k| branches(fi, r.line).any(|h| h == k));
-                    s.kind == kind::MACRO
-                        && (s.flags & flag::CONDITIONAL != 0 && !along() || s.file != fi as u32 && !sure.member[s.file as usize])
-                        && compiled(*c) != crate::cond::Tri::True
-                };
-                // C++: a name called that only a macro the corpus defines
-                // once can mean is that macro, defined or not where it is
-                // tested (`#if !GTEST_DONT_DEFINE_ASSERT_EQ`): without it
-                // the call would not compile.
-                let sole_macro = in_cpp
-                    && kind == refkind::CALL
-                    && tmp.len() == 1
-                    && syms[tmp[0] as usize].kind == kind::MACRO
-                    && cands.iter().all(|&c| c == tmp[0] || !matches!(syms[c as usize].kind, kind::FUNCTION | kind::MACRO));
-                let optional = |c: &u32| !sole_macro && optional(c);
-                // (C++: overloads are one function, of one class in one file.)
-                let several = if in_cpp {
-                    let first = (syms[tmp[0] as usize].file, cpp.class(tmp[0]));
-                    tmp.iter().any(|&c| (syms[c as usize].file, cpp.class(c)) != first)
+                let h = header_of.get(s.file as usize).copied().unwrap_or(NONE);
+                let p = path_of.get(s.file as usize).copied().unwrap_or(NONE);
+                let file = if p.ne(&NONE) { readings.paths[p as usize].as_str() } else { "?" };
+                if h == NONE {
+                    eprintln!("edgewhy     {file}:{}: read one way by all; read {}, for sure {}", s.line, unit != NONE && p != NONE && readings.reads(unit, p), unit != NONE && p != NONE && readings.reads_surely(unit, p));
+                    let call: Vec<u32> = files[fi].undecided.iter().filter(|b| b.0 <= r.line && r.line <= b.1).map(|b| b.2).collect();
+                    let under = (unit != NONE && p != NONE).then(|| readings.read_under(unit, p)).flatten();
+                    eprintln!("edgewhy     included under branches (lines): {under:?}; the call is under {call:?}");
                 } else {
-                    // (A macro that wraps the function of its name is the
-                    // way to it, not another reading of the call.)
-                    let function = |c: &u32| syms[*c as usize].kind == kind::FUNCTION;
-                    let wraps = tmp.iter().any(function);
-                    tmp.iter().filter(|c| !(wraps && wrappers.contains(c))).count() > 1
-                };
-                let twin = in_cpp && tmp.iter().all(|&c| aliased_class(&g, &cpp, c));
-                let ambiguous = several || maybe || guessed || twin || tmp.iter().any(optional);
-                counts[ambiguous as usize] += 1;
-                // `SI_EDGE_WHY=<name>[,<name>...]`: why each call of those names that is
-                // not certain is not.
-                if ambiguous && edge_why.as_deref().is_some_and(|w| w.split(',').any(|w| g.name(remap[fi][r.name as usize]) == w)) {
-                    let at = path_of.get(fi).and_then(|&p| readings.paths.get(p as usize)).map_or(files[fi].path.as_str(), |p| p.as_str());
-                    let c = tmp[0];
-                    // (Here worked out only to say: the link asks the turned-over table.)
-                    let readers = readers.get_or_init(|| {
-                        let p = path_of.get(fi).copied().unwrap_or(NONE);
-                        if p == NONE { Vec::new() } else { (0..readings.units.len() as u32).filter(|&u| readings.reads(u, p)).collect() }
-                    });
-                    let n_readers = readers.len();
+                    let lines = &readings.files[h as usize].1;
+                    let stretch = lines.partition_point(|&l| l < s.line);
+                    let way = (unit != NONE).then(|| readings.units[unit as usize].1.binary_search_by_key(&h, |w| w.0).ok()).flatten();
+                    let way = way.map(|i| &readings.ways[h as usize][readings.units[unit as usize].1[i].1 as usize]);
                     eprintln!(
-                        "edgewhy   {at}:{}: {} {} target(s) {:?}, maybe {maybe}, guessed {guessed}, optional {}, conditional {}, compiled {:?}, in its unit {}, readers {n_readers}",
-                        r.line,
-                        g.name(remap[fi][r.name as usize]),
-                        tmp.len(),
-                        tmp.iter().map(|&t| format!("{}{}", files[syms[t as usize].file as usize].path, if optional(&t) { " (optional)" } else { "" })).collect::<Vec<_>>(),
-                        tmp.iter().any(optional),
-                        syms[c as usize].flags & flag::CONDITIONAL != 0,
-                        compiled(c),
-                        unit != NONE,
+                        "edgewhy     {file}:{}: read {} ways, {} directives (around: {:?}), stretch {stretch}, its way {:?}",
+                        s.line,
+                        readings.ways[h as usize].len(),
+                        lines.len(),
+                        &lines[stretch.saturating_sub(2)..(stretch + 2).min(lines.len())],
+                        way.map(|w| (w.len(), w.get(stretch.saturating_sub(2)..(stretch + 2).min(w.len())).map(|x| x.to_vec()))),
                     );
-                    // How its own compilation reads the macro's file.
-                    let s = &syms[c as usize];
-                    {
-                        // In a header: what each compilation reading it says
-                        // (yes, no, not known, does not read the macro's file).
-                        use crate::cond::Tri;
-                        let h = header_of.get(s.file as usize).copied().unwrap_or(NONE);
-                        let p = path_of.get(s.file as usize).copied().unwrap_or(NONE);
-                        let say = |u: u32| -> Option<Tri> {
-                            if h != NONE {
-                                return readings.units[u as usize].1.binary_search_by_key(&h, |w| w.0).is_ok().then(|| readings.compiled(u, h, s.line));
-                            }
-                            if p == NONE || !readings.reads(u, p) {
-                                return None;
-                            }
-                            Some(if s.flags & flag::CONDITIONAL == 0 && readings.reads_surely(u, p) { Tri::True } else { Tri::Unknown })
-                        };
-                        let mut n = [0u32; 4];
-                        let mut odd: Vec<&str> = Vec::new();
-                        for &u in readers {
-                            let k = match say(u) { Some(Tri::True) => 0, Some(Tri::False) => 1, Some(Tri::Unknown) => 2, None => 3 };
-                            n[k] += 1;
-                            if (k == 1 || k == 2) && odd.len() < 4 {
-                                odd.push(readings.units[u as usize].0.as_str());
-                            }
-                        }
-                        eprintln!("edgewhy     readers say: yes {}, no {}, not known {}, do not read it {}; e.g. {}", n[0], n[1], n[2], n[3], odd.join(" "));
-                    }
-                    let h = header_of.get(s.file as usize).copied().unwrap_or(NONE);
-                    let p = path_of.get(s.file as usize).copied().unwrap_or(NONE);
-                    let file = if p.ne(&NONE) { readings.paths[p as usize].as_str() } else { "?" };
-                    if h == NONE {
-                        eprintln!("edgewhy     {file}:{}: read one way by all; read {}, for sure {}", s.line, unit != NONE && p != NONE && readings.reads(unit, p), unit != NONE && p != NONE && readings.reads_surely(unit, p));
-                        let call: Vec<u32> = files[fi].undecided.iter().filter(|b| b.0 <= r.line && r.line <= b.1).map(|b| b.2).collect();
-                        let under = (unit != NONE && p != NONE).then(|| readings.read_under(unit, p)).flatten();
-                        eprintln!("edgewhy     included under branches (lines): {under:?}; the call is under {call:?}");
-                    } else {
-                        let lines = &readings.files[h as usize].1;
-                        let stretch = lines.partition_point(|&l| l < s.line);
-                        let way = (unit != NONE).then(|| readings.units[unit as usize].1.binary_search_by_key(&h, |w| w.0).ok()).flatten();
-                        let way = way.map(|i| &readings.ways[h as usize][readings.units[unit as usize].1[i].1 as usize]);
-                        eprintln!(
-                            "edgewhy     {file}:{}: read {} ways, {} directives (around: {:?}), stretch {stretch}, its way {:?}",
-                            s.line,
-                            readings.ways[h as usize].len(),
-                            lines.len(),
-                            &lines[stretch.saturating_sub(2)..(stretch + 2).min(lines.len())],
-                            way.map(|w| (w.len(), w.get(stretch.saturating_sub(2)..(stretch + 2).min(w.len())).map(|x| x.to_vec()))),
-                        );
-                    }
-                }
-                if in_cpp && through {
-                    // A method reached through an object is called, not a
-                    // function stored in a member.
-                    let meta = |to: u32, amb: bool| {
-                        let k = if syms[to as usize].kind == kind::FUNCTION { refkind::CALL } else { kind };
-                        pack_meta(r.line, amb, k)
-                    };
-                    edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta(to, ambiguous)]));
-                } else {
-                    let meta = pack_meta(r.line, ambiguous, edge_kind);
-                    edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta]));
-                }
-                // (Not of a function no header read here declares: gtest's
-                // `printf ("...")` is the C library's, not fmt's.)
-                let hidden = tmp.iter().any(|&c| {
-                    let seen = |d: &u32| syms[*d as usize].file == fi as u32 || closure.member[syms[*d as usize].file as usize];
-                    syms[c as usize].kind == kind::FUNCTION && !g.syms_named(syms[c as usize].name).iter().any(|d| seen(d) && cpp.class(*d) == cpp.class(c))
-                });
-                if in_cpp && edge_kind != refkind::USE && !hidden {
-                    convert(ri, r, &tmp, ambiguous, &mut lineage, &mut edges);
-                }
-                // A virtual method called on an object may run an override:
-                // those of the classes derived from its class.
-                if in_cpp && (through || (!member && qual == NONE)) && edge_kind != refkind::USE {
-                    overrides.clear();
-                    for &t in tmp.iter() {
-                        let (s, class) = (&syms[t as usize], cpp.class(t));
-                        if s.kind != kind::FUNCTION || class == NONE || !cpp.is_virtual(class, s.name, &mut lineage) {
-                            continue;
-                        }
-                        cpp.descendants(class, &mut descendants);
-                        for &c in g.syms_named(s.name) {
-                            let o = &syms[c as usize];
-                            if o.kind == kind::FUNCTION && o.flags & flag::DECL == 0 && descendants.contains(&cpp.class(c)) && !tmp.contains(&c) && !overrides.contains(&c) {
-                                overrides.push(c);
-                            }
-                        }
-                    }
-                    overrides.truncate(MAX_CANDIDATES);
-                    let meta = pack_meta(r.line, true, refkind::CALL);
-                    edges.extend(overrides.iter().map(|&to| [base + r.scope, to, meta]));
                 }
             }
+            if in_cpp && through {
+                // A method reached through an object is called, not a
+                // function stored in a member.
+                let meta = |to: u32, amb: bool| {
+                    let k = if syms[to as usize].kind == kind::FUNCTION { refkind::CALL } else { kind };
+                    pack_meta(r.line, amb, k)
+                };
+                edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta(to, ambiguous)]));
+            } else {
+                let meta = pack_meta(r.line, ambiguous, edge_kind);
+                edges.extend(tmp.iter().map(|&to| [base + r.scope, to, meta]));
+            }
+            // (Not of a function no header read here declares: gtest's
+            // `printf ("...")` is the C library's, not fmt's.)
+            let hidden = tmp.iter().any(|&c| {
+                let seen = |d: &u32| syms[*d as usize].file == fi as u32 || closure.member[syms[*d as usize].file as usize];
+                syms[c as usize].kind == kind::FUNCTION && !g.syms_named(syms[c as usize].name).iter().any(|d| seen(d) && cpp.class(*d) == cpp.class(c))
+            });
+            if in_cpp && edge_kind != refkind::USE && !hidden {
+                convert(ri, &r, &tmp, ambiguous, &mut lineage, &mut edges);
+            }
+            // A virtual method called on an object may run an override:
+            // those of the classes derived from its class.
+            if in_cpp && (through || (!member && qual == NONE)) && edge_kind != refkind::USE {
+                overrides.clear();
+                for &t in tmp.iter() {
+                    let (s, class) = (&syms[t as usize], cpp.class(t));
+                    if s.kind != kind::FUNCTION || class == NONE || !cpp.is_virtual(class, s.name, &mut lineage) {
+                        continue;
+                    }
+                    cpp.descendants(class, &mut descendants);
+                    for &c in g.syms_named(s.name) {
+                        let o = &syms[c as usize];
+                        if o.kind == kind::FUNCTION && o.flags & flag::DECL == 0 && descendants.contains(&cpp.class(c)) && !tmp.contains(&c) && !overrides.contains(&c) {
+                            overrides.push(c);
+                        }
+                    }
+                }
+                overrides.truncate(MAX_CANDIDATES);
+                let meta = pack_meta(r.line, true, refkind::CALL);
+                edges.extend(overrides.iter().map(|&to| [base + r.scope, to, meta]));
+            }
+        }
 
-            // Functions stored in members and variables: an edge from the
-            // member or variable to the function.
-            let mut bound: Vec<[u32; 3]> = Vec::new();
-            let mut slots: Vec<u32> = Vec::new();
-            for b in f.binds.iter().filter(|b| b.slot != NONE) {
-                let typed = (!b.var && b.index == NONE && b.hint != NONE)
-                    .then(|| types.member(&f.hints[b.hint as usize], remap[fi][b.slot as usize], fi, &g, base..end, closure, &mut scratch))
-                    .flatten();
-                if let Some(sym) = typed {
+        // Functions stored in members and variables: an edge from the
+        // member or variable to the function.
+        let mut bound: Vec<[u32; 3]> = Vec::new();
+        let mut slots: Vec<u32> = Vec::new();
+        for b in f.binds.iter().filter(|b| b.slot != NONE) {
+            let typed = (!b.var && b.index == NONE && b.hint != NONE)
+                .then(|| types.member(&f.hints[b.hint as usize], remap[fi][b.slot as usize], fi, &g, base..end, closure, &mut scratch))
+                .flatten();
+            if let Some(sym) = typed {
+                slots.clear();
+                slots.push(sym);
+            } else if b.var {
+                in_sight(g.syms_named(remap[fi][b.slot as usize]), syms, base..end, closure, &sure.member, |s| s.kind == kind::GLOBAL, &mut slots);
+            } else {
+                // Positional: the member is the struct's `index`-th.
+                // The struct may be named through a macro, and then it
+                // is the one the macro names where this is read: in the
+                // translation unit itself first, else here, else any
+                // that has a member at that place.
+                let mut ty = remap[fi][b.slot as usize];
+                if b.index != NONE && !records.contains_key(&ty) && !aliases.contains_key(&ty) {
+                    if let Some(named) = renames.get(&ty) {
+                        let has = |tag: u32| {
+                            layout(tag, fi as u32, closure, &records, &aliases, files).is_some_and(|(_, fields)| fields.get(b.index as usize).is_some_and(|f| *f != NONE))
+                        };
+                        let pick = named
+                            .iter()
+                            .find(|(file, tag)| *file == b.unit && has(*tag))
+                            .or_else(|| named.iter().find(|(file, tag)| *file == fi as u32 && has(*tag)))
+                            .or_else(|| named.iter().find(|(_, tag)| b.unit == NONE && has(*tag)));
+                        match pick {
+                            Some(&(_, tag)) => ty = tag,
+                            None => continue,
+                        }
+                    }
+                }
+                let (name, home) = if b.index == NONE {
+                    (remap[fi][b.slot as usize], None)
+                } else {
+                    let layout = layout(ty, fi as u32, closure, &records, &aliases, files);
+                    match layout.and_then(|(rf, fields)| Some((rf, *fields.get(b.index as usize)?))) {
+                        Some((rf, field)) if field != NONE => (remap[rf as usize][field as usize], Some(rf)),
+                        _ => continue,
+                    }
+                };
+                let cands = g.syms_named(name);
+                let holds = |s: &Sym| s.kind == kind::FIELD && s.flags & flag::CALLABLE != 0;
+                in_sight(cands, syms, base..end, closure, &sure.member, holds, &mut slots);
+                // The very member at that position, when the struct's
+                // layout says which definition it is.
+                let exact = (b.index != NONE)
+                    .then(|| record_of(ty, fi as u32, closure, &records, &aliases))
+                    .flatten()
+                    .and_then(|(rf, ri)| {
+                        let def = *files[rf as usize].records[ri as usize].defs.get(b.index as usize)?;
+                        (def != NONE).then(|| g.files[rf as usize].sym_start + def)
+                    });
+                if let Some(sym) = exact {
                     slots.clear();
                     slots.push(sym);
-                } else if b.var {
-                    in_sight(g.syms_named(remap[fi][b.slot as usize]), syms, base..end, closure, &sure.member, |s| s.kind == kind::GLOBAL, &mut slots);
-                } else {
-                    // Positional: the member is the struct's `index`-th.
-                    // The struct may be named through a macro, and then it
-                    // is the one the macro names where this is read: in the
-                    // translation unit itself first, else here, else any
-                    // that has a member at that place.
-                    let mut ty = remap[fi][b.slot as usize];
-                    if b.index != NONE && !records.contains_key(&ty) && !aliases.contains_key(&ty) {
-                        if let Some(named) = renames.get(&ty) {
-                            let has = |tag: u32| {
-                                layout(tag, fi as u32, closure, &records, &aliases, files).is_some_and(|(_, fields)| fields.get(b.index as usize).is_some_and(|f| *f != NONE))
-                            };
-                            let pick = named
-                                .iter()
-                                .find(|(file, tag)| *file == b.unit && has(*tag))
-                                .or_else(|| named.iter().find(|(file, tag)| *file == fi as u32 && has(*tag)))
-                                .or_else(|| named.iter().find(|(_, tag)| b.unit == NONE && has(*tag)));
-                            match pick {
-                                Some(&(_, tag)) => ty = tag,
-                                None => continue,
-                            }
-                        }
-                    }
-                    let (name, home) = if b.index == NONE {
-                        (remap[fi][b.slot as usize], None)
-                    } else {
-                        let layout = layout(ty, fi as u32, closure, &records, &aliases, files);
-                        match layout.and_then(|(rf, fields)| Some((rf, *fields.get(b.index as usize)?))) {
-                            Some((rf, field)) if field != NONE => (remap[rf as usize][field as usize], Some(rf)),
-                            _ => continue,
-                        }
-                    };
-                    let cands = g.syms_named(name);
-                    let holds = |s: &Sym| s.kind == kind::FIELD && s.flags & flag::CALLABLE != 0;
-                    in_sight(cands, syms, base..end, closure, &sure.member, holds, &mut slots);
-                    // The very member at that position, when the struct's
-                    // layout says which definition it is.
-                    let exact = (b.index != NONE)
-                        .then(|| record_of(ty, fi as u32, closure, &records, &aliases))
-                        .flatten()
-                        .and_then(|(rf, ri)| {
-                            let def = *files[rf as usize].records[ri as usize].defs.get(b.index as usize)?;
-                            (def != NONE).then(|| g.files[rf as usize].sym_start + def)
-                        });
-                    if let Some(sym) = exact {
+                } else if let Some(rf) = home {
+                    let there = |c: &&u32| holds(&syms[**c as usize]) && syms[**c as usize].file == rf;
+                    if cands.iter().any(|c| there(&c)) {
                         slots.clear();
-                        slots.push(sym);
-                    } else if let Some(rf) = home {
-                        let there = |c: &&u32| holds(&syms[**c as usize]) && syms[**c as usize].file == rf;
-                        if cands.iter().any(|c| there(&c)) {
-                            slots.clear();
-                            slots.extend(cands.iter().filter(there));
-                        }
-                    }
-                }
-                if slots.is_empty() || slots.len() > MAX_MEMBER_CANDIDATES {
-                    continue;
-                }
-                let named = g.syms_named(remap[fi][b.func as usize]);
-                in_sight(named, syms, base..end, closure, &sure.member, |s| s.kind == kind::FUNCTION, &mut tmp);
-                // Read in another translation unit, the name is first of all
-                // that unit's own function.
-                let own = |c: &&u32| syms[**c as usize].kind == kind::FUNCTION && syms[**c as usize].file == b.unit;
-                if b.unit != NONE && named.iter().any(|c| own(&c)) {
-                    tmp.clear();
-                    tmp.extend(named.iter().filter(own));
-                }
-                let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
-                if tmp.iter().any(is_def) {
-                    tmp.retain(is_def);
-                }
-                tmp.truncate(MAX_CANDIDATES);
-                let meta = pack_meta(b.line, slots.len() > 1 || tmp.len() > 1, refkind::BIND);
-                for &slot in &slots {
-                    bound.extend(tmp.iter().map(|&to| [slot, to, meta]));
-                }
-            }
-            // Callbacks: a function passed where the callee calls its
-            // parameter is called by the callee.
-            let mut handed: Vec<[u32; 3]> = Vec::new();
-            if !through_param.is_empty() {
-                let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
-                for a in &f.arg_passes {
-                    in_sight(g.syms_named(remap[fi][a.callee as usize]), syms, base..end, closure, &sure.member, |s| s.kind == kind::FUNCTION, &mut slots);
-                    if slots.iter().any(is_def) {
-                        slots.retain(is_def);
-                    }
-                    for &callee in slots.iter().take(MAX_MEMBER_CANDIDATES) {
-                        for &(_, line) in through_param.get(&callee).into_iter().flatten().filter(|p| p.0 == a.index) {
-                            in_sight(g.syms_named(remap[fi][a.func as usize]), syms, base..end, closure, &sure.member, |s| s.kind == kind::FUNCTION, &mut tmp);
-                            if tmp.iter().any(is_def) {
-                                tmp.retain(is_def);
-                            }
-                            tmp.truncate(MAX_CANDIDATES);
-                            let meta = pack_meta(line, slots.len() > 1 || tmp.len() > 1, refkind::PCALL);
-                            handed.extend(tmp.iter().map(|&to| [callee, to, meta]));
-                        }
+                        slots.extend(cands.iter().filter(there));
                     }
                 }
             }
-            // Every place a function is stored is kept (for "who assigns
-            // this member"); the graph needs each pair only once.
-            bound.sort_unstable();
-            bound.dedup();
-            let sites = bound.iter().map(|e| [fi as u32, e[2] >> 4, e[0], e[1]]).collect();
-            bound.dedup_by_key(|e| (e[0], e[1]));
-            edges.extend(bound);
-            handed.sort_unstable();
-            handed.dedup();
-            (edges, counts, sites, handed)
-        })
-        .collect();
+            if slots.is_empty() || slots.len() > MAX_MEMBER_CANDIDATES {
+                continue;
+            }
+            let named = g.syms_named(remap[fi][b.func as usize]);
+            in_sight(named, syms, base..end, closure, &sure.member, |s| s.kind == kind::FUNCTION, &mut tmp);
+            // Read in another translation unit, the name is first of all
+            // that unit's own function.
+            let own = |c: &&u32| syms[**c as usize].kind == kind::FUNCTION && syms[**c as usize].file == b.unit;
+            if b.unit != NONE && named.iter().any(|c| own(&c)) {
+                tmp.clear();
+                tmp.extend(named.iter().filter(own));
+            }
+            let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
+            if tmp.iter().any(is_def) {
+                tmp.retain(is_def);
+            }
+            tmp.truncate(MAX_CANDIDATES);
+            let meta = pack_meta(b.line, slots.len() > 1 || tmp.len() > 1, refkind::BIND);
+            for &slot in &slots {
+                bound.extend(tmp.iter().map(|&to| [slot, to, meta]));
+            }
+        }
+        // Callbacks: a function passed where the callee calls its
+        // parameter is called by the callee.
+        let mut handed: Vec<[u32; 3]> = Vec::new();
+        if !through_param.is_empty() {
+            let is_def = |c: &u32| syms[*c as usize].flags & flag::DECL == 0;
+            for a in &f.arg_passes {
+                in_sight(g.syms_named(remap[fi][a.callee as usize]), syms, base..end, closure, &sure.member, |s| s.kind == kind::FUNCTION, &mut slots);
+                if slots.iter().any(is_def) {
+                    slots.retain(is_def);
+                }
+                for &callee in slots.iter().take(MAX_MEMBER_CANDIDATES) {
+                    for &(_, line) in through_param.get(&callee).into_iter().flatten().filter(|p| p.0 == a.index) {
+                        in_sight(g.syms_named(remap[fi][a.func as usize]), syms, base..end, closure, &sure.member, |s| s.kind == kind::FUNCTION, &mut tmp);
+                        if tmp.iter().any(is_def) {
+                            tmp.retain(is_def);
+                        }
+                        tmp.truncate(MAX_CANDIDATES);
+                        let meta = pack_meta(line, slots.len() > 1 || tmp.len() > 1, refkind::PCALL);
+                        handed.extend(tmp.iter().map(|&to| [callee, to, meta]));
+                    }
+                }
+            }
+        }
+        // Every place a function is stored is kept (for "who assigns
+        // this member"); the graph needs each pair only once.
+        bound.sort_unstable();
+        bound.dedup();
+        let sites = bound.iter().map(|e| [fi as u32, e[2] >> 4, e[0], e[1]]).collect();
+        bound.dedup_by_key(|e| (e[0], e[1]));
+        edges.extend(bound);
+        handed.sort_unstable();
+        handed.dedup();
+        (edges, counts, sites, handed)
+    };
+    let fresh = || (Closure::new(files.len()), Closure::new(files.len()));
+
+    // An edit seldom changes what other files see of the files it changed
+    // (but for where their definitions are): then those files are resolved
+    // again, and the files that use a name they define, and every other
+    // file's edges are taken from the graph before.
+    let environment = {
+        use xxhash_rust::xxh3::xxh3_64_with_seed as mix;
+        let mut h = mix(options.not_built.join("\n").as_bytes(), files.len() as u64);
+        for (from, to) in &options.include_aliases {
+            h = mix(to.as_bytes(), mix(from.as_bytes(), h));
+        }
+        for (f, (edges, sure)) in files.iter().zip(includes.iter().zip(&sure_includes)) {
+            h = mix(bytemuck::cast_slice(sure), mix(bytemuck::cast_slice(edges), mix(f.path.as_bytes(), h)));
+        }
+        h
+    };
+    let wrappers_sorted = {
+        let mut w: Vec<u32> = wrappers.iter().copied().collect();
+        w.sort_unstable();
+        w
+    };
+    let directives: FxHashMap<&str, &[u32]> = options.readings.files.iter().map(|(p, lines)| (p.as_str(), &lines[..])).collect();
+    // Files whose functions or variables changed (one put in, taken out,
+    // renamed, moved into another `#if`) number their symbols otherwise:
+    // `moved` is where a symbol of the graph before is now.
+    let mut maps: FxHashMap<usize, Vec<u32>> = FxHashMap::default();
+    let again: Option<Vec<bool>> = last.as_deref().zip(previous.as_ref()).and_then(|(last, previous)| {
+        // (What the names are numbered in the graph is no matter: the
+        // edges are between symbols.)
+        let same = last.keys.len() == files.len() && last.environment == environment && *last.readings == *options.readings && last.graph == graph_id(previous);
+        if !same {
+            lp(&format!(
+                "relink in full: files {}, environment {}, readings {}, graph {}",
+                last.keys.len() == files.len(),
+                last.environment == environment,
+                *last.readings == *options.readings,
+                last.graph == graph_id(previous)
+            ));
+            return None;
+        }
+        let changed: Vec<usize> = (0..files.len()).filter(|&i| keys[i] != last.keys[i]).collect();
+        // (Most of the tree changed: resolving it all is as quick.)
+        if changed.len() > 64 && changed.len() > files.len() / 8 {
+            return None;
+        }
+        let mut named = vec![false; names.len()];
+        let mut any = false;
+        let mut name = |n: u32| {
+            if let Some(slot) = named.get_mut(n as usize) {
+                *slot = true;
+                any = true;
+            }
+        };
+        for &i in &changed {
+            let f = files[i];
+            let lines = directives.get(f.path.as_str()).copied();
+            if f.cpp() {
+                lp(&format!("relink in full: {} is C++", f.path));
+                return None;
+            }
+            if seen(f, lines) != last.seen[i] {
+                // What changed is its functions and variables alone: who
+                // names one that is not as it was is resolved again.
+                let Some(was) = was.get(&i).filter(|w| !w.cpp() && shape(w, lines) == shape(f, lines)) else {
+                    lp(&format!("relink in full: {} changed what other files see of it", f.path));
+                    return None;
+                };
+                let (redefined, map) = redefined(was, f, lines);
+                let rank = |id: u32| name_cache.rank_of(id);
+                redefined.into_iter().filter_map(rank).for_each(&mut name);
+                maps.insert(i, map);
+            }
+            // The callbacks handed to a function are called where it calls
+            // its parameter: who hands one over is resolved again.
+            if handing(f) != last.handing[i] {
+                for c in f.param_calls.iter() {
+                    name(remap[i][f.defs[c.scope as usize].name as usize]);
+                }
+            }
+        }
+        let mut again = vec![false; files.len()];
+        for &i in &changed {
+            again[i] = true;
+        }
+        if any {
+            let users: Vec<bool> = remap.par_iter().map(|r| r.iter().any(|&n| n != NONE && named[n as usize])).collect();
+            for (a, u) in again.iter_mut().zip(users) {
+                *a |= u;
+            }
+        }
+        let n = again.iter().filter(|&&a| a).count();
+        (n <= 64 || n <= files.len() / 2).then_some(again)
+    });
+    // Where a symbol of the graph before is now: past the files whose
+    // symbols changed, as many places on as they gained.
+    let spans: Vec<(u32, u32, usize, i64)> = match last.as_deref() {
+        Some(last) => {
+            let mut spans: Vec<(u32, u32, usize, i64)> = maps.keys().map(|&k| (last.starts[k], last.starts[k + 1], k, 0)).collect();
+            spans.sort_unstable();
+            let mut shift = 0i64;
+            for s in &mut spans {
+                shift += files[s.2].defs.len() as i64 - (s.1 - s.0) as i64;
+                s.3 = shift;
+            }
+            spans
+        }
+        None => Vec::new(),
+    };
+    let moved = |s: u32| -> u32 {
+        if spans.is_empty() {
+            return s;
+        }
+        let i = spans.partition_point(|sp| sp.1 <= s);
+        match spans.get(i) {
+            Some(&(a, _, k, _)) if a <= s => {
+                let at = maps[&k][(s - a) as usize];
+                if at == NONE {
+                    NONE
+                } else {
+                    g.files[k].sym_start + at
+                }
+            }
+            _ => (s as i64 + if i == 0 { 0 } else { spans[i - 1].3 }) as u32,
+        }
+    };
+    // The macros that wrap functions are the same, but for where.
+    let again = again.filter(|_| {
+        let last = last.as_deref().expect("the link before");
+        let mut w: Vec<u32> = last.wrappers.iter().map(|&s| moved(s)).collect();
+        w.sort_unstable();
+        let same = w == wrappers_sorted;
+        if !same {
+            lp("relink in full: the macros that wrap functions changed");
+        }
+        same
+    });
+    // A file resolved as before is not resolved, nor are its edges taken
+    // out of the graph before: they are read from it as the new one is made.
+    let mut handed_from: FxHashMap<u32, usize> = FxHashMap::default();
+    if let (Some(_), Some(last)) = (&again, last.as_deref()) {
+        for e in &last.handed {
+            *handed_from.entry(e[0]).or_default() += 1;
+        }
+    }
+    let reused = |k: usize| again.as_ref().is_some_and(|a| !a[k]);
+    let kept = |k: usize| {
+        let (previous, last) = (previous.as_ref().expect("the graph before"), last.as_deref().expect("the link before"));
+        // (What started or ended at a symbol now gone was named by a file
+        // resolved again: none of these.)
+        kept_edges(previous, &handed_from, last.starts[k]..last.starts[k + 1], &last.files[k].binds)
+            .map(|e| [moved(e[0]), moved(e[1]), e[2]])
+            .filter(|e| e[0] != NONE && e[1] != NONE)
+    };
+    let moved_all = |list: &[[u32; 3]]| -> Vec<[u32; 3]> { list.iter().map(|e| [moved(e[0]), moved(e[1]), e[2]]).collect() };
+    let per_file: Vec<PerFile> = match (&again, last.as_deref()) {
+        (Some(again), Some(last)) => (0..files.len())
+            .into_par_iter()
+            .map_init(fresh, |st, fi| {
+                if again[fi] {
+                    return resolve(st, fi);
+                }
+                let r = &last.files[fi];
+                let sites = r.sites.iter().map(|s| [s[0], s[1], moved(s[2]), moved(s[3])]).collect();
+                (Vec::new(), r.counts, sites, moved_all(&r.handed))
+            })
+            .collect(),
+        _ => files.par_iter().enumerate().map_init(fresh, |st, (fi, _)| resolve(st, fi)).collect(),
+    };
+    stats.resolved_files = again.as_ref().map_or(files.len(), |a| a.iter().filter(|&&a| a).count()) as u64;
+    lp(&format!("resolved {} of {} files", stats.resolved_files, files.len()));
+    if again.is_some() && std::env::var_os("SI_LINK_CHECK").is_some() {
+        let all: Vec<PerFile> = files.par_iter().enumerate().map_init(fresh, |st, (fi, _)| resolve(st, fi)).collect();
+        // What the graph makes of them: each symbol's edges, in order.
+        let by_source = |p: &PerFile, edges: Vec<[u32; 3]>| {
+            let mut e = edges;
+            e.sort_by_key(|e| e[0]);
+            (e, p.1, p.2.clone(), p.3.clone())
+        };
+        let edges = |i: usize| if reused(i) { kept(i).collect() } else { per_file[i].0.clone() };
+        let differ: Vec<&str> =
+            (0..files.len()).filter(|&i| by_source(&per_file[i], edges(i)) != by_source(&all[i], all[i].0.clone())).map(|i| files[i].path.as_str()).collect();
+        eprintln!("link      check: {} of {} files resolved again; {} differ from resolving every file {:?}", stats.resolved_files, files.len(), differ.len(), &differ[..differ.len().min(5)]);
+    }
+    let snapshot = relinks.then(|| {
+        let digests = |what: &(dyn Fn(usize) -> u64 + Sync), old: Option<&Vec<u64>>| -> Vec<u64> {
+            (0..files.len())
+                .into_par_iter()
+                .map(|i| match (old, &again) {
+                    (Some(old), Some(again)) if !again[i] => old[i],
+                    _ => what(i),
+                })
+                .collect()
+        };
+        let resolved = per_file
+            .par_iter()
+            .enumerate()
+            .map(|(k, p)| {
+                let binds = match &last {
+                    Some(last) if reused(k) => moved_all(&last.files[k].binds),
+                    _ => p.0.iter().filter(|e| e[2] & 7 == refkind::BIND as u32).copied().collect(),
+                };
+                Resolved { binds, counts: p.1, sites: p.2.clone(), handed: p.3.clone() }
+            })
+            .collect();
+        Last {
+            keys,
+            seen: digests(&|i| seen(files[i], directives.get(files[i].path.as_str()).copied()), last.as_ref().map(|l| &l.seen)),
+            handing: digests(&|i| handing(files[i]), last.as_ref().map(|l| &l.handing)),
+            environment,
+            wrappers: wrappers_sorted.clone(),
+            starts: g.files.iter().map(|f| f.sym_start).chain([n_syms as u32]).collect(),
+            readings: options.readings.clone(),
+            handed: Vec::new(),
+            files: resolved,
+            graph: (0, 0),
+        }
+    });
     // The same callback is handed over in many places.
+    lp("resolve");
     let mut handed: Vec<[u32; 3]> = per_file.iter().flat_map(|p| p.3.iter().copied()).collect();
     handed.sort_unstable();
     handed.dedup();
+    let mut snapshot = snapshot.map(|s| Last { handed: handed.clone(), ..s });
     for (_, c, sites, _) in &per_file {
         stats.bind_sites.extend_from_slice(sites);
         stats.resolved += c[0];
@@ -2318,7 +2776,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         stats.capped += c[3];
     }
     stats.refs = stats.resolved + stats.ambiguous + stats.unresolved;
-    stats.edges = (handed.len() + per_file.iter().map(|p| p.0.len()).sum::<usize>()) as u64;
+    stats.edges = (handed.len() + per_file.iter().enumerate().map(|(k, p)| if reused(k) { kept(k).count() } else { p.0.len() }).sum::<usize>()) as u64;
     stats.resolve_ms = ms(t);
     drop((remap, names));
     crate::mem_mark("resolved");
@@ -2326,23 +2784,40 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     // 4. Forward and reverse adjacency. The edges are never all in one
     //    list: each file's are put in their place and let go, and the
     //    reverse is made from the forward one.
+    lp("handed, stats");
     let t = Instant::now();
     let mut out_off = vec![0u32; n_syms + 1];
-    for e in std::iter::once(&handed).chain(per_file.iter().map(|p| &p.0)).flatten() {
+    for e in handed.iter().copied() {
         out_off[e[0] as usize + 1] += 1;
+    }
+    for (k, p) in per_file.iter().enumerate() {
+        let mut count = |e: [u32; 3]| out_off[e[0] as usize + 1] += 1;
+        if reused(k) {
+            kept(k).for_each(&mut count);
+        } else {
+            p.0.iter().copied().for_each(&mut count);
+        }
     }
     for i in 0..n_syms {
         out_off[i + 1] += out_off[i];
     }
     let mut next = out_off.clone();
     let mut out = vec![EdgeHalf { other: 0, meta: 0 }; stats.edges as usize];
-    for list in std::iter::once(handed).chain(per_file.into_iter().map(|p| p.0)) {
-        for e in &list {
-            let slot = &mut next[e[0] as usize];
-            out[*slot as usize] = EdgeHalf { other: e[1], meta: e[2] };
-            *slot += 1;
+    let mut place = |e: [u32; 3]| {
+        let slot = &mut next[e[0] as usize];
+        out[*slot as usize] = EdgeHalf { other: e[1], meta: e[2] };
+        *slot += 1;
+    };
+    handed.into_iter().for_each(&mut place);
+    for (k, p) in per_file.into_iter().enumerate() {
+        if reused(k) {
+            kept(k).for_each(&mut place);
+        } else {
+            p.0.into_iter().for_each(&mut place);
         }
     }
+    drop(previous);
+    lp("out filled");
     let (in_off, inc) = transposed(n_syms, &out_off, &out, next);
     g.out_off = out_off;
     g.out = out;
@@ -2351,6 +2826,11 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     stats.csr_ms = ms(t);
     crate::mem_mark("packed");
 
+    lp("transposed");
+    if let Some(mut s) = snapshot.take() {
+        s.graph = graph_id(&g);
+        *left = Some(Box::new(s));
+    }
     crate::progress::idle();
     (g, stats)
 }
