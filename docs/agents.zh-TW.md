@@ -24,8 +24,23 @@ AI coding agent（Copilot 的 agent 模式、Claude Code、Codex、OpenCode）�
 | OpenCode | 同上 |
 | 其他支援 Model Context Protocol 的工具 | 指令設成 `norn mcp`（見[下方](#其他工具)） |
 
-**Norn: Connect AI Agents**（VS Code 裡按 `Ctrl+Shift+P`）和 `norn setup` 做的是同一件事。沒有 VS Code 時，先從
-[releases](https://github.com/humphrey0925/norn/releases) 下載對應平台的 `norn` 執行檔（見[命令列手冊](cli.zh-TW.md#安裝)）。
+**Norn: Connect AI Agents**（VS Code 裡按 `Ctrl+Shift+P`）和 `norn setup` 做的是同一件事。沒有 VS Code 時，一行指令就會從最新的
+release 安裝 `norn`、比對 release 的 `SHA256SUMS`，再執行 `norn setup`：
+
+```sh
+# Linux、macOS
+curl -fsSL https://norn-c.com/install.sh | sh
+```
+
+```powershell
+# Windows（PowerShell）
+irm https://norn-c.com/install.ps1 | iex
+```
+
+（`NORN_VERSION=0.26.0` 可指定其他版本；`NORN_NO_SETUP=1` 則不設定任何 agent。）也可以自己從
+[releases](https://github.com/humphrey0925/norn/releases) 下載執行檔（見[命令列手冊](cli.zh-TW.md#安裝)），再執行 `norn setup`。
+
+`[已驗證]` `install.sh` 在 Linux 上實測過：能下載並比對 checksum，checksum 不符時不會安裝。`[未測]` `install.ps1`：這裡沒有 PowerShell 可以測。
 
 它會對這台電腦上找得到的每個 agent 做這些事：
 

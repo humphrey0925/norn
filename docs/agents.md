@@ -27,9 +27,24 @@ first and use the tools rather than grep.
 | Any other client of the Model Context Protocol | Give it the command `norn mcp` (see [below](#other-clients)) |
 
 **Norn: Connect AI Agents** (in VS Code, `Ctrl+Shift+P`) and `norn setup` (in
-a terminal) do the same thing. Without VS Code, download the `norn` executable for your platform from the
-[releases](https://github.com/humphrey0925/norn/releases) first (see
-[the command line](cli.md#installing)).
+a terminal) do the same thing. Without VS Code, one line installs `norn` from
+the latest release, checks it against the release's `SHA256SUMS`, and runs
+`norn setup`:
+
+```sh
+# Linux, macOS
+curl -fsSL https://norn-c.com/install.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://norn-c.com/install.ps1 | iex
+```
+
+(`NORN_VERSION=0.26.0` for another release; `NORN_NO_SETUP=1` to set no
+agent up.) Or download the executable from the
+[releases](https://github.com/humphrey0925/norn/releases) yourself (see
+[the command line](cli.md#installing)) and run `norn setup`.
 
 What it does, for each agent found on the machine:
 
@@ -229,6 +244,9 @@ find_callees main
   shows the wiring, not whether a real model chooses the tools.
 - Tried: VS Code (Linux, Windows): the extension's MCP server answers
   `initialize`, `tools/list` and `tools/call`.
+- Tried: `install.sh` on Linux, against a release, and with a checksum that
+  did not match (nothing installed).
+- Not tried: `install.ps1` (no PowerShell where it was written).
 - Not tried: whether Copilot loads `~/.agents/skills/norn/` (VS Code's
   documentation says it reads that folder).
 - Not tried: Codex in VS Code and in the ChatGPT desktop app, and the folder
