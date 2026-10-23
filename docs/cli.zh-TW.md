@@ -260,6 +260,7 @@ norn setup [claude | codex | opencode]... [--remove | --print | --refresh]
 | `--remove` | 從每個 agent 的設定中移除 Norn，以及它的 skill |
 | `--print` | 只印出每個 agent 的設定會加入什麼 |
 | `--refresh` | 只在 `~/.norn/bin` 的副本和 skill 已經存在時，把它們更新到最新。VS Code 擴充套件每次啟動都會做，所以擴充套件更新後 agent 也會跟著更新 |
+| `--status` | 只以 JSON 回報這台電腦上有哪些 agent、哪些已經會啟動 Norn（`{"agents": [{"name": "claude", "present": true, "setUp": false}, …], "installed": true}`）；不執行也不寫入任何東西。VS Code 擴充套件用它來提示設定其餘的 agent |
 
 在 VS Code 裡：**Norn: Connect AI Agents** 做的是同一件事。Copilot 的 agent 模式不需要這些（見 [`mcp`](#mcp)）。
 

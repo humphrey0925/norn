@@ -27,7 +27,10 @@ first and use the tools rather than grep.
 | Any other client of the Model Context Protocol | Give it the command `norn mcp` (see [below](#other-clients)) |
 
 **Norn: Connect AI Agents** (in VS Code, `Ctrl+Shift+P`) and `norn setup` (in
-a terminal) do the same thing. Without VS Code, one line installs `norn` from
+a terminal) do the same thing. VS Code also offers it by itself: when it
+finds Claude Code, Codex or OpenCode on the machine without Norn, it asks
+once, a little after it starts (**Connect** / **Not Now**), and does not ask
+about that agent again. Without VS Code, one line installs `norn` from
 the latest release, checks it against the release's `SHA256SUMS`, and runs
 `norn setup`:
 

@@ -162,6 +162,10 @@ enum Cmd {
         /// update of the extension does).
         #[arg(long, conflicts_with_all = ["remove", "print"])]
         refresh: bool,
+        /// Only say, as JSON, which agents are on this machine and which of
+        /// them start Norn already; nothing is written.
+        #[arg(long, conflicts_with_all = ["remove", "print", "refresh"])]
+        status: bool,
     },
     /// Every symbol as `file<TAB>line<TAB>kind<TAB>decl|def<TAB>name` (for accuracy checks).
     Symbols {
@@ -857,7 +861,7 @@ fn main() {
             let keep = keep.clone();
             return mcp::run(root.as_deref(), move |dir: &Path| keep.open(dir, &options));
         }
-        Cmd::Setup { agents, remove, print, refresh } => std::process::exit(setup::run_setup(agents, *remove, *print, *refresh)),
+        Cmd::Setup { agents, remove, print, refresh, status } => std::process::exit(setup::run_setup(agents, *remove, *print, *refresh, *status)),
         Cmd::Symbols { dir } => return symbols(dir),
         Cmd::Calls { dir } => return calls(dir),
     };

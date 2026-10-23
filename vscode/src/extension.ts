@@ -2240,6 +2240,40 @@ function connectAgents(context: vscode.ExtensionContext): void {
     );
   // (Nothing is written unless the agents were set up before.)
   void setup(["--refresh"]);
+  // Agents on this machine that do not start Norn yet: offered, once per
+  // agent, a little after the start, so as not to come with everything
+  // else then. Whatever the answer, an agent is not asked about again; one
+  // that comes later is. (An older server, without --status, offers none.)
+  setTimeout(() => void offer(), 15_000);
+  const offer = async () => {
+    if (!vscode.workspace.getConfiguration("norn").get<boolean>("mcp.enabled", true)) {
+      return;
+    }
+    const r = await setup(["--status"]);
+    let status: { agents?: { name: string; present: boolean; setUp: boolean }[] };
+    try {
+      status = JSON.parse(r.out) as typeof status;
+    } catch {
+      return;
+    }
+    const offered = context.globalState.get<string[]>("norn.agentsOffered", []);
+    const fresh = (status.agents ?? []).filter((a) => a.present && !a.setUp && !offered.includes(a.name));
+    if (!r.ok || fresh.length === 0) {
+      return;
+    }
+    await context.globalState.update("norn.agentsOffered", [...offered, ...fresh.map((a) => a.name)]);
+    const names: Record<string, string> = { claude: "Claude Code", codex: "Codex", opencode: "OpenCode" };
+    const list = fresh.map((a) => names[a.name] ?? a.name);
+    const who = list.length === 1 ? list[0] : `${list.slice(0, -1).join(", ")} and ${list[list.length - 1]}`;
+    const pick = await vscode.window.showInformationMessage(
+      `Give ${who} Norn's index as tools? They then find callers through macros and function pointers, and see which #if branches the build compiles. (Later: Norn: Connect AI Agents.)`,
+      "Connect",
+      "Not Now",
+    );
+    if (pick === "Connect") {
+      await vscode.commands.executeCommand("norn.connectAgents");
+    }
+  };
   let channel: vscode.OutputChannel | undefined;
   context.subscriptions.push(
     vscode.commands.registerCommand("norn.connectAgents", async () => {

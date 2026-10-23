@@ -156,6 +156,30 @@ pub fn present(agent: &str) -> bool {
         }
 }
 
+/// Whether `agent`'s settings already start Norn: read only, nothing run.
+pub fn is_set_up(agent: &str) -> bool {
+    let read = |p: PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+    match agent {
+        "claude" => serde_json::from_str::<serde_json::Value>(&read(home().join(".claude.json"))).is_ok_and(|v| v["mcpServers"]["norn"].is_object()),
+        "codex" => without_codex_table(&read(codex_config())).1,
+        "opencode" => ["opencode.jsonc", "opencode.json"].iter().any(|n| {
+            let text = read(opencode_dir().join(n));
+            let mcp = text.find('{').and_then(|open| json_member(&text, open, "mcp"));
+            mcp.filter(|&m| text.as_bytes()[m] == b'{').and_then(|m| json_member(&text, m, "norn")).is_some()
+        }),
+        _ => false,
+    }
+}
+
+/// `norn setup --status`: each agent, whether it is on this machine and
+/// whether it starts Norn, as JSON (for the extension to offer to set up
+/// those that do not).
+pub fn status() -> serde_json::Value {
+    let agents: Vec<serde_json::Value> =
+        AGENTS.iter().map(|&a| serde_json::json!({ "name": a, "present": present(a), "setUp": is_set_up(a) })).collect();
+    serde_json::json!({ "agents": agents, "installed": installed().exists() })
+}
+
 /// Set Norn up for `agent`, or take it out (`remove`).
 pub fn agent(agent: &str, exe: &Path, remove: bool) -> Done {
     match agent {
@@ -386,7 +410,11 @@ fn opencode(exe: &Path, remove: bool) -> Done {
 
 /// `norn setup`: put this program where it stays, and set up each agent
 /// asked for (each one on this machine, if none is named).
-pub fn run_setup(asked: &[String], remove: bool, print: bool, refresh: bool) -> i32 {
+pub fn run_setup(asked: &[String], remove: bool, print: bool, refresh: bool, status_only: bool) -> i32 {
+    if status_only {
+        println!("{}", status());
+        return 0;
+    }
     // An update of the extension: the copy brought up to date, if it is there.
     if refresh {
         if installed().exists() {

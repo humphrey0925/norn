@@ -305,6 +305,7 @@ starts again.
 | `--remove` | Take Norn out of each agent's settings, and its skill |
 | `--print` | Only print what each agent's settings would get |
 | `--refresh` | Only bring `~/.norn/bin`'s copy and the skills up to date, if they are there. The VS Code extension does this at each start, so its updates reach the agents |
+| `--status` | Only say, as JSON, which agents are on this machine and which start Norn already (`{"agents": [{"name": "claude", "present": true, "setUp": false}, …], "installed": true}`); nothing is run or written. The VS Code extension asks this to offer to set up the others |
 
 In VS Code: **Norn: Connect AI Agents** does the same. Copilot's agent mode
 needs none of it (see [`mcp`](#mcp)).

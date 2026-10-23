@@ -50,6 +50,12 @@ fn setup_gives_each_agent_the_server_and_takes_it_out_again() {
     let skill = std::fs::read_to_string(&shared).unwrap_or_default();
     assert!(skill.starts_with("---\nname: norn\n") && skill.contains("list_configurations"), "{said}");
 
+    // What the extension asks before it offers to set agents up.
+    let (said, _) = setup(&home, path, &["--status"]);
+    let status: serde_json::Value = serde_json::from_str(&said).unwrap_or_else(|e| panic!("{e}: {said}"));
+    let set_up = |name: &str| status["agents"].as_array().unwrap().iter().find(|a| a["name"] == name).unwrap()["setUp"] == true;
+    assert!(set_up("codex") && set_up("opencode") && !set_up("claude") && status["installed"] == true, "{said}");
+
     // Again: nothing more.
     let (said, ok) = setup(&home, path, &["codex", "opencode"]);
     assert!(ok && said.matches("already set up").count() == 2 && said.contains("already there"), "{said}");
@@ -68,6 +74,8 @@ fn setup_gives_each_agent_the_server_and_takes_it_out_again() {
     assert_eq!(std::fs::read_to_string(&codex).unwrap(), codex_before);
     assert_eq!(std::fs::read_to_string(&opencode).unwrap(), opencode_before);
     assert!(!shared.exists() && claude_skill.exists(), "{said}");
+    let (said, _) = setup(&home, path, &["--status"]);
+    assert!(!said.contains("\"setUp\":true"), "{said}");
 
     // Norn's own, saved again with Windows line endings, is still known as Norn's.
     std::fs::create_dir_all(shared.parent().unwrap()).unwrap();

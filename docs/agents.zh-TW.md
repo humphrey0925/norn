@@ -24,7 +24,9 @@ AI coding agent（Copilot 的 agent 模式、Claude Code、Codex、OpenCode）�
 | OpenCode | 同上 |
 | 其他支援 Model Context Protocol 的工具 | 指令設成 `norn mcp`（見[下方](#其他工具)） |
 
-**Norn: Connect AI Agents**（VS Code 裡按 `Ctrl+Shift+P`）和 `norn setup` 做的是同一件事。沒有 VS Code 時，一行指令就會從最新的
+**Norn: Connect AI Agents**（VS Code 裡按 `Ctrl+Shift+P`）和 `norn setup` 做的是同一件事。VS Code 也會主動提示：
+啟動一會兒後，如果發現電腦上有 Claude Code、Codex 或 OpenCode 但還沒接上 Norn，會詢問一次（**Connect** / **Not Now**），
+之後不會再為同一個 agent 詢問。沒有 VS Code 時，一行指令就會從最新的
 release 安裝 `norn`、比對 release 的 `SHA256SUMS`，再執行 `norn setup`：
 
 ```sh
