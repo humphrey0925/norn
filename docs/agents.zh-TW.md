@@ -39,7 +39,7 @@ curl -fsSL https://norn-c.com/install.sh | sh
 irm https://norn-c.com/install.ps1 | iex
 ```
 
-（`NORN_VERSION=0.26.0` 可指定其他版本；`NORN_NO_SETUP=1` 則不設定任何 agent。）也可以自己從
+（`NORN_VERSION=0.26.0` 可指定其他版本；`NORN_NO_SETUP=1` 則不設定任何 agent；`NORN_DOWNLOAD_URL` 可改從 release 檔案的鏡像下載，而不是 GitHub。）也可以自己從
 [releases](https://github.com/humphrey0925/norn/releases) 下載執行檔（見[命令列手冊](cli.zh-TW.md#安裝)），再執行 `norn setup`。
 
 `[已驗證]` `install.sh` 在 Linux 上實測過：能下載並比對 checksum，checksum 不符時不會安裝。`[未測]` `install.ps1`：這裡沒有 PowerShell 可以測。

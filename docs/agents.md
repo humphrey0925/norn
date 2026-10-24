@@ -45,7 +45,8 @@ irm https://norn-c.com/install.ps1 | iex
 ```
 
 (`NORN_VERSION=0.26.0` for another release; `NORN_NO_SETUP=1` to set no
-agent up.) Or download the executable from the
+agent up; `NORN_DOWNLOAD_URL` to download from a mirror of the release's
+files rather than GitHub.) Or download the executable from the
 [releases](https://github.com/humphrey0925/norn/releases) yourself (see
 [the command line](cli.md#installing)) and run `norn setup`.
 

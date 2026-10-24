@@ -10,6 +10,8 @@
 #
 #   NORN_VERSION=0.26.0   a release other than the latest
 #   NORN_NO_SETUP=1       put the executable there, set no agent up
+#   NORN_DOWNLOAD_URL=... a folder of a release's files other than GitHub's
+#                         (a mirror), SHA256SUMS among them
 set -eu
 
 repo="https://github.com/humphrey0925/norn/releases"
@@ -23,7 +25,9 @@ case "$(uname -m)" in
   aarch64 | arm64) arch=arm64 ;;
   *) echo "norn: no release for $(uname -m)" >&2; exit 1 ;;
 esac
-if [ -n "${NORN_VERSION:-}" ]; then
+if [ -n "${NORN_DOWNLOAD_URL:-}" ]; then
+  base="${NORN_DOWNLOAD_URL%/}"
+elif [ -n "${NORN_VERSION:-}" ]; then
   base="$repo/download/v${NORN_VERSION#v}"
 else
   base="$repo/latest/download"
