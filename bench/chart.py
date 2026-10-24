@@ -11,7 +11,12 @@ from pathlib import Path
 
 ORDER = ["si", "clangd-db", "clangd", "cbm", "cscope", "gtags", "ctags"]
 NAMES = {"si": "Norn", "clangd-db": "clangd + build database", "cbm": "codebase-memory-mcp", "clangd": "clangd", "cscope": "cscope", "gtags": "GNU Global", "ctags": "Universal Ctags"}
-CORPORA = {"redis": "Redis", "git-c": "git", "c-only": "binutils", "stm32f4": "STM32F4 HAL", "nrfx": "nrfx", "nrfx-corpus": "nrfx", "linux": "Linux"}
+CORPORA = {"redis": "Redis", "git-c": "git", "c-only": "binutils", "stm32f4": "STM32F4 HAL", "nrfx": "nrfx", "nrfx-corpus": "nrfx", "linux": "Linux",
+           "curl": "curl", "sqlite": "SQLite", "mbedtls": "Mbed TLS", "freertos": "FreeRTOS", "lwip": "lwIP", "u-boot": "U-Boot",
+           "fmt": "fmt", "leveldb": "LevelDB", "bitcoin": "Bitcoin Core", "ninja": "Ninja", "googletest": "GoogleTest", "abseil": "Abseil",
+           "yaml-cpp": "yaml-cpp", "spdlog": "spdlog", "cppcheck": "Cppcheck"}
+# Projects written in C++ (the rest are C), for the charts' groups.
+CPP = {"fmt", "LevelDB", "Bitcoin Core", "Ninja", "GoogleTest", "Abseil", "yaml-cpp", "spdlog", "Cppcheck"}
 # One colour per tool, readable on a light and a dark page alike.
 COLORS = {"si": "#f0a830", "clangd-db": "#2f5f9e", "clangd": "#4c8fd6", "cbm": "#8a6fd1", "cscope": "#4fae7a", "gtags": "#d0644f", "ctags": "#8c96a3"}
 TEXT = "#7d8590"
@@ -47,6 +52,70 @@ def get(d, tool, *path):
     for k in path:
         v = v.get(k) if isinstance(v, dict) else None
     return v if isinstance(v, (int, float)) else None
+
+
+def dot_rows(title, subtitle, groups, tools, value, fmt, log=False, best_high=True):
+    """A row per project, C then C++, and on it a dot per tool at its value:
+    as many projects as there are fit one width. `value(d, tool)` or None;
+    a tool with no value on a project has no dot there, and one with none
+    anywhere is left out of the legend."""
+    import math
+    tools = [t for t in tools if any(value(d, t) is not None for _, d in groups)]
+    rows = [("C", None)] + [(c, d) for c, d in groups if c not in CPP] + [("C++", None)] + [(c, d) for c, d in groups if c in CPP]
+    rows = [r for i, r in enumerate(rows) if r[1] is not None or any(x[1] is not None for x in rows[i + 1:i + 2])]
+    w, left, right, row_h = 760, 120, 70, 22
+    # The legend, wrapped to the width: (tool, x, y of its line).
+    legend, x, y = [], 16, 66
+    for t in tools:
+        width = 15 + 7.0 * len(NAMES[t]) + 18
+        if x + width > w - 16 and x > 16:
+            x, y = 16, y + 20
+        legend.append((t, x, y))
+        x += width
+    top = y + 26
+    h = top + row_h * len(rows) + 34
+    vals = [v for _, d in groups if d for t in tools if (v := value(d, t)) is not None]
+    if log:
+        lo = 10 ** math.floor(math.log10(min([v for v in vals if v > 0] or [1])))
+        hi = 10 ** math.ceil(math.log10(max(vals or [1])))
+        frac = lambda v: (math.log10(max(v, lo)) - math.log10(lo)) / (math.log10(hi) - math.log10(lo))
+        ticks = [lo * 10 ** k for k in range(round(math.log10(hi / lo)) + 1)]
+    else:
+        lo = min(0.5, math.floor(min(vals or [0]) * 10) / 10)
+        hi = 1.0
+        frac = lambda v: (v - lo) / (hi - lo)
+        ticks = [lo + (hi - lo) * k / 5 for k in range(6)]
+    x_of = lambda v: left + (w - left - right) * max(0.0, min(1.0, frac(v)))
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">',
+           f'<text x="16" y="24" font-size="18" font-weight="600" fill="{TEXT}">{html.escape(title)}</text>',
+           f'<text x="16" y="44" font-size="12" fill="{TEXT}">{html.escape(subtitle)} {"Higher is better." if best_high else "Lower is better."}{" Log scale." if log else ""}</text>']
+    for t, x, y in legend:
+        out.append(f'<circle cx="{x + 6}" cy="{y}" r="5" fill="{COLORS[t]}"/>')
+        out.append(f'<text x="{x + 15}" y="{y + 4}" font-size="12" fill="{TEXT}"{" font-weight=" + chr(34) + "700" + chr(34) if t == "si" else ""}>{html.escape(NAMES[t])}</text>')
+    bottom = top + row_h * len(rows)
+    for tk in ticks:
+        x = x_of(tk)
+        out.append(f'<line x1="{x:.1f}" x2="{x:.1f}" y1="{top - 4}" y2="{bottom}" stroke="{TEXT}" stroke-opacity="0.18"/>')
+        out.append(f'<text x="{x:.1f}" y="{bottom + 16}" font-size="10" text-anchor="middle" fill="{TEXT}">{html.escape(short_secs(tk) if log else fmt(tk))}</text>')
+    for i, (corpus, d) in enumerate(rows):
+        y = top + row_h * i + row_h / 2
+        if d is None:
+            out.append(f'<text x="16" y="{y + 4:.1f}" font-size="11" font-weight="700" fill="{TEXT}">{html.escape(corpus)}</text>')
+            continue
+        out.append(f'<text x="{left - 10}" y="{y + 4:.1f}" font-size="12" text-anchor="end" fill="{TEXT}">{html.escape(corpus)}</text>')
+        out.append(f'<line x1="{left}" x2="{w - right}" y1="{y:.1f}" y2="{y:.1f}" stroke="{TEXT}" stroke-opacity="0.08"/>')
+        # (Norn last, on top; its value at the end of the row.)
+        for t in sorted(tools, key=lambda t: t == "si"):
+            v = value(d, t)
+            if v is None:
+                continue
+            r = 5.5 if t == "si" else 4.5
+            stroke = f' stroke="{TEXT}" stroke-width="1"' if t == "si" else ' fill-opacity="0.85"'
+            out.append(f'<circle cx="{x_of(v):.1f}" cy="{y:.1f}" r="{r}" fill="{COLORS[t]}"{stroke}><title>{html.escape(NAMES[t])}: {html.escape(fmt(v))}</title></circle>')
+        if (v := value(d, "si")) is not None:
+            out.append(f'<text x="{w - right + 8}" y="{y + 4:.1f}" font-size="11" font-weight="700" fill="{TEXT}">{html.escape(fmt(v))}</text>')
+    out.append("</svg>")
+    return "\n".join(out)
 
 
 def grouped_bars(title, subtitle, groups, tools, value, fmt, log=False, best_high=True):
@@ -142,6 +211,7 @@ def write_summary(readme, out, runs, tools):
     rel = out.resolve().relative_to(readme.parent.resolve()).as_posix()
     block = [f'<p align="center"><img src="{rel}/calls-found.svg" alt="Calls found" width="760"></p>', "",
              f'<p align="center"><img src="{rel}/index-time.svg" alt="Time to index" width="760"></p>', "",
+             f'<p align="center"><img src="{rel}/peak-memory.svg" alt="Peak memory" width="760"></p>', "",
              "| Project | Files | " + " | ".join(NAMES[t] for t in tools) + " |",
              "|---|--:|" + "|".join(":-:" for _ in tools) + "|"]
     for corpus, d in runs:
@@ -179,25 +249,26 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     runs = load(a.results)
     tools = [t for t in ORDER if any(t in tools_of(d) for _, d in runs)]
-    # (The charts and the summary compare like with like: the tools
-    # measured on every project. The pages per project list all.)
-    every = [t for t in tools if all(t in tools_of(d) for _, d in runs)]
 
     calls = lambda d, t: get(d, t, "accuracy", "calls", "recall_any")
-    (out / "calls-found.svg").write_text(grouped_bars(
+    (out / "calls-found.svg").write_text(dot_rows(
         "Calls found (%)", "Of the calls in clang's own view of a real build, the share each tool reports.", runs,
-        every, calls, lambda v: f"{v * 100:.1f}"), encoding="utf-8")
-    (out / "index-time.svg").write_text(grouped_bars(
-        "Time to index (seconds)", "A cold index of the whole project, wall-clock.", runs, every,
+        tools, calls, lambda v: f"{v * 100:.1f}"), encoding="utf-8")
+    (out / "index-time.svg").write_text(dot_rows(
+        "Time to index (seconds)", "A cold index of the whole project, wall-clock.", runs, tools,
         lambda d, t: get(d, t, "index", "wall_s"), short_secs, log=True, best_high=False), encoding="utf-8")
+    peak = lambda d, t: (v / 2**20 if (v := get(d, t, "index", "peak_rss_bytes")) is not None else None)
+    (out / "peak-memory.svg").write_text(dot_rows(
+        "Peak memory while indexing (MB)", "The most memory each tool's indexing held at once.", runs, tools,
+        peak, lambda v: f"{v:,.0f}", log=True, best_high=False), encoding="utf-8")
 
     m = runs[0][1].get("machine", {})
     # (Where Norn ran: the Windows machine, or Linux, as on EC2.)
     on_windows = any(str(d["tools"].get("si", {}).get("platform", "")).startswith("Windows") for _, d in runs)
     lines = ["# Benchmarks", "",
-             "Norn against other ways of indexing C, on public projects. Every number here is produced by",
+             "Norn against other ways of indexing C and C++, on public projects. Every number here is produced by",
              "`bench/compare.py` and turned into this page by `bench/chart.py`; nothing is typed in.", "",
-             "![Calls found](calls-found.svg)", "", "![Time to index](index-time.svg)", "",
+             "![Calls found](calls-found.svg)", "", "![Time to index](index-time.svg)", "", "![Peak memory](peak-memory.svg)", "",
              "## How it is measured", "",
              "- **Ground truth**: clang's own view of each project, compiled with its real build",
              "  (`bench/gt_extract.py`): every function definition, and every call with the function it",
@@ -264,7 +335,7 @@ def main():
     (out / "README.md").write_text("\n".join(lines), encoding="utf-8")
     if a.readme:
         for r in a.readme:
-            write_summary(Path(r), out, runs, every)
+            write_summary(Path(r), out, runs, tools)
     print(f"{out}: {len(runs)} projects, {len(tools)} tools")
 
 

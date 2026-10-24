@@ -1,0 +1,239 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="652" viewBox="0 0 760 652" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<text x="16" y="24" font-size="18" font-weight="600" fill="#7d8590">Peak memory while indexing (MB)</text>
+<text x="16" y="44" font-size="12" fill="#7d8590">The most memory each tool&#x27;s indexing held at once. Lower is better. Log scale.</text>
+<circle cx="22" cy="66" r="5" fill="#f0a830"/>
+<text x="31" y="70" font-size="12" fill="#7d8590" font-weight="700">Norn</text>
+<circle cx="83.0" cy="66" r="5" fill="#2f5f9e"/>
+<text x="92.0" y="70" font-size="12" fill="#7d8590">clangd + build database</text>
+<circle cx="277.0" cy="66" r="5" fill="#4c8fd6"/>
+<text x="286.0" y="70" font-size="12" fill="#7d8590">clangd</text>
+<circle cx="352.0" cy="66" r="5" fill="#8a6fd1"/>
+<text x="361.0" y="70" font-size="12" fill="#7d8590">codebase-memory-mcp</text>
+<circle cx="518.0" cy="66" r="5" fill="#4fae7a"/>
+<text x="527.0" y="70" font-size="12" fill="#7d8590">cscope</text>
+<circle cx="593.0" cy="66" r="5" fill="#d0644f"/>
+<text x="602.0" y="70" font-size="12" fill="#7d8590">GNU Global</text>
+<circle cx="22" cy="86" r="5" fill="#8c96a3"/>
+<text x="31" y="90" font-size="12" fill="#7d8590">Universal Ctags</text>
+<line x1="120.0" x2="120.0" y1="108" y2="618" stroke="#7d8590" stroke-opacity="0.18"/>
+<text x="120.0" y="634" font-size="10" text-anchor="middle" fill="#7d8590">10</text>
+<line x1="262.5" x2="262.5" y1="108" y2="618" stroke="#7d8590" stroke-opacity="0.18"/>
+<text x="262.5" y="634" font-size="10" text-anchor="middle" fill="#7d8590">100</text>
+<line x1="405.0" x2="405.0" y1="108" y2="618" stroke="#7d8590" stroke-opacity="0.18"/>
+<text x="405.0" y="634" font-size="10" text-anchor="middle" fill="#7d8590">1000</text>
+<line x1="547.5" x2="547.5" y1="108" y2="618" stroke="#7d8590" stroke-opacity="0.18"/>
+<text x="547.5" y="634" font-size="10" text-anchor="middle" fill="#7d8590">10000</text>
+<line x1="690.0" x2="690.0" y1="108" y2="618" stroke="#7d8590" stroke-opacity="0.18"/>
+<text x="690.0" y="634" font-size="10" text-anchor="middle" fill="#7d8590">100000</text>
+<text x="16" y="127.0" font-size="11" font-weight="700" fill="#7d8590">C</text>
+<text x="110" y="149.0" font-size="12" text-anchor="end" fill="#7d8590">Redis</text>
+<line x1="120" x2="690" y1="145.0" y2="145.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="370.5" cy="145.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 573</title></circle>
+<circle cx="460.1" cy="145.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 2,435</title></circle>
+<circle cx="407.8" cy="145.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 1,046</title></circle>
+<circle cx="251.9" cy="145.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 84</title></circle>
+<circle cx="148.2" cy="145.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 16</title></circle>
+<circle cx="144.6" cy="145.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 15</title></circle>
+<circle cx="288.2" cy="145.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 151</title></circle>
+<text x="698" y="149.0" font-size="11" font-weight="700" fill="#7d8590">151</text>
+<text x="110" y="171.0" font-size="12" text-anchor="end" fill="#7d8590">git</text>
+<line x1="120" x2="690" y1="167.0" y2="167.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="354.2" cy="167.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 440</title></circle>
+<circle cx="498.7" cy="167.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 4,542</title></circle>
+<circle cx="404.5" cy="167.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 992</title></circle>
+<circle cx="251.2" cy="167.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 83</title></circle>
+<circle cx="158.9" cy="167.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 19</title></circle>
+<circle cx="148.7" cy="167.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 16</title></circle>
+<circle cx="266.9" cy="167.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 107</title></circle>
+<text x="698" y="171.0" font-size="11" font-weight="700" fill="#7d8590">107</text>
+<text x="110" y="193.0" font-size="12" text-anchor="end" fill="#7d8590">binutils</text>
+<line x1="120" x2="690" y1="189.0" y2="189.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="426.6" cy="189.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 1,418</title></circle>
+<circle cx="455.0" cy="189.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 2,242</title></circle>
+<circle cx="453.8" cy="189.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 2,200</title></circle>
+<circle cx="343.5" cy="189.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 370</title></circle>
+<circle cx="194.7" cy="189.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 33</title></circle>
+<circle cx="242.9" cy="189.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 73</title></circle>
+<circle cx="380.0" cy="189.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 667</title></circle>
+<text x="698" y="193.0" font-size="11" font-weight="700" fill="#7d8590">667</text>
+<text x="110" y="215.0" font-size="12" text-anchor="end" fill="#7d8590">STM32F4 HAL</text>
+<line x1="120" x2="690" y1="211.0" y2="211.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="367.2" cy="211.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 543</title></circle>
+<circle cx="292.4" cy="211.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 162</title></circle>
+<circle cx="410.0" cy="211.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 1,083</title></circle>
+<circle cx="270.9" cy="211.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 115</title></circle>
+<circle cx="229.7" cy="211.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 59</title></circle>
+<circle cx="256.4" cy="211.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 91</title></circle>
+<circle cx="357.9" cy="211.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 467</title></circle>
+<text x="698" y="215.0" font-size="11" font-weight="700" fill="#7d8590">467</text>
+<text x="110" y="237.0" font-size="12" text-anchor="end" fill="#7d8590">nrfx</text>
+<line x1="120" x2="690" y1="233.0" y2="233.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="364.3" cy="233.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 518</title></circle>
+<circle cx="308.3" cy="233.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 210</title></circle>
+<circle cx="401.6" cy="233.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 947</title></circle>
+<circle cx="221.8" cy="233.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 52</title></circle>
+<circle cx="201.2" cy="233.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 37</title></circle>
+<circle cx="219.8" cy="233.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 50</title></circle>
+<circle cx="322.0" cy="233.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 262</title></circle>
+<text x="698" y="237.0" font-size="11" font-weight="700" fill="#7d8590">262</text>
+<text x="110" y="259.0" font-size="12" text-anchor="end" fill="#7d8590">curl</text>
+<line x1="120" x2="690" y1="255.0" y2="255.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="350.6" cy="255.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 415</title></circle>
+<circle cx="462.8" cy="255.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 2,547</title></circle>
+<circle cx="393.8" cy="255.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 834</title></circle>
+<circle cx="212.3" cy="255.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 44</title></circle>
+<circle cx="144.6" cy="255.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 15</title></circle>
+<circle cx="142.7" cy="255.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 14</title></circle>
+<circle cx="252.8" cy="255.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 85</title></circle>
+<text x="698" y="259.0" font-size="11" font-weight="700" fill="#7d8590">85</text>
+<text x="110" y="281.0" font-size="12" text-anchor="end" fill="#7d8590">SQLite</text>
+<line x1="120" x2="690" y1="277.0" y2="277.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="340.3" cy="277.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 352</title></circle>
+<circle cx="471.2" cy="277.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 2,913</title></circle>
+<circle cx="403.9" cy="277.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 983</title></circle>
+<circle cx="253.5" cy="277.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 86</title></circle>
+<circle cx="149.8" cy="277.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 16</title></circle>
+<circle cx="144.6" cy="277.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 15</title></circle>
+<circle cx="291.4" cy="277.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 160</title></circle>
+<text x="698" y="281.0" font-size="11" font-weight="700" fill="#7d8590">160</text>
+<text x="110" y="303.0" font-size="12" text-anchor="end" fill="#7d8590">Mbed TLS</text>
+<line x1="120" x2="690" y1="299.0" y2="299.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="329.7" cy="299.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 296</title></circle>
+<circle cx="310.4" cy="299.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 217</title></circle>
+<circle cx="365.0" cy="299.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 524</title></circle>
+<circle cx="143.7" cy="299.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 15</title></circle>
+<circle cx="144.6" cy="299.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 15</title></circle>
+<circle cx="143.7" cy="299.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 15</title></circle>
+<circle cx="232.0" cy="299.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 61</title></circle>
+<text x="698" y="303.0" font-size="11" font-weight="700" fill="#7d8590">61</text>
+<text x="110" y="325.0" font-size="12" text-anchor="end" fill="#7d8590">FreeRTOS</text>
+<line x1="120" x2="690" y1="321.0" y2="321.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="293.0" cy="321.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 164</title></circle>
+<circle cx="360.1" cy="321.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 484</title></circle>
+<circle cx="370.5" cy="321.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 573</title></circle>
+<circle cx="173.8" cy="321.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 24</title></circle>
+<circle cx="154.0" cy="321.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 17</title></circle>
+<circle cx="144.6" cy="321.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 15</title></circle>
+<circle cx="267.1" cy="321.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 108</title></circle>
+<text x="698" y="325.0" font-size="11" font-weight="700" fill="#7d8590">108</text>
+<text x="110" y="347.0" font-size="12" text-anchor="end" fill="#7d8590">lwIP</text>
+<line x1="120" x2="690" y1="343.0" y2="343.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="315.1" cy="343.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 234</title></circle>
+<circle cx="391.8" cy="343.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 807</title></circle>
+<circle cx="377.3" cy="343.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 639</title></circle>
+<circle cx="159.1" cy="343.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 19</title></circle>
+<circle cx="144.6" cy="343.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 15</title></circle>
+<circle cx="142.7" cy="343.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 14</title></circle>
+<circle cx="252.2" cy="343.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 85</title></circle>
+<text x="698" y="347.0" font-size="11" font-weight="700" fill="#7d8590">85</text>
+<text x="110" y="369.0" font-size="12" text-anchor="end" fill="#7d8590">U-Boot</text>
+<line x1="120" x2="690" y1="365.0" y2="365.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="394.6" cy="365.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 845</title></circle>
+<circle cx="493.3" cy="365.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 4,163</title></circle>
+<circle cx="479.0" cy="365.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 3,306</title></circle>
+<circle cx="378.4" cy="365.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 651</title></circle>
+<circle cx="239.2" cy="365.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 69</title></circle>
+<circle cx="308.7" cy="365.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 211</title></circle>
+<circle cx="390.2" cy="365.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 788</title></circle>
+<text x="698" y="369.0" font-size="11" font-weight="700" fill="#7d8590">788</text>
+<text x="110" y="391.0" font-size="12" text-anchor="end" fill="#7d8590">Linux</text>
+<line x1="120" x2="690" y1="387.0" y2="387.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="484.2" cy="387.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 3,599</title></circle>
+<circle cx="549.7" cy="387.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 10,367</title></circle>
+<circle cx="526.9" cy="387.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 7,167</title></circle>
+<circle cx="251.2" cy="387.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 83</title></circle>
+<circle cx="462.0" cy="387.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 2,511</title></circle>
+<circle cx="499.5" cy="387.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 4,605</title></circle>
+<text x="698" y="391.0" font-size="11" font-weight="700" fill="#7d8590">4,605</text>
+<text x="16" y="413.0" font-size="11" font-weight="700" fill="#7d8590">C++</text>
+<text x="110" y="435.0" font-size="12" text-anchor="end" fill="#7d8590">fmt</text>
+<line x1="120" x2="690" y1="431.0" y2="431.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="451.0" cy="431.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 2,104</title></circle>
+<circle cx="475.9" cy="431.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 3,145</title></circle>
+<circle cx="358.7" cy="431.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 473</title></circle>
+<circle cx="142.7" cy="431.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 14</title></circle>
+<circle cx="143.7" cy="431.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 15</title></circle>
+<circle cx="146.5" cy="431.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 15</title></circle>
+<circle cx="242.5" cy="431.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 72</title></circle>
+<text x="698" y="435.0" font-size="11" font-weight="700" fill="#7d8590">72</text>
+<text x="110" y="457.0" font-size="12" text-anchor="end" fill="#7d8590">LevelDB</text>
+<line x1="120" x2="690" y1="453.0" y2="453.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="406.6" cy="453.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 1,026</title></circle>
+<circle cx="476.1" cy="453.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 3,156</title></circle>
+<circle cx="388.1" cy="453.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 761</title></circle>
+<circle cx="153.1" cy="453.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 17</title></circle>
+<circle cx="143.7" cy="453.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 15</title></circle>
+<circle cx="144.6" cy="453.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 15</title></circle>
+<circle cx="247.9" cy="453.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 79</title></circle>
+<text x="698" y="457.0" font-size="11" font-weight="700" fill="#7d8590">79</text>
+<text x="110" y="479.0" font-size="12" text-anchor="end" fill="#7d8590">Bitcoin Core</text>
+<line x1="120" x2="690" y1="475.0" y2="475.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="509.5" cy="475.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 5,407</title></circle>
+<circle cx="488.4" cy="475.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 3,850</title></circle>
+<circle cx="420.8" cy="475.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 1,290</title></circle>
+<circle cx="270.0" cy="475.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 113</title></circle>
+<circle cx="237.5" cy="475.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 67</title></circle>
+<circle cx="144.6" cy="475.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 15</title></circle>
+<circle cx="319.8" cy="475.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 252</title></circle>
+<text x="698" y="479.0" font-size="11" font-weight="700" fill="#7d8590">252</text>
+<text x="110" y="501.0" font-size="12" text-anchor="end" fill="#7d8590">Ninja</text>
+<line x1="120" x2="690" y1="497.0" y2="497.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="423.6" cy="497.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 1,350</title></circle>
+<circle cx="495.0" cy="497.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 4,278</title></circle>
+<circle cx="385.3" cy="497.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 727</title></circle>
+<circle cx="149.8" cy="497.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 16</title></circle>
+<circle cx="144.6" cy="497.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 15</title></circle>
+<circle cx="143.7" cy="497.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 15</title></circle>
+<circle cx="263.6" cy="497.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 102</title></circle>
+<text x="698" y="501.0" font-size="11" font-weight="700" fill="#7d8590">102</text>
+<text x="110" y="523.0" font-size="12" text-anchor="end" fill="#7d8590">GoogleTest</text>
+<line x1="120" x2="690" y1="519.0" y2="519.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="456.5" cy="519.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 2,297</title></circle>
+<circle cx="462.7" cy="519.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 2,539</title></circle>
+<circle cx="377.7" cy="519.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 643</title></circle>
+<circle cx="144.6" cy="519.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 15</title></circle>
+<circle cx="143.7" cy="519.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 15</title></circle>
+<circle cx="144.6" cy="519.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 15</title></circle>
+<circle cx="265.3" cy="519.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 105</title></circle>
+<text x="698" y="523.0" font-size="11" font-weight="700" fill="#7d8590">105</text>
+<text x="110" y="545.0" font-size="12" text-anchor="end" fill="#7d8590">Abseil</text>
+<line x1="120" x2="690" y1="541.0" y2="541.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="459.1" cy="541.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 2,396</title></circle>
+<circle cx="487.3" cy="541.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 3,779</title></circle>
+<circle cx="403.1" cy="541.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 970</title></circle>
+<circle cx="218.6" cy="541.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 49</title></circle>
+<circle cx="144.6" cy="541.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 15</title></circle>
+<circle cx="144.6" cy="541.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 15</title></circle>
+<circle cx="261.0" cy="541.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 98</title></circle>
+<text x="698" y="545.0" font-size="11" font-weight="700" fill="#7d8590">98</text>
+<text x="110" y="567.0" font-size="12" text-anchor="end" fill="#7d8590">yaml-cpp</text>
+<line x1="120" x2="690" y1="563.0" y2="563.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="424.4" cy="563.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 1,368</title></circle>
+<circle cx="465.4" cy="563.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 2,656</title></circle>
+<circle cx="382.6" cy="563.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 696</title></circle>
+<circle cx="149.8" cy="563.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 16</title></circle>
+<circle cx="144.6" cy="563.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 15</title></circle>
+<circle cx="144.6" cy="563.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 15</title></circle>
+<circle cx="262.9" cy="563.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 101</title></circle>
+<text x="698" y="567.0" font-size="11" font-weight="700" fill="#7d8590">101</text>
+<text x="110" y="589.0" font-size="12" text-anchor="end" fill="#7d8590">spdlog</text>
+<line x1="120" x2="690" y1="585.0" y2="585.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="428.9" cy="585.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 1,470</title></circle>
+<circle cx="475.6" cy="585.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 3,128</title></circle>
+<circle cx="375.4" cy="585.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 620</title></circle>
+<circle cx="147.2" cy="585.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 16</title></circle>
+<circle cx="144.6" cy="585.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 15</title></circle>
+<circle cx="142.7" cy="585.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 14</title></circle>
+<circle cx="249.0" cy="585.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 80</title></circle>
+<text x="698" y="589.0" font-size="11" font-weight="700" fill="#7d8590">80</text>
+<text x="110" y="611.0" font-size="12" text-anchor="end" fill="#7d8590">Cppcheck</text>
+<line x1="120" x2="690" y1="607.0" y2="607.0" stroke="#7d8590" stroke-opacity="0.08"/>
+<circle cx="420.8" cy="607.0" r="4.5" fill="#2f5f9e" fill-opacity="0.85"><title>clangd + build database: 1,290</title></circle>
+<circle cx="499.4" cy="607.0" r="4.5" fill="#4c8fd6" fill-opacity="0.85"><title>clangd: 4,594</title></circle>
+<circle cx="404.5" cy="607.0" r="4.5" fill="#8a6fd1" fill-opacity="0.85"><title>codebase-memory-mcp: 992</title></circle>
+<circle cx="220.0" cy="607.0" r="4.5" fill="#4fae7a" fill-opacity="0.85"><title>cscope: 50</title></circle>
+<circle cx="144.6" cy="607.0" r="4.5" fill="#d0644f" fill-opacity="0.85"><title>GNU Global: 15</title></circle>
+<circle cx="144.6" cy="607.0" r="4.5" fill="#8c96a3" fill-opacity="0.85"><title>Universal Ctags: 15</title></circle>
+<circle cx="291.1" cy="607.0" r="5.5" fill="#f0a830" stroke="#7d8590" stroke-width="1"><title>Norn: 159</title></circle>
+<text x="698" y="611.0" font-size="11" font-weight="700" fill="#7d8590">159</text>
+</svg>
