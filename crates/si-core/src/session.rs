@@ -16,7 +16,7 @@ use crate::expand::Cache;
 use crate::extract::Extractor;
 use crate::graph::Graph;
 use crate::link::{link_cached, LinkStats, Options};
-use crate::mask::{self, Define, MacroSets};
+use crate::mask::{self, Define, DefineView, MacroSets};
 use crate::model::FileFacts;
 use crate::scope::Scope;
 use crate::store::{stamp, Stamp, Store};
@@ -84,6 +84,11 @@ impl Packed {
         bincode::options().deserialize(&self.0).unwrap_or_default()
     }
 
+    /// The same, read in place.
+    fn view(&self) -> Vec<DefineView<'_>> {
+        bincode::options().deserialize(&self.0).unwrap_or_default()
+    }
+
     /// Those of every file. Packed by all threads, then moved into memory
     /// of this one's (see `crate::gather`).
     fn all(defines: Vec<Vec<Define>>) -> Vec<Packed> {
@@ -95,6 +100,22 @@ impl Packed {
     fn each(defines: &[Vec<Define>]) -> Vec<Packed> {
         let packed: Vec<Packed> = defines.par_iter().map(|d| Packed::of(d)).collect();
         packed.into_iter().map(|p| Packed(p.0.clone())).collect()
+    }
+
+    /// Those of the files `read`, into `packed`, the others' as they were.
+    /// Returns whether any of those makes other macro sets than before.
+    fn some(packed: &mut [Packed], defines: &[Vec<Define>], read: &[bool]) -> bool {
+        let fresh: Vec<(usize, Packed, bool)> = (0..defines.len())
+            .into_par_iter()
+            .filter(|&i| read[i])
+            .map(|i| (i, Packed::of(&defines[i]), !MacroSets::same_for_sets(&defines[i], &packed[i].get())))
+            .collect();
+        let mut sets = false;
+        for (i, p, other) in fresh {
+            packed[i] = Packed(p.0.clone());
+            sets |= other;
+        }
+        sets
     }
 }
 
@@ -359,7 +380,12 @@ impl Session {
             let digest = session.state_digest();
             if paths.is_empty() {
                 let mut up = Update { loaded, extract_ms: ms(t), ..Update::default() };
+                // What the link that made the saved graph left, for the
+                // first edit to be relinked from (checked against the graph
+                // the session ends up with when it is).
+                let last = session.store.as_ref().and_then(|s| s.load_last(digest)).and_then(|l| l.restored(&session.cache.made));
                 if have == Some(digest) {
+                    session.cache.last = last.map(Box::new);
                     up.graph_kept = true;
                     profile("graph kept");
                     return (session, up);
@@ -368,8 +394,22 @@ impl Session {
                 if let Some((_, graph, binds)) = saved {
                     session.graph = graph;
                     session.stats.bind_sites = binds;
+                    session.cache.last = last.map(Box::new);
                     profile("graph read");
                     return (session, up);
+                }
+            }
+            // Files changed since: if the saved graph is the graph of the
+            // facts read back (not of facts saved since, under other
+            // conditions), the link takes what still holds from it.
+            if let Some(store) = session.store.as_ref().filter(|s| s.graph_digest() == Some(digest)) {
+                if let Some(last) = store.load_last(digest).and_then(|l| l.restored(&session.cache.made)) {
+                    if let Some((_, graph, binds)) = store.load_graph().filter(|g| g.0 == digest) {
+                        session.graph = graph;
+                        session.stats.bind_sites = binds;
+                        session.cache.last = Some(Box::new(last));
+                        profile("graph read, to relink from");
+                    }
                 }
             }
             let mut up = session.update_listed(&paths, Some(&listed));
@@ -512,7 +552,11 @@ impl Session {
     pub fn save_graph(&mut self) {
         if self.graph_unsaved && self.unsaved.is_empty() && !self.unsaved_manifest {
             if let Some(store) = &self.store {
-                store.save_graph(self.state_digest(), &self.graph, &self.stats.bind_sites);
+                let digest = self.state_digest();
+                store.save_graph(digest, &self.graph, &self.stats.bind_sites);
+                if let Some(last) = self.cache.last.as_deref().filter(|l| l.of(&self.graph)) {
+                    store.save_last(digest, last);
+                }
                 self.graph_unsaved = false;
             }
         }
@@ -697,6 +741,9 @@ impl Session {
         let mut touched: FxHashSet<PathBuf> = FxHashSet::default();
         // Most edits leave every `#define` as it was, and the macro sets with them.
         let mut defines_changed = false;
+        // And most of those leave all the macro sets read of them as it was
+        // (a value changed, say): the sets stand.
+        let mut sets_changed = false;
         // What the sources settle of a file's `#if`s, and of how each
         // compilation reads it, holds of its directives as they were: an
         // edited file whose directives changed is settled again, with every
@@ -755,6 +802,7 @@ impl Session {
                     let (now, then) = (unlined(&defines), unlined(&was));
                     if now != then {
                         defines_changed = true;
+                        sets_changed |= !MacroSets::same_for_sets(&defines, &was);
                         let names = |d: &[Define]| d.iter().filter(|d| !d.include && !d.test).map(|d| d.name.clone()).collect::<FxHashSet<_>>();
                         let (a, b) = (names(&now), names(&then));
                         edited.extend(a.symmetric_difference(&b).cloned());
@@ -775,6 +823,7 @@ impl Session {
                     self.stamps.remove(i);
                     touched.remove(&path);
                     defines_changed = true;
+                    sets_changed = true;
                     whole = true;
                     up.removed += 1;
                 }
@@ -784,6 +833,7 @@ impl Session {
                     self.facts.insert(i, FileFacts::new(String::new()));
                     self.stamps.insert(i, (0, 0));
                     defines_changed = true;
+                    sets_changed = true;
                     whole = true;
                     up.added += 1;
                 }
@@ -813,8 +863,9 @@ impl Session {
         // Only definitions changed, of names no `#if` tests, even through
         // the value of one it does.
         let again = uses_source && !all_stale && !whole && !told_changed && defines_changed && {
-            let all: Vec<Vec<Define>> = self.defines.par_iter().map(Packed::get).collect();
-            let tested: FxHashSet<&[u8]> = all.iter().flatten().filter(|d| d.test).map(|d| &d.name[..]).collect();
+            // (Read in place: only names are wanted, of millions of definitions.)
+            let all: Vec<Vec<DefineView>> = self.defines.par_iter().map(Packed::view).collect();
+            let tested: FxHashSet<&[u8]> = all.iter().flatten().filter(|d| d.test).map(|d| d.name).collect();
             let users = crate::users_of(&all);
             let mut seen: FxHashSet<&[u8]> = edited.iter().map(|n| &n[..]).collect();
             let mut work: Vec<&[u8]> = seen.iter().copied().collect();
@@ -827,8 +878,6 @@ impl Session {
                     }
                 }
             }
-            drop((users, tested, seen));
-            per_file = Some(all);
             !tests
         };
         let settling = all_stale || !again && (defines_changed || told_changed) && uses_source;
@@ -839,19 +888,41 @@ impl Session {
         let mut retold: FxHashSet<PathBuf> = FxHashSet::default();
         if settling || again {
             let before = self.conditions.source().cloned();
+            let check = std::env::var_os("SI_SETTLE_CHECK").is_some();
             if again {
-                let all = per_file.as_mut().unwrap();
-                crate::settle_again(&self.root, &self.files, &mut self.conditions, all);
-                self.defines = Packed::each(all);
+                // (Where the sources settled nothing, nothing is settled again.)
+                if before.is_some() || check {
+                    let mut all: Vec<Vec<Define>> = self.defines.par_iter().map(Packed::get).collect();
+                    let read = crate::settle_again(&self.root, &self.files, &mut self.conditions, &mut all);
+                    sets_changed |= Packed::some(&mut self.defines, &all, &read);
+                    if check {
+                        let mut whole = self.conditions.clone();
+                        let from_nothing = crate::settle(&self.root, &self.files, &mut whole);
+                        let differ = (0..self.files.len()).filter(|&i| from_nothing[i] != all[i]).count();
+                        eprintln!("settle    again: {} files' definitions differ from settling from nothing; conditions the same: {}", differ, whole == self.conditions);
+                    }
+                    per_file = Some(all);
+                }
+            } else if !all_stale && !whole {
+                // The files that changed have changed `#if`s or `#include`s,
+                // or `#define`s an `#if` may test: what each compilation's
+                // conditions come to is worked out again, and the files
+                // told otherwise now read again.
+                let mut all: Vec<Vec<Define>> = self.defines.par_iter().map(Packed::get).collect();
+                let changed: Vec<bool> = self.files.iter().map(|p| touched.contains(p)).collect();
+                let read = crate::settle_changed(&self.root, &self.files, &mut self.conditions, &mut all, &changed);
+                sets_changed |= Packed::some(&mut self.defines, &all, &read);
                 if std::env::var_os("SI_SETTLE_CHECK").is_some() {
                     let mut whole = self.conditions.clone();
                     let from_nothing = crate::settle(&self.root, &self.files, &mut whole);
                     let differ = (0..self.files.len()).filter(|&i| from_nothing[i] != all[i]).count();
-                    eprintln!("settle    again: {} files' definitions differ from settling from nothing; conditions the same: {}", differ, whole == self.conditions);
+                    eprintln!("settle    changed: {} of {} files read again, {} files' definitions differ from settling from nothing; conditions the same: {}", read.iter().filter(|r| **r).count(), self.files.len(), differ, whole == self.conditions);
                 }
+                per_file = Some(all);
             } else {
                 per_file = None;
                 self.defines = Packed::all(crate::settle(&self.root, &self.files, &mut self.conditions));
+                sets_changed = true;
             }
             defines_changed = true;
             (up.settled, up.settled_again) = (!again, again);
@@ -873,12 +944,20 @@ impl Session {
         mark("settled");
         // Did any macro change character? Then whoever mentions it is stale.
         let mut reclassified = FxHashSet::default();
-        if defines_changed {
+        if defines_changed && sets_changed {
             let per_file: Vec<Vec<Define>> = per_file.take().unwrap_or_else(|| self.defines.par_iter().map(Packed::get).collect());
             let paths: Vec<String> = self.files.iter().map(|p| crate::rel_path(&self.root, p)).collect();
             let sets = MacroSets::of_files(&per_file, &paths, self.conditions.not_built()).with_conditions(self.conditions.clone());
             reclassified = self.sets.reclassified(&sets);
             self.sets = sets;
+        } else if defines_changed {
+            self.sets.set_conditions(self.conditions.clone());
+            if std::env::var_os("SI_SETTLE_CHECK").is_some() {
+                let per_file: Vec<Vec<Define>> = per_file.take().unwrap_or_else(|| self.defines.par_iter().map(Packed::get).collect());
+                let paths: Vec<String> = self.files.iter().map(|p| crate::rel_path(&self.root, p)).collect();
+                let sets = MacroSets::of_files(&per_file, &paths, self.conditions.not_built()).with_conditions(self.conditions.clone());
+                eprintln!("settle    macro sets kept: {} macros otherwise made anew, digest the same: {}", self.sets.reclassified(&sets).len(), sets.digest() == self.sets.digest());
+            }
         }
         up.macros_reclassified = reclassified.len();
         mark("macro sets");
@@ -1125,12 +1204,42 @@ int slow (void) { return 0; }
         edit("a.c", &format!("#include \"a.h\"\n{}", a_c.replace("int slow", "int slower")), 3, "a function renamed");
         edit("c.c", "int counter;\nint alone (void) { return 2; }\nint another (void) { return alone (); }\n", 1, "a variable put in");
         edit("c.c", "int counter;\nint alone (void) { return 2; }\n", 1, "a function taken out");
-        // Another #if group: in full.
-        edit("c.c", "int counter;\n#ifdef FAST\nint alone (void) { return 2; }\n#endif\n", n, "a function put under #ifdef");
-        edit("a.h", "struct ops { int (*go) (void); int (*stop) (void); };\n#ifdef FAST\nint fast (void);\n#endif\nint slow (void);\nint helper (int (*f) (void));\n", n, "a member added");
+        // Under another #if group: as a function changed, its own file and
+        // who names it (no other file names `alone`; a.h and b.c name `slow`,
+        // a.c defining `slower` now).
+        edit("c.c", "int counter;\n#ifdef FAST\nint alone (void) { return 2; }\n#endif\n", 1, "a function put under #ifdef");
+        edit("c.c", "int counter;\n#ifdef FAST\nint alone (void) { return 2; }\n#endif\n#if 0\n#endif\n", 1, "an #if around nothing");
+        edit("a.h", "struct ops { int (*go) (void); };\n#ifdef FAST\nint fast (void);\nint slow (void);\n#endif\nint helper (int (*f) (void));\n", 2, "a declaration put under #ifdef");
+        edit("a.h", "struct ops { int (*go) (void); int (*stop) (void); };\n#ifdef FAST\nint fast (void);\nint slow (void);\n#endif\nint helper (int (*f) (void));\n", n, "a member added");
         // Saved as it was: nothing to link.
         let up = s.update(&[PathBuf::from("c.c")]);
         assert_eq!((up.changed, up.link_ms), (0, 0.0));
+    }
+
+    #[test]
+    fn a_session_read_back_relinks_from_the_saved_graph() {
+        let d = Dir::new("relink-saved");
+        d.write("a.h", "int slow (void);\nint helper (int (*f) (void));\n");
+        d.write("a.c", "#include \"a.h\"\nint slow (void) { return 1; }\nint helper (int (*f) (void)) {\n  return f ();\n}\n");
+        d.write("b.c", "#include \"a.h\"\nstatic int cb (void) { return 3; }\nint main (void) {\n  helper (cb);\n  return slow ();\n}\n");
+        d.write("c.c", "int alone (void) { return 2; }\n");
+        let fresh = |d: &Dir| layout(&Session::open(&d.0, Options::default()).graph);
+        drop(opened(&d.0));
+        // Read back, its first edit is resolved alone.
+        let (mut s, up) = opened(&d.0);
+        assert_eq!(up.extracted, 0);
+        let c = d.write("c.c", "int alone (void) { return slow (); }\n");
+        s.update(&[c]);
+        assert_eq!(s.stats.resolved_files, 1, "the first edit after a start");
+        assert!(layout(&s.graph) == fresh(&d), "the graph differs from one made anew");
+        while s.save_some(usize::MAX) {}
+        drop(s);
+        // Edited while no session had it open: the start relinks from the
+        // saved graph.
+        d.write("c.c", "int alone (void) { return 4; }\n");
+        let (s, up) = opened(&d.0);
+        assert_eq!((up.extracted, s.stats.resolved_files), (1, 1), "a file edited before a start");
+        assert!(layout(&s.graph) == fresh(&d), "the graph differs from one made anew");
     }
 
     #[test]
@@ -1465,6 +1574,8 @@ int slow (void) { return 0; }
             assert_eq!(shape(s), shape(&fresh));
             assert_eq!(s.conditions(), fresh.conditions());
             assert!(s.defines.iter().map(Packed::get).eq(fresh.defines.iter().map(Packed::get)), "definitions differ");
+            assert_eq!(s.sets.digest(), fresh.sets.digest());
+            assert!(s.sets.reclassified(&fresh.sets).is_empty());
         };
         same(&s);
         // A macro of a.c's own, which no #if tests: from where it stood.
@@ -1484,6 +1595,141 @@ int slow (void) { return 0; }
         assert!(up.settled && !up.settled_again);
         same(&s);
         assert_eq!(functions(&s, "net_up"), 1);
+        // An #if put in: worked out again, only a.c read again.
+        d.write("a.c", &a("#ifdef USE_USB\nint usb_probe (void) { return 3; }\n#endif\n"));
+        let up = s.update(&[d.0.join("a.c")]);
+        assert!(up.settled && !up.settled_again);
+        same(&s);
+        assert_eq!(functions(&s, "usb_probe"), 1);
+        // And a macro that only stands for its value changed in it: the macro sets stand.
+        d.write("config.h", "#ifndef CONFIG_H\n#define CONFIG_H\n#define NET_ON 1\n#define USE_NET NET_ON\n#define USE_USB 0\n#define LIMIT 4\n#endif\n");
+        s.update(&[d.0.join("config.h")]);
+        same(&s);
+        d.write("config.h", "#ifndef CONFIG_H\n#define CONFIG_H\n#define NET_ON 1\n#define USE_NET NET_ON\n#define USE_USB 0\n#define LIMIT 5\n#endif\n");
+        let up = s.update(&[d.0.join("config.h")]);
+        assert_eq!(up.macros_reclassified, 0);
+        same(&s);
+    }
+
+    #[test]
+    fn a_header_its_readers_decide_otherwise_now_is_read_again() {
+        let d = Dir::new("decided");
+        d.write("config.h", "#define MODE 1\n");
+        d.write("feat.h", "#if MODE\n#define FEAT_CALL(x) feat (x)\n#else\n#define FEAT_CALL(x) 0\n#endif\nint feat (int);\n");
+        d.write("a.c", "#include \"config.h\"\n#include \"feat.h\"\nint go (void) { return FEAT_CALL (1); }\n");
+        let mut s = Session::open(&d.0, Options::default());
+        let same = |s: &Session| {
+            let fresh = Session::open(&d.0, Options::default());
+            assert_eq!(shape(s), shape(&fresh));
+            assert_eq!(s.conditions(), fresh.conditions());
+            assert!(s.defines.iter().map(Packed::get).eq(fresh.defines.iter().map(Packed::get)), "definitions differ");
+            assert_eq!(s.sets.digest(), fresh.sets.digest());
+        };
+        same(&s);
+        // (What feat.h defines is what its #if comes to.)
+        let feat = |s: &Session| s.defines[s.files.iter().position(|p| p.ends_with("feat.h")).unwrap()].get();
+        let mut seen = vec![feat(&s)];
+        // The value an #if of feat.h tests, and then the #ifs around it.
+        for text in ["#define MODE 0\n", "#ifndef CONFIG_H\n#define CONFIG_H\n#define MODE 1\n#endif\n", "#if 1\n#define MODE 0\n#endif\n"] {
+            d.write("config.h", text);
+            let up = s.update(&[d.0.join("config.h")]);
+            assert!(up.settled && !up.settled_again);
+            same(&s);
+            seen.push(feat(&s));
+        }
+        assert!(seen[0] != seen[1] && seen[1] != seen[2] && seen[0] == seen[2] && seen[1] == seen[3]);
+    }
+
+    #[test]
+    fn a_header_a_source_decides_otherwise_now_is_read_again() {
+        let d = Dir::new("decided-by-source");
+        d.write("feat.h", "#if MODE\n#define FEAT_CALL(x) feat (x)\n#else\n#define FEAT_CALL(x) 0\n#endif\nint feat (int);\n");
+        let a = |more: &str, first: bool| {
+            let (define, include) = ("#define MODE 1\n", "#include \"feat.h\"\n");
+            let (x, y) = if first { (define, include) } else { (include, define) };
+            // (Left open at the end, MODE is no name the sources know.)
+            format!("{more}{x}{y}int go (void) {{ return FEAT_CALL (1); }}\n#undef MODE\n")
+        };
+        d.write("a.c", &a("", true));
+        for i in 0..6 {
+            d.write(&format!("z{i}.c"), &format!("int z{i} (void) {{ return {i}; }}\n"));
+        }
+        let mut s = Session::open(&d.0, Options::default());
+        let same = |s: &Session| {
+            let fresh = Session::open(&d.0, Options::default());
+            assert_eq!(shape(s), shape(&fresh));
+            assert_eq!(s.conditions(), fresh.conditions());
+            assert!(s.defines.iter().map(Packed::get).eq(fresh.defines.iter().map(Packed::get)), "definitions differ");
+            assert_eq!(s.sets.digest(), fresh.sets.digest());
+        };
+        same(&s);
+        let feat = |s: &Session| s.defines[s.files.iter().position(|p| p.ends_with("feat.h")).unwrap()].get();
+        let mut seen = vec![feat(&s)];
+        // MODE defined after feat.h is read, then before again: an #if
+        // more each time, so that the #ifs are worked out again.
+        for (more, first) in [("#if 1\n#endif\n", false), ("#if 1\n#endif\n#if 1\n#endif\n", true)] {
+            d.write("a.c", &a(more, first));
+            let up = s.update(&[d.0.join("a.c")]);
+            assert!(up.settled && !up.settled_again);
+            same(&s);
+            seen.push(feat(&s));
+        }
+        assert!(seen[0] != seen[1] && seen[0] == seen[2]);
+    }
+
+    #[test]
+    fn definitions_read_in_place_are_those_packed() {
+        let d = |name: &str, i: u8| Define {
+            name: name.as_bytes().to_vec(),
+            function_like: i.is_multiple_of(2),
+            deps: (i != 1).then(|| vec![b"a".to_vec(), b"bb".to_vec()]),
+            hides: i == 1,
+            refs: vec![b"r".to_vec(); i as usize],
+            value: (i == 1).then(|| b"1 + X".to_vec()),
+            certain: i == 0,
+            fallback: i == 1,
+            guard: i == 2,
+            undef: i == 1,
+            include: i == 2,
+            test: i == 0,
+            line: 300 + i as u32,
+            local: i == 1,
+            system: i == 2,
+            head: b"for".to_vec(),
+            branch: 5 << 16 | i as u64,
+            unused: 3 << i,
+            pasted: 1 << (40 + i),
+            forwards: vec![(i, b"M".to_vec(), 2); i as usize + 1],
+        };
+        let list = vec![d("X", 0), d("YY", 1), d("inc.h", 2), d("Z", 3)];
+        let packed = Packed::of(&list);
+        let views = packed.view();
+        let back: Vec<Define> = views
+            .iter()
+            .map(|v| Define {
+                name: v.name.to_vec(),
+                function_like: v.function_like,
+                deps: v.deps.as_ref().map(|d| d.iter().map(|x| x.to_vec()).collect()),
+                hides: v.hides,
+                refs: v.refs.iter().map(|x| x.to_vec()).collect(),
+                value: v.value.map(<[u8]>::to_vec),
+                certain: v.certain,
+                fallback: v.fallback,
+                guard: v.guard,
+                undef: v.undef,
+                include: v.include,
+                test: v.test,
+                line: v.line,
+                local: v.local,
+                system: v.system,
+                head: v.head.to_vec(),
+                branch: v.branch,
+                unused: v.unused,
+                pasted: v.pasted,
+                forwards: v.forwards.iter().map(|&(a, m, b)| (a, m.to_vec(), b)).collect(),
+            })
+            .collect();
+        assert!(back == list);
     }
 
     #[test]
