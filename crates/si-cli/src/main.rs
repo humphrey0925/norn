@@ -362,8 +362,7 @@ fn query(dir: &Path, op: &str, name: &str, depth: u32) {
 }
 
 /// Most callers one answer lists; `count` is of all of them. A name that
-/// most of a tree reaches through macros has millions: `printk` in Linux,
-/// where each of its nine definitions is reached through the same uses.
+/// most of a tree reaches through macros has millions: `printk` in Linux.
 const MOST_CALLERS: usize = 1_000_000;
 
 /// An answer, written out as it is serialized.
@@ -396,13 +395,24 @@ struct CallersReply<'g> {
 }
 
 impl<'g> CallersReply<'g> {
+    /// Each row once: a call that may be to any of a name's definitions is
+    /// found from each of them, and one through a macro from each
+    /// definition of that macro, the row the same every time (`printk` in
+    /// Linux: nine definitions, eight of `memcpy` on the way, 11.2M rows of
+    /// which 0.6M differ).
     fn new(g: &'g Graph, syms: &[u32], most: usize) -> Self {
         let (mut found, mut count) = (Vec::new(), 0);
+        let name = |x: Option<u32>| x.map(|x| g.syms[x as usize].name);
+        let mut seen = std::collections::HashSet::new();
         for &s in syms {
-            let callers = si_core::callers_through_macros(g, s);
-            count += callers.len();
-            let room = most.saturating_sub(found.len());
-            found.extend(callers.into_iter().take(room));
+            for c in si_core::callers_through_macros(g, s) {
+                if seen.insert((c.caller, c.line, c.ambiguous, name(c.via), name(c.slot))) {
+                    count += 1;
+                    if found.len() < most {
+                        found.push(c);
+                    }
+                }
+            }
         }
         CallersReply { g, found, count }
     }
