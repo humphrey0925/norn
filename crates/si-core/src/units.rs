@@ -799,23 +799,29 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
             names_in(expr, |name| _ = asked.insert(name));
         }
     }
-    loop {
-        let before = asked.len();
-        let set: Vec<&[u8]> = asked.iter().filter_map(|n| conditions.setting(n)).collect();
-        for value in set {
-            names_in(value, |name| _ = asked.insert(name));
-        }
-        for op in scripts.iter().flat_map(|s| &s.ops) {
-            if let Op::Define { name, value } = op {
-                if asked.contains(&name[..]) {
-                    names_in(value, |name| _ = asked.insert(name));
-                }
-            }
-        }
-        if asked.len() == before {
-            break;
+    // (Each name's values in the sources, gathered once: a name asked
+    // about asks about what they name, and so on.)
+    let mut values: FxHashMap<&[u8], Vec<&[u8]>> = FxHashMap::default();
+    for op in scripts.iter().flat_map(|s| &s.ops) {
+        if let Op::Define { name, value } = op {
+            values.entry(&name[..]).or_default().push(&value[..]);
         }
     }
+    let mut work: Vec<&[u8]> = asked.iter().copied().collect();
+    while let Some(n) = work.pop() {
+        let mut ask = |name| {
+            if asked.insert(name) {
+                work.push(name);
+            }
+        };
+        if let Some(value) = conditions.setting(n) {
+            names_in(value, &mut ask);
+        }
+        for value in values.get(n).into_iter().flatten() {
+            names_in(value, &mut ask);
+        }
+    }
+    drop(values);
     // Which file an include reads: the one beside the includer, else the
     // ones of that name nearest to it.
     let by_path: FxHashMap<&str, u32> = paths.iter().enumerate().map(|(i, p)| (p.as_str(), i as u32)).collect();
@@ -1113,32 +1119,70 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
     // `#define` of it next): a name every definition of which is such, and
     // no other file tests (`support_p` another tests is a switch).
     {
-        let mut inner: FxHashMap<Vec<u8>, (bool, FxHashSet<usize>)> = FxHashMap::default();
-        for (f, s) in scripts.iter().enumerate() {
-            for (k, op) in s.ops.iter().enumerate() {
-                if let Op::Define { name, value } = op {
-                    let guarded = k > 0 && matches!(&s.ops[k - 1], Op::If { kind: 2, expr, .. } if expr == name) && value.is_empty();
-                    let e = inner.entry(name.clone()).or_insert((true, FxHashSet::default()));
-                    e.0 &= guarded;
-                    e.1.insert(f);
+        // (Only a name some file defines so can be one: those first, then
+        // whether every definition of each is so, all files at once.)
+        let guarded = |s: &crate::mask::Script, k: usize| match &s.ops[k] {
+            Op::Define { name, value } => k > 0 && matches!(&s.ops[k - 1], Op::If { kind: 2, expr, .. } if expr == name) && value.is_empty(),
+            _ => false,
+        };
+        let found: Vec<Vec<&[u8]>> = scripts
+            .par_iter()
+            .map(|s| (0..s.ops.len()).filter(|&k| guarded(s, k)).filter_map(|k| if let Op::Define { name, .. } = &s.ops[k] { Some(&name[..]) } else { None }).collect())
+            .collect();
+        // name -> (every definition so, the files defining it).
+        let mut inner: FxHashMap<&[u8], (bool, Vec<usize>)> = FxHashMap::default();
+        for &name in found.iter().flatten() {
+            inner.entry(name).or_insert((true, Vec::new()));
+        }
+        let defining: Vec<Vec<(&[u8], bool)>> = scripts
+            .par_iter()
+            .map(|s| {
+                let mut out = Vec::new();
+                for (k, op) in s.ops.iter().enumerate() {
+                    if let Op::Define { name, .. } = op {
+                        if inner.contains_key(&name[..]) {
+                            out.push((&name[..], guarded(s, k)));
+                        }
+                    }
+                }
+                out
+            })
+            .collect();
+        for (f, list) in defining.iter().enumerate() {
+            for &(name, so) in list {
+                let e = inner.get_mut(name).expect("a name found");
+                e.0 &= so;
+                if e.1.last() != Some(&f) {
+                    e.1.push(f);
                 }
             }
         }
         inner.retain(|n, e| e.0 && !conditions.settles(n));
-        for (f, s) in scripts.iter().enumerate() {
-            for op in &s.ops {
-                if let Op::If { expr, .. } | Op::Elif { expr, .. } = op {
-                    names_in(expr, |n| {
-                        if let Some(e) = inner.get_mut(n) {
-                            if !e.1.contains(&f) {
-                                e.0 = false;
+        let testing: Vec<Vec<&[u8]>> = scripts
+            .par_iter()
+            .map(|s| {
+                let mut out = Vec::new();
+                for op in &s.ops {
+                    if let Op::If { expr, .. } | Op::Elif { expr, .. } = op {
+                        names_in(expr, |n| {
+                            if inner.contains_key(n) {
+                                out.push(n);
                             }
-                        }
-                    });
+                        });
+                    }
+                }
+                out
+            })
+            .collect();
+        for (f, names) in testing.iter().enumerate() {
+            for &n in names {
+                let e = inner.get_mut(n).expect("a name kept");
+                if e.1.binary_search(&f).is_err() {
+                    e.0 = false;
                 }
             }
         }
-        guards.extend(inner.into_iter().filter(|(_, e)| e.0).map(|(n, _)| n));
+        guards.extend(inner.into_iter().filter(|(_, e)| e.0).map(|(n, _)| n.to_vec()));
     }
     w.unseen = conditions.with_undefined(guards.iter().cloned());
     outright.extend(guards);
