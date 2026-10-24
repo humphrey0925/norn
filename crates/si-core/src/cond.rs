@@ -801,7 +801,7 @@ pub struct Conditions {
     /// for what the compiler defines of itself (see `builtin`).
     assume_built: bool,
     /// Names the sources `#define` somewhere: not for assuming about.
-    in_source: FxHashSet<Vec<u8>>,
+    in_source: std::sync::Arc<FxHashSet<Vec<u8>>>,
     /// What the sources define, file by file (see [`Source`]). What the
     /// settings say of a name comes first.
     source: Option<std::sync::Arc<Source>>,
@@ -1336,7 +1336,7 @@ impl Conditions {
     }
 
     pub fn set_in_source(&mut self, names: FxHashSet<Vec<u8>>) {
-        self.in_source = names;
+        self.in_source = std::sync::Arc::new(names);
     }
 
     /// Are macros the sources define to one value to be taken as known?

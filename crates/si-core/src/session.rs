@@ -46,6 +46,10 @@ pub struct Session {
     conditions: Conditions,
     /// Set when the conditions changed: every file is then read again.
     all_stale: bool,
+    /// What working the conditions out again after an edit of `#if`s takes
+    /// from (`units::Tree`), as the last reading of the tree left it and
+    /// kept up with the files since; none until the tree is read.
+    tree: Option<crate::units::Tree>,
     pub graph: Graph,
     pub stats: LinkStats,
     /// Files whose facts are still to be saved, after an index from
@@ -137,6 +141,10 @@ pub struct Update {
     /// (`settled_again`).
     pub settled: bool,
     pub settled_again: bool,
+    /// Settled from nothing, after `#if`s around code alone changed: what
+    /// the conditions come to was worked out from the compilations that
+    /// read the files changed (`units::Tree::again`).
+    pub settled_from_readers: bool,
     pub extract_ms: f64,
     pub link_ms: f64,
     /// At opening, with nothing of this root saved: files whose facts were
@@ -166,7 +174,8 @@ impl Session {
         let scope = Scope::load(root);
         let files = crate::scan_scope(root, &scope);
         let mut conditions = crate::conditions_of(root, &files);
-        let defines: Vec<Vec<Define>> = crate::settle(root, &files, &mut conditions);
+        let mut tree = None;
+        let defines: Vec<Vec<Define>> = crate::settle_kept(root, &files, &mut conditions, &mut tree);
         let paths: Vec<String> = files.iter().map(|p| crate::rel_path(root, p)).collect();
         let sets = MacroSets::of_files(&defines, &paths, conditions.not_built()).with_conditions(conditions.clone());
         drop(paths);
@@ -190,6 +199,7 @@ impl Session {
             scope,
             conditions,
             all_stale: false,
+            tree,
             graph,
             stats,
             unsaved: Vec::new(),
@@ -469,6 +479,7 @@ impl Session {
             scope: Scope::load(root),
             conditions: Conditions::default(),
             all_stale: false,
+            tree: None,
             graph: Graph::default(),
             stats: LinkStats::default(),
             unsaved: Vec::new(),
@@ -648,6 +659,7 @@ impl Session {
             scope: Scope::load(root),
             conditions,
             all_stale: false,
+            tree: None,
             graph: Graph::default(),
             stats: LinkStats::default(),
             unsaved: Vec::new(),
@@ -730,6 +742,14 @@ impl Session {
     /// The same, a walk of the tree having found which of `paths` are in
     /// the project (`listed`): a file of another kind comes and goes with
     /// the sources that include it.
+    /// For `SI_SETTLE_CHECK`: the first few of the files `which`, by path.
+    fn named(&self, which: &[usize]) -> String {
+        if which.is_empty() {
+            return String::new();
+        }
+        format!(" ({})", which.iter().take(3).map(|&i| crate::rel_path(&self.root, &self.files[i])).collect::<Vec<_>>().join(", "))
+    }
+
     fn update_listed(&mut self, paths: &[PathBuf], listed: Option<&FxHashSet<PathBuf>>) -> Update {
         let mut up = Update::default();
         let t = Instant::now();
@@ -757,6 +777,8 @@ impl Session {
         // tests one of them, only what the sources settle of macros is
         // worked out again, from where it stood (`crate::settle_again`).
         let mut edited: FxHashSet<Vec<u8>> = FxHashSet::default();
+        // The directives of the files changed, to keep `tree` up with them.
+        let mut scripts: Vec<(usize, mask::Script)> = Vec::new();
         for p in paths {
             let path = if p.is_absolute() { p.clone() } else { self.root.join(p) };
             // (A file of another kind is in the index when a source includes it.)
@@ -780,7 +802,9 @@ impl Session {
                         continue;
                     }
                     let rel = crate::rel_path(&self.root, &path);
-                    let skeleton = mask::script(&src).skeleton();
+                    let script = mask::script(&src);
+                    let skeleton = script.skeleton();
+                    scripts.push((i, script));
                     let old = &self.facts[i].skeleton;
                     let shaped = self.conditions.uses_source() && !self.facts[i].path.is_empty() && old.branches == skeleton.branches;
                     // Only moved: what the sources say of it moves with its
@@ -898,8 +922,8 @@ impl Session {
                     if check {
                         let mut whole = self.conditions.clone();
                         let from_nothing = crate::settle(&self.root, &self.files, &mut whole);
-                        let differ = (0..self.files.len()).filter(|&i| from_nothing[i] != all[i]).count();
-                        eprintln!("settle    again: {} files' definitions differ from settling from nothing; conditions the same: {}", differ, whole == self.conditions);
+                        let differ: Vec<usize> = (0..self.files.len()).filter(|&i| from_nothing[i] != all[i]).collect();
+                        eprintln!("settle    again: {} files' definitions differ from settling from nothing{}; conditions the same: {}", differ.len(), self.named(&differ), whole == self.conditions);
                     }
                     per_file = Some(all);
                 }
@@ -910,19 +934,22 @@ impl Session {
                 // told otherwise now read again.
                 let mut all: Vec<Vec<Define>> = self.defines.par_iter().map(Packed::get).collect();
                 let changed: Vec<bool> = self.files.iter().map(|p| touched.contains(p)).collect();
-                let read = crate::settle_changed(&self.root, &self.files, &mut self.conditions, &mut all, &changed);
+                let read;
+                (read, up.settled_from_readers) = crate::settle_changed(&self.root, &self.files, &mut self.conditions, &mut all, &changed, &mut self.tree);
+                scripts.clear();
                 sets_changed |= Packed::some(&mut self.defines, &all, &read);
                 if std::env::var_os("SI_SETTLE_CHECK").is_some() {
                     let mut whole = self.conditions.clone();
                     let from_nothing = crate::settle(&self.root, &self.files, &mut whole);
-                    let differ = (0..self.files.len()).filter(|&i| from_nothing[i] != all[i]).count();
-                    eprintln!("settle    changed: {} of {} files read again, {} files' definitions differ from settling from nothing; conditions the same: {}", read.iter().filter(|r| **r).count(), self.files.len(), differ, whole == self.conditions);
+                    let differ: Vec<usize> = (0..self.files.len()).filter(|&i| from_nothing[i] != all[i]).collect();
+                    eprintln!("settle    changed: {} of {} files read again, {} files' definitions differ from settling from nothing{}; conditions the same: {}", read.iter().filter(|r| **r).count(), self.files.len(), differ.len(), self.named(&differ), whole == self.conditions);
                 }
                 per_file = Some(all);
             } else {
                 per_file = None;
-                self.defines = Packed::all(crate::settle(&self.root, &self.files, &mut self.conditions));
+                self.defines = Packed::all(crate::settle_kept(&self.root, &self.files, &mut self.conditions, &mut self.tree));
                 sets_changed = true;
+                scripts.clear();
             }
             defines_changed = true;
             (up.settled, up.settled_again) = (!again, again);
@@ -939,6 +966,14 @@ impl Session {
                     })
                     .cloned()
                     .collect();
+            }
+        }
+        // Where nothing was worked out anew, what is kept for the next time
+        // moves with the directives, or holds no longer.
+        if let Some(tree) = self.tree.as_mut().filter(|_| !scripts.is_empty()) {
+            let paths: Vec<String> = self.files.iter().map(|p| crate::rel_path(&self.root, p)).collect();
+            if !scripts.iter().all(|(i, script)| tree.refresh(*i, script, &paths, &self.conditions)) {
+                self.tree = None;
             }
         }
         mark("settled");
@@ -1675,6 +1710,47 @@ int slow (void) { return 0; }
             seen.push(feat(&s));
         }
         assert!(seen[0] != seen[1] && seen[0] == seen[2]);
+    }
+
+    #[test]
+    fn ifs_around_code_are_worked_out_from_the_compilations_that_read_them() {
+        let d = Dir::new("ifs-around-code");
+        d.write("config.h", "#ifndef CONFIG_H\n#define CONFIG_H\n#define MODE 1\n#endif\n");
+        d.write("feat.h", "#ifndef FEAT_H\n#define FEAT_H\n#if MODE\n#define FEAT_CALL(x) feat (x)\n#else\n#define FEAT_CALL(x) 0\n#endif\nint feat (int);\nint shown (void);\n#endif\n");
+        let a = |above: &str, body: &str| format!("{above}#include \"config.h\"\n#include \"feat.h\"\n{body}int go (void) {{ return FEAT_CALL (1); }}\n");
+        d.write("a.c", &a("", ""));
+        d.write("b.c", "#include \"config.h\"\n#include \"feat.h\"\nint other (void) { return shown (); }\n");
+        for i in 0..4 {
+            d.write(&format!("z{i}.c"), &format!("int z{i} (void) {{ return {i}; }}\n"));
+        }
+        let mut s = Session::open(&d.0, Options::default());
+        let same = |s: &Session, what: &str| {
+            let fresh = Session::open(&d.0, Options::default());
+            assert_eq!(shape(s), shape(&fresh), "{what}");
+            assert_eq!(s.conditions(), fresh.conditions(), "{what}");
+            assert!(s.defines.iter().map(Packed::get).eq(fresh.defines.iter().map(Packed::get)), "{what}: definitions differ");
+            assert_eq!(s.sets.digest(), fresh.sets.digest(), "{what}");
+        };
+        let edit = |s: &mut Session, name: &str, text: &str, quick: bool, what: &str| {
+            let up = s.update(&[d.write(name, text)]);
+            assert!(up.settled, "{what}: settled");
+            assert_eq!(up.settled_from_readers, quick, "{what}: from the compilations that read it");
+            same(s, what);
+        };
+        same(&s, "opened");
+        edit(&mut s, "a.c", &a("", "#ifdef MODE\nint on (void) { return 1; }\n#else\nint off (void) { return 0; }\n#endif\n"), true, "a function put under #ifdef");
+        edit(&mut s, "a.c", &a("", "#ifdef MODE\nint on (void) { return 1; }\n#endif\n#if 0\nint never;\n#endif\n"), true, "an #if put in, one taken out");
+        edit(&mut s, "feat.h", "#ifndef FEAT_H\n#define FEAT_H\n#if MODE\n#define FEAT_CALL(x) feat (x)\n#else\n#define FEAT_CALL(x) 0\n#endif\nint feat (int);\n#if MODE > 0\nint shown (void);\n#endif\n#endif\n", true, "a header's declaration put under #if");
+        // Lines put in above the directives, nothing worked out anew: what
+        // is kept moves with them.
+        let up = s.update(&[d.write("a.c", &a("/* one */\n/* two */\n", "#ifdef MODE\nint on (void) { return 1; }\n#endif\n#if 0\nint never;\n#endif\n"))]);
+        assert!(!up.settled);
+        same(&s, "lines put in");
+        edit(&mut s, "a.c", &a("/* one */\n/* two */\n", "#ifndef MODE\nint on (void) { return 1; }\n#endif\n"), true, "after lines put in");
+        // A definition put under an #if: from every compilation, and then
+        // from the readers again.
+        edit(&mut s, "config.h", "#ifndef CONFIG_H\n#define CONFIG_H\n#ifndef NO_MODE\n#define MODE 1\n#endif\n#endif\n", false, "a definition put under #ifndef");
+        edit(&mut s, "a.c", &a("", "#ifdef MODE\nint on (void) { return 1; }\n#endif\n"), true, "an #if, after that");
     }
 
     #[test]

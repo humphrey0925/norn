@@ -198,8 +198,14 @@ fn step(what: &'static str, since: &mut std::time::Instant) {
 /// compiled depends on that, and that on which are compiled, so it is done
 /// until nothing changes.
 pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions) -> Vec<Vec<mask::Define>> {
+    settle_kept(root, files, conditions, &mut None)
+}
+
+/// The same, keeping in `tree` what working out the conditions again
+/// after an edit takes from (see `settle_changed`).
+pub fn settle_kept(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions, tree: &mut Option<units::Tree>) -> Vec<Vec<mask::Define>> {
     let mut defines = Vec::new();
-    settle_into(root, files, conditions, &mut defines, None);
+    settle_into(root, files, conditions, &mut defines, None, tree, &mut false);
     defines
 }
 
@@ -208,12 +214,17 @@ pub fn settle(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions)
 /// as they were): `defines`, every file's as `conditions` had them, are
 /// read again only where a file's text changed or what the sources settle
 /// tells it otherwise now (`cond::Source::file_digest`, all a file's
-/// `#define`s depend on of them). Returns the files read again.
-pub fn settle_changed(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions, defines: &mut Vec<Vec<mask::Define>>, changed: &[bool]) -> Vec<bool> {
-    settle_into(root, files, conditions, defines, Some(changed))
+/// `#define`s depend on of them). With `tree` (as `settle_kept` left it,
+/// and kept up since), where only `#if`s around code changed, only the
+/// compilations that read those files are read again (`units::Tree::again`).
+/// Returns the files read again, and whether it was so.
+pub fn settle_changed(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions, defines: &mut Vec<Vec<mask::Define>>, changed: &[bool], tree: &mut Option<units::Tree>) -> (Vec<bool>, bool) {
+    let mut quick = false;
+    let read = settle_into(root, files, conditions, defines, Some(changed), tree, &mut quick);
+    (read, quick)
 }
 
-fn settle_into(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions, defines: &mut Vec<Vec<mask::Define>>, changed: Option<&[bool]>) -> Vec<bool> {
+fn settle_into(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions, defines: &mut Vec<Vec<mask::Define>>, changed: Option<&[bool]>, kept: &mut Option<units::Tree>, quickly: &mut bool) -> Vec<bool> {
     PRESCAN_STEPS.lock().unwrap().clear();
     PRESCAN_SLOWEST.lock().unwrap().clear();
     let mut t = std::time::Instant::now();
@@ -247,39 +258,53 @@ fn settle_into(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions
         read
     };
     if !conditions.uses_source() {
+        *kept = None;
         let read = read(conditions, defines, changed);
         step("defines", &mut t);
         return read;
     }
     // What each condition comes to compilation by compilation, first:
-    // which definitions are compiled depends on it.
-    let (scripts, times): (Vec<mask::Script>, Vec<_>) = files
-        .par_iter()
-        .zip(&paths)
-        .map(|(p, rel)| {
-            let src = std::fs::read(p).unwrap_or_default();
-            let t = std::time::Instant::now();
-            (mask::script(&src), (t.elapsed().as_secs_f64() * 1000.0, src.len(), rel))
-        })
-        .unzip();
-    slowest("scripts", times);
-    step("scripts", &mut t);
-    let (verdicts, readings) = units::read_tree(&paths, &scripts, conditions).unwrap_or_default();
-    let (verdicts, readings) = (std::sync::Arc::new(verdicts), std::sync::Arc::new(readings));
+    // which definitions are compiled depends on it. Where only `#if`s
+    // around code changed, worked out again from the compilations that
+    // read them; else from every one.
+    let quick = changed.zip(kept.as_mut()).and_then(|(changed, tree)| {
+        let scripts: Vec<(usize, mask::Script)> = (0..files.len()).filter(|&i| changed[i]).map(|i| (i, mask::script(&std::fs::read(&files[i]).unwrap_or_default()))).collect();
+        let scripts: Vec<(usize, &mask::Script)> = scripts.iter().map(|(i, s)| (*i, s)).collect();
+        let (verdicts, readings) = was.as_ref().map_or_else(Default::default, |s| (s.verdicts().clone(), s.readings().clone()));
+        match tree.again(&paths, &scripts, conditions, &verdicts)? {
+            Some(verdicts) => Some((std::sync::Arc::new(verdicts), readings)),
+            // (Too much to read, as it was.)
+            None => Some(Default::default()),
+        }
+    });
+    *quickly = quick.is_some();
+    if changed.is_some() && std::env::var_os("SI_COND_PROFILE").is_some() {
+        eprintln!("units     worked out again {}", if quick.is_some() { "from the compilations that read the files changed" } else { "from every compilation" });
+    }
+    let (verdicts, readings) = match quick {
+        Some(quick) => quick,
+        None => {
+            let (scripts, times): (Vec<mask::Script>, Vec<_>) = files
+                .par_iter()
+                .zip(&paths)
+                .map(|(p, rel)| {
+                    let src = std::fs::read(p).unwrap_or_default();
+                    let t = std::time::Instant::now();
+                    (mask::script(&src), (t.elapsed().as_secs_f64() * 1000.0, src.len(), rel))
+                })
+                .unzip();
+            slowest("scripts", times);
+            step("scripts", &mut t);
+            let (read, tree) = units::read_tree_kept(&paths, &scripts, conditions);
+            *kept = Some(tree);
+            let (verdicts, readings) = read.unwrap_or_default();
+            (std::sync::Arc::new(verdicts), std::sync::Arc::new(readings))
+        }
+    };
     // The names each file's conditions name: its `#define`s come out
     // otherwise only where what is known of one of these does.
-    let tested: Vec<rustc_hash::FxHashSet<&[u8]>> = scripts
-        .par_iter()
-        .map(|s| {
-            let mut names = rustc_hash::FxHashSet::default();
-            for op in &s.ops {
-                if let mask::Op::If { expr, .. } | mask::Op::Elif { expr, .. } = op {
-                    units::names_in(expr, |n| _ = names.insert(n));
-                }
-            }
-            names
-        })
-        .collect();
+    let tree = kept.as_ref().expect("the tree read");
+    let tested: Vec<rustc_hash::FxHashSet<&[u8]>> = (0..files.len()).into_par_iter().map(|f| tree.tested(f)).collect();
     step("verdicts", &mut t);
     if std::env::var_os("SI_COND_PROFILE").is_some() {
         eprintln!("decided   {} conditions, by reading each compilation", verdicts.iter().map(Vec::len).sum::<usize>());
@@ -291,11 +316,22 @@ fn settle_into(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions
             }
         }
     }
-    let mut first = cond::Source::new(&paths);
-    first.set_verdicts(verdicts.clone());
-    first.set_readings(readings.clone());
-    if !first.is_empty() {
-        conditions.set_source(Some(std::sync::Arc::new(first)));
+    // From nothing but what each compilation's conditions come to; or,
+    // where only some of those changed, from where it stood with them.
+    match was.as_ref().filter(|_| *quickly) {
+        Some(was) => {
+            let mut from = (**was).clone();
+            from.set_verdicts(verdicts.clone());
+            conditions.set_source(Some(std::sync::Arc::new(from)));
+        }
+        None => {
+            let mut first = cond::Source::new(&paths);
+            first.set_verdicts(verdicts.clone());
+            first.set_readings(readings.clone());
+            if !first.is_empty() {
+                conditions.set_source(Some(std::sync::Arc::new(first)));
+            }
+        }
     }
     // A file whose text is as it was, told what it was told, reads as it
     // did. (Told nothing at all and told nothing in particular may read
@@ -313,7 +349,6 @@ fn settle_into(root: &Path, files: &[PathBuf], conditions: &mut cond::Conditions
     step("defines", &mut t);
     let fresh = settle_from(files, &paths, conditions, defines, (&verdicts, &readings), &tested, &mut t);
     read.iter_mut().zip(fresh).for_each(|(r, f)| *r |= f);
-    drop(scripts);
     read
 }
 
