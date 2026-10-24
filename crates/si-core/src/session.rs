@@ -1204,9 +1204,13 @@ int slow (void) { return 0; }
         edit("a.c", &format!("#include \"a.h\"\n{}", a_c.replace("int slow", "int slower")), 3, "a function renamed");
         edit("c.c", "int counter;\nint alone (void) { return 2; }\nint another (void) { return alone (); }\n", 1, "a variable put in");
         edit("c.c", "int counter;\nint alone (void) { return 2; }\n", 1, "a function taken out");
-        // Another #if group: in full.
-        edit("c.c", "int counter;\n#ifdef FAST\nint alone (void) { return 2; }\n#endif\n", n, "a function put under #ifdef");
-        edit("a.h", "struct ops { int (*go) (void); int (*stop) (void); };\n#ifdef FAST\nint fast (void);\n#endif\nint slow (void);\nint helper (int (*f) (void));\n", n, "a member added");
+        // Under another #if group: as a function changed, its own file and
+        // who names it (no other file names `alone`; a.h and b.c name `slow`,
+        // a.c defining `slower` now).
+        edit("c.c", "int counter;\n#ifdef FAST\nint alone (void) { return 2; }\n#endif\n", 1, "a function put under #ifdef");
+        edit("c.c", "int counter;\n#ifdef FAST\nint alone (void) { return 2; }\n#endif\n#if 0\n#endif\n", 1, "an #if around nothing");
+        edit("a.h", "struct ops { int (*go) (void); };\n#ifdef FAST\nint fast (void);\nint slow (void);\n#endif\nint helper (int (*f) (void));\n", 2, "a declaration put under #ifdef");
+        edit("a.h", "struct ops { int (*go) (void); int (*stop) (void); };\n#ifdef FAST\nint fast (void);\nint slow (void);\n#endif\nint helper (int (*f) (void));\n", n, "a member added");
         // Saved as it was: nothing to link.
         let up = s.update(&[PathBuf::from("c.c")]);
         assert_eq!((up.changed, up.link_ms), (0, 0.0));

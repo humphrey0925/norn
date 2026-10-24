@@ -1442,11 +1442,6 @@ fn digest(f: &FileFacts, directives: Option<&[u32]>, all: bool) -> u64 {
         put(text as u32);
         put((text >> 32) as u32);
     }
-    put(f.undecided.len() as u32);
-    for u in &f.undecided {
-        put(u.3 as u32);
-        put((u.3 >> 32) as u32);
-    }
     let path = xxhash_rust::xxh3::xxh3_64(f.path.as_bytes());
     put(path as u32);
     put((path >> 32) as u32);

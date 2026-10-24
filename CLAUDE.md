@@ -117,10 +117,11 @@ The index is built in stages (`lib.rs` strings them together; `si-cli`'s
 6. **Session** (`session.rs`): the live index the language server holds. An
    update re-extracts the files that changed (and, when `#define`s changed, the
    files the macro sets now read otherwise), settles conditions again if it
-   must, and relinks. A relink resolves again only what the edit can change
-   (`link::Last`: per-file digests of what other files read of each file;
-   files and their users otherwise read from the previous graph); new types,
-   records, macros, `#if` groups and C++ files link in full.
+   must (reading again only the files they now tell otherwise), and relinks.
+   A relink resolves again only what the edit can change (`link::Last`:
+   per-file digests of what other files read of each file; files and their
+   users otherwise read from the previous graph); new types, records, macros
+   and C++ files link in full.
 7. **Store** (`store.rs`): each file's facts on disk, one small file per source
    file, plus the expansions, the macro sets and the graph, so that a start
    parses only what changed.
