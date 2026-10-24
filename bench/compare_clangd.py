@@ -7,6 +7,7 @@ its index next to that database, in `.cache/clangd/index`.
 import hashlib
 import math
 import json
+import re
 import os
 import queue
 import subprocess
@@ -172,12 +173,16 @@ class Clangd:
 
     def prepare(self, rel, lines, name, line):
         """The call hierarchy item for function `name` defined on `line`."""
-        col = lines[line - 1].find(name) if line <= len(lines) else -1
+        text = lines[line - 1] if line <= len(lines) else ""
+        # (The name where it is declared, before its parameters: `Foo::Foo (`
+        # is the constructor at its second `Foo`, not the class at its first.)
+        m = [m.start() for m in re.finditer(rf"\b{re.escape(name)}\s*\(", text)]
+        col = m[-1] if m else text.find(name)
         if col < 0:
             return None
         items = self.request("textDocument/prepareCallHierarchy", {
             "textDocument": {"uri": self.uri(rel)}, "position": {"line": line - 1, "character": col}}) or []
-        return next((i for i in items if i["name"] == name), None)
+        return next((i for i in items if short(i["name"]) == name), None)
 
     def stop(self):
         try:
@@ -187,6 +192,16 @@ class Clangd:
         except Exception:
             self.p.kill()
         self.log.close()
+
+
+# The kinds of symbol a function is (LSP's Method, Constructor, Function).
+FUNCTION_KINDS = (6, 9, 12)
+
+
+def short(name):
+    """A name as the truth compared with clangd has it: without its classes
+    (clangd names a method `State::AddValidation`, the truth `AddValidation`)."""
+    return name.rsplit("::", 1)[-1]
 
 
 def sample(functions, fraction):
@@ -226,7 +241,7 @@ def call_edges(c, functions, deadline):
         lines = c.open(file)
         for name, line in fns:
             hits = c.request("workspace/symbol", {"query": name}) or []
-            if any(h["name"] == name and h["kind"] == 12 and c.rel(h["location"]["uri"]) == file for h in hits):
+            if any(short(h["name"]) == name and h["kind"] in FUNCTION_KINDS and c.rel(h["location"]["uri"]) == file for h in hits):
                 found_defs.add((file, name))
             item = c.prepare(file, lines, name, line)
             if item is None:
@@ -235,7 +250,7 @@ def call_edges(c, functions, deadline):
             for call in c.request("callHierarchy/outgoingCalls", {"item": item}) or []:
                 to = call["to"]
                 site = call["fromRanges"][0]["start"]["line"] + 1 if call.get("fromRanges") else line
-                rows.append((file, site, name, file, to["name"], c.rel(to["uri"]), "certain", "def"))
+                rows.append((file, site, name, file, short(to["name"]), c.rel(to["uri"]), "certain", "def"))
         c.close_doc(file)
     return rows, unresolved, found_defs
 
@@ -259,7 +274,7 @@ def time_queries(c, names, reps):
             calls = c.request("callHierarchy/incomingCalls", {"item": item}) if item else []
             callers.append(time.perf_counter() - t0)
             if rep == 0:
-                answered_find += any(h["name"] == n["name"] for h in hits)
+                answered_find += any(short(h["name"]) == n["name"] for h in hits)
                 answered_callers += bool(calls)
     for file in lines:
         c.close_doc(file)

@@ -122,11 +122,22 @@
 <section id="benchmarks" class="alt">
   <div class="wrap">
     <h2>基準測試</h2>
-    <p class="intro">在公開專案上量測，標準答案是 clang 對該專案實際 build 的結果。每個工具回報的每個呼叫都和 clang 實際編譯的呼叫對照。clangd 量了兩次：一次給它真實 build 的 compilation database，一次什麼都不給。Norn 什麼都不給。</p>
-    <div class="chart"><img src="/assets/calls-found.svg" width="1108" height="386" alt="各專案、各工具找到的呼叫比例"></div>
-    <div class="chart"><img src="/assets/index-time.svg" alt="各專案、各工具建立索引的時間"></div>
+    <p class="intro">在 C 與 C++ 的公開專案上量測，標準答案是 clang 對該專案實際 build 的結果：每個工具回報的每個呼叫，都和 clang 實際編譯的呼叫對照。Norn 什麼都不給；clangd 量了兩次，一次給它真實 build 的 compilation database，一次什麼都不給。</p>
+    <div class="stats">
+      <!-- BENCH-STATS:BEGIN -->
+      <!-- Filled in from README.md by site/build.mjs. -->
+      <!-- BENCH-STATS:END -->
+    </div>
+    <div class="tabs">
+      <input type="radio" name="bench-chart" id="bench-calls" checked><label for="bench-calls">找到的呼叫</label>
+      <input type="radio" name="bench-chart" id="bench-time"><label for="bench-time">建立索引的時間</label>
+      <input type="radio" name="bench-chart" id="bench-memory"><label for="bench-memory">峰值記憶體</label>
+      <div class="chart p-calls"><a href="/assets/calls-found.svg"><img src="/assets/calls-found.svg" alt="各專案、各工具找到的呼叫比例" loading="lazy"></a></div>
+      <div class="chart p-time"><a href="/assets/index-time.svg"><img src="/assets/index-time.svg" alt="各專案、各工具建立索引的時間" loading="lazy"></a></div>
+      <div class="chart p-memory"><a href="/assets/peak-memory.svg"><img src="/assets/peak-memory.svg" alt="各專案、各工具建立索引時的峰值記憶體" loading="lazy"></a></div>
+    </div>
     <div class="table-scroll">
-      <table>
+      <table class="bench">
         <thead><tr><th>專案</th><th>檔案數</th><th class="norn">Norn</th><th>clangd + build database</th><th>clangd</th><th>cscope</th></tr></thead>
         <tbody>
           <!-- BENCHMARKS:BEGIN -->
@@ -135,7 +146,7 @@
         </tbody>
       </table>
     </div>
-    <p class="note">每格：找到的呼叫比例（和 clang 對照），下方為建立索引的時間。量測方法、所有數字與工具版本見 <a href="https://github.com/humphrey0925/norn/blob/master/docs/benchmarks/README.md">docs/benchmarks</a>。所有數字都由 <code>bench/compare.py</code> 產生，沒有手打的。</p>
+    <p class="note">每格：找到的呼叫比例，下方是從零建立索引的時間；底下的長條就是那個比例。Linux 核心、FreeRTOS 與 spdlog 另外量了像使用者一樣給 Norn 建置設定的情況。每個工具的所有數字（記憶體、磁碟、更新、查詢、精確度）、量測方法與工具版本見 <a href="https://github.com/humphrey0925/norn/blob/master/docs/benchmarks/README.md">docs/benchmarks</a>（英文）。所有數字都由 <code>bench/compare.py</code> 產生，沒有手打的。</p>
   </div>
 </section>
 

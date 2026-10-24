@@ -87,17 +87,35 @@ index fastest because they record names and places, not a call graph.
 
 <p align="center"><img src="docs/benchmarks/index-time.svg" alt="Time to index" width="760"></p>
 
-| Project | Files | Norn | clangd + build database | clangd | codebase-memory-mcp | cscope | GNU Global | Universal Ctags |
-|---|--:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
-| Redis | 801 | **100.0%<br><sub>0.32 s</sub>** | 100.0%<br><sub>1.67 s</sub> | 95.8%<br><sub>11 s</sub> | 97.1%<br><sub>13 s</sub> | 96.9%<br><sub>0.26 s</sub> | n/a<br><sub>0.18 s</sub> | n/a<br><sub>0.17 s</sub> |
-| git | 919 | **99.9%<br><sub>0.25 s</sub>** | 99.9%<br><sub>2.40 s</sub> | 64.2%<br><sub>32 s</sub> | 85.8%<br><sub>12 s</sub> | 87.9%<br><sub>0.27 s</sub> | n/a<br><sub>0.18 s</sub> | n/a<br><sub>0.17 s</sub> |
-| binutils | 1,622 | **99.6%<br><sub>2.72 s</sub>** | 92.7%<br><sub>9.72 s</sub> | 32.2%<br><sub>16 s</sub> | 81.0%<br><sub>37 s</sub> | 70.6%<br><sub>1.34 s</sub> | n/a<br><sub>0.81 s</sub> | n/a<br><sub>0.99 s</sub> |
-| STM32F4 HAL | 253 | **96.5%<br><sub>0.64 s</sub>** | 95.0%<br><sub>3.14 s</sub> | 0.0%<br><sub>1.14 s</sub> | 85.8%<br><sub>9.62 s</sub> | 75.7%<br><sub>0.44 s</sub> | n/a<br><sub>0.68 s</sub> | n/a<br><sub>0.60 s</sub> |
-| nrfx | 535 | **98.0%<br><sub>0.84 s</sub>** | 100.0%<br><sub>1.15 s</sub> | 14.1%<br><sub>1.22 s</sub> | 94.2%<br><sub>8.29 s</sub> | 12.0%<br><sub>0.28 s</sub> | n/a<br><sub>0.36 s</sub> | n/a<br><sub>0.32 s</sub> |
+<p align="center"><img src="docs/benchmarks/peak-memory.svg" alt="Peak memory" width="760"></p>
+
+| Project | Language | Files | Norn | clangd + build database | clangd | codebase-memory-mcp | cscope | GNU Global | Universal Ctags |
+|---|---|--:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| Redis | C | 801 | **100.0%<br><sub>0.33 s</sub>** | 100.0%<br><sub>2.71 s</sub> | 95.8%<br><sub>15 s</sub> | 97.1%<br><sub>15 s</sub> | 96.9%<br><sub>0.28 s</sub> | n/a<br><sub>0.20 s</sub> | n/a<br><sub>0.18 s</sub> |
+| git | C | 919 | **99.9%<br><sub>0.26 s</sub>** | 99.9%<br><sub>2.42 s</sub> | 64.2%<br><sub>34 s</sub> | 85.9%<br><sub>12 s</sub> | 87.9%<br><sub>0.28 s</sub> | n/a<br><sub>0.21 s</sub> | n/a<br><sub>0.17 s</sub> |
+| binutils | C | 1,622 | **99.6%<br><sub>2.56 s</sub>** | 92.7%<br><sub>9.65 s</sub> | 32.3%<br><sub>22 s</sub> | 81.0%<br><sub>38 s</sub> | 70.6%<br><sub>1.40 s</sub> | n/a<br><sub>0.87 s</sub> | n/a<br><sub>1.03 s</sub> |
+| STM32F4 HAL | C | 253 | **96.5%<br><sub>0.67 s</sub>** | 95.0%<br><sub>2.82 s</sub> | 0.0%<br><sub>1.86 s</sub> | 85.8%<br><sub>10 s</sub> | 75.7%<br><sub>0.46 s</sub> | n/a<br><sub>0.72 s</sub> | n/a<br><sub>0.63 s</sub> |
+| nrfx | C | 535 | **99.4%<br><sub>0.58 s</sub>** | 100.0%<br><sub>1.12 s</sub> | 14.1%<br><sub>1.59 s</sub> | 94.2%<br><sub>8.65 s</sub> | 12.0%<br><sub>0.31 s</sub> | n/a<br><sub>0.41 s</sub> | n/a<br><sub>0.36 s</sub> |
+| curl | C | 1,067 | **89.6%<br><sub>0.34 s</sub>** | 100.0%<br><sub>1.12 s</sub> | 45.4%<br><sub>22 s</sub> | 78.5%<br><sub>9.74 s</sub> | 78.7%<br><sub>0.20 s</sub> | n/a<br><sub>0.15 s</sub> | n/a<br><sub>0.12 s</sub> |
+| SQLite | C | 360 | **93.9%<br><sub>0.26 s</sub>** | 99.2%<br><sub>0.64 s</sub> | 74.5%<br><sub>15 s</sub> | 90.8%<br><sub>12 s</sub> | 83.6%<br><sub>0.29 s</sub> | n/a<br><sub>0.19 s</sub> | n/a<br><sub>0.19 s</sub> |
+| Mbed TLS | C | 131 | **89.8%<br><sub>0.11 s</sub>** | 99.3%<br><sub>0.40 s</sub> | 0.0%<br><sub>1.54 s</sub> | 68.1%<br><sub>5.43 s</sub> | 69.0%<br><sub>0.06 s</sub> | n/a<br><sub>0.05 s</sub> | n/a<br><sub>0.04 s</sub> |
+| FreeRTOS | C | 655 | **98.6%<br><sub>0.34 s</sub>** | 100.0%<br><sub>0.11 s</sub> | 9.1%<br><sub>5.57 s</sub> | 48.1%<br><sub>9.17 s</sub> | 50.6%<br><sub>0.21 s</sub> | n/a<br><sub>0.18 s</sub> | n/a<br><sub>0.19 s</sub> |
+| lwIP | C | 480 | **80.5%<br><sub>0.16 s</sub>** | 96.6%<br><sub>0.48 s</sub> | 0.8%<br><sub>4.44 s</sub> | 68.8%<br><sub>6.20 s</sub> | 75.1%<br><sub>0.11 s</sub> | n/a<br><sub>0.09 s</sub> | n/a<br><sub>0.07 s</sub> |
+| U-Boot | C | 13,352 | **94.9%<br><sub>5.54 s</sub>** | 96.4%<br><sub>4.09 s</sub> | 19.9%<br><sub>150 s</sub> | 65.5%<br><sub>65 s</sub> | 76.2%<br><sub>3.22 s</sub> | n/a<br><sub>1.98 s</sub> | n/a<br><sub>2.02 s</sub> |
+| Linux | C | 64,574 | **91.1%<br><sub>64 s</sub>** | 99.6%<br><sub>113 s</sub> | 18.8%<br><sub>1026 s</sub> | – | 63.9%<br><sub>56 s</sub> | n/a<br><sub>23 s</sub> | n/a<br><sub>26 s</sub> |
+| fmt | C++ | 72 | **89.9%<br><sub>0.20 s</sub>** | 91.6%<br><sub>3.88 s</sub> | 68.1%<br><sub>13 s</sub> | 9.2%<br><sub>6.24 s</sub> | 4.8%<br><sub>0.06 s</sub> | n/a<br><sub>0.04 s</sub> | n/a<br><sub>0.04 s</sub> |
+| LevelDB | C++ | 366 | **96.1%<br><sub>0.27 s</sub>** | 98.8%<br><sub>2.45 s</sub> | 6.3%<br><sub>17 s</sub> | 9.2%<br><sub>7.52 s</sub> | 4.3%<br><sub>0.09 s</sub> | n/a<br><sub>0.08 s</sub> | n/a<br><sub>0.07 s</sub> |
+| Bitcoin Core | C++ | 1,498 | **94.0%<br><sub>3.62 s</sub>** | 86.8%<br><sub>72 s</sub> | 15.2%<br><sub>45 s</sub> | 12.3%<br><sub>18 s</sub> | 25.9%<br><sub>0.43 s</sub> | n/a<br><sub>0.42 s</sub> | n/a<br><sub>0.27 s</sub> |
+| Ninja | C++ | 258 | **99.1%<br><sub>0.31 s</sub>** | 100.0%<br><sub>2.47 s</sub> | 40.7%<br><sub>26 s</sub> | 7.6%<br><sub>6.79 s</sub> | 15.1%<br><sub>0.08 s</sub> | n/a<br><sub>0.07 s</sub> | n/a<br><sub>0.06 s</sub> |
+| GoogleTest | C++ | 155 | **85.3%<br><sub>0.31 s</sub>** | 92.0%<br><sub>6.92 s</sub> | 5.3%<br><sub>10 s</sub> | 6.3%<br><sub>5.99 s</sub> | 4.1%<br><sub>0.07 s</sub> | n/a<br><sub>0.07 s</sub> | n/a<br><sub>0.05 s</sub> |
+| Abseil | C++ | 837 | **78.8%<br><sub>0.28 s</sub>** | 96.3%<br><sub>22 s</sub> | 10.8%<br><sub>27 s</sub> | 5.7%<br><sub>8.61 s</sub> | 0.8%<br><sub>0.18 s</sub> | n/a<br><sub>0.13 s</sub> | n/a<br><sub>0.13 s</sub> |
+| yaml-cpp | C++ | 259 | **86.7%<br><sub>0.36 s</sub>** | 99.0%<br><sub>2.51 s</sub> | 22.4%<br><sub>12 s</sub> | 9.2%<br><sub>6.44 s</sub> | 2.5%<br><sub>0.08 s</sub> | n/a<br><sub>0.06 s</sub> | n/a<br><sub>0.06 s</sub> |
+| spdlog | C++ | 542 | **77.1%<br><sub>0.36 s</sub>** | 92.3%<br><sub>4.14 s</sub> | 2.5%<br><sub>17 s</sub> | 4.3%<br><sub>7.30 s</sub> | 1.3%<br><sub>0.08 s</sub> | n/a<br><sub>0.08 s</sub> | n/a<br><sub>0.07 s</sub> |
+| Cppcheck | C++ | 554 | **84.3%<br><sub>0.29 s</sub>** | 99.7%<br><sub>8.33 s</sub> | 83.4%<br><sub>47 s</sub> | 3.3%<br><sub>19 s</sub> | 49.7%<br><sub>0.21 s</sub> | n/a<br><sub>0.15 s</sub> | n/a<br><sub>0.14 s</sub> |
 
 <sub>Each cell: the share of calls found (checked against clang), and below it the time to index.</sub>
 
-<sub>clangd on binutils, STM32F4 HAL, nrfx: given no include paths and no <code>-D</code>, as a project without a compilation database would, most of the code that needs the build's include paths or definitions does not parse for it. With a real build's database it does far better; that is not what is measured here.</sub>
+<sub>clangd on binutils, STM32F4 HAL, nrfx, curl, Mbed TLS, FreeRTOS, lwIP, U-Boot, Linux, LevelDB, Bitcoin Core, Ninja, GoogleTest, Abseil, yaml-cpp, spdlog: given no include paths and no <code>-D</code>, as a project without a compilation database would, most of the code that needs the build's include paths or definitions does not parse for it. With a real build's database it does far better; that is not what is measured here.</sub>
 <!-- BENCHMARKS:END -->
 
 How the numbers are made, every figure for every project, and the versions of

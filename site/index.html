@@ -122,11 +122,22 @@
 <section id="benchmarks" class="alt">
   <div class="wrap">
     <h2>Benchmarks</h2>
-    <p class="intro">Measured on public projects against clang's own view of a real build of each. Every call a tool reports is checked against the call clang compiles. clangd is measured twice: with each build's own compilation database, and with none. Norn is given nothing.</p>
-    <div class="chart"><img src="/assets/calls-found.svg" width="1108" height="386" alt="Calls found, per project and tool"></div>
-    <div class="chart"><img src="/assets/index-time.svg" alt="Time to index, per project and tool"></div>
+    <p class="intro">Measured on public projects in C and C++ against clang's own view of a real build of each: every call a tool reports is checked against the call clang compiles. Norn is given nothing. clangd is measured twice, given each build's own compilation database and given none.</p>
+    <div class="stats">
+      <!-- BENCH-STATS:BEGIN -->
+      <!-- Filled in from README.md by site/build.mjs. -->
+      <!-- BENCH-STATS:END -->
+    </div>
+    <div class="tabs">
+      <input type="radio" name="bench-chart" id="bench-calls" checked><label for="bench-calls">Calls found</label>
+      <input type="radio" name="bench-chart" id="bench-time"><label for="bench-time">Time to index</label>
+      <input type="radio" name="bench-chart" id="bench-memory"><label for="bench-memory">Peak memory</label>
+      <div class="chart p-calls"><a href="/assets/calls-found.svg"><img src="/assets/calls-found.svg" alt="Calls found, per project and tool" loading="lazy"></a></div>
+      <div class="chart p-time"><a href="/assets/index-time.svg"><img src="/assets/index-time.svg" alt="Time to index, per project and tool" loading="lazy"></a></div>
+      <div class="chart p-memory"><a href="/assets/peak-memory.svg"><img src="/assets/peak-memory.svg" alt="Peak memory while indexing, per project and tool" loading="lazy"></a></div>
+    </div>
     <div class="table-scroll">
-      <table>
+      <table class="bench">
         <thead><tr><th>Project</th><th>Files</th><th class="norn">Norn</th><th>clangd + build database</th><th>clangd</th><th>cscope</th></tr></thead>
         <tbody>
           <!-- BENCHMARKS:BEGIN -->
@@ -135,7 +146,7 @@
         </tbody>
       </table>
     </div>
-    <p class="note">Each cell: the share of calls found (checked against clang), and below it the time to index. Methods, every figure and tool versions: <a href="https://github.com/humphrey0925/norn/blob/master/docs/benchmarks/README.md">docs/benchmarks</a>. Every number is produced by <code>bench/compare.py</code>; none is typed in.</p>
+    <p class="note">Each cell: the share of calls found, and below it the time to index from nothing; the bar under it is the share. Norn given the build's configuration, as a user would give it, is measured too on the Linux kernel, FreeRTOS and spdlog. Every figure for every tool (memory, disk, updates, queries, precision), how they are measured and the tools' versions: <a href="https://github.com/humphrey0925/norn/blob/master/docs/benchmarks/README.md">docs/benchmarks</a>. Every number is produced by <code>bench/compare.py</code>; none is typed in.</p>
   </div>
 </section>
 
