@@ -256,6 +256,40 @@ fn started_in_the_home_folder_it_indexes_only_a_project_it_is_told_of() {
 }
 
 #[test]
+fn what_a_board_stores_in_a_member_is_what_a_call_through_it_reaches() {
+    // A call written by a macro, through a member whose function each
+    // board chooses in an `#if`, `#elif`, `#else` of an initializer.
+    let dir = std::env::temp_dir().join(format!("norn-mcp-stored-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".norn")).unwrap();
+    std::fs::write(
+        dir.join("main.c"),
+        "int uart_a_send(const char *s);\nint uart_b_send(const char *s);\nint uart_generic_send(const char *s);\n\
+         struct console { int (*send)(const char *); };\nstatic struct console con = {\n\
+         #if defined(BOARD_A)\n    .send = uart_a_send,\n#elif defined(BOARD_B)\n    .send = uart_b_send,\n#else\n    .send = uart_generic_send,\n#endif\n};\n\
+         #define LOG(msg) con.send(msg)\nint main(void) { return LOG(\"hello\"); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".norn").join("config.json"),
+        r#"{"include": [], "exclude": [], "configurations": {"BoardB": {"defines": {"BOARD_B": ""}, "undefines": ["BOARD_A"]}}, "activeConfiguration": "BoardB"}"#,
+    )
+    .unwrap();
+    let mut s = Server::start(&dir);
+    init(&mut s);
+    let (calls, _) = s.call(1, "find_callees", json!({ "name": "main" }));
+    assert!(
+        calls.contains("main.c:15  uart_b_send (function declaration, main.c:2) — through member `send`, which can hold it — via macro `LOG`")
+            && calls.contains("main.c:15  LOG (macro")
+            && !calls.contains("uart_a_send")
+            && !calls.contains("uart_generic_send"),
+        "{calls}"
+    );
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn an_agent_sees_the_configurations_and_switches_to_the_one_its_task_is_about() {
     let dir = std::env::temp_dir().join(format!("norn-mcp-configurations-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

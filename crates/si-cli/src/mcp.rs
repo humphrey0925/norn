@@ -605,7 +605,7 @@ impl<'a> Tools<'a> {
         let mut out = String::new();
         let (mut listed, mut all) = (0, 0);
         for &t in &targets {
-            let mut calls = si_core::callees_through_slots(g, t);
+            let mut calls = self.callees_of(t);
             if calls.is_empty() && targets.len() > 1 {
                 continue;
             }
@@ -618,12 +618,36 @@ impl<'a> Tools<'a> {
                     break;
                 }
                 listed += 1;
-                let _ = writeln!(out, "  {file}:{}  {}{}{}", c.line, self.describe(&q, c.caller), self.how(c, false), self.maybe(g.syms[t as usize].file, c.line));
+                let _ = writeln!(out, "  {file}:{}  {}{}{}", c.line, self.describe(&q, c.caller), self.how(c, true), self.maybe(g.syms[t as usize].file, c.line));
             }
             out.push('\n');
         }
         self.more(&mut out, listed, limit, all);
         Ok(out)
+    }
+
+    /// What `sym` calls, and at a macro it uses, what the macro's text
+    /// calls there (`LOG(m)` for `con.send(m)`: the functions `send` can
+    /// hold), as the callers of those functions have `sym` among them.
+    fn callees_of(&self, sym: u32) -> Vec<si_core::Caller> {
+        let g = self.g();
+        let mut out = si_core::callees_through_slots(g, sym);
+        let mut seen: Vec<u32> = Vec::new();
+        let mut work: Vec<(u32, u32, u32)> =
+            out.iter().filter(|c| g.syms[c.caller as usize].kind == kind::MACRO).map(|c| (c.caller, c.caller, c.line)).collect();
+        while let Some((m, first, line)) = work.pop() {
+            if seen.contains(&m) {
+                continue;
+            }
+            seen.push(m);
+            for c in si_core::callees_through_slots(g, m) {
+                if g.syms[c.caller as usize].kind == kind::MACRO {
+                    work.push((c.caller, first, line));
+                }
+                out.push(si_core::Caller { line, via: Some(first), ..c });
+            }
+        }
+        out
     }
 
     fn references(&self, name: &str, file: Option<&str>, limit: usize) -> Result<String, String> {

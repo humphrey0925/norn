@@ -17,6 +17,11 @@
 - Which project: the folder given, else the one the client says it has open (MCP roots), else the current folder, but never the home folder or the root of the file system, where a desktop app starts a server: there each tool says how to name the project instead of the server indexing the home folder.
 - In VS Code, nothing to set up: the extension offers the same tools to Copilot's agent mode and the other agents VS Code serves MCP servers to, answered by the language server it already runs (`si/mcp`), from the index the editor has, kept up to date as the editor keeps it: no second index, nothing more in memory. VS Code 1.101 or later; `norn.mcp.enabled` turns it off.
 
+### More accurate
+
+- A function stored in a struct's initializer under an `#elif` is stored: `{ #if A fa, #elif B fb, #else fc #endif }` had only `fa` and `fc` (each `#if` group of an initializer was read by its first branch and its `#else`; now by each of its branches). And under a configuration, a branch it switches off in an initializer stores nothing, as anywhere else.
+- `find_callees` (MCP) lists, at a macro a function uses, what the macro calls there, through members and variables too: for `LOG("x")` that is `con.send("x")`, the functions `send` can hold, marked `— via macro LOG`, as `find_callers` of those functions already listed the function.
+
 ## 0.25.0
 
 **Kconfig builds read as they are configured, and saving a file of the kernel in seconds**

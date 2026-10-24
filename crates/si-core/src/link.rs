@@ -2954,6 +2954,25 @@ mod tests {
     }
 
     #[test]
+    fn every_branch_of_an_if_in_an_initializer_is_stored() {
+        // (The middle ones too, by position and by name.)
+        let g = expanded(&[(
+            "m.c",
+            "struct ops { int (*f) (void); int (*g) (void); };\n\
+             int fa (void); int fb (void); int fc (void); int fd (void);\n\
+             int ga (void); int gb (void); int gc (void);\n\
+             static struct ops o = {\n#if defined (A)\n  fa,\n#elif defined (B)\n  fb,\n#elif defined (C)\n  fc,\n#else\n  fd,\n#endif\n  0 };\n\
+             static struct ops p = {\n#ifdef A\n  .g = ga,\n#elif defined (B)\n  .g = gb,\n#else\n  .g = gc,\n#endif\n};\n\
+             int run (void) { return o.f () + p.g (); }\n",
+        )]);
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            callees(&g, "run"),
+            [pair("fa", "f"), pair("fb", "f"), pair("fc", "f"), pair("fd", "f"), pair("ga", "g"), pair("gb", "g"), pair("gc", "g")]
+        );
+    }
+
+    #[test]
     fn calls_through_a_variable_reach_what_is_assigned_to_it() {
         let g = graph(&[(
             "h.c",
