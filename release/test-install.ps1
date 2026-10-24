@@ -50,3 +50,5 @@ try {
   Stop-Process -Id $server.Id -ErrorAction SilentlyContinue
   Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 }
+# (The last install failed, as it should: not this script.)
+$global:LASTEXITCODE = 0

@@ -241,23 +241,36 @@ find_callees main
 | Answers look wrong for the board or build in question | Another configuration is in force: `list_configurations`, then `switch_configuration` |
 | The agent still greps for callers | Check that it has the skill (`/skills` in Claude Code, `ls ~/.agents/skills ~/.claude/skills`), and ask it to use Norn |
 | A second index of the same project | The agent's `norn` and the editor's are of different versions: open VS Code once (it updates `~/.norn/bin`), or run `norn setup` with the newer one |
-| Codex in VS Code or the ChatGPT desktop app does not find the project | Add the project's folder to `args` in `[mcp_servers.norn]` of `~/.codex/config.toml` |
+| Codex says Norn does not know which project to index | Codex starts the server in the folder it has open; if that is not the project, add the project's folder to `args` in `[mcp_servers.norn]` of `~/.codex/config.toml` |
 
 ### What has been tried
 
+- Tried, with a real model: Claude Code 2.1.310, set up by `norn setup`,
+  with Claude Sonnet. Asked who calls a Redis function, without a word
+  about Norn, it called `list_configurations` and then `find_callers`, and
+  no grep. Asked which UART function a board's build calls, it called
+  `list_configurations`, said it was switching to that board's
+  configuration and why, then `switch_configuration`, `find_callees` and
+  `read_file`.
 - Tried: Claude Code 2.1.309, Codex CLI 0.164.0 and OpenCode 1.19.4 start
   `norn mcp` from what `norn setup` writes, call its tools and get the
-  answers, and load the skill. A local stand-in played the model, so this
-  shows the wiring, not whether a real model chooses the tools.
+  answers, and load the skill (a local stand-in playing the model).
+- Tried: `codex app-server`, which Codex in VS Code and in the ChatGPT
+  desktop app run, started in `/` as a desktop app starts it: it starts
+  `norn mcp` in the folder of the thread (the project open), so Norn finds
+  the project with nothing given.
 - Tried: VS Code (Linux, Windows): the extension's MCP server answers
   `initialize`, `tools/list` and `tools/call`.
 - Tried: VSCodium 1.140 (VS Code's open-source build), with Claude Code,
   Codex and OpenCode on the machine: the offer came a little after start,
   and **Connect** wrote all three agents' settings and both skill folders.
-- Tried: `install.sh` on Linux, against a release, and with a checksum that
-  did not match (nothing installed).
-- Not tried: `install.ps1` (no PowerShell where it was written).
-- Not tried: whether Copilot loads `~/.agents/skills/norn/` (VS Code's
-  documentation says it reads that folder).
-- Not tried: Codex in VS Code and in the ChatGPT desktop app, and the folder
-  they start the server in.
+- Tried, in CI: `install.sh` (Linux) and `install.ps1` under PowerShell 7
+  and Windows PowerShell 5.1, run as `curl | sh` and `irm | iex` run them,
+  with a release served from the build: installed, Codex, OpenCode and the
+  skill set up, and a checksum that did not match refused with nothing
+  changed.
+- Read, not tried: VS Code 1.140's own code reads skills from
+  `~/.agents/skills` and `~/.claude/skills` (`chat.useAgentSkills`, on by
+  default). Copilot itself, which needs a GitHub sign-in, was not run.
+- Not tried: the ChatGPT desktop app and Codex's VS Code extension
+  themselves (macOS and Windows; the app-server they run was).

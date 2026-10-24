@@ -339,6 +339,8 @@ impl<'a> Tools<'a> {
 
     pub fn call(&mut self, tool: &str, args: &Value) -> Result<String, String> {
         let name = args["name"].as_str().unwrap_or("").trim();
+        // (`path` too: the name agents guess first for a file.)
+        let file = args["file"].as_str().or(args["path"].as_str());
         let limit = args["limit"].as_u64().map_or(DEFAULT_LIMIT, |n| (n as usize).clamp(1, MAX_LIMIT));
         let needs_name = !matches!(tool, "search_symbols" | "compiled_lines" | "list_configurations" | "read_file" | "search_code");
         if needs_name && name.is_empty() {
@@ -346,21 +348,21 @@ impl<'a> Tools<'a> {
         }
         match tool {
             "search_symbols" => self.search(args["query"].as_str().unwrap_or(""), args["limit"].as_u64().map_or(30, |n| (n as usize).clamp(1, 200))),
-            "find_definition" => self.find_definition(name, args["file"].as_str(), args["line"].as_u64()),
-            "read_symbol" => self.read_symbol(name, args["file"].as_str()),
-            "find_callers" => self.callers(name, args["file"].as_str(), limit),
-            "find_callees" => self.callees(name, args["file"].as_str(), limit),
-            "find_references" => self.references(name, args["file"].as_str(), limit),
+            "find_definition" => self.find_definition(name, file, args["line"].as_u64()),
+            "read_symbol" => self.read_symbol(name, file),
+            "find_callers" => self.callers(name, file, limit),
+            "find_callees" => self.callees(name, file, limit),
+            "find_references" => self.references(name, file, limit),
             "call_tree" => {
                 let up = args["direction"].as_str() == Some("callers");
                 let depth = args["depth"].as_u64().unwrap_or(2).clamp(1, 6) as u32;
                 let limit = args["limit"].as_u64().map_or(200, |n| (n as usize).clamp(1, MAX_LIMIT));
-                self.call_tree(name, args["file"].as_str(), up, depth, limit)
+                self.call_tree(name, file, up, depth, limit)
             }
-            "compiled_lines" => self.compiled_lines(args["file"].as_str().unwrap_or(""), args["line"].as_u64()),
+            "compiled_lines" => self.compiled_lines(file.unwrap_or(""), args["line"].as_u64()),
             "list_configurations" => self.configurations(),
             "read_file" => self.read_file(
-                args["file"].as_str().unwrap_or(""),
+                file.unwrap_or(""),
                 args["from"].as_u64().map(|n| n as u32),
                 args["to"].as_u64().map(|n| n as u32),
                 args["hide_inactive"].as_bool().unwrap_or(false),

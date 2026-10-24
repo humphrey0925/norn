@@ -293,7 +293,8 @@ fn an_agent_sees_the_configurations_and_switches_to_the_one_its_task_is_about() 
         read.contains("     7  #else\n        >>> not compiled under BoardA (line 8)\n     8      return uart_b();\n        <<< end of not compiled (line 8)\n     9  #endif"),
         "{read}"
     );
-    let (folded, _) = s.call(7, "read_file", json!({ "file": "a.c", "hide_inactive": true }));
+    // (The file given as `path`, the name agents guess first.)
+    let (folded, _) = s.call(7, "read_file", json!({ "path": "a.c", "hide_inactive": true }));
     assert!(folded.contains("     7  #else\n        --- line 8 not compiled under BoardA (hidden) ---\n     9  #endif") && !folded.contains("return uart_b"), "{folded}");
     let (found, _) = s.call(8, "search_code", json!({ "pattern": "uart_b" }));
     assert!(found.contains("a.c:2 ") && !found.contains("a.c:8") && found.contains("1 more where it does not"), "{found}");

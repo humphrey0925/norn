@@ -42,7 +42,7 @@ irm https://norn-c.com/install.ps1 | iex
 （`NORN_VERSION=0.26.0` 可指定其他版本；`NORN_NO_SETUP=1` 則不設定任何 agent；`NORN_DOWNLOAD_URL` 可改從 release 檔案的鏡像下載，而不是 GitHub。）也可以自己從
 [releases](https://github.com/humphrey0925/norn/releases) 下載執行檔（見[命令列手冊](cli.zh-TW.md#安裝)），再執行 `norn setup`。
 
-`[已驗證]` `install.sh` 在 Linux 上實測過：能下載並比對 checksum，checksum 不符時不會安裝。`[未測]` `install.ps1`：這裡沒有 PowerShell 可以測。
+`[已驗證]` `install.sh`（Linux）和 `install.ps1`（PowerShell 7、Windows PowerShell 5.1）都在 CI 上測過：能安裝並設定 agent，checksum 不符時不會安裝。
 
 它會對這台電腦上找得到的每個 agent 做這些事：
 
@@ -201,13 +201,15 @@ find_callees main
 | 結果和要查的板子或 build 對不上 | 生效的是另一個設定組：先 `list_configurations`，再 `switch_configuration` |
 | Agent 還是用 grep 找呼叫者 | 確認它有這個 skill（Claude Code 用 `/skills`，或 `ls ~/.agents/skills ~/.claude/skills`），並要求它用 Norn |
 | 同一個專案出現第二份索引 | Agent 的 `norn` 和編輯器的版本不同：開一次 VS Code（它會更新 `~/.norn/bin`），或用較新的 `norn` 再執行一次 `norn setup` |
-| VS Code 或 ChatGPT 桌面 app 裡的 Codex 找不到專案 | 在 `~/.codex/config.toml` 的 `[mcp_servers.norn]` 裡，把專案資料夾加進 `args` |
+| Codex 說 Norn 不知道要索引哪個專案 | Codex 會在它開著的資料夾裡啟動 server；如果那不是專案資料夾，就在 `~/.codex/config.toml` 的 `[mcp_servers.norn]` 裡把專案資料夾加進 `args` |
 
 ### 驗證狀態
 
-- `[已驗證]` Claude Code 2.1.309、Codex CLI 0.164.0、OpenCode 1.19.4：`norn setup` 寫入的設定能讓它們啟動 `norn mcp`、呼叫工具並收到回答，也都會載入
-  skill。測試時模型是用本機替身代替的，所以只驗證了接線，沒有驗證真模型會不會主動選用工具。
+- `[已驗證]` 真模型：用 `norn setup` 設定好的 Claude Code 2.1.310，搭配 Claude Sonnet。問它 Redis 某個函式被誰呼叫（提問完全沒提到 Norn），它先呼叫 `list_configurations`，再呼叫 `find_callers`，沒有用 grep。問它某塊板子的 build 會呼叫哪個 UART 函式，它先 `list_configurations`，說明要切換到那塊板子的設定組及原因，再依序 `switch_configuration`、`find_callees`、`read_file`。
+- `[已驗證]` Claude Code 2.1.309、Codex CLI 0.164.0、OpenCode 1.19.4：`norn setup` 寫入的設定能讓它們啟動 `norn mcp`、呼叫工具並收到回答，也都會載入 skill（這部分模型是用本機替身代替的）。
+- `[已驗證]` `codex app-server`（VS Code 的 Codex 擴充套件和 ChatGPT 桌面 app 的 Codex 跑的就是它）：像桌面 app 一樣在 `/` 啟動時，它會在 thread 的資料夾（開著的專案）裡啟動 `norn mcp`，所以不用另外指定，Norn 就找得到專案。
 - `[已驗證]` VS Code（Linux、Windows）：擴充套件提供的 MCP server 能回答 `initialize`、`tools/list`、`tools/call`。
 - `[已驗證]` VSCodium 1.140（VS Code 的開源建置）：機器上有 Claude Code、Codex、OpenCode 時，啟動後不久會跳出提示；按 **Connect** 會寫好三個 agent 的設定和兩個 skill 資料夾。
-- `[未測]` Copilot 是否會載入 `~/.agents/skills/norn/`：依 VS Code 文件應該會，但沒有實測。
-- `[未測]` VS Code 的 Codex 擴充套件和 ChatGPT 桌面 app 的 Codex：不確定它們在哪個資料夾啟動 server。
+- `[已驗證]` CI：`install.sh`（Linux）和 `install.ps1`（PowerShell 7、Windows PowerShell 5.1）用 `curl | sh`、`irm | iex` 的方式執行，從 build 出來的檔案模擬 release：能安裝、設定好 Codex、OpenCode 和 skill；checksum 不符時拒絕安裝，原本的檔案不變。
+- `[讀過程式碼]` VS Code 1.140 本身會從 `~/.agents/skills` 和 `~/.claude/skills` 讀 skill（`chat.useAgentSkills`，預設開啟）。Copilot 本身需要登入 GitHub，沒有實際跑。
+- `[未測]` ChatGPT 桌面 app 和 VS Code 的 Codex 擴充套件本身（只有 macOS、Windows 版；它們底下跑的 app-server 已驗證）。
