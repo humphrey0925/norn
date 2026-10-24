@@ -31,6 +31,10 @@ Norn against other ways of indexing C and C++, on public projects. Every number 
   through its call hierarchy); the other tools' on every call.
 - ctags records definitions only, and GNU Global references to a name rather than calls from a
   function, so neither has a figure for calls.
+- **Norn** is given nothing: no configuration, no include paths, no `-D`. Where a project's
+  `#if`s leave many calls uncertain without one (FreeRTOS, spdlog, Linux), it is measured again
+  given the build's configuration, as a user would give it (*Norn + build configuration*, on
+  those projects' pages only).
 - Norn marks a call it cannot be sure of (under an `#if` the configuration does not settle) as
   uncertain. *Calls found* counts every call a tool reports; *of them certain* counts only the
   ones it reports as certain, and *precision* is measured on those. The other tools mark none.
@@ -186,6 +190,7 @@ Versions: clangd + build database 20.1.2; clangd 21.1.0; codebase-memory-mcp 0.1
 | Tool | Index | Peak memory | On disk | Update after an edit | Find | Callers | Definitions found | Calls found | of them certain | Call precision |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
 | **Norn** | 0.34 s | 108 MB | 6 MB | 0.02 s | 0.02 ms | 0.02 ms | 100.0% | 98.6% | 46.5% | 100.0% |
+| **Norn + build configuration** | 0.32 s | 100 MB | 8 MB | 0.02 s | 0.02 ms | 0.03 ms | 100.0% | 99.5% | 84.3% | 100.0% |
 | clangd + build database | 0.11 s | 164 MB | 0 MB | 0.05 s | 0.24 ms | 6.48 ms | 100.0% | 100.0% | 100.0% | 91.7% |
 | clangd | 5.57 s | 484 MB | 6 MB | 0.36 s | 0.23 ms | 16 ms | 56.5% | 9.1% | 9.1% | 57.1% |
 | codebase-memory-mcp | 9.17 s | 573 MB | 99 MB | 6.33 s | 29 ms | 34 ms | 98.2% | 48.1% | 48.1% | 95.3% |
@@ -194,6 +199,8 @@ Versions: clangd + build database 20.1.2; clangd 21.1.0; codebase-memory-mcp 0.1
 | Universal Ctags | 0.19 s | 15 MB | 5 MB | – | 0.57 ms | – | 99.1% | – | – | – |
 
 clangd is given no include paths and no `-D`, as a project without a compilation database would: most of the code that needs the build's include paths or definitions does not parse for it. With a real build's database it does far better; that is not what is measured here.
+
+Norn + build configuration: Norn given the folders and files its build does not compile (the other ports, the other heap implementations and the other example configuration) as `notBuilt` in `.norn/config.json`, worked out from the build's `compile_commands.json`. Everywhere else Norn is given nothing.
 
 Versions: clangd + build database 20.1.2; clangd 21.1.0; codebase-memory-mcp 0.11.0; cscope 15.9; GNU Global 6.6.11; Universal Ctags 5.9.0.
 
@@ -240,15 +247,18 @@ Versions: clangd + build database 20.1.2; clangd 21.1.0; codebase-memory-mcp 0.1
 | Tool | Index | Peak memory | On disk | Update after an edit | Find | Callers | Definitions found | Calls found | of them certain | Call precision |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
 | **Norn** | 64 s | 4,605 MB | 1,188 MB | 1.96 s | 0.02 ms | 0.02 ms | 92.1% | 91.1% | 64.7% | 99.0% |
+| **Norn + build configuration** | 80 s | 5,511 MB | 906 MB | 1.89 s | 0.02 ms | 0.02 ms | 99.7% | 98.5% | 95.8% | 99.1% |
 | clangd + build database | 113 s | 3,599 MB | 91 MB | 2.73 s | 0.59 ms | 60 ms | 99.8% | 99.6% | 99.6% | 89.0% |
 | clangd | 1026 s | 10,367 MB | 361 MB | 28 s | 0.61 ms | 30 ms | 85.8% | 18.8% | 18.8% | 66.2% |
 | cscope | 56 s | 7,167 MB | 2,463 MB | 44 s | 2.65 ms | 2.58 ms | 74.4% | 63.9% | 47.2% | 91.4% |
 | GNU Global | 23 s | 83 MB | 1,556 MB | 1.79 s | 0.79 ms | 0.88 ms | 74.3% | – | – | – |
 | Universal Ctags | 26 s | 2,511 MB | 1,412 MB | – | 0.45 ms | – | 74.4% | – | – | – |
 
-codebase-memory-mcp: did not finish (RuntimeError: E:\Projects\si-replicate\tools\cbm\codebase-memory-mcp.exe exited with 1).
+codebase-memory-mcp: did not finish (RuntimeError: codebase-memory-mcp.exe exited with 1).
 
 clangd is given no include paths and no `-D`, as a project without a compilation database would: most of the code that needs the build's include paths or definitions does not parse for it. With a real build's database it does far better; that is not what is measured here.
+
+Norn + build configuration: Norn given the build's Kconfig configuration (`include/generated/autoconf.h` of its defconfig), which Norn follows unasked. Everywhere else Norn is given nothing.
 
 Versions: clangd + build database 20.1.2; clangd 21.1.0; cscope 15.9; GNU Global 6.6.11; Universal Ctags 5.9.0.
 
@@ -383,6 +393,7 @@ Versions: clangd + build database 20.1.2; clangd 21.1.0; codebase-memory-mcp 0.1
 | Tool | Index | Peak memory | On disk | Update after an edit | Find | Callers | Definitions found | Calls found | of them certain | Call precision |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
 | **Norn** | 0.36 s | 80 MB | 6 MB | 0.02 s | 0.02 ms | 0.02 ms | 91.2% | 77.1% | 41.5% | 95.3% |
+| **Norn + build configuration** | 0.33 s | 71 MB | 6 MB | 0.02 s | 0.02 ms | 0.02 ms | 91.2% | 77.1% | 41.5% | 95.3% |
 | clangd + build database | 4.14 s | 1,470 MB | 4 MB | 0.20 s | 0.22 ms | 0.47 ms | 100.0% | 92.3% | 92.3% | 92.3% |
 | clangd | 17 s | 3,128 MB | 9 MB | 0.32 s | 0.32 ms | 25 ms | 27.1% | 2.5% | 2.5% | 54.5% |
 | codebase-memory-mcp | 7.30 s | 620 MB | 42 MB | 4.66 s | 18 ms | 14 ms | 25.8% | 4.3% | 4.3% | 87.1% |
@@ -391,6 +402,8 @@ Versions: clangd + build database 20.1.2; clangd 21.1.0; codebase-memory-mcp 0.1
 | Universal Ctags | 0.07 s | 14 MB | 3 MB | – | 0.38 ms | – | 89.2% | – | – | – |
 
 clangd is given no include paths and no `-D`, as a project without a compilation database would: most of the code that needs the build's include paths or definitions does not parse for it. With a real build's database it does far better; that is not what is measured here.
+
+Norn + build configuration: Norn given the build's `compile_commands.json`, named in `.norn/config.json`. Everywhere else Norn is given nothing.
 
 Versions: clangd + build database 20.1.2; clangd 21.1.0; codebase-memory-mcp 0.11.0; cscope 15.9; GNU Global 6.6.11; Universal Ctags 5.9.0.
 

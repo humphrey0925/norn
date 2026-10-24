@@ -7,10 +7,14 @@ JSON files; nothing is typed in.
 import argparse
 import html
 import json
+import re
 from pathlib import Path
 
-ORDER = ["si", "clangd-db", "clangd", "cbm", "cscope", "gtags", "ctags"]
-NAMES = {"si": "Norn", "clangd-db": "clangd + build database", "cbm": "codebase-memory-mcp", "clangd": "clangd", "cscope": "cscope", "gtags": "GNU Global", "ctags": "Universal Ctags"}
+ORDER = ["si", "si-cfg", "clangd-db", "clangd", "cbm", "cscope", "gtags", "ctags"]
+# Measured on some projects only, and shown on their pages, not in the charts
+# or the summary: Norn given the build's configuration, as a user would.
+PAGE_ONLY = {"si-cfg"}
+NAMES = {"si": "Norn", "si-cfg": "Norn + build configuration", "clangd-db": "clangd + build database", "cbm": "codebase-memory-mcp", "clangd": "clangd", "cscope": "cscope", "gtags": "GNU Global", "ctags": "Universal Ctags"}
 CORPORA = {"redis": "Redis", "git-c": "git", "c-only": "binutils", "stm32f4": "STM32F4 HAL", "nrfx": "nrfx", "nrfx-corpus": "nrfx", "linux": "Linux",
            "curl": "curl", "sqlite": "SQLite", "mbedtls": "Mbed TLS", "freertos": "FreeRTOS", "lwip": "lwIP", "u-boot": "U-Boot",
            "fmt": "fmt", "leveldb": "LevelDB", "bitcoin": "Bitcoin Core", "ninja": "Ninja", "googletest": "GoogleTest", "abseil": "Abseil",
@@ -18,7 +22,7 @@ CORPORA = {"redis": "Redis", "git-c": "git", "c-only": "binutils", "stm32f4": "S
 # Projects written in C++ (the rest are C), for the charts' groups.
 CPP = {"fmt", "LevelDB", "Bitcoin Core", "Ninja", "GoogleTest", "Abseil", "yaml-cpp", "spdlog", "Cppcheck"}
 # One colour per tool, readable on a light and a dark page alike.
-COLORS = {"si": "#f0a830", "clangd-db": "#2f5f9e", "clangd": "#4c8fd6", "cbm": "#8a6fd1", "cscope": "#4fae7a", "gtags": "#d0644f", "ctags": "#8c96a3"}
+COLORS = {"si": "#f0a830", "si-cfg": "#c98a1c", "clangd-db": "#2f5f9e", "clangd": "#4c8fd6", "cbm": "#8a6fd1", "cscope": "#4fae7a", "gtags": "#d0644f", "ctags": "#8c96a3"}
 TEXT = "#7d8590"
 
 
@@ -248,7 +252,7 @@ def main():
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     runs = load(a.results)
-    tools = [t for t in ORDER if any(t in tools_of(d) for _, d in runs)]
+    tools = [t for t in ORDER if t not in PAGE_ONLY and any(t in tools_of(d) for _, d in runs)]
 
     calls = lambda d, t: get(d, t, "accuracy", "calls", "recall_any")
     (out / "calls-found.svg").write_text(dot_rows(
@@ -293,6 +297,10 @@ def main():
              "  through its call hierarchy); the other tools' on every call.",
              "- ctags records definitions only, and GNU Global references to a name rather than calls from a",
              "  function, so neither has a figure for calls.",
+             "- **Norn** is given nothing: no configuration, no include paths, no `-D`. Where a project's",
+             "  `#if`s leave many calls uncertain without one (FreeRTOS, spdlog, Linux), it is measured again",
+             "  given the build's configuration, as a user would give it (*Norn + build configuration*, on",
+             "  those projects' pages only).",
              "- Norn marks a call it cannot be sure of (under an `#if` the configuration does not settle) as",
              "  uncertain. *Calls found* counts every call a tool reports; *of them certain* counts only the",
              "  ones it reports as certain, and *precision* is measured on those. The other tools mark none.",
@@ -316,19 +324,23 @@ def main():
                   "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|"]
         for t in ts:
             q = lambda k: get(d, t, "query", k, "p50_ms")
-            name = f"**{NAMES[t]}**" if t == "si" else NAMES[t]
+            name = f"**{NAMES[t]}**" if t in ("si", "si-cfg") else NAMES[t]
             lines.append(f"| {name} | {secs(get(d, t, 'index', 'wall_s'))} | {mb(get(d, t, 'index', 'peak_rss_bytes'))} | "
                          f"{mb(get(d, t, 'index', 'disk_bytes'))} | {secs(get(d, t, 'incremental', 'wall_s'))} | {ms(q('find'))} | {ms(q('callers'))} | "
                          f"{pct(get(d, t, 'accuracy', 'definitions', 'recall'))} | {pct(calls(d, t))} | {pct(get(d, t, 'accuracy', 'calls', 'recall_certain'))} | "
                          f"{pct(get(d, t, 'accuracy', 'calls', 'precision_certain'))} |")
         failed = [t for t in ORDER if t in d.get("tools", {}) and d["tools"][t].get("status") not in ("ok", None) and "skipped" not in d["tools"][t]]
         for t in failed:
-            lines.append(f"\n{NAMES[t]}: did not finish ({d['tools'][t].get('reason', 'failed')}).")
+            # (A program's path as this machine has it, as its name.)
+            reason = re.sub(r"(?:[A-Za-z]:)?[\\/]\S*[\\/]([^\\/\s]+)", r"\1", str(d["tools"][t].get("reason", "failed")))
+            lines.append(f"\n{NAMES[t]}: did not finish ({reason}).")
         if (r := get(d, "clangd", "accuracy", "calls", "recall_any")) is not None and r < 0.5:
             lines += ["", "clangd is given no include paths and no `-D`, as a project without a compilation database would: "
                       "most of the code that needs the build's include paths or definitions does not parse for it. "
                       "With a real build's database it does far better; that is not what is measured here."]
-        versions = [f"{NAMES[t]} {version(d['tools'][t].get('version'))}" for t in ts if t != "si"]
+        if (given := d["tools"].get("si-cfg", {}).get("given")) and "si-cfg" in ts:
+            lines += ["", f"Norn + build configuration: Norn given {given}. Everywhere else Norn is given nothing."]
+        versions = [f"{NAMES[t]} {version(d['tools'][t].get('version'))}" for t in ts if t not in ("si", "si-cfg")]
         if versions:
             lines += ["", "Versions: " + "; ".join(versions) + "."]
         lines.append("")
