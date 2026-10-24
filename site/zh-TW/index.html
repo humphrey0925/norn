@@ -66,6 +66,7 @@
       <a href="#why">為什麼用 Norn</a>
       <a href="#benchmarks">基準測試</a>
       <a href="#features">功能</a>
+      <a href="#agents">AI agent</a>
       <a href="#start">開始使用</a>
       <a href="https://github.com/humphrey0925/norn">GitHub</a>
       <a class="lang" href="/" hreflang="en" lang="en">English</a>
@@ -166,14 +167,36 @@
   </div>
 </section>
 
-<section id="start" class="alt">
+<section id="agents" class="alt">
+  <div class="wrap">
+    <h2>給 AI agent</h2>
+    <p class="intro">Copilot、Claude Code、Codex、OpenCode 都靠 grep 找程式碼。在 C 裡，這會漏掉巨集寫出來的呼叫、經由函式指標的呼叫，也不知道哪些 <code>#if</code> 分支真的會編譯。Norn 透過 Model Context Protocol 把索引當成工具交給它們，並附上一份 skill，告訴它們先設定好設定組，再用這些工具查詢，不要用 grep。</p>
+    <div class="points">
+      <div class="point"><h3>查呼叫，不是 grep</h3><p>定義、呼叫者、被呼叫者、呼叫樹與參照，經由巨集和函式指標的也找得到，並說明每個呼叫是怎麼來的。</p></div>
+      <div class="point"><h3>只看 build 會編譯的程式碼</h3><p><code>read_file</code> 會標出這個設定組不編譯的行；<code>search_code</code> 是會略過這些行的 grep。agent 也能切到任務講的板子或 build。</p></div>
+      <div class="point"><h3>一份索引</h3><p>同一個專案的編輯器和所有 agent 共用一份索引，檔案一改就跟著更新。所有資料都留在你的電腦上。</p></div>
+    </div>
+    <ol class="steps" style="margin-top:28px">
+      <li><b>在 VS Code 裡</b>，Copilot 的 agent 模式已經有這些工具。Claude Code、Codex、OpenCode 則執行一次 <b>Norn: Connect AI Agents</b>。</li>
+      <li><b>沒有 VS Code 時</b>，以下指令會從最新的 release 安裝 <code>norn</code>（並比對 checksum），再設定好找得到的每個 agent：
+<pre><code># Linux、macOS
+curl -fsSL https://norn-c.com/install.sh | sh
+
+# Windows（PowerShell）
+irm https://norn-c.com/install.ps1 | iex</code></pre></li>
+    </ol>
+    <p class="intro" style="margin-top:28px">每個工具、agent 該怎麼用、出問題時怎麼處理：<a href="https://github.com/humphrey0925/norn/blob/master/docs/agents.zh-TW.md">給 AI agent 用的 Norn</a>。</p>
+  </div>
+</section>
+
+<section id="start">
   <div class="wrap">
     <h2>開始使用</h2>
     <ol class="steps">
       <li>安裝 <b>Norn — Code Navigation &amp; Symbol Index</b>：從 <a href="https://marketplace.visualstudio.com/items?itemName=humphrey0925.norn-c">Visual Studio Marketplace</a>，或給 VSCodium、Cursor、Windsurf 用的 <a href="https://open-vsx.org/extension/humphrey0925/norn-c">Open VSX</a>，或從 <a href="https://github.com/humphrey0925/norn/releases">releases</a> 下載 <code>.vsix</code>。</li>
       <li>開啟一個有 C 原始碼的資料夾。這樣就好了。</li>
     </ol>
-    <p class="intro" style="margin-top:28px">每個檢視和設定的說明見<a href="https://github.com/humphrey0925/norn/blob/master/docs/norn-guide.zh-TW.md">使用指南</a>。不用 VS Code 時，同一個索引程式也是獨立的指令 <code>norn</code>，可在終端機、腳本、CI 和其他編輯器使用：見<a href="https://github.com/humphrey0925/norn/blob/master/docs/cli.zh-TW.md">命令列手冊</a>。</p>
+    <p class="intro" style="margin-top:28px">每個檢視和設定的說明見<a href="https://github.com/humphrey0925/norn/blob/master/docs/norn-guide.zh-TW.md">使用指南</a>。不用 VS Code 時，同一個索引程式也是獨立的指令 <code>norn</code>，可在終端機、腳本、CI、其他編輯器和 AI agent 使用：見<a href="https://github.com/humphrey0925/norn/blob/master/docs/cli.zh-TW.md">命令列手冊</a>。</p>
     <h2 style="margin-top:48px">運作原理</h2>
 <pre><code>原始碼 ─► tree-sitter 解析 ─► 每個檔案的事實 ─► 連結 ─► 呼叫圖（CSR）─► 語言伺服器
              ▲                                  ▲
@@ -190,6 +213,7 @@
       <a href="https://github.com/humphrey0925/norn">GitHub</a>
       <a href="https://github.com/humphrey0925/norn/blob/master/CHANGELOG.md">更新紀錄</a>
       <a href="https://github.com/humphrey0925/norn/blob/master/docs/norn-guide.zh-TW.md">使用指南</a>
+      <a href="https://github.com/humphrey0925/norn/blob/master/docs/agents.zh-TW.md">AI agent</a>
       <a href="https://github.com/humphrey0925/norn/blob/master/docs/lsp-api.zh-TW.md">LSP API</a>
       <a href="https://github.com/humphrey0925/norn/issues">Issues</a>
     </div>

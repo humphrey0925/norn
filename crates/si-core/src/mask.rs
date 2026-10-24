@@ -222,6 +222,74 @@ pub struct Define {
     pub forwards: Vec<(u8, Vec<u8>, u8)>,
 }
 
+/// A `Define` read in place from its saved bytes (`bincode` writes a
+/// `Vec<u8>` as it writes bytes), the names borrowed: the fields are
+/// `Define`'s, in its order.
+#[derive(serde::Deserialize)]
+pub struct DefineView<'a> {
+    #[serde(borrow)]
+    pub name: &'a [u8],
+    pub function_like: bool,
+    #[serde(borrow)]
+    pub deps: Option<Vec<&'a [u8]>>,
+    pub hides: bool,
+    #[serde(borrow)]
+    pub refs: Vec<&'a [u8]>,
+    #[serde(borrow)]
+    pub value: Option<&'a [u8]>,
+    pub certain: bool,
+    pub fallback: bool,
+    pub guard: bool,
+    pub undef: bool,
+    pub include: bool,
+    pub test: bool,
+    pub line: u32,
+    pub local: bool,
+    pub system: bool,
+    #[serde(borrow)]
+    pub head: &'a [u8],
+    pub branch: u64,
+    pub unused: u64,
+    pub pasted: u64,
+    #[serde(borrow)]
+    pub forwards: Vec<(u8, &'a [u8], u8)>,
+}
+
+/// What `crate::users_of` reads of a definition, kept or read in place.
+pub trait Mentions: Sync {
+    /// The name, where this is a definition (not an `#include`, nor a
+    /// name an `#if` tests).
+    fn defines(&self) -> Option<&[u8]>;
+    /// The names its body refers to or is made of, and those its value names.
+    fn mentions<'s>(&'s self, each: &mut dyn FnMut(&'s [u8]));
+}
+
+impl Mentions for Define {
+    fn defines(&self) -> Option<&[u8]> {
+        (!self.include && !self.test).then_some(&self.name[..])
+    }
+
+    fn mentions<'s>(&'s self, each: &mut dyn FnMut(&'s [u8])) {
+        self.refs.iter().chain(self.deps.iter().flatten()).for_each(|r| each(r));
+        if let Some(v) = &self.value {
+            crate::units::names_in(v, each);
+        }
+    }
+}
+
+impl Mentions for DefineView<'_> {
+    fn defines(&self) -> Option<&[u8]> {
+        (!self.include && !self.test).then_some(self.name)
+    }
+
+    fn mentions<'s>(&'s self, each: &mut dyn FnMut(&'s [u8])) {
+        self.refs.iter().chain(self.deps.iter().flatten()).for_each(|r| each(r));
+        if let Some(v) = self.value {
+            crate::units::names_in(v, each);
+        }
+    }
+}
+
 impl Define {
     /// A note about `name` that is not a definition of it.
     fn note(name: &[u8], certain: bool) -> Define {
@@ -717,17 +785,34 @@ impl MacroSets {
     }
 
     /// The same, of definitions kept elsewhere (none copied: the kernel's
-    /// are millions).
+    /// are millions, of millions of names: each name is looked up once,
+    /// and what is said of it kept by its number).
     pub fn of_defines<'a>(defines: impl IntoIterator<Item = &'a Define>) -> Self {
-        let mut by_name: FxHashMap<&[u8], (bool, Vec<Option<&[Vec<u8>]>>)> = FxHashMap::default();
-        // name -> (takes arguments, hides names, names its bodies refer to)
-        let mut bodies: FxHashMap<&[u8], (bool, bool, Vec<&[u8]>)> = FxHashMap::default();
+        /// What the definitions of one name say.
+        #[derive(Default)]
+        struct Of<'a> {
+            /// Any takes arguments; any hides names; the names the bodies refer to.
+            function_like: bool,
+            hides: bool,
+            refs: Vec<&'a [u8]>,
+            /// Defined outside a `.c` file (a `.c` file's macro is its own):
+            /// whether any of those takes arguments, the names each body
+            /// is made of (`None`: not only names), the parameters none
+            /// uses, and whether every one pastes a parameter.
+            shared: bool,
+            shared_function_like: bool,
+            deps: Vec<Option<&'a [Vec<u8>]>>,
+            unused: u64,
+            pastes: bool,
+        }
+        let mut ids: FxHashMap<&[u8], u32> = FxHashMap::default();
+        let mut of: Vec<Of> = Vec::new();
+        let mut names: Vec<&[u8]> = Vec::new();
         // (name, first word of the body) of each macro with arguments.
         let mut loop_heads: Vec<(&[u8], &[u8])> = Vec::new();
-        let mut discards: FxHashMap<&[u8], u64> = FxHashMap::default();
-        // name -> each definition's (parameters it pastes or hands on, and
-        // those it hands on).
-        let mut pasting: FxHashMap<&[u8], Vec<(u64, &[(u8, Vec<u8>, u8)])>> = FxHashMap::default();
+        // Each definition's (parameters it pastes or hands on, and those it
+        // hands on), by name, of the names every definition of which pastes.
+        let mut pasting: Vec<(u32, u64, &[(u8, Vec<u8>, u8)])> = Vec::new();
         for d in defines {
             // `#define inline` and the like: the keyword still matters to us.
             if is_keyword(&d.name) || d.undef || d.include || d.test {
@@ -737,91 +822,105 @@ impl MacroSets {
             if d.function_like && !d.local {
                 loop_heads.push((&d.name, &d.head));
             }
-            let b = bodies.entry(&d.name).or_default();
-            b.0 |= d.function_like;
-            b.1 |= d.hides;
-            b.2.extend(d.refs.iter().map(|r| &r[..]));
+            let id = *ids.entry(&d.name).or_insert_with(|| {
+                names.push(&d.name);
+                of.push(Of { pastes: true, unused: u64::MAX, ..Of::default() });
+                of.len() as u32 - 1
+            });
+            let b = &mut of[id as usize];
+            b.function_like |= d.function_like;
+            b.hides |= d.hides;
+            b.refs.extend(d.refs.iter().map(|r| &r[..]));
             // (One in a `.c` file is that file's: see `Lexer::define`.)
             if d.local {
                 continue;
             }
-            let unused = if d.function_like { d.unused } else { 0 };
-            *discards.entry(&d.name).or_insert(u64::MAX) &= unused;
-            pasting.entry(&d.name).or_default().push(if d.function_like { (d.pasted, &d.forwards[..]) } else { (0, &[][..]) });
-            let e = by_name.entry(&d.name).or_default();
-            e.0 |= d.function_like;
-            e.1.push(d.deps.as_deref());
+            b.shared = true;
+            b.shared_function_like |= d.function_like;
+            b.deps.push(d.deps.as_deref());
+            b.unused &= if d.function_like { d.unused } else { 0 };
+            let pasted = if d.function_like { d.pasted } else { 0 };
+            b.pastes &= pasted != 0;
+            if b.pastes {
+                pasting.push((id, pasted, if d.function_like { &d.forwards[..] } else { &[][..] }));
+            }
         }
+        let id = |name: &[u8]| ids.get(name).map(|&i| i as usize);
         // Transparent: least fixed point over "every body is only
-        // transparent macros", each name counting down what it waits for.
-        let mut set: FxHashMap<&[u8], bool> = FxHashMap::default();
-        let mut waits: FxHashMap<&[u8], usize> = FxHashMap::default();
-        let mut waiting: FxHashMap<&[u8], Vec<&[u8]>> = FxHashMap::default();
-        let mut ready: Vec<&[u8]> = Vec::new();
-        for (&name, (_, bodies)) in &by_name {
-            if bodies.iter().any(Option::is_none) {
+        // transparent macros", each name counting down what it waits for
+        // (a name no macro's is never ready).
+        let mut transparent = vec![false; of.len()];
+        let mut waits: Vec<usize> = vec![0; of.len()];
+        let mut waiting: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+        let mut ready: Vec<usize> = Vec::new();
+        for (name, b) in of.iter().enumerate() {
+            if !b.shared || b.deps.iter().any(Option::is_none) {
                 continue;
             }
             let mut count = 0;
-            for d in bodies.iter().flatten().flat_map(|deps| deps.iter()) {
-                waiting.entry(&d[..]).or_default().push(name);
+            for d in b.deps.iter().flatten().flat_map(|deps| deps.iter()) {
+                if let Some(d) = id(d) {
+                    waiting.entry(d).or_default().push(name);
+                }
                 count += 1;
             }
             if count == 0 {
                 ready.push(name);
             }
-            waits.insert(name, count);
+            waits[name] = count;
         }
         while let Some(name) = ready.pop() {
-            if set.insert(name, by_name[name].0).is_some() {
+            if std::mem::replace(&mut transparent[name], true) {
                 continue;
             }
-            for &user in waiting.get(name).into_iter().flatten() {
-                let w = waits.get_mut(user).unwrap();
-                *w -= 1;
-                if *w == 0 {
+            for &user in waiting.get(&name).into_iter().flatten() {
+                waits[user] -= 1;
+                if waits[user] == 0 {
                     ready.push(user);
                 }
             }
         }
         // Expanding: least fixed point over "uses an expanding macro".
-        let mut users: FxHashMap<&[u8], Vec<&[u8]>> = FxHashMap::default();
-        for (&name, (_, _, refs)) in &bodies {
-            for &r in refs {
+        let mut users: FxHashMap<&[u8], Vec<usize>> = FxHashMap::default();
+        for (name, b) in of.iter().enumerate() {
+            for &r in &b.refs {
                 users.entry(r).or_default().push(name);
             }
         }
-        let mut expanding: FxHashMap<Vec<u8>, bool> = FxHashMap::default();
-        let mut work: Vec<&[u8]> = bodies.iter().filter(|(n, b)| b.1 && !set.contains_key(*n)).map(|(n, _)| *n).collect();
+        let mut expanding = vec![false; of.len()];
+        let mut work: Vec<usize> = (0..of.len()).filter(|&n| of[n].hides && !transparent[n]).collect();
         while let Some(name) = work.pop() {
-            if expanding.insert(name.to_vec(), bodies[name].0).is_none() {
-                work.extend(users.get(name).into_iter().flatten().filter(|u| !set.contains_key(**u)));
+            if !std::mem::replace(&mut expanding[name], true) {
+                work.extend(users.get(names[name]).into_iter().flatten().filter(|&&u| !transparent[u]));
             }
         }
+        drop(users);
         // Kept: everything those bodies can reach, and what they can make
         // by pasting: a name a body writes that is no macro's and ends in
         // `_` (gmock's `GMOCK_PP_CAT (GMOCK_PP_INTERNAL_IF_, c)`) reaches
         // every macro whose name begins with it.
-        let mut names: Vec<&[u8]> = bodies.keys().copied().collect();
-        names.sort_unstable();
+        let mut sorted: Option<Vec<usize>> = None;
         let mut prefixes: FxHashSet<&[u8]> = FxHashSet::default();
-        let mut kept: FxHashSet<Vec<u8>> = FxHashSet::default();
-        let mut work: Vec<&[u8]> = expanding.keys().map(|n| &n[..]).collect();
+        let mut kept = vec![false; of.len()];
+        let mut work: Vec<usize> = (0..of.len()).filter(|&n| expanding[n]).collect();
         while let Some(name) = work.pop() {
-            if let Some((key, b)) = bodies.get_key_value(name) {
-                if kept.insert(key.to_vec()) {
-                    for &r in &b.2 {
-                        if bodies.contains_key(r) {
-                            work.push(r);
-                        } else if r.len() > 2 && r.ends_with(b"_") && prefixes.insert(r) {
-                            let from = names.partition_point(|n| *n < r);
-                            work.extend(names[from..].iter().take_while(|n| n.starts_with(r)).copied());
-                        }
+            if !std::mem::replace(&mut kept[name], true) {
+                for &r in &of[name].refs {
+                    if let Some(r) = id(r) {
+                        work.push(r);
+                    } else if r.len() > 2 && r.ends_with(b"_") && prefixes.insert(r) {
+                        let sorted = sorted.get_or_insert_with(|| {
+                            use rayon::prelude::*;
+                            let mut all: Vec<usize> = (0..names.len()).collect();
+                            all.par_sort_unstable_by_key(|&n| names[n]);
+                            all
+                        });
+                        let from = sorted.partition_point(|&n| names[n] < r);
+                        work.extend(sorted[from..].iter().take_while(|&&n| names[n].starts_with(r)).copied());
                     }
                 }
             }
         }
-        let set: FxHashMap<Vec<u8>, bool> = set.into_iter().map(|(n, f)| (n.to_vec(), f)).collect();
         // Loops: least fixed point over "begins with a loop".
         let mut heads: FxHashMap<&[u8], Vec<&[u8]>> = FxHashMap::default();
         for d in &loop_heads {
@@ -839,24 +938,30 @@ impl MacroSets {
                 break;
             }
         }
-        let discards = discards.into_iter().filter(|(_, bits)| *bits != 0).map(|(n, bits)| (n.to_vec(), bits)).collect();
         // Pasted: least fixed point over "every definition pastes it, or
-        // hands it to a macro whose parameter is pasted".
-        let mut pasted: FxHashMap<&[u8], u64> = FxHashMap::default();
+        // hands it to a macro whose parameter is pasted" (a name one
+        // definition of which pastes nothing pastes nothing).
+        pasting.retain(|p| of[p.0 as usize].pastes);
+        pasting.sort_by_key(|p| p.0);
+        let mut pasted: Vec<u64> = vec![0; of.len()];
         loop {
             let mut changed = false;
-            for (&name, defs) in &pasting {
-                let bits = defs.iter().fold(u64::MAX, |all, (bits, forwards)| {
-                    let mut ok = *bits;
+            let mut i = 0;
+            while i < pasting.len() {
+                let name = pasting[i].0;
+                let mut bits = u64::MAX;
+                while i < pasting.len() && pasting[i].0 == name {
+                    let (_, mut ok, forwards) = pasting[i];
                     for (k, target, j) in forwards.iter() {
-                        if *j >= 64 || pasted.get(&target[..]).is_none_or(|t| t & 1 << j == 0) {
+                        if *j >= 64 || id(target).is_none_or(|t| pasted[t] & 1 << j == 0) {
                             ok &= !(1 << k);
                         }
                     }
-                    all & ok
-                });
-                if bits != 0 && pasted.get(name) != Some(&bits) {
-                    pasted.insert(name, bits);
+                    bits &= ok;
+                    i += 1;
+                }
+                if bits != 0 && pasted[name as usize] != bits {
+                    pasted[name as usize] = bits;
                     changed = true;
                 }
             }
@@ -864,8 +969,17 @@ impl MacroSets {
                 break;
             }
         }
-        let pasted = pasted.into_iter().map(|(n, bits)| (n.to_vec(), bits)).collect();
-        MacroSets { transparent: set, expanding, kept, loops, discards, pasted, ..MacroSets::default() }
+        let named = |n: usize| names[n].to_vec();
+        let all = 0..of.len();
+        MacroSets {
+            transparent: all.clone().filter(|&n| transparent[n]).map(|n| (named(n), of[n].shared_function_like)).collect(),
+            expanding: all.clone().filter(|&n| expanding[n]).map(|n| (named(n), of[n].function_like)).collect(),
+            kept: all.clone().filter(|&n| kept[n]).map(named).collect(),
+            loops,
+            discards: all.clone().filter(|&n| of[n].shared && of[n].unused != 0).map(|n| (named(n), of[n].unused)).collect(),
+            pasted: all.filter(|&n| pasted[n] != 0).map(|n| (named(n), pasted[n])).collect(),
+            ..MacroSets::default()
+        }
     }
 
     /// The sets of every file's `#define`s (`per_file`, the files being
@@ -877,6 +991,31 @@ impl MacroSets {
         let mut sets = MacroSets::of_defines(per_file.iter().flatten());
         sets.scope(per_file, paths, not_built);
         sets
+    }
+
+    /// Do two readings of a file's `#define`s come to the same sets, as
+    /// `of_files` makes them, the other files' being the same? Only what
+    /// those read is compared: not values or lines, nor the `#undef`s and
+    /// the names `#if`s test; of the `#if` an include is in, which branch
+    /// of which.
+    pub fn same_for_sets(a: &[Define], b: &[Define]) -> bool {
+        type View<'a> = ((&'a [u8], bool, bool, u64), (bool, Option<&'a [Vec<u8>]>, bool, &'a [Vec<u8>], bool, &'a [u8]), (u64, u64, &'a [(u8, Vec<u8>, u8)]));
+        fn view(list: &[Define]) -> Vec<View<'_>> {
+            let mut starts: Vec<u64> = Vec::new();
+            list.iter()
+                .filter(|d| !d.test && !d.undef)
+                .map(|d| {
+                    let branch = if d.include && d.branch != 0 {
+                        let group = starts.iter().position(|&s| s == d.branch >> 16).unwrap_or_else(|| (starts.push(d.branch >> 16), starts.len() - 1).1);
+                        (group as u64 + 1) << 16 | d.branch & 0xffff
+                    } else {
+                        0
+                    };
+                    ((&d.name[..], d.include, d.system, branch), (d.function_like, d.deps.as_deref(), d.hides, &d.refs[..], d.local, &d.head[..]), (d.unused, d.pasted, &d.forwards[..]))
+                })
+                .collect()
+        }
+        view(a) == view(b)
     }
 
     pub(crate) fn scope(&mut self, per_file: &[Vec<Define>], paths: &[String], not_built: &[String]) {

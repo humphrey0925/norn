@@ -1268,7 +1268,12 @@ type PerFile = (Vec<[u32; 3]>, [u64; 4], Vec<[u32; 4]>, Vec<[u32; 3]>);
 /// which of the file's `#if`s it is in (see `seen`). When the files that
 /// changed say the same of those, and nothing else that resolving reads
 /// changed, only they are resolved again; and if the lines of their calls
-/// through parameters moved, the files that name those functions.
+/// through parameters moved, the files that name those functions. (When
+/// only their functions and variables changed, see `redefined`.)
+///
+/// Saved with the graph (`Store::save_last`), so that the first edit after
+/// a start is relinked the same way.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct Last {
     /// Per file: its hash, and when it was last expanded (`Cache::made`).
     keys: Vec<(u64, u64)>,
@@ -1290,6 +1295,7 @@ pub(crate) struct Last {
     graph: (usize, u64),
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Resolved {
     /// The edges from where a function is stored to it, some of which
     /// start in other files.
@@ -1311,6 +1317,26 @@ fn kept_edges<'a>(previous: &'a Graph, handed_from: &'a FxHashMap<u32, usize>, s
         list[skip..].iter().filter(|e| e.meta & 7 != refkind::BIND as u32).map(move |e| [s, e.other, e.meta])
     })
     .chain(binds.iter().copied())
+}
+
+impl Last {
+    /// Read back with the graph it was left beside, for a cache read back
+    /// too: what each file was when the link saw it is what the cache says
+    /// it is now (`Cache::restored` counts every file expanded once).
+    pub(crate) fn restored(mut self, made: &[u64]) -> Option<Last> {
+        if self.keys.len() != made.len() {
+            return None;
+        }
+        for (k, &m) in self.keys.iter_mut().zip(made) {
+            k.1 = m;
+        }
+        Some(self)
+    }
+
+    /// Whether it was left by the link that made `g`.
+    pub(crate) fn of(&self, g: &Graph) -> bool {
+        self.graph == graph_id(g)
+    }
 }
 
 fn graph_id(g: &Graph) -> (usize, u64) {
@@ -1415,11 +1441,6 @@ fn digest(f: &FileFacts, directives: Option<&[u32]>, all: bool) -> u64 {
         let text = xxhash_rust::xxh3::xxh3_64(f.name(m.text as usize).as_bytes());
         put(text as u32);
         put((text >> 32) as u32);
-    }
-    put(f.undecided.len() as u32);
-    for u in &f.undecided {
-        put(u.3 as u32);
-        put((u.3 >> 32) as u32);
     }
     let path = xxhash_rust::xxh3::xxh3_64(f.path.as_bytes());
     put(path as u32);
@@ -2951,6 +2972,25 @@ mod tests {
         // Members are symbols; a plain use of one is not a call through it.
         assert_eq!(kinds(&g, "count"), [kind::FIELD]);
         assert_eq!(targets(&g, "run", "count"), ["ops.h"]);
+    }
+
+    #[test]
+    fn every_branch_of_an_if_in_an_initializer_is_stored() {
+        // (The middle ones too, by position and by name.)
+        let g = expanded(&[(
+            "m.c",
+            "struct ops { int (*f) (void); int (*g) (void); };\n\
+             int fa (void); int fb (void); int fc (void); int fd (void);\n\
+             int ga (void); int gb (void); int gc (void);\n\
+             static struct ops o = {\n#if defined (A)\n  fa,\n#elif defined (B)\n  fb,\n#elif defined (C)\n  fc,\n#else\n  fd,\n#endif\n  0 };\n\
+             static struct ops p = {\n#ifdef A\n  .g = ga,\n#elif defined (B)\n  .g = gb,\n#else\n  .g = gc,\n#endif\n};\n\
+             int run (void) { return o.f () + p.g (); }\n",
+        )]);
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            callees(&g, "run"),
+            [pair("fa", "f"), pair("fb", "f"), pair("fc", "f"), pair("fd", "f"), pair("ga", "g"), pair("gb", "g"), pair("gc", "g")]
+        );
     }
 
     #[test]

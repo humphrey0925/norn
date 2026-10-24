@@ -372,6 +372,7 @@ Norn 不提供編譯錯誤的紅色波浪線：那要由編譯器產生。
 | `norn.serverPath` | 空白 | 留空使用內建的索引程式。只有要改用自己建置的版本時才填完整路徑 |
 | `norn.cache.enabled` | 開 | 把索引存在磁碟，下次開啟只處理有變動的檔案 |
 | `norn.cache.directory` | 空白 | 索引存放位置。留空為工作區的 `.norn/cache` |
+| `norn.mcp.enabled` | 開 | 把索引的工具提供給 VS Code 裡的 AI agent，例如 Copilot 的 agent 模式（只在本機的 MCP 伺服器，用同一份索引回答；需要 VS Code 1.101 以上） |
 | `norn.codeLens.enabled` | 開 | 在每個函式上方顯示呼叫者與被呼叫者數量 |
 | `norn.relation.click` | auto | 單擊 Relation 一列時的動作。auto：參考顯示在 Context，其他直接開啟；context：全部先顯示在 Context，雙擊才開啟；editor：全部直接開啟 |
 | `norn.conditions.followBuildConfig` | 開 | 沒有自己的設定時，自動套用工作區裡找到的第一組建置設定。關閉：在你選一組之前不套用任何編譯條件 |
@@ -393,6 +394,7 @@ Norn 不提供編譯錯誤的紅色波浪線：那要由編譯器產生。
 | Norn: Lock Relation / Lock Context | 鎖定，不再跟著游標 |
 | Norn: Sync Index with Disk | 和磁碟同步 |
 | Norn: Restart Index | 重新啟動索引程式，只重新處理有變動的檔案 |
+| Norn: Connect AI Agents | 把索引的工具提供給 Claude Code、Codex、OpenCode（`norn setup`）；Copilot 的 agent 模式本來就有 |
 | Norn: Discard the Saved Index and Rebuild | 丟掉存檔，從頭建立索引 |
 | Norn: Switch Compile Configuration… | 切換編譯條件的設定組 |
 | Norn: Open the Scope File | 開啟 `.norn/config.json` |
