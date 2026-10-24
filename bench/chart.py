@@ -216,8 +216,8 @@ def write_summary(readme, out, runs, tools):
     block = [f'<p align="center"><img src="{rel}/calls-found.svg" alt="Calls found" width="760"></p>', "",
              f'<p align="center"><img src="{rel}/index-time.svg" alt="Time to index" width="760"></p>', "",
              f'<p align="center"><img src="{rel}/peak-memory.svg" alt="Peak memory" width="760"></p>', "",
-             "| Project | Files | " + " | ".join(NAMES[t] for t in tools) + " |",
-             "|---|--:|" + "|".join(":-:" for _ in tools) + "|"]
+             "| Project | Language | Files | " + " | ".join(NAMES[t] for t in tools) + " |",
+             "|---|---|--:|" + "|".join(":-:" for _ in tools) + "|"]
     for corpus, d in runs:
         files = d["tools"].get("si", {}).get("counts", {}).get("files") or (d.get("corpus") or {}).get("c_files", 0) + (d.get("corpus") or {}).get("h_files", 0)
         cells = []
@@ -225,7 +225,8 @@ def write_summary(readme, out, runs, tools):
             c, w = get(d, t, "accuracy", "calls", "recall_any"), get(d, t, "index", "wall_s")
             cell = "–" if c is None and w is None else f"{pct(c) if c is not None else 'n/a'}<br><sub>{secs(w)}</sub>"
             cells.append(f"**{cell}**" if t == "si" and cell != "–" else cell)
-        block.append(f"| {corpus} | {f'{files:,}' if files else '–'} | " + " | ".join(cells) + " |")
+        lang = "C++" if corpus in CPP else "C"
+        block.append(f"| {corpus} | {lang} | {f'{files:,}' if files else '–'} | " + " | ".join(cells) + " |")
     zh = readme.name.endswith(".zh-TW.md")
     block += ["", "<sub>每格：找到的呼叫比例（和 clang 對照），下方為建立索引的時間。</sub>" if zh else
               "<sub>Each cell: the share of calls found (checked against clang), and below it the time to index.</sub>"]

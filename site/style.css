@@ -104,7 +104,25 @@ td sub { display: block; color: var(--muted); font-size: 12px; }
 
 /* Benchmarks */
 .chart { background: #f7f8fc; border-radius: 10px; padding: 20px; margin-bottom: 20px; }
+.chart img { width: 100%; height: auto; }
 .note { color: var(--muted); font-size: 13px; margin-top: 14px; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 0 0 32px; }
+.stat { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; }
+.stat b { display: block; font-size: 32px; line-height: 1.1; color: var(--accent); font-variant-numeric: tabular-nums; }
+.stat span { display: block; margin-top: 6px; color: var(--muted); font-size: 14px; }
+/* The charts, one at a time, chosen by the radios before them. */
+.tabs { display: flex; flex-wrap: wrap; gap: 8px; }
+.tabs input { position: absolute; opacity: 0; pointer-events: none; }
+.tabs label { cursor: pointer; padding: 6px 14px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: 14px; }
+.tabs input:checked + label { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+.tabs input:focus-visible + label { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tabs .chart { display: none; width: 100%; margin-top: 8px; }
+#bench-calls:checked ~ .p-calls, #bench-time:checked ~ .p-time, #bench-memory:checked ~ .p-memory { display: block; }
+table.bench td { font-variant-numeric: tabular-nums; }
+table.bench td.cell { position: relative; }
+table.bench .bar { position: absolute; left: 0; bottom: 0; height: 3px; background: var(--muted); opacity: .45; }
+table.bench td.norn .bar { background: var(--accent); opacity: .9; }
+table.bench tr.group th { text-align: left; background: var(--bg); color: var(--accent); font-size: 13px; letter-spacing: .04em; padding: 10px 14px; }
 
 /* Features */
 .features { display: grid; grid-template-columns: repeat(2, 1fr); gap: 24px; }
