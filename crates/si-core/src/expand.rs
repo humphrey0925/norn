@@ -1531,13 +1531,16 @@ impl Names {
     }
 }
 
-/// `text` with its `#if` groups resolved one way: with `first`, each group's
-/// first branch; without, its `#else` branch (nothing if it has none). An
-/// initializer read both ways gives every element its position under either
-/// configuration, where reading all branches at once would shift them.
-fn one_branch(text: &str, first: bool) -> String {
+/// `text` with its `#if` groups resolved one way: with `Some(k)`, each
+/// group's `k`-th branch (the `#if` its 0th, each `#elif` the next; nothing
+/// if it has fewer); with `None`, its `#else` branch (nothing if it has
+/// none). An initializer read every way gives every element its position
+/// under each configuration, where reading all branches at once would
+/// shift them.
+fn one_branch(text: &str, take: Option<u32>) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut taking: Vec<bool> = Vec::new();
+    // Each open group: which branch it is in, and whether it is taken.
+    let mut groups: Vec<(u32, bool)> = Vec::new();
     let mut continued = false;
     for line in text.split('\n') {
         let directive = continued || line.trim_start().starts_with('#');
@@ -1545,26 +1548,48 @@ fn one_branch(text: &str, first: bool) -> String {
             let word = line.trim_start().trim_start_matches('#').trim_start();
             if !continued {
                 if word.starts_with("if") {
-                    taking.push(first);
+                    groups.push((0, take == Some(0)));
                 } else if word.starts_with("elif") {
-                    if let Some(t) = taking.last_mut() {
-                        *t = false;
+                    if let Some((branch, taking)) = groups.last_mut() {
+                        *branch += 1;
+                        *taking = take == Some(*branch);
                     }
                 } else if word.starts_with("else") {
-                    if let Some(t) = taking.last_mut() {
-                        *t = !first;
+                    if let Some((_, taking)) = groups.last_mut() {
+                        *taking = take.is_none();
                     }
                 } else if word.starts_with("endif") {
-                    taking.pop();
+                    groups.pop();
                 }
             }
             continued = line.trim_end().ends_with('\\');
-        } else if taking.iter().all(|&t| t) {
+        } else if groups.iter().all(|&(_, taking)| taking) {
             out.push_str(line);
         }
         out.push('\n');
     }
     out
+}
+
+/// The most `#elif`s any one `#if` group of `text` has.
+fn most_elifs(text: &str) -> u32 {
+    let (mut most, mut open) = (0, Vec::new());
+    for line in text.split('\n') {
+        let word = line.trim_start();
+        let Some(word) = word.strip_prefix('#') else { continue };
+        let word = word.trim_start();
+        if word.starts_with("if") {
+            open.push(0u32);
+        } else if word.starts_with("elif") {
+            if let Some(n) = open.last_mut() {
+                *n += 1;
+                most = most.max(*n);
+            }
+        } else if word.starts_with("endif") {
+            open.pop();
+        }
+    }
+    most
 }
 
 /// `type name = {` or `type name[] = {` in an expansion: the type's name,
@@ -2080,7 +2105,7 @@ fn expand_file(
         let text = f.name(init.text as usize);
         let conditional = text.split('\n').any(|l| l.trim_start().starts_with('#'));
         let readings: Vec<Vec<T>> = if conditional {
-            [true, false].iter().map(|&first| tokenize(one_branch(text, first).as_bytes(), Origin::Site)).collect()
+            (0..=most_elifs(text)).map(Some).chain([None]).map(|take| tokenize(one_branch(text, take).as_bytes(), Origin::Site)).collect()
         } else {
             vec![tokenize(text.as_bytes(), Origin::Site)]
         };

@@ -129,7 +129,11 @@ itself:
 2. Open a folder containing C sources.
 
 The status bar shows progress while the first index is built. Nothing else
-has to be set up. To index only part of a large tree, use the **Index Scope**
+has to be set up. AI agents in VS Code, such as Copilot's agent mode, get the
+same index as tools (callers and callees through macros and function
+pointers, a definition's source, which lines are compiled) by themselves;
+for Claude Code, Codex and OpenCode, run **Norn: Connect AI Agents** once
+([Norn for AI agents](https://github.com/humphrey0925/norn/blob/master/docs/agents.md)). To index only part of a large tree, use the **Index Scope**
 view to choose the folders.
 
 Norn includes its index server for Windows (x64, Arm64), Linux (x64, Arm64;
@@ -146,6 +150,7 @@ any distribution) and macOS (Intel and Apple silicon).
 | `norn.dimInactive` | `auto` | Dim lines the current configuration does not compile (`auto`: when the C/C++ extension does not) |
 | `norn.cache.enabled` | `true` | Keep the index on disk, so a workspace reopens instantly |
 | `norn.cache.directory` | | Where the index is kept (default: `.norn/cache` in the workspace) |
+| `norn.mcp.enabled` | `true` | Offer the index's tools to AI agents in VS Code, such as Copilot's agent mode (VS Code 1.101 or later) |
 | `norn.includeAliases` | | Headers the build generates from a template, e.g. `bfd.h=bfd-in2.h` |
 | `norn.serverPath` | | Use your own build of the server instead of the bundled one |
 

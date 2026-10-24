@@ -1,13 +1,13 @@
 # `norn` 命令列手冊
 
 `norn` 是 VS Code 擴充套件在背後執行的索引程式，也可以單獨使用：不用編譯就能替
-C 原始碼建索引，查詢符號和呼叫關係，提供給腳本和編輯器使用，也能把找到的全部列出來。
+C 原始碼建索引，查詢符號和呼叫關係，提供給腳本、編輯器和 AI agent 使用，也能把找到的全部列出來。
 [English](cli.md)
 
 - [安裝](#安裝)
 - [五個指令上手](#五個指令上手)
 - [指令](#指令)：[`index`](#index)、[`query`](#query)、[`serve`](#serve)、
-  [`live`](#live)、[`lsp`](#lsp)、[`symbols`](#symbols)、[`calls`](#calls)、
+  [`live`](#live)、[`lsp`](#lsp)、[`mcp`](#mcp)、[`setup`](#setup)、[`symbols`](#symbols)、[`calls`](#calls)、
   [`sample`](#sample)、[`bench-query`](#bench-query)、[`bench-incr`](#bench-incr)
 - [結果的格式](#結果的格式)
 - [專案設定](#專案設定)
@@ -182,6 +182,87 @@ args = ["lsp"]
 name = "c"
 language-servers = ["norn"]
 ```
+
+### `mcp`
+
+```
+norn mcp [ROOT] [--cache-dir <DIR> | --no-cache] [--rebuild] [--include-alias <FROM=TO>]...
+```
+
+怎麼設定 agent、agent 該怎麼用：見[給 AI agent 用的 Norn](agents.zh-TW.md)。
+
+透過 stdin/stdout 的 [Model Context Protocol](https://modelcontextprotocol.io) 伺服器，給 AI agent
+用：Claude Code、VS Code 的 Copilot、Cursor，以及其他支援 MCP 伺服器的工具。專案資料夾的決定順序：
+有給 `ROOT` 就用它；否則用工具告知的已開啟資料夾（MCP roots）；再否則用目前所在的資料夾，但如果那是
+家目錄或檔案系統的根目錄（桌面 app 通常在這裡啟動 server），就不建索引，每個工具都會說明怎麼指定專案。
+它會立刻回應，同時在背景建索引；第一次呼叫工具時會等索引建好。
+
+一個專案只有一份索引，不管有幾個 agent 在用。某個專案的第一個 `norn mcp` 負責建索引，之後為同一個
+專案啟動的（另一個 agent、另一個工作階段）都直接用它的索引回答，不再自己建；它結束時，其中一個會接手，
+從磁碟上保留的索引載入。VS Code 的語言伺服器一開啟該資料夾，就會接手這個專案，agent 改用編輯器的索引
+回答。哪個程序負責哪個專案記在 `~/.norn/run`（一個鎖，以及負責者在哪裡回答：只在本機，而且只回答知道
+那裡寫的密語的程序）。
+
+它像 VS Code
+擴充套件一樣監看檔案：agent 改了哪個原始檔，下次回答前就只重讀那個檔；建置設定（`.norn/config.json`、
+Keil、IAR、Eclipse、Visual Studio 專案、`compile_commands.json`…）改了，或新增、刪除了資料夾，才重新
+檢查整棵樹。沒有任何變動時，什麼都不讀。索引也像 `live` 一樣保留到下次執行。
+
+工具以文字回答，讓 agent 閱讀，路徑都相對於根目錄：
+
+| 工具 | 回答 |
+|---|---|
+| `search_symbols` | 名稱符合部分字串的符號：片段順序不拘、字首縮寫、依序出現的字母 |
+| `find_definition` | 名稱在哪裡定義和宣告；給了使用該名稱的檔案和行號時，只回答那個位置看到的定義 |
+| `read_symbol` | 一個定義的原始碼，連同上方的註解，附行號 |
+| `find_callers` | 一個函式的每個呼叫，並標出哪些經由巨集、經由存放它的成員或變數、經由指標，以及哪些不確定 |
+| `find_callees` | 一個函式發出的每個呼叫，包括經由成員或變數呼叫時，那個成員或變數可能存放的函式 |
+| `find_references` | 一個符號的每個使用處 |
+| `call_tree` | 一個函式往下呼叫到哪些函式，或有哪些函式呼叫到它，幾層深 |
+| `compiled_lines` | 一個檔案的哪些行在建置設定下會編譯，或某一行是否會編譯 |
+| `read_file` | 讀一個檔案或其中幾行，附行號，並在設定組不編譯的區段起點和終點各加一行標示 |
+| `search_code` | 搜尋 C/C++ 檔案的文字或 regular expression，只看設定組會編譯的部分（`include_inactive` 才列出其餘的） |
+| `list_configurations` | 有哪些設定組、目前生效的是哪個，以及它定義了什麼 |
+| `switch_configuration` | 讓另一個設定組生效（這是專案的設定，和編輯器共用），並重建索引 |
+
+清單最多列出 100 筆，除非 agent 要求更多（`limit`），並會說明總共有幾筆。一個名稱有多個定義時，
+每個定義都會回答；用 `file` 可以只選其中一個。
+
+在 VS Code 裡什麼都不用設定：擴充套件會把同樣的工具提供給 VS Code 管理 MCP 伺服器的 agent（Copilot
+的 agent 模式），由它已經在執行的語言伺服器回答。所以 agent 用的就是編輯器手上的那份索引，跟編輯器一樣
+保持最新，不會多建第二份索引（需要 VS Code 1.101 以上；`norn.mcp.enabled` 可以關掉）。
+
+Claude Code、Codex、OpenCode：用 [`norn setup`](#setup) 一次設定好。其他工具：指令是 `norn`，參數是 `mcp`；
+如果工具不是在專案資料夾裡啟動它，也不會告知開啟的資料夾，就再加上專案資料夾。
+
+### `setup`
+
+```
+norn setup [claude | codex | opencode]... [--remove | --print | --refresh]
+```
+
+把 [`mcp`](#mcp) 的工具提供給這台電腦上的 agent，不必逐一手動設定：
+
+1. 把這個程式放到 `~/.norn/bin/norn`（Windows 為 `norn.exe`），這是不會變動的路徑；那裡已經有同版或更新的版本時就保留它。
+2. 把指定的 agent（沒指定就是這台電腦上找得到的每一個）設定成以 `norn mcp` 啟動它。專案就是 agent 當下工作的那個資料夾。
+3. 把 skill [`norn`](../skills/norn/SKILL.md) 放到 agent 讀取 skill 的地方：`~/.claude/skills/norn/`（Claude Code）和 `~/.agents/skills/norn/`（Codex、OpenCode、VS Code 的 Copilot）。這份 skill 告訴 agent 先設定好設定組，再用這些工具，不要用 grep。使用者自己同名的 skill 不會被動到。
+
+| Agent | 寫在哪裡 |
+|---|---|
+| Claude Code（終端機、VS Code、桌面 app） | 用 Claude Code 自己的指令 `claude mcp add --scope user`；`PATH` 上沒有 `claude` 時，照印出來的指令手動執行 |
+| Codex（命令列、VS Code、ChatGPT 桌面 app 的 Codex） | `~/.codex/config.toml`（`$CODEX_HOME`）的 `[mcp_servers.norn]` |
+| OpenCode | `~/.config/opencode/opencode.json` 的 `"mcp": { "norn": … }` |
+
+只寫入 Norn 自己的那一項：每個檔案的其他內容（包括註解）都維持原樣。已經在執行的 agent，重新啟動後就有這些工具。
+
+| 選項 | |
+|---|---|
+| `--remove` | 從每個 agent 的設定中移除 Norn，以及它的 skill |
+| `--print` | 只印出每個 agent 的設定會加入什麼 |
+| `--refresh` | 只在 `~/.norn/bin` 的副本和 skill 已經存在時，把它們更新到最新。VS Code 擴充套件每次啟動都會做，所以擴充套件更新後 agent 也會跟著更新 |
+| `--status` | 只以 JSON 回報這台電腦上有哪些 agent、哪些已經會啟動 Norn（`{"agents": [{"name": "claude", "present": true, "setUp": false}, …], "installed": true}`）；不執行也不寫入任何東西。VS Code 擴充套件用它來提示設定其餘的 agent |
+
+在 VS Code 裡：**Norn: Connect AI Agents** 做的是同一件事。Copilot 的 agent 模式不需要這些（見 [`mcp`](#mcp)）。
 
 ### `symbols`
 

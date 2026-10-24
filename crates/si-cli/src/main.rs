@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 mod lsp;
+mod mcp;
 mod mem;
+mod setup;
+mod share;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -129,6 +132,40 @@ enum Cmd {
         include_alias: Vec<String>,
         #[command(flatten)]
         keep: Keep,
+    },
+    /// Model Context Protocol server over stdin/stdout, for AI agents: the
+    /// queries as tools, over the sources, kept up to date.
+    Mcp {
+        /// The source tree (default: the folder the client says it has
+        /// open, else the current folder, unless that is the home folder
+        /// or the root of the file system).
+        root: Option<PathBuf>,
+        /// `FROM=TO`: an `#include` of a file named FROM reads TO instead. Repeatable.
+        #[arg(long, value_name = "FROM=TO")]
+        include_alias: Vec<String>,
+        #[command(flatten)]
+        keep: Keep,
+    },
+    /// Give the agents on this machine (Claude Code, Codex, OpenCode) the
+    /// index's tools: put this program at ~/.norn/bin and set each agent
+    /// up to start it as `norn mcp`.
+    Setup {
+        /// claude | codex | opencode (default: each one on this machine).
+        agents: Vec<String>,
+        /// Take Norn out of each agent's settings instead.
+        #[arg(long)]
+        remove: bool,
+        /// Only print what each agent's settings would get.
+        #[arg(long, conflicts_with = "remove")]
+        print: bool,
+        /// Only bring ~/.norn/bin's copy up to date, if there is one (an
+        /// update of the extension does).
+        #[arg(long, conflicts_with_all = ["remove", "print"])]
+        refresh: bool,
+        /// Only say, as JSON, which agents are on this machine and which of
+        /// them start Norn already; nothing is written.
+        #[arg(long, conflicts_with_all = ["remove", "print", "refresh"])]
+        status: bool,
     },
     /// Every symbol as `file<TAB>line<TAB>kind<TAB>decl|def<TAB>name` (for accuracy checks).
     Symbols {
@@ -819,6 +856,12 @@ fn main() {
         Cmd::Live { root, include_alias, keep } => {
             return live(root, keep, &si_core::link::Options { include_aliases: aliases(include_alias), ..Default::default() })
         }
+        Cmd::Mcp { root, include_alias, keep } => {
+            let options = si_core::link::Options { include_aliases: aliases(include_alias), ..Default::default() };
+            let keep = keep.clone();
+            return mcp::run(root.as_deref(), move |dir: &Path| keep.open(dir, &options));
+        }
+        Cmd::Setup { agents, remove, print, refresh, status } => std::process::exit(setup::run_setup(agents, *remove, *print, *refresh, *status)),
         Cmd::Symbols { dir } => return symbols(dir),
         Cmd::Calls { dir } => return calls(dir),
     };

@@ -345,6 +345,8 @@ struct Walk<'a> {
     events: std::slice::Iter<'a, Event>,
     next_event: Option<&'a Event>,
     blocks: &'a [(u32, u32, u32)],
+    /// The branches the conditions in force switch off (byte ranges).
+    skipped: &'a [(u32, u32)],
     ids: &'a Ids,
     /// The macro sets, for the parameters macros leave unused.
     sets: &'a MacroSets,
@@ -500,6 +502,7 @@ impl Extractor {
             next_event: events.next(),
             events,
             blocks: &lexed.blocks,
+            skipped: &lexed.skipped,
             ids,
             sets: transparent,
             quiet: Vec::new(),
@@ -1556,7 +1559,7 @@ impl<'a, 't> Walk<'a> {
                     let (open, close) = (s.init.0 as usize, s.init.1 as usize);
                     if close > open && close - open <= MAX_INIT_TEXT {
                         let type_name = self.intern(&self.orig[s.init_type.0 as usize..s.init_type.1 as usize]);
-                        let text = String::from_utf8_lossy(&self.orig[open..close]);
+                        let text = self.init_text(open, close);
                         let text = self.out.push_text(&text);
                         let scope = if def == NONE { scope } else { def };
                         self.out.inits.push(InitSite { type_name, text, line: s.name.line, scope, array: s.init_array });
@@ -2240,6 +2243,22 @@ impl<'a, 't> Walk<'a> {
         self.out.records.push(Record { name, fields, types, defs });
     }
 
+    /// The original text of an initializer, its `#if`s kept (it is read
+    /// one branch at a time), but the branches the conditions in force
+    /// switch off blanked, as the parser has them.
+    fn init_text(&self, start: usize, end: usize) -> String {
+        let mut text = self.orig[start..end].to_vec();
+        for &(a, b) in self.skipped.iter().filter(|&&(a, b)| (a as usize) < end && (b as usize) > start) {
+            let (a, b) = ((a as usize).max(start) - start, (b as usize).min(end) - start);
+            for c in &mut text[a..b] {
+                if *c != b'\n' {
+                    *c = b' ';
+                }
+            }
+        }
+        String::from_utf8_lossy(&text).into_owned()
+    }
+
     /// A braced initializer of an object of struct type `type_name` (or of
     /// an array of them): bind the functions in it to the members they
     /// initialize.
@@ -2330,7 +2349,7 @@ impl<'a, 't> Walk<'a> {
                 // read on its own, and an `#if` inside a row goes with it.
                 let by_row = array && end - start > ROWS_APART;
                 if !by_row && end - start <= MAX_INIT_TEXT {
-                    let text = String::from_utf8_lossy(&self.orig[start..end]);
+                    let text = self.init_text(start, end);
                     let text = self.out.push_text(&text);
                     let line = value.start_position().row as u32 + 1;
                     self.out.inits.push(InitSite { type_name, text, line, scope, array });
@@ -2348,7 +2367,7 @@ impl<'a, 't> Walk<'a> {
                             // (`ROW (a, b)` for `{ a, b }`), or `[i] = ...`:
                             // an array of that one element.
                             if e - a <= MAX_INIT_TEXT {
-                                let text = format!("{{{}}}", String::from_utf8_lossy(&self.orig[a..e]));
+                                let text = format!("{{{}}}", self.init_text(a, e));
                                 let text = self.out.push_text(&text);
                                 let line = row.start_position().row as u32 + 1;
                                 self.out.inits.push(InitSite { type_name, text, line, scope, array: true });
