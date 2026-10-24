@@ -2,13 +2,13 @@
 
 `norn` is the indexer the VS Code extension runs, and a tool of its own: it
 indexes a C tree without a build, answers queries about symbols and calls,
-serves them to scripts and editors, and lists everything it found.
+serves them to scripts, editors and AI agents, and lists everything it found.
 [繁體中文版](cli.zh-TW.md)
 
 - [Installing](#installing)
 - [In five commands](#in-five-commands)
 - [Commands](#commands): [`index`](#index), [`query`](#query),
-  [`serve`](#serve), [`live`](#live), [`lsp`](#lsp), [`symbols`](#symbols),
+  [`serve`](#serve), [`live`](#live), [`lsp`](#lsp), [`mcp`](#mcp), [`setup`](#setup), [`symbols`](#symbols),
   [`calls`](#calls), [`sample`](#sample), [`bench-query`](#bench-query),
   [`bench-incr`](#bench-incr)
 - [What a result looks like](#what-a-result-looks-like)
@@ -203,6 +203,112 @@ args = ["lsp"]
 name = "c"
 language-servers = ["norn"]
 ```
+
+### `mcp`
+
+```
+norn mcp [ROOT] [--cache-dir <DIR> | --no-cache] [--rebuild] [--include-alias <FROM=TO>]...
+```
+
+How to set agents up and how they should use it:
+[Norn for AI agents](agents.md).
+
+A [Model Context Protocol](https://modelcontextprotocol.io) server on
+stdin/stdout, for AI agents: Claude Code, VS Code's Copilot, Cursor and the
+others that take MCP servers. The project is `ROOT` if given; else the
+folder the client says it has open (MCP roots), where it says; else the
+current folder, unless that is the home folder or the root of the file
+system, where a desktop app starts a server: then nothing is indexed, and
+each tool says how to name the project. It answers at once and indexes
+meanwhile; the first tool called waits for the index.
+
+One project has one index, however many ask of it. The first `norn mcp` of
+a project makes it, and the others started for the same project (another
+agent, another session) are answered from it rather than make their own;
+if it ends, one of them takes over, from the index kept on disk. VS Code's
+language server, once it opens the folder, takes the project over, and the
+agents are answered from the editor's index. Who holds which project is
+kept in `~/.norn/run` (a lock, and where the holder answers: on this
+machine only, to a process that knows the word written there).
+
+It watches the tree as the VS Code extension does: a
+source file the agent edits is read again before the next answer, and only
+it; a changed build configuration (`.norn/config.json`, a Keil, IAR,
+Eclipse or Visual Studio project, `compile_commands.json`…) or a folder
+added or removed has the whole tree looked at again. With nothing changed,
+nothing is read. The index is kept between runs as `live` keeps it.
+
+Its tools answer in text, for the agent to read, with paths relative to the
+root:
+
+| Tool | Answers |
+|---|---|
+| `search_symbols` | Symbols matching part of a name: fragments in any order, initials, letters in order |
+| `find_definition` | Where a name is defined and declared; given the file and line it is used on, the definition that place sees |
+| `read_symbol` | The source of a definition, with the comment above it, numbered |
+| `find_callers` | Every call of a function, saying which come through a macro, a member or variable holding it, or a pointer, and which are uncertain |
+| `find_callees` | Every call a function makes, including the functions a member or variable it calls through can hold |
+| `find_references` | Every use of a symbol |
+| `call_tree` | What a function reaches through calls, or what reaches it, a few levels deep |
+| `compiled_lines` | Which lines of a file the build configuration compiles, or whether one line is |
+| `read_file` | A file, or some of its lines, numbered, with where the configuration stops and starts compiling it said on a line of its own |
+| `search_code` | Text or a regular expression in the C/C++ files, only where the configuration compiles (`include_inactive` for the rest) |
+| `list_configurations` | The build configurations, which is in force, and what it defines |
+| `switch_configuration` | Puts another configuration in force (the project's setting, shared with the editor) and re-indexes |
+
+Lists stop at 100 results unless the agent asks for more (`limit`), and say
+how many there are. A name with several definitions answers for each; `file`
+chooses one.
+
+In VS Code there is nothing to set up: the extension offers the same tools
+to the agents VS Code serves MCP servers to (Copilot's agent mode), from the
+language server it already runs, so an agent is answered from the index the
+editor has, kept up to date as the editor keeps it, with no second index
+(VS Code 1.101 or later; `norn.mcp.enabled` turns it off).
+
+Claude Code, Codex and OpenCode: [`norn setup`](#setup) sets each of them
+up. Any other client: the command `norn` with the argument `mcp`, and the
+project's folder if the client neither starts it in that folder nor says
+which one it has open.
+
+### `setup`
+
+```
+norn setup [claude | codex | opencode]... [--remove | --print | --refresh]
+```
+
+Gives the agents on this machine the tools of [`mcp`](#mcp), with nothing
+to type for each:
+
+1. Puts this program at `~/.norn/bin/norn` (`norn.exe` on Windows), a path
+   that does not move: one as new or newer already there is kept.
+2. Sets up each agent named, or each one found on this machine, to start
+   it as `norn mcp`. Which project is then the one the agent works in.
+3. Puts the skill [`norn`](../skills/norn/SKILL.md), which tells an agent to
+   set the build configuration first and use the tools rather than grep,
+   where the agents read skills: `~/.claude/skills/norn/` (Claude Code) and
+   `~/.agents/skills/norn/` (Codex, OpenCode, VS Code's Copilot). A skill of
+   the user's own of that name is left alone.
+
+| Agent | Where |
+|---|---|
+| Claude Code (terminal, VS Code, desktop app) | `claude mcp add --scope user`, Claude Code's own command; done by hand, as printed, where it is not on the `PATH` |
+| Codex (command line, VS Code, the ChatGPT desktop app's Codex) | `[mcp_servers.norn]` in `~/.codex/config.toml` (`$CODEX_HOME`) |
+| OpenCode | `"mcp": { "norn": … }` in `~/.config/opencode/opencode.json` |
+
+Only Norn's own entry is written: the rest of each file, comments
+included, stays as it was. An agent running already has the tools once it
+starts again.
+
+| Option | |
+|---|---|
+| `--remove` | Take Norn out of each agent's settings, and its skill |
+| `--print` | Only print what each agent's settings would get |
+| `--refresh` | Only bring `~/.norn/bin`'s copy and the skills up to date, if they are there. The VS Code extension does this at each start, so its updates reach the agents |
+| `--status` | Only say, as JSON, which agents are on this machine and which start Norn already (`{"agents": [{"name": "claude", "present": true, "setUp": false}, …], "installed": true}`); nothing is run or written. The VS Code extension asks this to offer to set up the others |
+
+In VS Code: **Norn: Connect AI Agents** does the same. Copilot's agent mode
+needs none of it (see [`mcp`](#mcp)).
 
 ### `symbols`
 

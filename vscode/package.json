@@ -29,6 +29,12 @@
     "workspaceContains:**/*.cc"
   ],
   "contributes": {
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "norn",
+        "label": "Norn"
+      }
+    ],
     "viewsContainers": {
       "activitybar": [
         {
@@ -133,6 +139,10 @@
       {
         "command": "norn.restart",
         "title": "Norn: Restart Index (parse only what changed)"
+      },
+      {
+        "command": "norn.connectAgents",
+        "title": "Norn: Connect AI Agents (Claude Code, Codex, OpenCode)"
       },
       {
         "command": "norn.relation.tree",
@@ -267,6 +277,10 @@
       {
         "command": "norn.context.shown",
         "title": "Norn: Context shown"
+      },
+      {
+        "command": "norn.mcp.address",
+        "title": "Norn: Address of the tools for agents"
       },
       {
         "command": "norn.serverInUse",
@@ -491,6 +505,10 @@
           "when": "false"
         },
         {
+          "command": "norn.mcp.address",
+          "when": "false"
+        },
+        {
           "command": "norn.serverInUse",
           "when": "false"
         },
@@ -589,6 +607,11 @@
           "type": "boolean",
           "default": true,
           "description": "Show the number of callers and calls above each function definition."
+        },
+        "norn.mcp.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Offer the index's tools (definitions, callers and callees through macros and function pointers, a definition's source, compiled lines) to AI agents in VS Code, such as Copilot's agent mode, as an MCP server that answers from the same index. It listens on this machine only. VS Code 1.101 or later."
         },
         "norn.cache.enabled": {
           "type": "boolean",

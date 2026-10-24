@@ -57,6 +57,17 @@ jobs:
         run: cargo test --locked
       - name: Build the server
         run: cargo build --release --locked
+      # site/install.sh and install.ps1, with the server just built served
+      # as a release (and under Windows PowerShell 5.1 too).
+      - name: Install scripts
+        if: runner.os != 'Windows'
+        run: release/test-install.sh
+      - name: Install scripts (PowerShell 7, Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./release/test-install.ps1 -Shell pwsh
+          ./release/test-install.ps1 -Shell powershell
 
       - uses: actions/setup-node@v4
         with:
