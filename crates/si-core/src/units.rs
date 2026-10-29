@@ -368,6 +368,43 @@ struct Unit<'a> {
     unknown_why: FxHashMap<u32, (u32, u8, u32, u32, u32)>,
 }
 
+impl<'a> Unit<'a> {
+    /// The compilation that starts from `root`, read: `first`, the first
+    /// pass, which notes the names defined outright.
+    fn of(w: &'a World<'a>, root: u32, read_first: &[u32], first: bool, profile: bool) -> Unit<'a> {
+        let mut unit = Unit {
+            w,
+            local: Local::default(),
+            // A header nothing here includes is included by
+            // something out of sight, after who knows what.
+            unseen: crate::is_header(&w.paths[root as usize]),
+            read: FxHashMap::default(),
+            outright: first.then(FxHashSet::default),
+            reading: FxHashMap::default(),
+            states: vec![0; w.ids.len()],
+            kept: Default::default(),
+            spent: 0,
+            prof: profile.then_some([0; 5]),
+            traces: FxHashMap::default(),
+            journal: None,
+            before: FxHashMap::default(),
+            dirs: FxHashSet::default(),
+            under_here: None,
+            under: FxHashMap::default(),
+            root,
+            files: Some(FxHashMap::default()),
+            unknown_why: FxHashMap::default(),
+        };
+        for &f in read_first.iter().filter(|&&f| f != root) {
+            unit.read.insert(f, true);
+            unit.read(f, false, 0);
+        }
+        unit.read.insert(root, true);
+        unit.read(root, false, 0);
+        unit
+    }
+}
+
 impl Unit<'_> {
     fn conditions(&self) -> &Conditions {
         if self.unseen { &self.w.unseen } else { &self.w.told }
@@ -780,6 +817,430 @@ fn tri(b: u8) -> Tri {
     }
 }
 
+/// Which file an include reads: the one beside the includer, else the
+/// ones of that name nearest to it.
+struct Resolve<'a> {
+    paths: &'a [String],
+    by_path: FxHashMap<&'a str, u32>,
+    by_base: FxHashMap<&'a str, Vec<u32>>,
+    not_built: &'a [String],
+}
+
+impl<'a> Resolve<'a> {
+    fn new(paths: &'a [String], not_built: &'a [String]) -> Resolve<'a> {
+        let by_path = paths.iter().enumerate().map(|(i, p)| (p.as_str(), i as u32)).collect();
+        let mut by_base: FxHashMap<&str, Vec<u32>> = FxHashMap::default();
+        for (i, p) in paths.iter().enumerate() {
+            by_base.entry(p.rsplit('/').next().unwrap_or(p)).or_default().push(i as u32);
+        }
+        Resolve { paths, by_path, by_base, not_built }
+    }
+
+    fn files(&self, from: &str, name: &[u8]) -> Vec<u32> {
+        let paths = self.paths;
+        let name = String::from_utf8_lossy(name);
+        let dir = dir_of(from);
+        if let Some(&id) = self.by_path.get(join(dir, &name).as_str()) {
+            return vec![id];
+        }
+        let tail = join("", &name);
+        let named = self.by_base.get(tail.rsplit('/').next().unwrap_or(&tail)).map_or(&[][..], |v| &v[..]);
+        let fits = |id: &&u32| {
+            let p = paths[**id as usize].as_str();
+            p == tail || p.ends_with(&tail) && p.as_bytes()[p.len() - tail.len() - 1] == b'/'
+        };
+        let near = |id: u32| dir.split('/').zip(dir_of(&paths[id as usize]).split('/')).take_while(|(a, b)| a == b).count();
+        let mut fitting: Vec<u32> = named.iter().filter(fits).copied().collect();
+        // (Of a folder the build compiles, where one is: not another
+        // architecture's.)
+        let built = |c: &u32| !crate::link::outside(&paths[*c as usize], self.not_built);
+        if fitting.iter().any(built) {
+            fitting.retain(built);
+        }
+        let nearest = fitting.iter().map(|&c| near(c)).max();
+        fitting.into_iter().filter(|&c| Some(near(c)) == nearest).collect()
+    }
+}
+
+/// The steps of a file's directives: its `#define`s and `#undef`s of the
+/// names asked about (numbered by `ids`), each include as the files it may
+/// mean. `None` where a name asked about is not numbered.
+fn steps_of(script: &Script, path: &str, resolve: &Resolve, asked: &(dyn Fn(&[u8]) -> bool + Sync), ids: &FxHashMap<Box<[u8]>, u32>, conditions: &Conditions) -> Option<Vec<Step>> {
+    let cut = |b: &[u8]| -> Box<[u8]> { b.into() };
+    let mut out = Vec::new();
+    for op in &script.ops {
+        out.push(match op {
+            Op::If { at, kind, expr } => Step::If { at: *at, kind: *kind, expr: cut(expr), slot: u32::MAX },
+            Op::Elif { at, kind, expr } => Step::Elif { at: *at, kind: *kind, expr: cut(expr), slot: u32::MAX },
+            Op::Else => Step::Else,
+            Op::Endif => Step::Endif,
+            // (What the settings say of a name has the last word.)
+            Op::Define { name, value } if asked(name) && !conditions.settles(name) => Step::Define { id: *ids.get(&name[..])?, name: cut(name), value: cut(value) },
+            Op::Undef { name } if asked(name) && !conditions.settles(name) => Step::Undef { id: *ids.get(&name[..])?, name: cut(name) },
+            Op::Define { .. } | Op::Undef { .. } => continue,
+            // (`<assert.h>` is the C library's, not a header of
+            // that name somewhere in the tree.)
+            Op::Include { name, quoted: false } if standard_header(name) => continue,
+            Op::Include { name, quoted } => match resolve.files(path, name) {
+                files if !files.is_empty() => Step::Include { files: files.into() },
+                _ if *quoted => Step::Unseen,
+                _ => continue,
+            },
+        });
+    }
+    Some(out)
+}
+
+/// Of several files an include may mean, those in the directory the
+/// sources most include from elsewhere (as an include path would have
+/// it), when that is not all of them.
+fn narrow(steps: &mut [Step], from_elsewhere: &[u32], dir: &[u32]) {
+    for step in steps {
+        if let Step::Include { files } = step {
+            if files.len() > 1 {
+                let most = files.iter().map(|&f| from_elsewhere[dir[f as usize] as usize]).max().unwrap_or(0);
+                let near: Box<[u32]> = files.iter().copied().filter(|&f| from_elsewhere[dir[f as usize] as usize] == most).collect();
+                if most > 0 && near.len() < files.len() {
+                    *files = near;
+                }
+            }
+        }
+    }
+}
+
+/// The names the files `#define` or `#undef`, as a filter: one it says
+/// no to is none of them; one it says yes to may not be (about one in
+/// three hundred).
+struct Defined {
+    bits: Vec<u64>,
+}
+
+impl Defined {
+    fn new(names: usize) -> Defined {
+        Defined { bits: vec![0; (names * 12).div_ceil(64).max(1)] }
+    }
+
+    fn places(&self, name: &[u8]) -> impl Iterator<Item = usize> {
+        let h = xxhash_rust::xxh3::xxh3_64(name);
+        let (a, b, m) = (h as u32 as u64, (h >> 32) | 1, self.bits.len() as u64 * 64);
+        (0..7u64).map(move |i| (a.wrapping_add(i.wrapping_mul(b)) % m) as usize)
+    }
+
+    fn add(&mut self, name: &[u8]) {
+        for p in self.places(name).collect::<Vec<_>>() {
+            self.bits[p / 64] |= 1 << (p % 64);
+        }
+    }
+
+    fn may_have(&self, name: &[u8]) -> bool {
+        self.places(name).all(|p| self.bits[p / 64] >> (p % 64) & 1 != 0)
+    }
+
+    fn add_of(&mut self, script: &Script) {
+        for op in &script.ops {
+            if let Op::Define { name, .. } | Op::Undef { name } = op {
+                self.add(name);
+            }
+        }
+    }
+}
+
+/// What [`read_tree_kept`] leaves for working the same out again after
+/// some files' directives changed (see [`Tree::again`]): every file's
+/// steps, the names asked about and their numbers, and what the reading
+/// found of the tree as a whole.
+pub struct Tree {
+    steps: Vec<Vec<Step>>,
+    asked: FxHashSet<Box<[u8]>>,
+    ids: FxHashMap<Box<[u8]>, u32>,
+    slots: usize,
+    once: Vec<bool>,
+    dir: Vec<u32>,
+    from_elsewhere: Vec<u32>,
+    read_first: Vec<u32>,
+    roots: Vec<u32>,
+    /// The names some file defines as a guard within it, with the files
+    /// that define them (see `read_tree_kept`).
+    candidates: FxHashMap<Box<[u8]>, Vec<usize>>,
+    /// The names taken as not defined: before their definitions (the
+    /// second pass), and after a header not in the tree.
+    outright: Vec<Vec<u8>>,
+    unseen: Vec<Vec<u8>>,
+    /// How many times every compilation was read (1 or 2).
+    passes: u8,
+    traced: Vec<bool>,
+    split: Vec<bool>,
+    unread: Vec<bool>,
+    /// The steps the most of either pass took, and whether it gave up.
+    spent: u64,
+    gave_up: bool,
+    /// The names the files define or undefine (see [`Defined`]): one an
+    /// `#if` asks about now that none defines asks nothing of the others.
+    defined: Defined,
+}
+
+/// What of a file's steps can change how anything else is read: its
+/// steps but for the `#if` groups with no definition or include in them
+/// (and for where each directive is).
+fn effect(steps: &[Step]) -> Vec<&Step> {
+    let mut out: Vec<&Step> = Vec::new();
+    // The open groups: where each began in `out`, and whether anything in
+    // it can change how anything else is read.
+    let mut open: Vec<(usize, bool)> = Vec::new();
+    for step in steps {
+        match step {
+            Step::If { .. } => open.push((out.len(), false)),
+            Step::Endif => {
+                if let Some((from, felt)) = open.pop() {
+                    if !felt {
+                        out.truncate(from);
+                        continue;
+                    }
+                }
+            }
+            Step::Elif { .. } | Step::Else => {}
+            _ => open.iter_mut().for_each(|g| g.1 = true),
+        }
+        out.push(step);
+    }
+    out
+}
+
+/// Two steps the same, wherever their directives are.
+fn same_step(a: &Step, b: &Step) -> bool {
+    match (a, b) {
+        (Step::If { kind: k, expr: e, .. }, Step::If { kind: l, expr: f, .. }) | (Step::Elif { kind: k, expr: e, .. }, Step::Elif { kind: l, expr: f, .. }) => k == l && e == f,
+        (Step::Else, Step::Else) | (Step::Endif, Step::Endif) | (Step::Unseen, Step::Unseen) => true,
+        (Step::Define { id: i, name: n, value: v }, Step::Define { id: j, name: m, value: w }) => i == j && n == m && v == w,
+        (Step::Undef { id: i, name: n }, Step::Undef { id: j, name: m }) => i == j && n == m,
+        (Step::Include { files: a }, Step::Include { files: b }) => a == b,
+        _ => false,
+    }
+}
+
+fn same_steps<'s>(a: impl ExactSizeIterator<Item = &'s Step>, b: impl ExactSizeIterator<Item = &'s Step>) -> bool {
+    a.len() == b.len() && a.zip(b).all(|(a, b)| same_step(a, b))
+}
+
+/// The names the `#if`s and `#elif`s of `steps` test.
+fn tested_in(steps: &[Step]) -> FxHashSet<&[u8]> {
+    let mut names = FxHashSet::default();
+    for step in steps {
+        if let Step::If { expr, .. } | Step::Elif { expr, .. } = step {
+            names_in(expr, |n| _ = names.insert(n));
+        }
+    }
+    names
+}
+
+impl Tree {
+    /// The names the `#if`s of file `f` test.
+    pub fn tested(&self, f: usize) -> FxHashSet<&[u8]> {
+        tested_in(&self.steps[f])
+    }
+
+    /// The steps of the file `f`, read anew: `script`.
+    fn steps_now(&self, f: usize, script: &Script, paths: &[String], resolve: &Resolve, conditions: &Conditions) -> Option<Vec<Step>> {
+        let asks = |n: &[u8]| self.asked.contains(n);
+        let mut steps = steps_of(script, &paths[f], resolve, &asks, &self.ids, conditions)?;
+        narrow(&mut steps, &self.from_elsewhere, &self.dir);
+        Some(steps)
+    }
+
+    fn number(&mut self, steps: &mut [Step]) {
+        for step in steps {
+            if let Step::If { kind: 0, slot, .. } | Step::Elif { kind: 0, slot, .. } = step {
+                *slot = self.slots as u32;
+                self.slots += 1;
+            }
+        }
+    }
+
+    /// File `f` read again where nothing was worked out anew: whether it
+    /// reads as it did but for where its directives are (then what is
+    /// kept of it is moved with them). Otherwise nothing kept holds.
+    pub fn refresh(&mut self, f: usize, script: &Script, paths: &[String], conditions: &Conditions) -> bool {
+        let resolve = Resolve::new(paths, conditions.not_built());
+        let Some(mut steps) = self.steps_now(f, script, paths, &resolve, conditions) else { return false };
+        if script.once != self.once[f] || !same_steps(steps.iter(), self.steps[f].iter()) {
+            return false;
+        }
+        self.number(&mut steps);
+        self.steps[f] = steps;
+        self.defined.add_of(script);
+        true
+    }
+
+    /// What the conditions of the files `changed` (each with its directives
+    /// now) come to, where their `#if`s changed and nothing that decides
+    /// how any other file is read did: no definition or include moved into
+    /// or out of a branch, no name asked about that was not. Only the
+    /// compilations that may read those files are read again, and only for
+    /// those files' conditions: every other verdict is as in `verdicts`,
+    /// and the readings are as they were.
+    ///
+    /// `None`: it has to be worked out anew (and what is kept here is no
+    /// longer of use). `Some(None)`: the tree is too much to read, as it
+    /// was. `conditions`: as `read_tree` had them, the sources' aside.
+    pub fn again(&mut self, paths: &[String], changed: &[(usize, &Script)], conditions: &Conditions, verdicts: &Verdicts) -> Option<Option<Verdicts>> {
+        let n = paths.len();
+        let resolve = Resolve::new(paths, conditions.not_built());
+        let mut fresh: Vec<(usize, Vec<Step>)> = Vec::new();
+        for &(f, script) in changed {
+            let steps = self.steps_now(f, script, paths, &resolve, conditions)?;
+            let was = &self.steps[f];
+            if script.once != self.once[f] || !same_steps(effect(&steps).into_iter(), effect(was).into_iter()) {
+                return None;
+            }
+            // (A name an `#if` asks about now that none did: what the
+            // others define of it was not followed, unless none does and
+            // the settings give it no value naming more.)
+            let (now, then) = (tested_in(&steps), tested_in(was));
+            if now.iter().any(|&t| !self.asked.contains(t) && (self.defined.may_have(t) || conditions.setting(t).is_some())) {
+                return None;
+            }
+            // (Tested by a file that does not define it, a guard within a
+            // file is a switch: one may be one now, or no longer.)
+            if now.symmetric_difference(&then).any(|t| self.candidates.get(*t).is_some_and(|files| !files.contains(&f))) {
+                return None;
+            }
+            // (Read in fewer steps, a tree too much to read may not be.)
+            if steps.len() < was.len() && self.gave_up {
+                return None;
+            }
+            fresh.push((f, steps));
+        }
+        for &(f, script) in changed {
+            self.defined.add_of(script);
+            for t in tested_in(&fresh.iter().find(|(g, _)| *g == f).expect("read").1) {
+                if !self.asked.contains(t) {
+                    self.asked.insert(t.into());
+                }
+            }
+        }
+        if self.gave_up {
+            for (f, mut steps) in fresh {
+                self.number(&mut steps);
+                self.steps[f] = steps;
+            }
+            return Some(None);
+        }
+        for (f, mut steps) in fresh.iter_mut().map(|(f, s)| (*f, std::mem::take(s))).collect::<Vec<_>>() {
+            self.number(&mut steps);
+            self.steps[f] = steps;
+        }
+        // The compilations that may read them: those whose files include
+        // them, under whatever conditions (all, where a file every one
+        // reads first does).
+        let mut up: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for (g, steps) in self.steps.iter().enumerate() {
+            for step in steps {
+                if let Step::Include { files } = step {
+                    files.iter().for_each(|&t| up[t as usize].push(g as u32));
+                }
+            }
+        }
+        let mut reach = vec![false; n];
+        let mut work: Vec<u32> = fresh.iter().map(|(f, _)| *f as u32).collect();
+        while let Some(f) = work.pop() {
+            if !std::mem::replace(&mut reach[f as usize], true) {
+                work.extend(up[f as usize].iter().copied().filter(|&g| !reach[g as usize]));
+            }
+        }
+        let readers: Vec<u32> = if self.read_first.iter().any(|&f| reach[f as usize]) { self.roots.clone() } else { self.roots.iter().copied().filter(|&r| reach[r as usize]).collect() };
+        if readers.len() > 64.max(self.roots.len() / 8) {
+            return None;
+        }
+        let changed: Vec<usize> = fresh.iter().map(|(f, _)| *f).collect();
+        let mut w = World {
+            paths,
+            why: FxHashMap::default(),
+            why_found: Default::default(),
+            why_unit: None,
+            why_lines: vec![Vec::new(); n],
+            ids: std::mem::take(&mut self.ids),
+            slots: self.slots,
+            once: std::mem::take(&mut self.once),
+            pass: AtomicU64::new(0),
+            dir: std::mem::take(&mut self.dir),
+            plain: conditions,
+            told: conditions.clone(),
+            unseen: conditions.clone(),
+            seen: Vec::new(),
+            reached: (0..n).map(|_| AtomicBool::new(false)).collect(),
+            traced: std::mem::take(&mut self.traced),
+            steps: std::mem::take(&mut self.steps),
+            spent: AtomicU64::new(0),
+            stop: AtomicBool::new(false),
+        };
+        let fresh_seen = |w: &World| -> Vec<Vec<AtomicU8>> { w.steps.iter().map(|s| (0..s.len()).map(|_| AtomicU8::new(0)).collect()).collect() };
+        // Each pass as `read_tree` reads it: the readers of those files,
+        // and of what they find only those files' conditions. (Within what
+        // the whole tree may take: as it took, and as much again as the
+        // readers take now.)
+        let read = |w: &World, first: bool| -> Option<Vec<Vec<u8>>> {
+            w.pass.store(PASSES.fetch_add(1, Relaxed), Relaxed);
+            let whole = readers.par_iter().all(|&root| Unit::of(w, root, &self.read_first, first, false).spent <= MOST_IN_ONE);
+            let within = !w.stop.load(Relaxed) && self.spent + w.spent.load(Relaxed) <= most_steps();
+            (whole && within).then(|| changed.iter().map(|&f| w.seen[f].iter().map(|s| s.load(Relaxed)).collect()).collect())
+        };
+        w.seen = fresh_seen(&w);
+        let first = read(&w, true);
+        let undecided = |steps: &[Step], seen: &[u8]| steps.iter().zip(seen).any(|(step, &s)| matches!(step, Step::If { .. } | Step::Elif { .. }) && !matches!(s, 0..=2));
+        let outcome = first.and_then(|first| {
+            // (A file left unread is as it was found, its readers not read.)
+            for (&f, seen) in changed.iter().zip(&first).filter(|(&f, _)| !self.unread[f]) {
+                w.traced[f] = undecided(&w.steps[f], seen);
+            }
+            let passes = if !self.outright.is_empty() || w.traced.iter().any(|t| *t) { 2 } else { 1 };
+            if passes != self.passes {
+                return None;
+            }
+            if passes == 1 {
+                return Some(first);
+            }
+            if !self.outright.is_empty() {
+                w.told = conditions.with_undefined(self.outright.iter().cloned());
+            }
+            w.unseen = conditions.with_undefined(self.unseen.iter().cloned());
+            w.seen = fresh_seen(&w);
+            w.spent = AtomicU64::new(0);
+            read(&w, false)
+        });
+        let mut now = verdicts.clone();
+        let outcome = outcome.and_then(|seen| {
+            for (&f, seen) in changed.iter().zip(&seen) {
+                let split = w.traced[f] && !self.unread[f] && w.steps[f].iter().zip(seen).any(|(step, &s)| matches!(step, Step::If { .. } | Step::Elif { .. }) && s & 3 != 0 && !matches!(s, 1 | 2));
+                if split || self.split[f] {
+                    return None;
+                }
+                now[f] = if self.unread[f] {
+                    Vec::new()
+                } else {
+                    w.steps[f]
+                        .iter()
+                        .zip(seen)
+                        .filter_map(|(step, &s)| {
+                            let (Step::If { at, .. } | Step::Elif { at, .. }) = step else { return None };
+                            match s {
+                                s if s == 1 << Tri::True as u8 => Some((*at, true)),
+                                s if s == 1 << Tri::False as u8 => Some((*at, false)),
+                                _ => None,
+                            }
+                        })
+                        .collect()
+                };
+            }
+            Some(())
+        });
+        rayon::broadcast(|_| KEPT.with(|k| std::mem::take(&mut *k.borrow_mut())));
+        KEPT.with(|k| std::mem::take(&mut *k.borrow_mut()));
+        let World { steps, ids, once, dir, traced, .. } = w;
+        (self.steps, self.ids, self.once, self.dir, self.traced) = (steps, ids, once, dir, traced);
+        outcome.map(|()| Some(now))
+    }
+}
+
 /// Read every compilation of the tree: `paths` as the files are indexed,
 /// `scripts` their directives. `None` when the tree is too much to read.
 pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -> Option<Verdicts> {
@@ -789,6 +1250,12 @@ pub fn verdicts(paths: &[String], scripts: &[Script], conditions: &Conditions) -
 /// The same, and how each compilation reads the headers compiled more
 /// than one way.
 pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) -> Option<(Verdicts, Readings)> {
+    read_tree_kept(paths, scripts, conditions).0
+}
+
+/// The same, and what working it out again after an edit takes from
+/// (see [`Tree`]).
+pub fn read_tree_kept(paths: &[String], scripts: &[Script], conditions: &Conditions) -> (Option<(Verdicts, Readings)>, Tree) {
     let n = paths.len();
     // The names a condition can be asked about: those the conditions
     // name, and those the values of such names name (in the sources or
@@ -799,53 +1266,32 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
             names_in(expr, |name| _ = asked.insert(name));
         }
     }
-    loop {
-        let before = asked.len();
-        let set: Vec<&[u8]> = asked.iter().filter_map(|n| conditions.setting(n)).collect();
-        for value in set {
-            names_in(value, |name| _ = asked.insert(name));
+    // (Each name's values in the sources, gathered once: a name asked
+    // about asks about what they name, and so on.)
+    let mut values: FxHashMap<&[u8], Vec<&[u8]>> = FxHashMap::default();
+    for op in scripts.iter().flat_map(|s| &s.ops) {
+        if let Op::Define { name, value } = op {
+            values.entry(&name[..]).or_default().push(&value[..]);
         }
-        for op in scripts.iter().flat_map(|s| &s.ops) {
-            if let Op::Define { name, value } = op {
-                if asked.contains(&name[..]) {
-                    names_in(value, |name| _ = asked.insert(name));
-                }
+    }
+    let mut work: Vec<&[u8]> = asked.iter().copied().collect();
+    while let Some(n) = work.pop() {
+        let mut ask = |name| {
+            if asked.insert(name) {
+                work.push(name);
             }
-        }
-        if asked.len() == before {
-            break;
-        }
-    }
-    // Which file an include reads: the one beside the includer, else the
-    // ones of that name nearest to it.
-    let by_path: FxHashMap<&str, u32> = paths.iter().enumerate().map(|(i, p)| (p.as_str(), i as u32)).collect();
-    let mut by_base: FxHashMap<&str, Vec<u32>> = FxHashMap::default();
-    for (i, p) in paths.iter().enumerate() {
-        by_base.entry(p.rsplit('/').next().unwrap_or(p)).or_default().push(i as u32);
-    }
-    let files_of = |from: &str, name: &[u8]| -> Vec<u32> {
-        let name = String::from_utf8_lossy(name);
-        let dir = dir_of(from);
-        if let Some(&id) = by_path.get(join(dir, &name).as_str()) {
-            return vec![id];
-        }
-        let tail = join("", &name);
-        let named = by_base.get(tail.rsplit('/').next().unwrap_or(&tail)).map_or(&[][..], |v| &v[..]);
-        let fits = |id: &&u32| {
-            let p = paths[**id as usize].as_str();
-            p == tail || p.ends_with(&tail) && p.as_bytes()[p.len() - tail.len() - 1] == b'/'
         };
-        let near = |id: u32| dir.split('/').zip(dir_of(&paths[id as usize]).split('/')).take_while(|(a, b)| a == b).count();
-        let mut fitting: Vec<u32> = named.iter().filter(fits).copied().collect();
-        // (Of a folder the build compiles, where one is: not another
-        // architecture's.)
-        let built = |c: &u32| !crate::link::outside(&paths[*c as usize], conditions.not_built());
-        if fitting.iter().any(built) {
-            fitting.retain(built);
+        if let Some(value) = conditions.setting(n) {
+            names_in(value, &mut ask);
         }
-        let nearest = fitting.iter().map(|&c| near(c)).max();
-        fitting.into_iter().filter(|&c| Some(near(c)) == nearest).collect()
-    };
+        for value in values.get(n).into_iter().flatten() {
+            names_in(value, &mut ask);
+        }
+    }
+    let values_len = values.len();
+    drop(values);
+    let resolve = Resolve::new(paths, conditions.not_built());
+    let files_of = |from: &str, name: &[u8]| resolve.files(from, name);
     let mut ids: FxHashMap<Box<[u8]>, u32> = FxHashMap::default();
     for op in scripts.iter().flat_map(|s| &s.ops) {
         if let Op::Define { name, .. } | Op::Undef { name } = op {
@@ -855,37 +1301,8 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         }
     }
     let mut included = vec![false; n];
-    let mut steps: Vec<Vec<Step>> = scripts
-        .par_iter()
-        .zip(paths)
-        .map(|(script, path)| {
-            let cut = |b: &[u8]| -> Box<[u8]> { b.into() };
-            script
-                .ops
-                .iter()
-                .filter_map(|op| {
-                    Some(match op {
-                        Op::If { at, kind, expr } => Step::If { at: *at, kind: *kind, expr: cut(expr), slot: u32::MAX },
-                        Op::Elif { at, kind, expr } => Step::Elif { at: *at, kind: *kind, expr: cut(expr), slot: u32::MAX },
-                        Op::Else => Step::Else,
-                        Op::Endif => Step::Endif,
-                        // (What the settings say of a name has the last word.)
-                        Op::Define { name, value } if asked.contains(&name[..]) && !conditions.settles(name) => Step::Define { id: ids[&name[..]], name: cut(name), value: cut(value) },
-                        Op::Undef { name } if asked.contains(&name[..]) && !conditions.settles(name) => Step::Undef { id: ids[&name[..]], name: cut(name) },
-                        Op::Define { .. } | Op::Undef { .. } => return None,
-                        // (`<assert.h>` is the C library's, not a header of
-                        // that name somewhere in the tree.)
-                        Op::Include { name, quoted: false } if standard_header(name) => return None,
-                        Op::Include { name, quoted } => match files_of(path, name) {
-                            files if !files.is_empty() => Step::Include { files: files.into() },
-                            _ if *quoted => Step::Unseen,
-                            _ => return None,
-                        },
-                    })
-                })
-                .collect()
-        })
-        .collect();
+    let asks = |name: &[u8]| asked.contains(name);
+    let mut steps: Vec<Vec<Step>> = scripts.par_iter().zip(paths).map(|(script, path)| steps_of(script, path, &resolve, &asks, &ids, conditions).expect("every name numbered")).collect();
     for step in steps.iter().flatten() {
         if let Step::Include { files } = step {
             files.iter().for_each(|&f| included[f as usize] = true);
@@ -909,16 +1326,8 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
             }
         }
     }
-    for step in steps.iter_mut().flatten() {
-        if let Step::Include { files } = step {
-            if files.len() > 1 {
-                let most = files.iter().map(|&f| from_elsewhere[dir[f as usize] as usize]).max().unwrap_or(0);
-                let near: Box<[u32]> = files.iter().copied().filter(|&f| from_elsewhere[dir[f as usize] as usize] == most).collect();
-                if most > 0 && near.len() < files.len() {
-                    *files = near;
-                }
-            }
-        }
+    for steps in steps.iter_mut() {
+        narrow(steps, &from_elsewhere, &dir);
     }
     // What a compilation starts from: a file that is not a header, or a
     // header nothing here includes (it is somebody's, out of sight).
@@ -1041,35 +1450,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
             .par_iter()
             .fold(Default::default, |mut all: (FxHashSet<Vec<u8>>, Vec<u32>), &root| {
                 let t = std::time::Instant::now();
-                let mut unit = Unit {
-                    w,
-                    local: Local::default(),
-                    // A header nothing here includes is included by
-                    // something out of sight, after who knows what.
-                    unseen: crate::is_header(&paths[root as usize]),
-                    read: FxHashMap::default(),
-                    outright: first.then(FxHashSet::default),
-                    reading: FxHashMap::default(),
-                    states: vec![0; w.ids.len()],
-                    kept: Default::default(),
-                    spent: 0,
-                    prof: profile.then_some([0; 5]),
-                    traces: FxHashMap::default(),
-                    journal: None,
-                    before: FxHashMap::default(),
-                    dirs: FxHashSet::default(),
-                    under_here: None,
-                    under: FxHashMap::default(),
-                    root,
-                    files: Some(FxHashMap::default()),
-                    unknown_why: FxHashMap::default(),
-                };
-                for &f in read_first.iter().filter(|&&f| f != root) {
-                    unit.read.insert(f, true);
-                    unit.read(f, false, 0);
-                }
-                unit.read.insert(root, true);
-                unit.read(root, false, 0);
+                let unit = Unit::of(w, root, &read_first, first, profile);
                 if let Some(p) = unit.prof {
                     let mut k = kept_counts.lock().unwrap();
                     (0..3).for_each(|i| k[i] += unit.kept.get()[i]);
@@ -1109,38 +1490,81 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         .filter_map(|(s, _)| crate::mask::guard_name(&s.ops))
         .filter(|g| !conditions.settles(g))
         .collect();
+    // (Names some file defines as a guard within it, each with the files
+    // that define it: whether one is a guard depends on who else tests it.)
+    let candidates: FxHashMap<Box<[u8]>, Vec<usize>>;
     // And a guard within a file (`#ifndef __CORE_CM4_H_DEPENDANT`, a bare
     // `#define` of it next): a name every definition of which is such, and
     // no other file tests (`support_p` another tests is a switch).
     {
-        let mut inner: FxHashMap<Vec<u8>, (bool, FxHashSet<usize>)> = FxHashMap::default();
-        for (f, s) in scripts.iter().enumerate() {
-            for (k, op) in s.ops.iter().enumerate() {
-                if let Op::Define { name, value } = op {
-                    let guarded = k > 0 && matches!(&s.ops[k - 1], Op::If { kind: 2, expr, .. } if expr == name) && value.is_empty();
-                    let e = inner.entry(name.clone()).or_insert((true, FxHashSet::default()));
-                    e.0 &= guarded;
-                    e.1.insert(f);
+        // (Only a name some file defines so can be one: those first, then
+        // whether every definition of each is so, all files at once.)
+        let guarded = |s: &crate::mask::Script, k: usize| match &s.ops[k] {
+            Op::Define { name, value } => k > 0 && matches!(&s.ops[k - 1], Op::If { kind: 2, expr, .. } if expr == name) && value.is_empty(),
+            _ => false,
+        };
+        let found: Vec<Vec<&[u8]>> = scripts
+            .par_iter()
+            .map(|s| (0..s.ops.len()).filter(|&k| guarded(s, k)).filter_map(|k| if let Op::Define { name, .. } = &s.ops[k] { Some(&name[..]) } else { None }).collect())
+            .collect();
+        // name -> (every definition so, the files defining it).
+        let mut inner: FxHashMap<&[u8], (bool, Vec<usize>)> = FxHashMap::default();
+        for &name in found.iter().flatten() {
+            inner.entry(name).or_insert((true, Vec::new()));
+        }
+        let defining: Vec<Vec<(&[u8], bool)>> = scripts
+            .par_iter()
+            .map(|s| {
+                let mut out = Vec::new();
+                for (k, op) in s.ops.iter().enumerate() {
+                    if let Op::Define { name, .. } = op {
+                        if inner.contains_key(&name[..]) {
+                            out.push((&name[..], guarded(s, k)));
+                        }
+                    }
+                }
+                out
+            })
+            .collect();
+        for (f, list) in defining.iter().enumerate() {
+            for &(name, so) in list {
+                let e = inner.get_mut(name).expect("a name found");
+                e.0 &= so;
+                if e.1.last() != Some(&f) {
+                    e.1.push(f);
                 }
             }
         }
         inner.retain(|n, e| e.0 && !conditions.settles(n));
-        for (f, s) in scripts.iter().enumerate() {
-            for op in &s.ops {
-                if let Op::If { expr, .. } | Op::Elif { expr, .. } = op {
-                    names_in(expr, |n| {
-                        if let Some(e) = inner.get_mut(n) {
-                            if !e.1.contains(&f) {
-                                e.0 = false;
+        candidates = inner.iter().map(|(&n, e)| (n.into(), e.1.clone())).collect();
+        let testing: Vec<Vec<&[u8]>> = scripts
+            .par_iter()
+            .map(|s| {
+                let mut out = Vec::new();
+                for op in &s.ops {
+                    if let Op::If { expr, .. } | Op::Elif { expr, .. } = op {
+                        names_in(expr, |n| {
+                            if inner.contains_key(n) {
+                                out.push(n);
                             }
-                        }
-                    });
+                        });
+                    }
+                }
+                out
+            })
+            .collect();
+        for (f, names) in testing.iter().enumerate() {
+            for &n in names {
+                let e = inner.get_mut(n).expect("a name kept");
+                if e.1.binary_search(&f).is_err() {
+                    e.0 = false;
                 }
             }
         }
-        guards.extend(inner.into_iter().filter(|(_, e)| e.0).map(|(n, _)| n));
+        guards.extend(inner.into_iter().filter(|(_, e)| e.0).map(|(n, _)| n.to_vec()));
     }
     w.unseen = conditions.with_undefined(guards.iter().cloned());
+    let mut unseen_names = guards.clone();
     outright.extend(guards);
     // So is a name defined only in files no compilation reads (another
     // chip's header): no source a compilation reads brings it in.
@@ -1158,6 +1582,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         let elsewhere: Vec<Vec<u8>> = defining.into_iter().filter(|(n, (read, _))| !read && !conditions.settles(n) && !crate::cond::builtin(n)).map(|(n, _)| n.to_vec()).collect();
         // (Nor does a header the build makes.)
         w.unseen = w.unseen.with_undefined(elsewhere.iter().cloned());
+        unseen_names.extend(elsewhere.iter().cloned());
         outright.extend(elsewhere);
     }
     if profile {
@@ -1176,8 +1601,36 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         }
         eprintln!("units     {} roots of {} files, {} steps, {} names defined outright, {} compilations left{}", roots.len(), n, w.spent.load(Relaxed), outright.len(), left.len(), if w.stop.load(Relaxed) { ", given up" } else { "" });
     }
+    let outright_all: Vec<Vec<u8>> = outright.iter().cloned().collect();
+    let mut spent = w.spent.load(Relaxed);
+    // What working it out again takes from, as it stands now.
+    let keep = |w: World, passes: u8, gave_up: bool, spent: u64, split: Vec<bool>, unread: Vec<bool>| Tree {
+        steps: w.steps,
+        asked: asked.iter().map(|&n| n.into()).collect(),
+        ids: w.ids,
+        slots: w.slots,
+        once: w.once,
+        dir: w.dir,
+        from_elsewhere: from_elsewhere.clone(),
+        read_first: read_first.clone(),
+        roots: roots.clone(),
+        candidates: candidates.clone(),
+        outright: outright_all.clone(),
+        unseen: unseen_names.clone(),
+        passes,
+        traced: w.traced,
+        split,
+        unread,
+        spent,
+        gave_up,
+        defined: {
+            let mut d = Defined::new(values_len);
+            scripts.iter().for_each(|s| d.add_of(s));
+            d
+        },
+    };
     if w.stop.load(Relaxed) {
-        return None;
+        return (None, keep(w, 1, true, spent, vec![false; n], vec![false; n]));
     }
     // A file some reading left open or decided otherwise than another is
     // one each compilation's reading of is kept (knowing the names
@@ -1186,7 +1639,8 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         w.steps[f].iter().zip(&w.seen[f]).any(|(step, seen)| matches!(step, Step::If { .. } | Step::Elif { .. }) && !matches!(seen.load(Relaxed), 0..=2))
     };
     w.traced = (0..n).map(|f| undecided(&w, f)).collect();
-    if !outright.is_empty() || w.traced.iter().any(|t| *t) {
+    let passes = if !outright.is_empty() || w.traced.iter().any(|t| *t) { 2 } else { 1 };
+    if passes == 2 {
         if !outright.is_empty() {
             w.told = conditions.with_undefined(outright);
         }
@@ -1196,8 +1650,9 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
         // (What the first reading kept, this one keeps anew.)
         read_as.lock().unwrap().clear();
         left = read_all(&w, false).1;
+        spent = spent.max(w.spent.load(Relaxed));
         if w.stop.load(Relaxed) {
-            return None;
+            return (None, keep(w, 2, true, spent, vec![false; n], vec![false; n]));
         }
     }
     rayon::broadcast(|_| KEPT.with(|k| std::mem::take(&mut *k.borrow_mut())));
@@ -1325,7 +1780,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
             *way = vec![Tri::Unknown as u8; stretches].into();
         }
     }
-    Some((verdicts, readings))
+    (Some((verdicts, readings)), keep(w, passes, false, spent, split, unread))
 }
 
 #[cfg(test)]
@@ -1346,6 +1801,66 @@ mod tests {
 
     fn one(line: &str, holds: bool) -> (String, bool) {
         (line.to_string(), holds)
+    }
+
+    /// The tree `files` read, then file `f` changed to `text`: what
+    /// `Tree::again` makes of it, and what reading the tree anew does.
+    fn again(files: &[(&str, &str)], f: usize, text: &str) -> (Option<Option<Verdicts>>, Option<Verdicts>) {
+        let paths: Vec<String> = files.iter().map(|f| f.0.to_string()).collect();
+        let mut scripts: Vec<Script> = files.iter().map(|f| crate::mask::script(f.1.as_bytes())).collect();
+        let conditions = Conditions::default();
+        let (read, mut tree) = read_tree_kept(&paths, &scripts, &conditions);
+        let verdicts = read.map(|r| r.0).unwrap_or_default();
+        scripts[f] = crate::mask::script(text.as_bytes());
+        let got = tree.again(&paths, &[(f, &scripts[f])], &conditions, &verdicts);
+        (got, read_tree(&paths, &scripts, &conditions).map(|r| r.0))
+    }
+
+    #[test]
+    fn ifs_around_code_alone_are_worked_out_again_from_who_reads_the_file() {
+        let files = [
+            ("a.c", "#define MODE 1\n#include \"h.h\"\nint a (void) { return 0; }\n"),
+            ("b.c", "#define MODE 2\n#include \"h.h\"\n#ifdef MODE\nint b;\n#endif\n"),
+            ("h.h", "#ifndef H_H\n#define H_H\n#ifdef MODE\nint on (void);\n#endif\n#endif\n"),
+            ("c.c", "#if defined (OTHER)\nint c;\n#endif\n"),
+            ("d.c", "#define LATE 1\n#ifdef LATE\n#endif\n"),
+        ];
+        let edits = [
+            // A source file's code put under #ifs, decided and not.
+            (0, "#define MODE 1\n#include \"h.h\"\n#ifdef MODE\nint a (void) { return 0; }\n#else\nint a (void) { return 1; }\n#endif\n#ifdef OTHER\n#endif\n"),
+            // A header's, read by both: what its new #ifs come to decided.
+            (2, "#ifndef H_H\n#define H_H\n#ifdef MODE\nint on (void);\n#if MODE > 0\nint one (void);\n#endif\n#endif\n#ifndef MODE\nint off (void);\n#endif\n#endif\n"),
+            // An #if taken out.
+            (3, "int c;\n"),
+            // One before a name's definition outright: not defined there,
+            // as the second reading knows.
+            (4, "#ifdef LATE\nint early;\n#endif\n#define LATE 1\n#ifdef LATE\n#endif\n"),
+        ];
+        for (f, text) in edits {
+            let (got, anew) = again(&files, f, text);
+            assert_eq!(got, Some(anew), "{}", files[f].0);
+        }
+    }
+
+    #[test]
+    fn what_decides_how_others_read_a_file_is_worked_out_anew() {
+        let files = [
+            ("a.c", "#include \"h.h\"\n#define LOCAL 1\nint a (void) { return 0; }\n"),
+            ("h.h", "#ifdef LOCAL\nint on (void);\n#endif\n"),
+            ("g.h", "#ifndef G_H\n#define G_H\n#ifndef G_INNER\n#define G_INNER\n#endif\n#endif\n"),
+            ("k.h", "#define KNOWN_ELSEWHERE 2\n"),
+        ];
+        // A definition put under an #if; a name no #if asked about that a
+        // file defines; a guard within a file tested by another.
+        for text in ["#include \"h.h\"\n#ifdef LOCAL\n#define LOCAL 1\n#endif\n", "#include \"h.h\"\n#define LOCAL 1\n#if KNOWN_ELSEWHERE > 1\n#endif\n", "#include \"h.h\"\n#define LOCAL 1\n#ifdef G_INNER\n#endif\n"] {
+            assert_eq!(again(&files, 0, text).0, None, "{text}");
+        }
+        // One no file defines asks nothing of the others.
+        let (got, anew) = again(&files, 0, "#include \"h.h\"\n#define LOCAL 1\n#ifdef NEVER_DEFINED\nint a (void) { return 0; }\n#endif\n");
+        assert_eq!(got, Some(anew));
+        // A header two compilations read two ways: its readings are kept.
+        let files = [("a.c", "#define MODE 1\n#include \"h.h\"\n"), ("b.c", "#include \"h.h\"\n"), ("h.h", "#ifdef MODE\nint on (void);\n#endif\n")];
+        assert_eq!(again(&files, 2, "#ifdef MODE\nint on (void);\n#endif\n#ifdef MODE\n#endif\n").0, None);
     }
 
     #[test]
