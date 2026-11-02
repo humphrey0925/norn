@@ -1,19 +1,21 @@
 # Changelog
 
-## Unreleased
+## 0.26.0
+
+**For AI agents, C++ as clang reads it, and saving after an `#if` in seconds**
 
 ### For AI agents
 
-- `norn mcp`: a Model Context Protocol server, for Claude Code, VS Code's Copilot, Cursor and other agents. Its tools find definitions, callers and callees (through macros and function pointers stored in members or variables, as the rest of Norn), references, call trees, a definition's source, and which lines the build compiles, answered as text for the agent to read. It watches the tree as the extension does: only the files an agent edits are read again, a changed build configuration has the whole tree looked at, and with nothing changed an answer reads nothing. The index is kept between runs as `live` keeps it. See [the command line](docs/cli.md#mcp).
+- `norn mcp`: a Model Context Protocol server, for Claude Code, VS Code's Copilot, Cursor and other agents. Its tools find definitions, callers and callees (through macros and function pointers stored in members or variables, as the rest of Norn), references, call trees, a definition's source, and which lines the build compiles, answered as text for the agent to read. It watches the tree as the extension does: only the files an agent edits are read again, a changed build configuration has the whole tree looked at, and with nothing changed an answer reads nothing. The index is kept between runs as `live` keeps it. See [the command line](https://github.com/humphrey0925/norn/blob/master/docs/cli.md#mcp).
 - One project, one index: the agents' `norn mcp`s of a project and VS Code's language server share the index the first of them makes (the language server taking it over when it starts), instead of each making its own. Who holds which project is kept in `~/.norn/run`; the others are answered from it on this machine only. If the holder ends, another takes over from the index kept on disk.
 - `norn setup`: the agents on this machine set up in one go. It puts the server at `~/.norn/bin`, a path that does not move, and sets up Claude Code (through `claude mcp add --scope user`), Codex (`~/.codex/config.toml`) and OpenCode (`~/.config/opencode/opencode.json`) to start it; only Norn's own entry is written, comments and the rest left as they were. `--remove` takes it out again. In VS Code: **Norn: Connect AI Agents**, and each start of the extension brings `~/.norn/bin`'s copy up to date, if there is one.
 - Two more tools: `list_configurations` (the build configurations, which is in force, what it defines) and `switch_configuration` (another in force, as **Switch Compile Configuration…** does, and the index in line with it). Calls whose line is under an `#if` the configuration does not settle are marked `[maybe not compiled: under the #if at line N]` in every list.
 - `read_file` and `search_code`: reading and searching C/C++ as the build sees it. `read_file` numbers a file's lines and says on a line of its own where a stretch the configuration does not compile begins (`>>> not compiled under X (lines a–b)`) and ends (`<<< end of not compiled`): the code is there, this build does not have it. The same for a stretch under an `#if` it does not settle; `hide_inactive` folds what is not compiled into that line. `search_code` is grep over the project's C/C++ files that leaves out matches where the configuration does not compile them, says how many it left out, and gives each match the function it is in. `read_symbol` shows its code the same way. A tool given a file takes it as `file` or as `path`, the name agents try first.
-- A skill, `norn` ([`skills/norn/SKILL.md`](skills/norn/SKILL.md)), that tells an agent to set the build configuration first and use the tools rather than grep for C and C++ symbols. `norn setup` puts it where Claude Code (`~/.claude/skills`), Codex, OpenCode and VS Code's Copilot (`~/.agents/skills`) read skills; tried with Claude Code 2.1.309, Codex CLI 0.164.0 and OpenCode 1.19.4.
+- A skill, `norn` ([`skills/norn/SKILL.md`](https://github.com/humphrey0925/norn/blob/master/skills/norn/SKILL.md)), that tells an agent to set the build configuration first and use the tools rather than grep for C and C++ symbols. `norn setup` puts it where Claude Code (`~/.claude/skills`), Codex, OpenCode and VS Code's Copilot (`~/.agents/skills`) read skills; tried with Claude Code 2.1.309, Codex CLI 0.164.0 and OpenCode 1.19.4.
 - VS Code offers it: a little after it starts, if Claude Code, Codex or OpenCode is on the machine without Norn, it asks once (**Connect** / **Not Now**), and not again about that agent. `norn setup --status` says which agents are there and which are set up, reading their settings only.
 - One line installs it without VS Code: `curl -fsSL https://norn-c.com/install.sh | sh` (Linux, macOS) or `irm https://norn-c.com/install.ps1 | iex` (Windows) downloads `norn` from the latest release, checks it against the release's `SHA256SUMS`, puts it at `~/.norn/bin`, and runs `norn setup` (`NORN_DOWNLOAD_URL` for a mirror of the release's files). CI runs both, Windows PowerShell 5.1 included.
 - The website has a section for AI agents, in English and Traditional Chinese.
-- A guide: [Norn for AI agents](docs/agents.md) ([繁體中文](docs/agents.zh-TW.md)): setting the agents up, how they should use the tools, build configurations, and what to do when something is wrong.
+- A guide: [Norn for AI agents](https://github.com/humphrey0925/norn/blob/master/docs/agents.md) ([繁體中文](https://github.com/humphrey0925/norn/blob/master/docs/agents.zh-TW.md)): setting the agents up, how they should use the tools, build configurations, and what to do when something is wrong.
 - Which project: the folder given, else the one the client says it has open (MCP roots), else the current folder, but never the home folder or the root of the file system, where a desktop app starts a server: there each tool says how to name the project instead of the server indexing the home folder.
 - In VS Code, nothing to set up: the extension offers the same tools to Copilot's agent mode and the other agents VS Code serves MCP servers to, answered by the language server it already runs (`si/mcp`), from the index the editor has, kept up to date as the editor keeps it: no second index, nothing more in memory. VS Code 1.101 or later; `norn.mcp.enabled` turns it off.
 
@@ -21,6 +23,43 @@
 
 - A function stored in a struct's initializer under an `#elif` is stored: `{ #if A fa, #elif B fb, #else fc #endif }` had only `fa` and `fc` (each `#if` group of an initializer was read by its first branch and its `#else`; now by each of its branches). And under a configuration, a branch it switches off in an initializer stores nothing, as anywhere else.
 - `find_callees` (MCP) lists, at a macro a function uses, what the macro calls there, through members and variables too: for `LOG("x")` that is `con.send("x")`, the functions `send` can hold, marked `— via macro LOG`, as `find_callers` of those functions already listed the function.
+
+- An include from a source file is looked up first from the outermost folder it is in that holds the name (`<rpc/util.h>` in Bitcoin Core's `src/rpc/mempool.cpp` is `src/rpc/util.h`, not `src/wallet/rpc/util.h`), as the build's `-I` would have it.
+- An include is not looked up in another program's copy of the tree (Linux's `tools/include/`, a copy of `include/`) where the tree has the file itself: through `tools/include/asm/barrier.h`, the copies of the kernel's headers came into every compilation, and `list_for_each_entry` had two definitions everywhere.
+
+### C++
+
+- What macros write in a class's body is the class's: gmock's `MOCK_METHOD`, gtest's `TEST` and `TEST_F` classes, gmock's `MATCHER_P` and `ACTION_P`; a constructor's initializers are calls of its bases' constructors. gmock's preprocessor loops (`GMOCK_PP_FOR_EACH`) expand in full, and an argument a macro only pastes onto another name (`EXPECT_CALL (mock, OnScalar (...))`, which makes `gmock_OnScalar`) is no reference of its own.
+- `__LINE__` is the line of its use, and `__COUNTER__` counts a file's uses in order, as clang does (Catch2's `TEST_CASE` makes `CATCH2_INTERNAL_TEST_0`, `_2`, ...).
+- A macro written as a whole template parameter (`template <class T, REQUIRES (...)>`) no longer loses the class around it; a function an expansion defines may return a template or a reference (`::testing::MockSpec<F> gmock_OnScalar (...) const`).
+- A member a macro calls is called on what the expansion says: an object it declares, a local of the function, a member of the method's class, a class template's argument it derives from (`StrictMock<MockHandler>`).
+- Fewer calls to the wrong method: a plain call in a method is of its class, its bases, the free functions, or a `static` method (only where a macro writes the call); a call only another source file's classes have a method for is none of them; an overload only declared beside inline ones is the one defined in a source file; an alias or a free operator a source file does not see is none of its; a method of a class that is an alias in another reading is one reading, not a certain call.
+- Measured against clang on six more C++ projects: Ninja, GoogleTest, Abseil, yaml-cpp, spdlog and Cppcheck. Against clang: Cppcheck definitions 94.6% → 99.7%, calls found 62.9% → 84.2%; yaml-cpp calls found 65.6% → 86.7%, certain calls 62.9% → 83.9%; GoogleTest definitions 83.8% → 94.7%, calls found 79.2% → 85.3%; spdlog calls found 50.9% → 77.1%; LevelDB definitions 88.2% → 96.9%. C projects unchanged or better.
+
+### Callers of a name called everywhere
+
+- `callers printk` on Linux killed `norn live` (out of memory on a 15 GB machine): the answer listed a row once per definition and macro it was reached through, 11.2 million rows for `printk`'s 0.6 million. Each row is now listed once (`pr_err` 402,036, `WARN_ON` 232,066), the answer is written as it is found, and it lists at most 1,000,000 rows: `count` is of all, `"truncated": true` says some were left out, and a request can ask for fewer with `"limit"`. On the kernel, `printk` answers in 3.7 s.
+- In VS Code, the call hierarchy and the Relation view of such a name answer in under a second (158 s, and none in 180 s, before).
+
+### Saving a file
+
+On the Linux kernel, measured on a 4-core, 15 GB Linux VM (not the machine of [the benchmarks](https://github.com/humphrey0925/norn/blob/master/docs/benchmarks/README.md)), each against the version before it:
+
+- An edit that puts code under an `#ifdef` or takes it out, configured kernel (x86_64 defconfig): about 70 s → 7.6 s. What each compilation's conditions come to is worked out again from the compilations that read the file alone, where no definition or include moved into or out of a branch; and the link resolves again only the file and the files that name what it defines.
+- A `#define`'s value changed, kernel without a configuration: 37 s → 9–11 s (the macro sets are kept when the definitions they read are as they were, and only the files told otherwise are read again).
+- An edit that changes no definition: the link resolves again only what the edit can change, 12–13 s → 3–4.5 s.
+- A start after files changed while nothing had the tree open (a `git pull`): the link at the start 19.2 s → 8.3 s, ready 43.7 s → 31.0 s; what the last link leaves for the next is saved with the graph.
+- `norn live` saves the graph, and what is left to save, when its input closes, so the next start reads it instead of linking in full.
+
+### Memory
+
+- A file's references are kept packed (about 5 bytes each instead of 16), and a macro expansion's copy of a file's facts shares what it leaves as it was. On the kernel without a configuration (4-core VM): the language server ready 4.7 GB → 4.0 GB (−15%), the peak while indexing 5.4 GB → 4.5 GB (−17%).
+
+### Benchmarks
+
+- [The benchmarks](https://github.com/humphrey0925/norn/blob/master/docs/benchmarks/README.md) are on 21 projects, C and C++, each against clang's view of a real build, and the website's charts are a row per project. Norn is given the build's configuration on FreeRTOS, spdlog and Linux; clangd's C++ answers are matched as C++ (its figures were far too low before).
+
+The first opening after the upgrade builds the index again.
 
 ## 0.25.0
 
