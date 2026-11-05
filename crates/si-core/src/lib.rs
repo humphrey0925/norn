@@ -750,7 +750,17 @@ pub fn definition_at(g: &graph::Graph, file: &str, line: u32, name: &str) -> Vec
     out.sort_unstable();
     out.dedup();
     if out.is_empty() {
-        out.extend_from_slice(g.find(name));
+        // On a definition's own name: that definition, not another of the
+        // name (another file's `static` function of the same name). Else,
+        // a prototype say, every symbol of the name.
+        let all = g.find(name);
+        out.extend(all.iter().copied().filter(|&s| {
+            let y = &g.syms[s as usize];
+            Some(y.file) == here && y.line == line && y.flags & model::flag::DECL == 0
+        }));
+        if out.is_empty() {
+            out.extend_from_slice(all);
+        }
     }
     out
 }

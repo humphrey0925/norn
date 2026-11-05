@@ -123,6 +123,19 @@ impl Packed {
     }
 }
 
+/// A call the conditions in force leave out (see `Session::excluded_calls`):
+/// the file, the function it is in (the file's path, at its top) and that
+/// function's line, the lines of the calls, and those of the `#if`s that
+/// switch them off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Excluded {
+    pub file: String,
+    pub caller: String,
+    pub caller_line: u32,
+    pub lines: Vec<u32>,
+    pub deciding: Vec<u32>,
+}
+
 /// What one `update` did.
 #[derive(Debug, Default)]
 pub struct Update {
@@ -244,6 +257,68 @@ impl Session {
     pub fn facts_of(&self, rel: &str) -> Option<&FileFacts> {
         let path = self.root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
         self.files.binary_search(&path).ok().and_then(|i| self.facts.get(i))
+    }
+
+    /// The calls of `name` on lines the conditions in force switch off,
+    /// which the graph, made under them, does not have: each file whose
+    /// lines switched off name it is read again with no conditions, and its
+    /// calls of the name on those lines taken, with the function each is in
+    /// and the `#if`s that leave it out. By name alone: what such a call
+    /// would reach is not worked out. `file`: only those of that file (a
+    /// `static` function's). At most `most` of them.
+    pub fn excluded_calls(&mut self, name: &str, file: Option<&str>, most: usize) -> Vec<Excluded> {
+        let mut out: Vec<Excluded> = Vec::new();
+        // (A word of the line, not part of a longer one.)
+        let names = |line: &[u8]| {
+            line.windows(name.len()).enumerate().any(|(i, w)| {
+                let edge = |b: Option<&u8>| b.is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+                w == name.as_bytes() && edge(i.checked_sub(1).and_then(|j| line.get(j))) && edge(line.get(i + name.len()))
+            })
+        };
+        let conditions = self.sets.take_conditions();
+        let mut ex = Extractor::new();
+        for i in 0..self.files.len() {
+            let rel = crate::rel_path(&self.root, &self.files[i]);
+            let off = &self.facts[i].inactive;
+            if off.is_empty() || file.is_some_and(|f| f != rel) || out.len() >= most {
+                continue;
+            }
+            let src = std::fs::read(&self.files[i]).unwrap_or_default();
+            let lines: Vec<&[u8]> = src.split(|&b| b == b'\n').collect();
+            let switched_off = |line: u32| off.iter().any(|&(a, b)| a <= line && line <= b);
+            if !off.iter().any(|&(a, b)| (a..=b).any(|l| lines.get(l as usize - 1).is_some_and(|t| names(t)))) {
+                continue;
+            }
+            let all = ex.extract(&rel, &src, &self.sets);
+            for r in all.refs.iter().filter(|r| r.kind == crate::model::refkind::CALL && switched_off(r.line) && all.name(r.name as usize) == name) {
+                let (caller, caller_line) = match all.defs.get(r.scope as usize).filter(|d| d.kind != crate::model::kind::FILE) {
+                    Some(d) => (all.name(d.name as usize).to_string(), d.line),
+                    None => (rel.clone(), 0),
+                };
+                // (The innermost `#if` around it: under no conditions, one
+                // not decided.)
+                let deciding = all.undecided.iter().rev().find(|u| u.0 <= r.line && r.line <= u.1).map_or_else(
+                    || off.iter().find(|&&(a, b)| a <= r.line && r.line <= b).map_or(0, |&(a, _)| a.saturating_sub(1)),
+                    |u| u.2,
+                );
+                match out.iter().position(|e| e.file == rel && e.caller == caller && e.caller_line == caller_line) {
+                    Some(k) => {
+                        out[k].lines.push(r.line);
+                        out[k].deciding.push(deciding);
+                    }
+                    None if out.len() < most => out.push(Excluded { file: rel.clone(), caller, caller_line, lines: vec![r.line], deciding: vec![deciding] }),
+                    None => {}
+                }
+            }
+        }
+        self.sets.set_conditions(conditions);
+        for e in &mut out {
+            e.lines.sort_unstable();
+            e.lines.dedup();
+            e.deciding.sort_unstable();
+            e.deciding.dedup();
+        }
+        out
     }
 
     /// What the settings and the build say is defined.
@@ -1476,6 +1551,45 @@ int slow (void) { return 0; }
         std::fs::remove_file(d.0.join("main.c")).unwrap();
         let up = s.sync();
         assert_eq!((up.added, up.removed, functions(&s, "b"), functions(&s, "main")), (1, 1, 1, 0));
+    }
+
+    #[test]
+    fn on_a_definition_s_own_name_that_definition_is_meant() {
+        let d = Dir::new("own-name");
+        d.write("s1.c", "void target (void);\nstatic void helper (void) { target (); }\nvoid s1_entry (void) { helper (); }\n");
+        d.write("s2.c", "void leaf (void);\nstatic void helper (void) { leaf (); }\nvoid s2_entry (void) { helper (); }\n");
+        let s = Session::open(&d.0, Options::default());
+        let g = &s.graph;
+        let files = |found: Vec<u32>| found.iter().map(|&x| g.file_path(g.syms[x as usize].file).to_string()).collect::<Vec<_>>();
+        // Each file's own `static` function, not the other's.
+        assert_eq!(files(crate::definition_at(g, "s1.c", 2, "helper")), ["s1.c"]);
+        assert_eq!(files(crate::definition_at(g, "s2.c", 2, "helper")), ["s2.c"]);
+        // A call: what it was resolved to.
+        assert_eq!(files(crate::definition_at(g, "s2.c", 3, "helper")), ["s2.c"]);
+    }
+
+    #[test]
+    fn the_calls_the_conditions_switch_off_are_found_by_reading_again_without_them() {
+        let d = Dir::new("excluded");
+        d.write("a.c", "int g_flag;\nstatic void leaf (void) { g_flag = 1; }\nvoid mid (void) { leaf (); }\n#ifdef FEATURE_X\nvoid only_x (void) { mid (); }\n#endif\nvoid top (void) {\n    mid ();\n#if 0\n    leaf ();\n#endif\n}\n");
+        d.write("b.c", "void mid (void);\nvoid top (void);\nvoid other (void) { top (); mid (); }\n#ifdef FEATURE_X\nvoid also (void) { mid (); }\n#endif\n");
+        let mut s = Session::open(&d.0, Options::default());
+        // Nothing configured: FEATURE_X is not decided, nothing is switched off.
+        assert_eq!(functions(&s, "only_x"), 1);
+        assert!(s.excluded_calls("mid", None, 100).is_empty());
+        // What the settings do not define is not defined: those branches are
+        // not indexed, and found again for asking.
+        s.set_conditions(&Settings { assume_undefined: vec!["*".into()], ..Settings::default() }).unwrap();
+        assert_eq!((functions(&s, "only_x"), functions(&s, "also")), (0, 0));
+        let off = |file: &str, caller: &str| Excluded { file: file.into(), caller: caller.into(), caller_line: 5, lines: vec![5], deciding: vec![4] };
+        assert_eq!(s.excluded_calls("mid", None, 100), [off("a.c", "only_x"), off("b.c", "also")]);
+        assert_eq!(s.excluded_calls("mid", Some("b.c"), 100), [off("b.c", "also")]);
+        assert_eq!(s.excluded_calls("mid", None, 1).len(), 1);
+        // (`#if 0` is switched off whatever is configured.)
+        assert!(s.excluded_calls("leaf", Some("a.c"), 100).is_empty());
+        // The conditions are as they were.
+        assert!(s.sets.conditions() == s.conditions());
+        assert_eq!(functions(&s, "only_x"), 0);
     }
 
     #[test]
