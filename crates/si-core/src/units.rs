@@ -69,6 +69,11 @@ pub struct Readings {
     /// the build makes may.
     #[serde(default)]
     pub orphans: Vec<u32>,
+    /// The names the build's files settle that some source file defines
+    /// or undefines too, sorted: where a compilation reads one of these
+    /// differently from the others, the settings are not what it reads.
+    #[serde(default)]
+    pub overridden: Vec<Vec<u8>>,
     /// For each of those (in that order), when it is read only under the
     /// compilation's own file's `#if`s not known: for each way it is
     /// included, the lines of the branches it is included in there.
@@ -849,11 +854,13 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
     let mut ids: FxHashMap<Box<[u8]>, u32> = FxHashMap::default();
     for op in scripts.iter().flat_map(|s| &s.ops) {
         if let Op::Define { name, .. } | Op::Undef { name } = op {
-            if asked.contains(&name[..]) && !conditions.settles(name) && !ids.contains_key(&name[..]) {
+            if asked.contains(&name[..]) && !conditions.forced(name) && !ids.contains_key(&name[..]) {
                 ids.insert(name[..].into(), ids.len() as u32);
             }
         }
     }
+    let mut overridden: Vec<Vec<u8>> = ids.keys().filter(|name| conditions.settles(name)).map(|name| name.to_vec()).collect();
+    overridden.sort_unstable();
     let mut included = vec![false; n];
     let mut steps: Vec<Vec<Step>> = scripts
         .par_iter()
@@ -869,9 +876,13 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
                         Op::Elif { at, kind, expr } => Step::Elif { at: *at, kind: *kind, expr: cut(expr), slot: u32::MAX },
                         Op::Else => Step::Else,
                         Op::Endif => Step::Endif,
-                        // (What the settings say of a name has the last word.)
-                        Op::Define { name, value } if asked.contains(&name[..]) && !conditions.settles(name) => Step::Define { id: ids[&name[..]], name: cut(name), value: cut(value) },
-                        Op::Undef { name } if asked.contains(&name[..]) && !conditions.settles(name) => Step::Undef { id: ids[&name[..]], name: cut(name) },
+                        // (What the settings themselves say of a name has the
+                        // last word. A name the build's files settle is read
+                        // like any other: what a file defines or undefines
+                        // before it includes a header is what the header
+                        // reads, whatever the build began with.)
+                        Op::Define { name, value } if asked.contains(&name[..]) && !conditions.forced(name) => Step::Define { id: ids[&name[..]], name: cut(name), value: cut(value) },
+                        Op::Undef { name } if asked.contains(&name[..]) && !conditions.forced(name) => Step::Undef { id: ids[&name[..]], name: cut(name) },
                         Op::Define { .. } | Op::Undef { .. } => return None,
                         // (`<assert.h>` is the C library's, not a header of
                         // that name somewhere in the tree.)
@@ -1281,6 +1292,7 @@ pub fn read_tree(paths: &[String], scripts: &[Script], conditions: &Conditions) 
     // (What a compilation left unread reaches may be read.)
     let mut readings = Readings {
         unread: (0..n).filter(|&f| !w.reached[f].load(Relaxed) && !unread[f]).map(|f| paths[f].clone()).collect(),
+        overridden,
         ..Default::default()
     };
     let mut number = vec![u32::MAX; n];

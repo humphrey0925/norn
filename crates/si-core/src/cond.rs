@@ -39,7 +39,12 @@
 //! reach anything that undefines it or may define it otherwise: a switch
 //! in a configuration header everything includes is known everywhere, a
 //! macro one `.c` file sets before including a shared header is not known
-//! in that header. Where the file brings the definition in itself, with an
+//! in that header. (A name the build's own files settle is read so too: a
+//! source that `#define`s or `#undef`s it before it includes a header makes
+//! that compilation read the header the other way, and a header the
+//! compilations then read differently is left open at the conditions that
+//! name it. Only what is written in the settings themselves, `defines` and
+//! `undefines`, cannot be changed by a source.) Where the file brings the definition in itself, with an
 //! `#include`, the name is known from the line after that one and not
 //! before. (The order of includes in the files that include it is not
 //! looked at.) `"sourceDefines": false` turns the second off.
@@ -802,6 +807,9 @@ pub struct Conditions {
     assume_built: bool,
     /// Names the sources `#define` somewhere: not for assuming about.
     in_source: FxHashSet<Vec<u8>>,
+    /// Names the settings themselves define or undefine (not those a
+    /// build's files do): a source file cannot change them.
+    forced: FxHashSet<Vec<u8>>,
     /// What the sources define, file by file (see [`Source`]). What the
     /// settings say of a name comes first.
     source: Option<std::sync::Arc<Source>>,
@@ -834,6 +842,12 @@ pub struct Source {
     verdicts: std::sync::Arc<crate::units::Verdicts>,
     /// How each compilation reads the headers compiled more than one way.
     readings: std::sync::Arc<crate::units::Readings>,
+    /// Per file, whether it is one of the headers `readings` has read more
+    /// than one way.
+    split: Vec<bool>,
+    /// `readings.overridden`, to look names up in; and its digest.
+    overridden: FxHashSet<Vec<u8>>,
+    overridden_digest: u64,
 }
 
 fn bits_of(flags: &[bool]) -> Vec<u64> {
@@ -856,6 +870,9 @@ impl Source {
             includes: vec![Vec::new(); paths.len()],
             verdicts: Default::default(),
             readings: Default::default(),
+            split: vec![false; paths.len()],
+            overridden: FxHashSet::default(),
+            overridden_digest: 0,
         }
     }
 
@@ -886,7 +903,29 @@ impl Source {
     }
 
     pub fn set_readings(&mut self, readings: std::sync::Arc<crate::units::Readings>) {
+        self.split = vec![false; self.split.len()];
+        for (path, _) in &readings.files {
+            if let Some(f) = self.files.get(path) {
+                self.split[*f as usize] = true;
+            }
+        }
+        self.overridden = readings.overridden.iter().cloned().collect();
+        self.overridden_digest = readings.overridden.iter().fold(0, |d, n| xxhash_rust::xxh3::xxh3_64_with_seed(n, d));
         self.readings = readings;
+    }
+
+    /// Whether `file` is one the compilations that read it read
+    /// differently, and `expr` (the text of a condition) names something
+    /// the build settles that a source file changes. What the settings say
+    /// of that condition, where they did not all come to the same, is not
+    /// what each of them reads.
+    pub fn split_on(&self, file: u32, expr: &[u8]) -> bool {
+        if !self.split.get(file as usize).copied().unwrap_or(false) || self.overridden.is_empty() {
+            return false;
+        }
+        let mut found = false;
+        crate::units::names_in(expr, |n| found |= self.overridden.contains(n));
+        found
     }
 
     pub fn readings(&self) -> &std::sync::Arc<crate::units::Readings> {
@@ -981,6 +1020,9 @@ impl Source {
         use xxhash_rust::xxh3::xxh3_64_with_seed as h;
         let Some(file) = self.file(path) else { return 0 };
         let mut d = self.verdicts.get(file as usize).map_or(0, |v| v.iter().fold(0, |d, &(at, holds)| h(&at.to_le_bytes(), d + 17 + holds as u64)));
+        if self.split.get(file as usize).copied().unwrap_or(false) {
+            d ^= h(&self.overridden_digest.to_le_bytes(), 18);
+        }
         for (k, values) in &self.names {
             for (v, known, brings) in values {
                 if has(known, file) {
@@ -1174,9 +1216,11 @@ impl Conditions {
         // What is written in the settings themselves has the last word.
         for (name, value) in &settings.defines {
             c.define(name, value);
+            c.forced.insert(name.as_bytes().to_vec());
         }
         for name in &settings.undefines {
             c.undefine(name);
+            c.forced.insert(name.as_bytes().to_vec());
         }
         let prefixes = || settings.assume_undefined.iter().map(|p| p.trim_end_matches('*')).filter(|p| !p.is_empty());
         c.assume_undefined = prefixes().map(|p| p.as_bytes().to_vec()).collect();
@@ -1356,6 +1400,12 @@ impl Conditions {
     /// Whether some source file defines `name`.
     pub fn in_source(&self, name: &[u8]) -> bool {
         self.in_source.contains(name)
+    }
+
+    /// Whether the settings themselves say what `name` is, over whatever a
+    /// source file defines or undefines of it.
+    pub fn forced(&self, name: &[u8]) -> bool {
+        self.forced.contains(name)
     }
 
     pub fn settles(&self, name: &[u8]) -> bool {

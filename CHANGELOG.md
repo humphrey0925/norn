@@ -19,6 +19,7 @@
 
 ### More accurate
 
+- A source file that defines or undefines, before it includes a header, a name the build's files settle (a `.config` that says `# CONFIG_FOO is not set`, a compilation database's `-D`, an IDE project) is read as the compiler reads it: in that file's compilation the header's `#ifdef CONFIG_FOO` is taken the other way, and the macro it defines there is the one used. Before, the build's value was taken in every compilation, and a call through the macro had one definite, wrong target. A header the compilations then read differently is left open at the conditions that name such a name, and each compilation takes the definition it reads. What is written in `.norn/config.json`'s `defines` and `undefines` still has the last word. On 4244 files of system headers the 6,011,810 call edges come out the same, with one more conditional `#define` (php.h's `#ifndef NDEBUG`).
 - A function stored in a struct's initializer under an `#elif` is stored: `{ #if A fa, #elif B fb, #else fc #endif }` had only `fa` and `fc` (each `#if` group of an initializer was read by its first branch and its `#else`; now by each of its branches). And under a configuration, a branch it switches off in an initializer stores nothing, as anywhere else.
 - `find_callees` (MCP) lists, at a macro a function uses, what the macro calls there, through members and variables too: for `LOG("x")` that is `con.send("x")`, the functions `send` can hold, marked `— via macro LOG`, as `find_callers` of those functions already listed the function.
 
