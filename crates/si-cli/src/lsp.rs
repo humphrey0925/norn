@@ -1800,7 +1800,27 @@ impl Server {
             v["certain"] = json!(certain);
             entries.push(v);
         }
-        json!({ "root": self.entry(root), "entries": entries })
+        let mut answer = json!({ "root": self.entry(root), "entries": entries });
+        // Asked for: the callers the conditions in force leave out, which
+        // the graph does not have (a `static` function's in its own file).
+        if incoming && callable_root && params["excluded"] == true {
+            let (name, file, own) = {
+                let g = self.g();
+                let y = &g.syms[root as usize];
+                (g.sym_name(root).to_string(), g.file_path(y.file).to_string(), y.flags & (flag::STATIC | flag::HEADER) == flag::STATIC)
+            };
+            let rows = self.session.excluded_calls(&name, own.then_some(file.as_str()), LIMIT);
+            let excluded: Vec<Value> = rows
+                .into_iter()
+                .map(|e| {
+                    let loc = self.location(&e.file, e.caller_line.max(1), &e.caller);
+                    let by: Vec<Value> = e.deciding.iter().map(|&l| json!({ "line": l, "text": self.line_text(&e.file, l).trim().to_string() })).collect();
+                    json!({ "name": e.caller, "file": e.file, "line": e.caller_line, "uri": loc["uri"], "range": loc["range"], "lines": e.lines, "excludedBy": by })
+                })
+                .collect();
+            answer["excluded"] = json!(excluded);
+        }
+        answer
     }
 
     /// `si/assignments`: where functions are stored in the member or

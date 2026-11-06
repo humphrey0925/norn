@@ -217,7 +217,9 @@ The callers or callees of a symbol, each saying how the call comes about.
 symbol is the root, and the position is not used: this is how a tree is
 expanded one level at a time. Without it, the root is, in order:
 
-1. a function or macro under the cursor (a definition before a prototype);
+1. a function or macro under the cursor (a definition before a prototype; on
+   a definition's own name, that definition, not another file's of the same
+   name, such as its own `static` function);
 2. any other symbol under the cursor (a variable, type, member or
    constant): its callers are the places that use it, and its callees, for a
    member or variable that holds functions, the functions stored in it;
@@ -243,6 +245,25 @@ Result:
 
 With no root: `{"root": null, "entries": []}`. On a line switched off:
 `{"inactive": [first, last]}`.
+
+With `"excluded": true` and callers of a function or macro, the answer also
+has `excluded`: the callers in branches the conditions in force switch off,
+which `entries` never has (with a build configuration that lists all it
+defines, such as `c_cpp_properties.json` or an Eclipse `.cproject`, an
+`#ifdef` of a name it does not define is switched off). The files whose
+switched-off lines name the function are read again with no conditions, and
+each call of that name on those lines is a row:
+
+```json
+"excluded": [{"name": "only_x", "file": "src/a.c", "line": 5, "uri": "…", "range": {…},
+              "lines": [5], "excludedBy": [{"line": 4, "text": "#ifdef FEATURE_X"}]}]
+```
+
+`name` and `line` are the function the call is in (the file's path and 0 at
+the top of a file), `lines` the calls, `excludedBy` the `#if`s that switch
+them off. A row is found by the name alone, not resolved as `entries` are; a
+`static` function's are looked for in its own file only; at most 2,000 rows.
+What is switched off with no configuration at all (`#if 0`) is not listed.
 
 On a local or parameter (without `item`), `root` is the local's entry, and
 for callers `entries` has one entry, its function, with `lines` the lines

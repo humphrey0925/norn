@@ -190,7 +190,8 @@ VS Code 擴充套件在已安裝 C/C++ 擴充套件、且其 IntelliSense 引擎
 `direction` 為 `"callees"` 表示被呼叫者；其他值（擴充套件送的是 `"callers"`）表示呼叫者。有 `item`
 （某個項目的 `data`）時，以該符號為根，不使用位置：樹就是這樣一次展開一層的。沒有 `item` 時，根依序為：
 
-1. 游標所在的函式或巨集（定義優先於原型）；
+1. 游標所在的函式或巨集（定義優先於原型；在定義本身的名字上，就是這個定義，不是其他檔案的同名定義，例如它自己的
+   `static` 函式）；
 2. 游標所在的其他符號（變數、型別、成員或常數）：它的呼叫者是使用它的地方；它的被呼叫者，對存放函式的
    成員或變數而言，是存進去的函式；
 3. 游標所在的函式。
@@ -214,6 +215,20 @@ VS Code 擴充套件在已安裝 C/C++ 擴充套件、且其 IntelliSense 引擎
 | `onlyIf` | `lines` 每一行都位在目前生效的條件判斷不了的分支裡時：決定它的那些 `#if`，格式為 `{line, text}`（行從 1 起算）；否則為 `[]` |
 
 沒有根時：`{"root": null, "entries": []}`。在被關掉的行上：`{"inactive": [first, last]}`。
+
+查函式或巨集的呼叫者時，加上 `"excluded": true`，結果會另外多一個 `excluded`：位在目前生效的條件所關掉的分支裡的
+呼叫者，`entries` 不會有這些（建置設定列出它定義的全部名稱時，例如 `c_cpp_properties.json` 或 Eclipse 的
+`.cproject`，它沒有定義的名稱的 `#ifdef` 就被關掉）。被關掉的行裡提到這個函式的檔案，會不帶任何條件再讀一次，
+那些行上對這個名稱的每個呼叫就是一筆：
+
+```json
+"excluded": [{"name": "only_x", "file": "src/a.c", "line": 5, "uri": "…", "range": {…},
+              "lines": [5], "excludedBy": [{"line": 4, "text": "#ifdef FEATURE_X"}]}]
+```
+
+`name` 和 `line` 是呼叫所在的函式（在檔案最上層時是檔案路徑和 0），`lines` 是呼叫所在的行，`excludedBy` 是關掉
+它們的 `#if`。每一筆只依名稱找出，不像 `entries` 那樣解析；`static` 函式只在它自己的檔案裡找；最多 2,000 筆。
+沒有任何設定時也會被關掉的部分（`#if 0`）不會列出。
 
 在區域變數或參數上（沒有 `item` 時），`root` 是該區域變數的項目；呼叫者的 `entries` 只有一筆，即它所屬
 的函式，`lines` 是用到它的行，`viaMacro` 和 `through` 為 `null`，`pointer` 為 `false`，`certain` 為
