@@ -5,6 +5,10 @@
 - On a function's own name, the Relation view, the call hierarchy and `si/relation` take that function, not another file's of the same name: asked from where a `static` function is defined, they answered for the first of its name anywhere (`helper` of `s2.c` for `helper` of `s1.c`), with no sign of it. In U-Boot, 2,856 function names are defined in more than one file.
 - `si/relation` with `"excluded": true` also lists, apart, the callers in branches the build's configuration switches off (with `c_cpp_properties.json` or an Eclipse `.cproject`, an `#ifdef` of a name it does not define), each with the `#if` that does: "no callers" under one configuration need not be none under another. See [the language server protocol](https://github.com/humphrey0925/norn/blob/master/docs/lsp-api.md#sirelation).
 
+### More accurate
+
+- A source file that defines or undefines, before it includes a header, a name the build's files settle (a `.config` that says `# CONFIG_FOO is not set`, a compilation database's `-D`, an IDE project) is read as the compiler reads it: in that file's compilation the header's `#ifdef CONFIG_FOO` is taken the other way, and the macro it defines there is the one used. Before, the build's value was taken in every compilation, and a call through the macro had one definite, wrong target. A header the compilations then read differently is left open at the conditions that name such a name, and each compilation takes the definition it reads. What is written in `.norn/config.json`'s `defines` and `undefines` still has the last word. On 4244 files of system headers the 6,011,810 call edges come out the same, with one more conditional `#define` (php.h's `#ifndef NDEBUG`).
+
 ## 0.26.0
 
 **For AI agents, C++ as clang reads it, and saving after an `#if` in seconds**

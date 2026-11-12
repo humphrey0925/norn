@@ -1636,6 +1636,39 @@ int slow (void) { return 0; }
     }
 
     #[test]
+    fn what_a_file_defines_before_a_header_overrules_the_settings_in_that_compilation() {
+        // The build says CONFIG_FOO is off and DEBUGX is on; `override.c`
+        // turns the one on and the other off before it includes the header,
+        // so the compiler reads it the other way there.
+        let d = Dir::new("override-settings");
+        d.write("cfg.h", "#ifdef CONFIG_FOO\n#define M1(x) foo_on(x)\n#else\n#define M1(x) foo_off(x)\n#endif\n#ifdef DEBUGX\n#define DBG(x) dbg_on(x)\n#else\n#define DBG(x) dbg_off(x)\n#endif\n#ifdef FORCED\n#define FRC(x) forced_on(x)\n#else\n#define FRC(x) forced_off(x)\n#endif\n");
+        d.write("impls.c", "void foo_on (int x) {}\nvoid foo_off (int x) {}\nvoid dbg_on (int x) {}\nvoid dbg_off (int x) {}\nvoid forced_on (int x) {}\nvoid forced_off (int x) {}\n");
+        d.write("main.c", "#include \"cfg.h\"\nint plain (void) { M1 (1); DBG (1); FRC (1); return 0; }\n");
+        d.write("override.c", "#define CONFIG_FOO 1\n#undef DEBUGX\n#undef FORCED\n#include \"cfg.h\"\nint overridden (void) { M1 (1); DBG (1); FRC (1); return 0; }\n");
+        d.write("dot-config", "# CONFIG_FOO is not set\nDEBUGX=1\n");
+        let (mut s, _) = Session::open_cached(&d.0, Options::default(), d.0.join("cache-outside-scan"));
+        // (What the settings themselves define is theirs to say, over the
+        // sources: `FORCED` stays on in `override.c`.)
+        let mut settings = Settings { condition_files: vec!["dot-config".into()], ..Settings::default() };
+        settings.defines.insert("FORCED".into(), "1".into());
+        s.set_conditions(&settings).unwrap();
+        let g = &s.graph;
+        // Who reaches each, and for sure.
+        let reached = |name: &str| -> Vec<(String, bool)> {
+            let f = g.find(name).iter().copied().find(|&x| g.syms[x as usize].kind == kind::FUNCTION).unwrap();
+            let mut callers: Vec<(String, bool)> = crate::callers_through_macros(g, f).iter().filter(|c| g.syms[c.caller as usize].kind == kind::FUNCTION).map(|c| (g.sym_name(c.caller).to_string(), !c.ambiguous)).collect();
+            callers.sort();
+            callers
+        };
+        let sure = |who: &str| vec![(who.to_string(), true)];
+        assert_eq!(reached("foo_on"), sure("overridden"));
+        assert_eq!(reached("foo_off"), sure("plain"));
+        assert_eq!(reached("dbg_on"), sure("plain"));
+        assert_eq!(reached("dbg_off"), sure("overridden"));
+        assert_eq!((reached("forced_on").len(), reached("forced_off")), (2, vec![]));
+    }
+
+    #[test]
     fn a_file_read_again_after_a_start_from_the_save_is_read_under_the_set_in_force() {
         let d = Dir::new("second-set");
         let set = |name: &str, value: u32| {
