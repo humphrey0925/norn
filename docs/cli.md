@@ -100,7 +100,7 @@ JSON object.
 |---|---|
 | `find` | Every definition and declaration of `NAME` |
 | `search` | Up to 50 symbols matching what is typed: fragments in any order (`uart snd`), initials (`us`), letters in order; best first, with a `score` |
-| `callers` | Every call of `NAME`: the calling function and the line of the call, including calls through macros and through function pointers stored in members or variables. At most 1,000,000 are listed; `count` is of all of them, and `"truncated": true` says some were left out |
+| `callers` | Every call of `NAME`: the calling function and the line of the call, including calls through macros and through function pointers stored in members or variables. Each row is listed once, however many definitions of `NAME` or of a macro on the way find it. At most 1,000,000 are listed; `count` is of all of them, and `"truncated": true` says some were left out |
 | `callees` | Every call `NAME` makes, the same way |
 | `refs` | Every reference to `NAME`, calls and the rest |
 | `tree` | How many functions `NAME` reaches through calls, `--depth` levels down (default 3), itself included |

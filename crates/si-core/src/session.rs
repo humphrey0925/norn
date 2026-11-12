@@ -46,6 +46,10 @@ pub struct Session {
     conditions: Conditions,
     /// Set when the conditions changed: every file is then read again.
     all_stale: bool,
+    /// What working the conditions out again after an edit of `#if`s takes
+    /// from (`units::Tree`), as the last reading of the tree left it and
+    /// kept up with the files since; none until the tree is read.
+    tree: Option<crate::units::Tree>,
     pub graph: Graph,
     pub stats: LinkStats,
     /// Files whose facts are still to be saved, after an index from
@@ -119,6 +123,19 @@ impl Packed {
     }
 }
 
+/// A call the conditions in force leave out (see `Session::excluded_calls`):
+/// the file, the function it is in (the file's path, at its top) and that
+/// function's line, the lines of the calls, and those of the `#if`s that
+/// switch them off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Excluded {
+    pub file: String,
+    pub caller: String,
+    pub caller_line: u32,
+    pub lines: Vec<u32>,
+    pub deciding: Vec<u32>,
+}
+
 /// What one `update` did.
 #[derive(Debug, Default)]
 pub struct Update {
@@ -137,6 +154,10 @@ pub struct Update {
     /// (`settled_again`).
     pub settled: bool,
     pub settled_again: bool,
+    /// Settled from nothing, after `#if`s around code alone changed: what
+    /// the conditions come to was worked out from the compilations that
+    /// read the files changed (`units::Tree::again`).
+    pub settled_from_readers: bool,
     pub extract_ms: f64,
     pub link_ms: f64,
     /// At opening, with nothing of this root saved: files whose facts were
@@ -166,7 +187,8 @@ impl Session {
         let scope = Scope::load(root);
         let files = crate::scan_scope(root, &scope);
         let mut conditions = crate::conditions_of(root, &files);
-        let defines: Vec<Vec<Define>> = crate::settle(root, &files, &mut conditions);
+        let mut tree = None;
+        let defines: Vec<Vec<Define>> = crate::settle_kept(root, &files, &mut conditions, &mut tree);
         let paths: Vec<String> = files.iter().map(|p| crate::rel_path(root, p)).collect();
         let sets = MacroSets::of_files(&defines, &paths, conditions.not_built()).with_conditions(conditions.clone());
         drop(paths);
@@ -190,6 +212,7 @@ impl Session {
             scope,
             conditions,
             all_stale: false,
+            tree,
             graph,
             stats,
             unsaved: Vec::new(),
@@ -234,6 +257,68 @@ impl Session {
     pub fn facts_of(&self, rel: &str) -> Option<&FileFacts> {
         let path = self.root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
         self.files.binary_search(&path).ok().and_then(|i| self.facts.get(i))
+    }
+
+    /// The calls of `name` on lines the conditions in force switch off,
+    /// which the graph, made under them, does not have: each file whose
+    /// lines switched off name it is read again with no conditions, and its
+    /// calls of the name on those lines taken, with the function each is in
+    /// and the `#if`s that leave it out. By name alone: what such a call
+    /// would reach is not worked out. `file`: only those of that file (a
+    /// `static` function's). At most `most` of them.
+    pub fn excluded_calls(&mut self, name: &str, file: Option<&str>, most: usize) -> Vec<Excluded> {
+        let mut out: Vec<Excluded> = Vec::new();
+        // (A word of the line, not part of a longer one.)
+        let names = |line: &[u8]| {
+            line.windows(name.len()).enumerate().any(|(i, w)| {
+                let edge = |b: Option<&u8>| b.is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+                w == name.as_bytes() && edge(i.checked_sub(1).and_then(|j| line.get(j))) && edge(line.get(i + name.len()))
+            })
+        };
+        let conditions = self.sets.take_conditions();
+        let mut ex = Extractor::new();
+        for i in 0..self.files.len() {
+            let rel = crate::rel_path(&self.root, &self.files[i]);
+            let off = &self.facts[i].inactive;
+            if off.is_empty() || file.is_some_and(|f| f != rel) || out.len() >= most {
+                continue;
+            }
+            let src = std::fs::read(&self.files[i]).unwrap_or_default();
+            let lines: Vec<&[u8]> = src.split(|&b| b == b'\n').collect();
+            let switched_off = |line: u32| off.iter().any(|&(a, b)| a <= line && line <= b);
+            if !off.iter().any(|&(a, b)| (a..=b).any(|l| lines.get(l as usize - 1).is_some_and(|t| names(t)))) {
+                continue;
+            }
+            let all = ex.extract(&rel, &src, &self.sets);
+            for r in all.refs.iter().filter(|r| r.kind == crate::model::refkind::CALL && switched_off(r.line) && all.name(r.name as usize) == name) {
+                let (caller, caller_line) = match all.defs.get(r.scope as usize).filter(|d| d.kind != crate::model::kind::FILE) {
+                    Some(d) => (all.name(d.name as usize).to_string(), d.line),
+                    None => (rel.clone(), 0),
+                };
+                // (The innermost `#if` around it: under no conditions, one
+                // not decided.)
+                let deciding = all.undecided.iter().rev().find(|u| u.0 <= r.line && r.line <= u.1).map_or_else(
+                    || off.iter().find(|&&(a, b)| a <= r.line && r.line <= b).map_or(0, |&(a, _)| a.saturating_sub(1)),
+                    |u| u.2,
+                );
+                match out.iter().position(|e| e.file == rel && e.caller == caller && e.caller_line == caller_line) {
+                    Some(k) => {
+                        out[k].lines.push(r.line);
+                        out[k].deciding.push(deciding);
+                    }
+                    None if out.len() < most => out.push(Excluded { file: rel.clone(), caller, caller_line, lines: vec![r.line], deciding: vec![deciding] }),
+                    None => {}
+                }
+            }
+        }
+        self.sets.set_conditions(conditions);
+        for e in &mut out {
+            e.lines.sort_unstable();
+            e.lines.dedup();
+            e.deciding.sort_unstable();
+            e.deciding.dedup();
+        }
+        out
     }
 
     /// What the settings and the build say is defined.
@@ -469,6 +554,7 @@ impl Session {
             scope: Scope::load(root),
             conditions: Conditions::default(),
             all_stale: false,
+            tree: None,
             graph: Graph::default(),
             stats: LinkStats::default(),
             unsaved: Vec::new(),
@@ -648,6 +734,7 @@ impl Session {
             scope: Scope::load(root),
             conditions,
             all_stale: false,
+            tree: None,
             graph: Graph::default(),
             stats: LinkStats::default(),
             unsaved: Vec::new(),
@@ -730,6 +817,14 @@ impl Session {
     /// The same, a walk of the tree having found which of `paths` are in
     /// the project (`listed`): a file of another kind comes and goes with
     /// the sources that include it.
+    /// For `SI_SETTLE_CHECK`: the first few of the files `which`, by path.
+    fn named(&self, which: &[usize]) -> String {
+        if which.is_empty() {
+            return String::new();
+        }
+        format!(" ({})", which.iter().take(3).map(|&i| crate::rel_path(&self.root, &self.files[i])).collect::<Vec<_>>().join(", "))
+    }
+
     fn update_listed(&mut self, paths: &[PathBuf], listed: Option<&FxHashSet<PathBuf>>) -> Update {
         let mut up = Update::default();
         let t = Instant::now();
@@ -757,6 +852,8 @@ impl Session {
         // tests one of them, only what the sources settle of macros is
         // worked out again, from where it stood (`crate::settle_again`).
         let mut edited: FxHashSet<Vec<u8>> = FxHashSet::default();
+        // The directives of the files changed, to keep `tree` up with them.
+        let mut scripts: Vec<(usize, mask::Script)> = Vec::new();
         for p in paths {
             let path = if p.is_absolute() { p.clone() } else { self.root.join(p) };
             // (A file of another kind is in the index when a source includes it.)
@@ -780,7 +877,9 @@ impl Session {
                         continue;
                     }
                     let rel = crate::rel_path(&self.root, &path);
-                    let skeleton = mask::script(&src).skeleton();
+                    let script = mask::script(&src);
+                    let skeleton = script.skeleton();
+                    scripts.push((i, script));
                     let old = &self.facts[i].skeleton;
                     let shaped = self.conditions.uses_source() && !self.facts[i].path.is_empty() && old.branches == skeleton.branches;
                     // Only moved: what the sources say of it moves with its
@@ -898,8 +997,8 @@ impl Session {
                     if check {
                         let mut whole = self.conditions.clone();
                         let from_nothing = crate::settle(&self.root, &self.files, &mut whole);
-                        let differ = (0..self.files.len()).filter(|&i| from_nothing[i] != all[i]).count();
-                        eprintln!("settle    again: {} files' definitions differ from settling from nothing; conditions the same: {}", differ, whole == self.conditions);
+                        let differ: Vec<usize> = (0..self.files.len()).filter(|&i| from_nothing[i] != all[i]).collect();
+                        eprintln!("settle    again: {} files' definitions differ from settling from nothing{}; conditions the same: {}", differ.len(), self.named(&differ), whole == self.conditions);
                     }
                     per_file = Some(all);
                 }
@@ -910,19 +1009,22 @@ impl Session {
                 // told otherwise now read again.
                 let mut all: Vec<Vec<Define>> = self.defines.par_iter().map(Packed::get).collect();
                 let changed: Vec<bool> = self.files.iter().map(|p| touched.contains(p)).collect();
-                let read = crate::settle_changed(&self.root, &self.files, &mut self.conditions, &mut all, &changed);
+                let read;
+                (read, up.settled_from_readers) = crate::settle_changed(&self.root, &self.files, &mut self.conditions, &mut all, &changed, &mut self.tree);
+                scripts.clear();
                 sets_changed |= Packed::some(&mut self.defines, &all, &read);
                 if std::env::var_os("SI_SETTLE_CHECK").is_some() {
                     let mut whole = self.conditions.clone();
                     let from_nothing = crate::settle(&self.root, &self.files, &mut whole);
-                    let differ = (0..self.files.len()).filter(|&i| from_nothing[i] != all[i]).count();
-                    eprintln!("settle    changed: {} of {} files read again, {} files' definitions differ from settling from nothing; conditions the same: {}", read.iter().filter(|r| **r).count(), self.files.len(), differ, whole == self.conditions);
+                    let differ: Vec<usize> = (0..self.files.len()).filter(|&i| from_nothing[i] != all[i]).collect();
+                    eprintln!("settle    changed: {} of {} files read again, {} files' definitions differ from settling from nothing{}; conditions the same: {}", read.iter().filter(|r| **r).count(), self.files.len(), differ.len(), self.named(&differ), whole == self.conditions);
                 }
                 per_file = Some(all);
             } else {
                 per_file = None;
-                self.defines = Packed::all(crate::settle(&self.root, &self.files, &mut self.conditions));
+                self.defines = Packed::all(crate::settle_kept(&self.root, &self.files, &mut self.conditions, &mut self.tree));
                 sets_changed = true;
+                scripts.clear();
             }
             defines_changed = true;
             (up.settled, up.settled_again) = (!again, again);
@@ -939,6 +1041,14 @@ impl Session {
                     })
                     .cloned()
                     .collect();
+            }
+        }
+        // Where nothing was worked out anew, what is kept for the next time
+        // moves with the directives, or holds no longer.
+        if let Some(tree) = self.tree.as_mut().filter(|_| !scripts.is_empty()) {
+            let paths: Vec<String> = self.files.iter().map(|p| crate::rel_path(&self.root, p)).collect();
+            if !scripts.iter().all(|(i, script)| tree.refresh(*i, script, &paths, &self.conditions)) {
+                self.tree = None;
             }
         }
         mark("settled");
@@ -1444,6 +1554,45 @@ int slow (void) { return 0; }
     }
 
     #[test]
+    fn on_a_definition_s_own_name_that_definition_is_meant() {
+        let d = Dir::new("own-name");
+        d.write("s1.c", "void target (void);\nstatic void helper (void) { target (); }\nvoid s1_entry (void) { helper (); }\n");
+        d.write("s2.c", "void leaf (void);\nstatic void helper (void) { leaf (); }\nvoid s2_entry (void) { helper (); }\n");
+        let s = Session::open(&d.0, Options::default());
+        let g = &s.graph;
+        let files = |found: Vec<u32>| found.iter().map(|&x| g.file_path(g.syms[x as usize].file).to_string()).collect::<Vec<_>>();
+        // Each file's own `static` function, not the other's.
+        assert_eq!(files(crate::definition_at(g, "s1.c", 2, "helper")), ["s1.c"]);
+        assert_eq!(files(crate::definition_at(g, "s2.c", 2, "helper")), ["s2.c"]);
+        // A call: what it was resolved to.
+        assert_eq!(files(crate::definition_at(g, "s2.c", 3, "helper")), ["s2.c"]);
+    }
+
+    #[test]
+    fn the_calls_the_conditions_switch_off_are_found_by_reading_again_without_them() {
+        let d = Dir::new("excluded");
+        d.write("a.c", "int g_flag;\nstatic void leaf (void) { g_flag = 1; }\nvoid mid (void) { leaf (); }\n#ifdef FEATURE_X\nvoid only_x (void) { mid (); }\n#endif\nvoid top (void) {\n    mid ();\n#if 0\n    leaf ();\n#endif\n}\n");
+        d.write("b.c", "void mid (void);\nvoid top (void);\nvoid other (void) { top (); mid (); }\n#ifdef FEATURE_X\nvoid also (void) { mid (); }\n#endif\n");
+        let mut s = Session::open(&d.0, Options::default());
+        // Nothing configured: FEATURE_X is not decided, nothing is switched off.
+        assert_eq!(functions(&s, "only_x"), 1);
+        assert!(s.excluded_calls("mid", None, 100).is_empty());
+        // What the settings do not define is not defined: those branches are
+        // not indexed, and found again for asking.
+        s.set_conditions(&Settings { assume_undefined: vec!["*".into()], ..Settings::default() }).unwrap();
+        assert_eq!((functions(&s, "only_x"), functions(&s, "also")), (0, 0));
+        let off = |file: &str, caller: &str| Excluded { file: file.into(), caller: caller.into(), caller_line: 5, lines: vec![5], deciding: vec![4] };
+        assert_eq!(s.excluded_calls("mid", None, 100), [off("a.c", "only_x"), off("b.c", "also")]);
+        assert_eq!(s.excluded_calls("mid", Some("b.c"), 100), [off("b.c", "also")]);
+        assert_eq!(s.excluded_calls("mid", None, 1).len(), 1);
+        // (`#if 0` is switched off whatever is configured.)
+        assert!(s.excluded_calls("leaf", Some("a.c"), 100).is_empty());
+        // The conditions are as they were.
+        assert!(s.sets.conditions() == s.conditions());
+        assert_eq!(functions(&s, "only_x"), 0);
+    }
+
+    #[test]
     fn compile_conditions_decide_which_branches_are_indexed() {
         let d = Dir::new("conditions");
         d.write("a.c", "#ifdef CONFIG_NET\nint net_init (void) { return helper (); }\n#else\nint net_stub (void) { return 0; }\n#endif\nint helper (void) { return 1; }\n");
@@ -1708,6 +1857,47 @@ int slow (void) { return 0; }
             seen.push(feat(&s));
         }
         assert!(seen[0] != seen[1] && seen[0] == seen[2]);
+    }
+
+    #[test]
+    fn ifs_around_code_are_worked_out_from_the_compilations_that_read_them() {
+        let d = Dir::new("ifs-around-code");
+        d.write("config.h", "#ifndef CONFIG_H\n#define CONFIG_H\n#define MODE 1\n#endif\n");
+        d.write("feat.h", "#ifndef FEAT_H\n#define FEAT_H\n#if MODE\n#define FEAT_CALL(x) feat (x)\n#else\n#define FEAT_CALL(x) 0\n#endif\nint feat (int);\nint shown (void);\n#endif\n");
+        let a = |above: &str, body: &str| format!("{above}#include \"config.h\"\n#include \"feat.h\"\n{body}int go (void) {{ return FEAT_CALL (1); }}\n");
+        d.write("a.c", &a("", ""));
+        d.write("b.c", "#include \"config.h\"\n#include \"feat.h\"\nint other (void) { return shown (); }\n");
+        for i in 0..4 {
+            d.write(&format!("z{i}.c"), &format!("int z{i} (void) {{ return {i}; }}\n"));
+        }
+        let mut s = Session::open(&d.0, Options::default());
+        let same = |s: &Session, what: &str| {
+            let fresh = Session::open(&d.0, Options::default());
+            assert_eq!(shape(s), shape(&fresh), "{what}");
+            assert_eq!(s.conditions(), fresh.conditions(), "{what}");
+            assert!(s.defines.iter().map(Packed::get).eq(fresh.defines.iter().map(Packed::get)), "{what}: definitions differ");
+            assert_eq!(s.sets.digest(), fresh.sets.digest(), "{what}");
+        };
+        let edit = |s: &mut Session, name: &str, text: &str, quick: bool, what: &str| {
+            let up = s.update(&[d.write(name, text)]);
+            assert!(up.settled, "{what}: settled");
+            assert_eq!(up.settled_from_readers, quick, "{what}: from the compilations that read it");
+            same(s, what);
+        };
+        same(&s, "opened");
+        edit(&mut s, "a.c", &a("", "#ifdef MODE\nint on (void) { return 1; }\n#else\nint off (void) { return 0; }\n#endif\n"), true, "a function put under #ifdef");
+        edit(&mut s, "a.c", &a("", "#ifdef MODE\nint on (void) { return 1; }\n#endif\n#if 0\nint never;\n#endif\n"), true, "an #if put in, one taken out");
+        edit(&mut s, "feat.h", "#ifndef FEAT_H\n#define FEAT_H\n#if MODE\n#define FEAT_CALL(x) feat (x)\n#else\n#define FEAT_CALL(x) 0\n#endif\nint feat (int);\n#if MODE > 0\nint shown (void);\n#endif\n#endif\n", true, "a header's declaration put under #if");
+        // Lines put in above the directives, nothing worked out anew: what
+        // is kept moves with them.
+        let up = s.update(&[d.write("a.c", &a("/* one */\n/* two */\n", "#ifdef MODE\nint on (void) { return 1; }\n#endif\n#if 0\nint never;\n#endif\n"))]);
+        assert!(!up.settled);
+        same(&s, "lines put in");
+        edit(&mut s, "a.c", &a("/* one */\n/* two */\n", "#ifndef MODE\nint on (void) { return 1; }\n#endif\n"), true, "after lines put in");
+        // A definition put under an #if: from every compilation, and then
+        // from the readers again.
+        edit(&mut s, "config.h", "#ifndef CONFIG_H\n#define CONFIG_H\n#ifndef NO_MODE\n#define MODE 1\n#endif\n#endif\n", false, "a definition put under #ifndef");
+        edit(&mut s, "a.c", &a("", "#ifdef MODE\nint on (void) { return 1; }\n#endif\n"), true, "an #if, after that");
     }
 
     #[test]

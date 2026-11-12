@@ -1,6 +1,6 @@
 //! `callers` from `norn live`: a name whose callers run to millions (`printk`
-//! in Linux, reached through every macro that logs) answers with at most
-//! so many of them, and says how many there were.
+//! in Linux, reached through every macro that logs) lists each once, at
+//! most so many of them, and says how many there were.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -12,16 +12,18 @@ fn callers_past_the_limit_are_counted_but_not_listed() {
     let root = std::env::temp_dir().join(format!("norn-live-callers-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    // Two copies of the logging header, as a tree with tools of its own has.
-    let header = "void emit (const char *s);\n#define log(s) emit (s)\n#define warn(s) log (s)\n";
-    std::fs::write(root.join("log.h"), header).unwrap();
-    std::fs::write(root.join("log_copy.h"), header).unwrap();
-    std::fs::write(root.join("emit.c"), "void emit (const char *s) { (void) s; }\n").unwrap();
-    std::fs::write(
-        root.join("a.c"),
-        "#include \"log.h\"\nvoid a (void) { log (\"a\"); }\nvoid b (void) { warn (\"b\"); }\nvoid c (void) { emit (\"c\"); log (\"c\"); }\n",
-    )
-    .unwrap();
+    // Two copies of a function and of the macro that calls it, as a tree
+    // with tools of its own has: a call may be to either, and is found from
+    // each.
+    for (file, text) in [
+        ("emit.c", "void emit (const char *s) { (void) s; }\n"),
+        ("emit_copy.c", "void emit (const char *s) { (void) s; }\n"),
+        ("log.h", "#define log(s) emit (s)\n"),
+        ("log_copy.h", "#define log(s) emit (s)\n"),
+        ("a.c", "void a (void) { emit (\"a\"); }\nvoid b (void) { log (\"b\"); }\nvoid c (void) { emit (\"c\"); log (\"c\"); }\n"),
+    ] {
+        std::fs::write(root.join(file), text).unwrap();
+    }
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_norn"))
         .args(["live", root.to_str().unwrap(), "--no-cache"])
@@ -50,6 +52,10 @@ fn callers_past_the_limit_are_counted_but_not_listed() {
     assert!(all.get("truncated").is_none(), "{all}");
     let names: std::collections::BTreeSet<&str> = rows.iter().map(|r| r["name"].as_str().unwrap()).collect();
     assert!(["a", "b", "c"].iter().all(|n| names.contains(n)), "{all}");
+    // `b` calls through `log`: found from both `emit`s, through both `log`s.
+    let distinct: std::collections::BTreeSet<String> = rows.iter().map(|r| r.to_string()).collect();
+    assert_eq!(distinct.len(), rows.len(), "{all}");
+    assert_eq!(rows.iter().filter(|r| r["name"] == "b").count(), 1, "{all}");
 
     let some = ask(json!({ "op": "callers", "name": "emit", "limit": 2 }));
     assert_eq!(some["count"], all["count"]);
