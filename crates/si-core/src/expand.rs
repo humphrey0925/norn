@@ -72,6 +72,9 @@ enum Origin {
     Body,
     /// Made by `##`.
     Pasted,
+    /// From the body of a macro the settings define: no file has its text,
+    /// so the parser has seen none of it.
+    Given,
 }
 
 /// The text of a token: one copy of each distinct text for the life of the
@@ -411,6 +414,24 @@ struct Parsed {
     param_at: Vec<u32>,
 }
 
+/// The macros the settings define, each as what follows `#define`
+/// (see `cond::Conditions::macro_texts`), parsed as a file's would be.
+fn given_macros(given: &[String]) -> FxHashMap<&str, Parsed> {
+    given
+        .iter()
+        .filter_map(|t| {
+            let end = t.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(t.len());
+            let (name, rest) = t.split_at(end);
+            let function_like = rest.starts_with('(');
+            // (No file has its text: what its body names only an expansion
+            // finds.)
+            let mut p = Parsed { file: NONE, at: 0, line: 0, hides: true, ..parse(rest, function_like, "") };
+            p.body.iter_mut().for_each(|t| t.origin = Origin::Given);
+            (!name.is_empty()).then_some((name, p))
+        })
+        .collect()
+}
+
 /// `text` is what follows the macro's name in its `#define`.
 fn parse(text: &str, function_like: bool, guard: &str) -> Parsed {
     let guards = guard
@@ -447,6 +468,10 @@ fn parse(text: &str, function_like: bool, guard: &str) -> Parsed {
 
 struct Table<'a> {
     files: &'a [FileFacts],
+    /// The macros the settings define (`-D`), by name: every compilation
+    /// begins with them. Read where no file's definition of the name is
+    /// there.
+    given: FxHashMap<&'a str, Parsed>,
     /// Per file, whether the build does not compile it, and whether it is
     /// in a folder the build does not compile (another program's; not a
     /// file of this one the configuration leaves out).
@@ -591,7 +616,7 @@ impl<'a> Table<'a> {
             }
         }
         let counts = !counting.is_empty();
-        Table { files, outside: vec![false; files.len()], apart: vec![false; files.len()], thorough: false, readings: None, unit_of: Vec::new(), header_of: Vec::new(), by_name, by_text, parsed, counts, counting }
+        Table { files, given: FxHashMap::default(), outside: vec![false; files.len()], apart: vec![false; files.len()], thorough: false, readings: None, unit_of: Vec::new(), header_of: Vec::new(), by_name, by_text, parsed, counts, counting }
     }
 }
 
@@ -631,6 +656,10 @@ impl<'a> Engine<'a> {
     /// Is there a translation unit here in which `name` is no macro?
     fn maybe_undefined(&mut self, name: &str) -> bool {
         let text = Text::of(name);
+        // (Defined by the settings, and by no file: a macro everywhere.)
+        if self.table.given.contains_key(name) && !self.table.by_name.contains_key(name) {
+            return false;
+        }
         match self.merged {
             // Several units at once: sure only if the file itself always
             // defines the name.
@@ -667,7 +696,9 @@ impl<'a> Engine<'a> {
                 out
             };
             let mut seen = one_of_each(&mut all.iter().filter(|d| self.visible[d.0 as usize]));
-            if seen.is_empty() {
+            // (None there, and the settings define it: what the compiler
+            // has from its command line, not a guess at a header.)
+            if seen.is_empty() && !self.table.given.contains_key(name.0) {
                 // An `#include` that could not be followed (a generated
                 // header, say) may hide the definition. A header can reach
                 // any file, a source file only itself. If several headers
@@ -688,6 +719,11 @@ impl<'a> Engine<'a> {
             }
             seen.truncate(MAX_CANDIDATES);
             let mut list: Vec<&'a Parsed> = seen.iter().map(|&(f, i, _)| &self.table.parsed[f as usize][i as usize]).filter(|p| self.there(p)).collect();
+            // No file's definition is there: the one the settings give, as
+            // the compiler has it from the command line.
+            if list.is_empty() {
+                list.extend(self.table.given.get(name.0));
+            }
             // `#ifndef X` / `#define X default` gives way to another
             // definition that is there for certain; one that may not be (the
             // tracepoint headers' `TRACE_EVENT`, read again under
@@ -921,7 +957,7 @@ impl<'a> Engine<'a> {
         let mut out: Vec<T> = Vec::with_capacity(res.len());
         let mut i = 0;
         while i < res.len() {
-            if res[i].is("##") && res[i].origin == Origin::Body && !out.is_empty() && i + 1 < res.len() {
+            if res[i].is("##") && matches!(res[i].origin, Origin::Body | Origin::Given) && !out.is_empty() && i + 1 < res.len() {
                 let right = res[i + 1];
                 let left = out.pop().unwrap();
                 if left.is(",") {
@@ -1420,7 +1456,7 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
                         };
                         found.receivers.entry(name()).or_insert(root);
                     }
-                } else if t.origin == Origin::Pasted {
+                } else if matches!(t.origin, Origin::Pasted | Origin::Given) {
                     found.refs.push((name(), refkind::MEMBER, owner.clone()));
                 }
             }
@@ -1477,10 +1513,11 @@ fn recognise(toks: &[T], s: &Site, macro_name: &str, cpp: bool) -> Found {
         }
         if owner.is_some() && brace > 0 && next_is("(") {
             found.refs.push((name(), refkind::CALL, owner.clone()));
-        } else if t.origin == Origin::Pasted {
+        } else if matches!(t.origin, Origin::Pasted | Origin::Given) {
             // Last of all, and the use is called: what follows the use is
             // its arguments (`guard(mutex)(m)`, which ends in
-            // `class_mutex_constructor`).
+            // `class_mutex_constructor`). (A name from a macro the settings
+            // define is one the parser has not seen either.)
             let called = next_is("(") || i + 1 == n && s.flags & site::CALLED != 0;
             found.refs.push((name(), if called { refkind::CALL } else { refkind::USE }, owner.clone()));
         }
@@ -2562,6 +2599,7 @@ pub fn expand(
     sure_includes: &[Vec<u32>],
     not_built: &[String],
     readings: &crate::units::Readings,
+    given: &[String],
     cache: &mut Cache,
 ) -> (u64, u64, u64) {
     let thorough = !readings.is_empty();
@@ -2573,7 +2611,8 @@ pub fn expand(
         ^ sure_digest(sure_includes)
         ^ not_built.iter().fold(0, |acc, d| acc ^ xxhash_rust::xxh3::xxh3_64(d.as_bytes()))
         ^ (thorough as u64) << 63
-        ^ readings.digest();
+        ^ readings.digest()
+        ^ given.iter().fold(0, |acc, t| acc ^ xxhash_rust::xxh3::xxh3_64_with_seed(t.as_bytes(), 31));
     let lines: FxHashMap<&str, &[u32]> = readings.files.iter().map(|(p, l)| (p.as_str(), &l[..])).collect();
     let macros: Vec<u64> = files.par_iter().map(|f| macro_digest(f, lines.get(f.path.as_str()).copied())).collect();
     let mut kept = cache.environment == environment && cache.hashes.len() == files.len() && cache.macros.len() == files.len();
@@ -2674,6 +2713,7 @@ pub fn expand(
             })
             .collect();
         let mut table = Table::new(files, by_name, parsed);
+        table.given = given_macros(given);
         table.outside = files.iter().map(|f| crate::link::outside(&f.path, not_built)).collect();
         let folders: Vec<String> = not_built.iter().filter(|f| f.ends_with('/')).cloned().collect();
         table.apart = files.iter().map(|f| crate::link::outside(&f.path, &folders)).collect();

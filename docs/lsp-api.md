@@ -631,7 +631,7 @@ level, is read as one set named `Default`.
 
 | Key | Type | |
 |---|---|---|
-| `defines` | object | Names the build defines, with their values (`""` for a bare `#define`) |
+| `defines` | object | Names the build defines, with their values (`""` for a bare `#define`); one with parameters as `"MAX(a,b)"`. One whose value names something (or is empty) is also expanded where code uses it and no file defines it, as with `-D` |
 | `undefines` | string[] | Names the build does not define |
 | `assumeUndefined` | string[] | Prefixes (`CONFIG_`), or `*` for every name: such a name is not defined unless listed or defined in the sources |
 | `conditionFiles` | string[] | Files to read more from: `#define`/`#undef` lines, a Kconfig `.config`; or a build description with the configuration after `#` (`fw/.cproject#Release`, `.vscode/c_cpp_properties.json#Linux`) |

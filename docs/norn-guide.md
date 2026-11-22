@@ -408,6 +408,12 @@ define is taken as not defined, as the compiler and IntelliSense take it; the
 macros a compiler defines itself (`__CC_ARM`, `__GNUC__`, `_WIN32`…) stay
 undecided.
 
+A macro the set in force defines that code uses, with a name or a call for its
+value (`-DLOG=uart_log`, `-DMAX(a,b)=...`, `-DEXPORT=`), is expanded wherever
+no file's own `#define` of it is there, as the compiler has it from its
+command line: a call through it reaches the function it names, and a
+`#ifndef LOG` default in a header is not what is called.
+
 ## 11. With the C/C++ extension (IntelliSense)
 
 With Microsoft's C/C++ extension (`ms-vscode.cpptools`) installed, Norn gives

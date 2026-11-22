@@ -269,6 +269,9 @@ pub struct Options {
     pub readings: std::sync::Arc<crate::units::Readings>,
     /// Folders the build does not compile, as `a/b/` (`notBuilt`).
     pub not_built: Vec<String>,
+    /// The macros the settings define that code can use, each as what
+    /// follows `#define` (see `cond::Conditions::macro_texts`).
+    pub given: std::sync::Arc<Vec<String>>,
 }
 
 /// How an `#include` operand is found among the indexed files, without the
@@ -1500,7 +1503,7 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
     let (includes, sure_includes) = include_edges(files, &options.include_aliases, &options.not_built, &mut stats);
     stats.include_ms = ms(t);
     let t = Instant::now();
-    (stats.sites, stats.expanded_defs, stats.expanded_refs) = crate::expand::expand(files, &includes, &sure_includes, &options.not_built, &options.readings, cache);
+    (stats.sites, stats.expanded_defs, stats.expanded_refs) = crate::expand::expand(files, &includes, &sure_includes, &options.not_built, &options.readings, &options.given, cache);
     stats.expand_ms = ms(t);
     crate::mem_mark("expanded");
     crate::trim_memory();
@@ -1712,6 +1715,17 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         }
     }
     let is_macro = &is_macro;
+    // The macros the settings define (`-D`) and no file does: a use of one
+    // writes its name, which is that macro, never a function or variable
+    // of the name (`-Dfopen=fopen64`); what it stands for comes of its
+    // expansion.
+    let given_only: FxHashSet<u32> = options
+        .given
+        .iter()
+        .filter_map(|t| g.name_id(&t[..t.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(t.len())]))
+        .filter(|&n| !is_macro.get(n as usize).copied().unwrap_or(false))
+        .collect();
+    let given_only = &given_only;
     let wrappers: FxHashSet<u32> = files
         .par_iter()
         .enumerate()
@@ -1814,6 +1828,9 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
             }
         };
         for (ri, r) in f.refs.iter().enumerate() {
+            if given_only.contains(&remap[fi][r.name as usize]) {
+                continue;
+            }
             if let Some(&(lh, rh, binary)) = operands.get(&(ri as u32)).filter(|_| in_cpp) {
                 // An operator used on objects: the left operand's
                 // class's (or a base's) member of that name, else a
@@ -2576,6 +2593,9 @@ fn link_all(files: &[FileFacts], options: &Options, cache: &mut crate::expand::C
         let mut h = mix(options.not_built.join("\n").as_bytes(), files.len() as u64);
         for (from, to) in &options.include_aliases {
             h = mix(to.as_bytes(), mix(from.as_bytes(), h));
+        }
+        for given in options.given.iter() {
+            h = mix(given.as_bytes(), h ^ 0x9e37);
         }
         for (f, (edges, sure)) in files.iter().zip(includes.iter().zip(&sure_includes)) {
             h = mix(bytemuck::cast_slice(sure), mix(bytemuck::cast_slice(edges), mix(f.path.as_bytes(), h)));

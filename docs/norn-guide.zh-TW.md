@@ -305,6 +305,8 @@ Norn 會**自動採用專案裡找得到的建置設定**，往下找三層資�
 
 設定來自 build 的描述檔（DS-5 的 `.cproject`、`c_cpp_properties.json`）時，裡面沒寫、原始碼也沒定義的名字視為未定義，和編譯器與 IntelliSense 一致；編譯器自己定義的巨集（`__CC_ARM`、`__GNUC__`、`_WIN32` 等）則維持「不確定」。
 
+目前設定裡定義、而且程式碼會用到的巨集，值是名稱或呼叫（`-DLOG=uart_log`、`-DMAX(a,b)=...`、`-DEXPORT=`）時，在看不到任何檔案自己的 `#define` 的地方都會展開，和編譯器從命令列拿到的一樣：透過它的呼叫會連到它指名的函式，標頭裡 `#ifndef LOG` 的預設值不會被當成呼叫目標。
+
 ## 11. 與 C/C++ 擴充套件（IntelliSense）連動
 
 如果同時安裝了微軟的 C/C++ 擴充套件（`ms-vscode.cpptools`），Norn 會把**目前生效的巨集定義和 include 路徑**即時提供給它，IntelliSense 的灰階顯示（未編譯的 `#if` 區塊）和跳轉就會和 Norn 一致。

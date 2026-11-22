@@ -190,13 +190,13 @@ impl Session {
         let mut tree = None;
         let defines: Vec<Vec<Define>> = crate::settle_kept(root, &files, &mut conditions, &mut tree);
         let paths: Vec<String> = files.iter().map(|p| crate::rel_path(root, p)).collect();
-        let sets = MacroSets::of_files(&defines, &paths, conditions.not_built()).with_conditions(conditions.clone());
+        let sets = MacroSets::of_files_under(&defines, &paths, &conditions);
         drop(paths);
         let defines = Packed::all(defines);
         let facts = crate::extract_all_reusing(root, &files, &sets, reuse);
         let mut cache = Cache::default();
         cache.relinking();
-        let options = Options { readings: crate::readings_of(&conditions), not_built: conditions.not_built().to_vec(), ..options };
+        let options = Options { readings: crate::readings_of(&conditions), not_built: conditions.not_built().to_vec(), given: crate::given_of(&conditions), ..options };
         let (graph, stats) = link_cached(&facts, &options, &mut cache);
         let stamps = files.par_iter().map(|p| stamp(p)).collect();
         Session {
@@ -695,7 +695,7 @@ impl Session {
         // Saved with the manifest; made again if not (a save from before
         // they were).
         let sets = store.load_sets(manifest.sets, &conditions).unwrap_or_else(|| {
-            let sets = MacroSets::of_files(&defines, &manifest.files, conditions.not_built()).with_conditions(conditions.clone());
+            let sets = MacroSets::of_files_under(&defines, &manifest.files, &conditions);
             if sets.digest() == manifest.sets {
                 store.save_sets(&sets);
             }
@@ -728,7 +728,7 @@ impl Session {
             facts,
             sets,
             cache,
-            options: Options { readings: crate::readings_of(&conditions), not_built: conditions.not_built().to_vec(), ..options.clone() },
+            options: Options { readings: crate::readings_of(&conditions), not_built: conditions.not_built().to_vec(), given: crate::given_of(&conditions), ..options.clone() },
             store: None,
             stamps,
             scope: Scope::load(root),
@@ -1057,7 +1057,7 @@ impl Session {
         if defines_changed && sets_changed {
             let per_file: Vec<Vec<Define>> = per_file.take().unwrap_or_else(|| self.defines.par_iter().map(Packed::get).collect());
             let paths: Vec<String> = self.files.iter().map(|p| crate::rel_path(&self.root, p)).collect();
-            let sets = MacroSets::of_files(&per_file, &paths, self.conditions.not_built()).with_conditions(self.conditions.clone());
+            let sets = MacroSets::of_files_under(&per_file, &paths, &self.conditions);
             reclassified = self.sets.reclassified(&sets);
             self.sets = sets;
         } else if defines_changed {
@@ -1065,7 +1065,7 @@ impl Session {
             if std::env::var_os("SI_SETTLE_CHECK").is_some() {
                 let per_file: Vec<Vec<Define>> = per_file.take().unwrap_or_else(|| self.defines.par_iter().map(Packed::get).collect());
                 let paths: Vec<String> = self.files.iter().map(|p| crate::rel_path(&self.root, p)).collect();
-                let sets = MacroSets::of_files(&per_file, &paths, self.conditions.not_built()).with_conditions(self.conditions.clone());
+                let sets = MacroSets::of_files_under(&per_file, &paths, &self.conditions);
                 eprintln!("settle    macro sets kept: {} macros otherwise made anew, digest the same: {}", self.sets.reclassified(&sets).len(), sets.digest() == self.sets.digest());
             }
         }
@@ -1119,6 +1119,7 @@ impl Session {
         self.cache.keep(std::mem::take(&mut self.graph));
         self.options.readings = crate::readings_of(&self.conditions);
         self.options.not_built = self.conditions.not_built().to_vec();
+        self.options.given = crate::given_of(&self.conditions);
         (self.graph, self.stats) = link_cached(&self.facts, &self.options, &mut self.cache);
         up.link_ms = ms(t);
         self.graph_unsaved = true;
@@ -1666,6 +1667,65 @@ int slow (void) { return 0; }
         assert_eq!(reached("dbg_on"), sure("plain"));
         assert_eq!(reached("dbg_off"), sure("overridden"));
         assert_eq!((reached("forced_on").len(), reached("forced_off")), (2, vec![]));
+    }
+
+    #[test]
+    fn a_macro_only_the_settings_define_is_expanded_where_it_is_used() {
+        // `-D`s with a name or a call for a value, which no file defines (or
+        // only as a default the build's value switches off): the compiler
+        // has them from its command line.
+        let d = Dir::new("settings-macros");
+        d.write("h.h", "void my_open (int x);\nvoid my_open64 (int x);\n#ifndef BACKEND\n#define BACKEND default_be\n#endif\n#define CALL(x) BACKEND (x)\n");
+        d.write("impls.c", "void custom_be (int x) {}\nvoid default_be (int x) {}\nvoid run_impl (int x) {}\nvoid my_open64 (int x) {}\nvoid log_impl (const char *s) {}\n");
+        d.write("main.c", "#include \"h.h\"\nint direct (void) { BACKEND (1); return 0; }\nint nested (void) { CALL (2); return 0; }\nint pasted (void) { WRAP (run, 3); return 0; }\nint quoted (void) { LOGV (hello); return 0; }\nint renamed (void) { my_open (4); return 0; }\n");
+        d.write("build-defines.txt", "#define BACKEND custom_be\n#define WRAP(f, x) f##_impl (x)\n");
+        let (mut s, _) = Session::open_cached(&d.0, Options::default(), d.0.join("cache-outside-scan"));
+        let mut settings = Settings { condition_files: vec!["build-defines.txt".into()], ..Settings::default() };
+        settings.defines.insert("LOGV(x)".into(), "log_impl (#x)".into());
+        settings.defines.insert("my_open".into(), "my_open64".into());
+        s.set_conditions(&settings).unwrap();
+        let callees = |s: &Session, caller: &str| -> Vec<(String, bool)> {
+            let g = &s.graph;
+            let mut out: Vec<(String, bool)> = g.find(caller).iter().flat_map(|&f| g.refs_from(f)).filter(|e| e.kind() == crate::model::refkind::CALL && g.syms[e.other as usize].kind == kind::FUNCTION).map(|e| (g.sym_name(e.other).to_string(), !e.ambiguous())).collect();
+            out.sort();
+            out.dedup();
+            out
+        };
+        let sure = |name: &str| vec![(name.to_string(), true)];
+        assert_eq!(callees(&s, "direct"), sure("custom_be"));
+        assert_eq!(callees(&s, "nested"), sure("custom_be"));
+        assert_eq!(callees(&s, "pasted"), sure("run_impl"));
+        assert_eq!(callees(&s, "quoted"), sure("log_impl"));
+        // (A use of the name is the macro: not the function of that name.)
+        assert_eq!(callees(&s, "renamed"), sure("my_open64"));
+        // Without them, as before: the default (under an `#ifndef` nothing
+        // settles now, so one reading), and no expansion of the rest.
+        s.set_conditions(&Settings::default()).unwrap();
+        let maybe = |name: &str| vec![(name.to_string(), false)];
+        assert_eq!((callees(&s, "direct"), callees(&s, "pasted"), callees(&s, "renamed")), (maybe("default_be"), vec![], sure("my_open")));
+    }
+
+    #[test]
+    fn a_condition_on_a_macro_whose_value_names_a_switch_a_source_changes_is_read_per_compilation() {
+        // `#if DBGV`, `DBGV` standing for `DEBUGX`, which the build turns on
+        // and `override.c` off before it includes the header.
+        let d = Dir::new("override-through-a-value");
+        d.write("config.h", "#define DBGV DEBUGX\n");
+        d.write("h.h", "#include \"config.h\"\n#if DBGV\n#define D(x) dbg_on(x)\n#else\n#define D(x) dbg_off(x)\n#endif\n");
+        d.write("impls.c", "void dbg_on (int x) {}\nvoid dbg_off (int x) {}\n");
+        d.write("main.c", "#include \"h.h\"\nint plain (void) { D (1); return 0; }\n");
+        d.write("override.c", "#undef DEBUGX\n#include \"h.h\"\nint overridden (void) { D (1); return 0; }\n");
+        d.write("dot-config", "DEBUGX=1\n");
+        let (mut s, _) = Session::open_cached(&d.0, Options::default(), d.0.join("cache-outside-scan"));
+        s.set_conditions(&Settings { condition_files: vec!["dot-config".into()], ..Settings::default() }).unwrap();
+        let g = &s.graph;
+        let reached = |name: &str| -> Vec<(String, bool)> {
+            let f = g.find(name).iter().copied().find(|&x| g.syms[x as usize].kind == kind::FUNCTION).unwrap();
+            let mut callers: Vec<(String, bool)> = crate::callers_through_macros(g, f).iter().filter(|c| g.syms[c.caller as usize].kind == kind::FUNCTION).map(|c| (g.sym_name(c.caller).to_string(), !c.ambiguous)).collect();
+            callers.sort();
+            callers
+        };
+        assert_eq!((reached("dbg_on"), reached("dbg_off")), (vec![("plain".to_string(), true)], vec![("overridden".to_string(), true)]));
     }
 
     #[test]

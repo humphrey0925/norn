@@ -557,7 +557,7 @@ VS Code 擴充套件在已安裝 C/C++ 擴充套件、且其 IntelliSense 引擎
 
 | 鍵 | 型別 | |
 |---|---|---|
-| `defines` | object | build 定義的名稱及其值（單純的 `#define` 為 `""`） |
+| `defines` | object | build 定義的名稱及其值（單純的 `#define` 為 `""`）；有參數的寫成 `"MAX(a,b)"`。值裡有名稱（或是空的）的巨集，在程式碼用到、而沒有任何檔案定義它的地方也會展開，和 `-D` 一樣 |
 | `undefines` | string[] | build 沒有定義的名稱 |
 | `assumeUndefined` | string[] | 字首（`CONFIG_`），或 `*` 表示所有名稱：這類名稱除非有列出或在原始碼中定義，否則視為未定義 |
 | `conditionFiles` | string[] | 要另外讀取的檔案：`#define`/`#undef` 行、Kconfig 的 `.config`；或在 `#` 後面接組態名稱的建置描述檔（`fw/.cproject#Release`、`.vscode/c_cpp_properties.json#Linux`） |

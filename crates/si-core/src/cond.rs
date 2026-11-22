@@ -810,6 +810,10 @@ pub struct Conditions {
     /// Names the settings themselves define or undefine (not those a
     /// build's files do): a source file cannot change them.
     forced: FxHashSet<Vec<u8>>,
+    /// Each name defined here as written: the name with its parameters,
+    /// and the body (`MAX(a, b)`, `((a) > (b) ? (a) : (b))`). `defined`
+    /// keeps only what a condition can use of it.
+    texts: FxHashMap<Vec<u8>, (String, String)>,
     /// What the sources define, file by file (see [`Source`]). What the
     /// settings say of a name comes first.
     source: Option<std::sync::Arc<Source>>,
@@ -916,16 +920,29 @@ impl Source {
 
     /// Whether `file` is one the compilations that read it read
     /// differently, and `expr` (the text of a condition) names something
-    /// the build settles that a source file changes. What the settings say
-    /// of that condition, where they did not all come to the same, is not
-    /// what each of them reads.
-    pub fn split_on(&self, file: u32, expr: &[u8]) -> bool {
+    /// the build settles that a source file changes: itself, or through
+    /// what the macros it names stand for (`value`, as `#define DBGV
+    /// DEBUGX` has `DBGV`). What the settings say of that condition, where
+    /// they did not all come to the same, is not what each of them reads.
+    pub fn split_on(&self, file: u32, expr: &[u8], value: impl Fn(&[u8]) -> Option<Vec<u8>>) -> bool {
         if !self.split.get(file as usize).copied().unwrap_or(false) || self.overridden.is_empty() {
             return false;
         }
-        let mut found = false;
-        crate::units::names_in(expr, |n| found |= self.overridden.contains(n));
-        found
+        let mut work: Vec<Vec<u8>> = Vec::new();
+        crate::units::names_in(expr, |n| work.push(n.to_vec()));
+        // (Each name read once, and not without end.)
+        let mut seen: FxHashSet<Vec<u8>> = FxHashSet::default();
+        while let Some(n) = work.pop() {
+            if self.overridden.contains(&n) {
+                return true;
+            }
+            if seen.len() < 256 && seen.insert(n.clone()) {
+                if let Some(v) = value(&n) {
+                    crate::units::names_in(&v, |m| work.push(m.to_vec()));
+                }
+            }
+        }
+        false
     }
 
     pub fn readings(&self) -> &std::sync::Arc<crate::units::Readings> {
@@ -1268,6 +1285,7 @@ impl Conditions {
     /// `NAME` as `value`; `NAME(a, b)` (`-D'MAX(a,b)=...'`) a macro with
     /// parameters.
     pub fn define(&mut self, name: &str, value: &str) {
+        let (whole, body) = (name, value);
         let (name, value) = match name.split_once('(') {
             Some((n, rest)) => {
                 if rest.contains("...") {
@@ -1280,11 +1298,32 @@ impl Conditions {
         };
         self.undefined.remove(name.as_bytes());
         self.defined.insert(name.as_bytes().to_vec(), value);
+        self.texts.insert(name.as_bytes().to_vec(), (whole.trim().to_string(), body.trim().to_string()));
     }
 
     pub fn undefine(&mut self, name: &str) {
         self.defined.remove(name.as_bytes());
+        self.texts.remove(name.as_bytes());
         self.undefined.insert(name.as_bytes().to_vec());
+    }
+
+    /// The macros the settings define that code can use, as what would
+    /// follow `#define`, sorted: those whose body is empty or names
+    /// something (a number or a string writes no name to find). Each
+    /// compilation begins with them, as with `-D`.
+    pub fn macro_texts(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .texts
+            .iter()
+            .filter(|(name, (_, body))| {
+                let mut names = false;
+                crate::units::names_in(body.as_bytes(), |_| names = true);
+                self.defined.contains_key(*name) && !crate::mask::is_keyword(name) && (body.is_empty() || !body.starts_with('"') && names)
+            })
+            .map(|(_, (head, body))| format!("{head} {body}"))
+            .collect();
+        out.sort_unstable();
+        out
     }
 
     /// A condition file as the settings name it: a path, and for a build
@@ -1452,7 +1491,8 @@ impl Conditions {
         let c = self.source.as_ref().map_or(0, |s| s.digest()) ^ self.no_source as u64 ^ (self.undecided_off as u64) << 1;
         let b = self.not_built.iter().fold(0, |acc, k| acc ^ h(k.as_bytes(), 15));
         let f = self.include_first.iter().enumerate().fold(0, |acc, (i, k)| acc ^ h(k.as_bytes(), 16 + i as u64));
-        d ^ u ^ a ^ s ^ c ^ b ^ f
+        let t = self.texts.iter().fold(0, |acc, (k, (head, body))| acc ^ h(body.as_bytes(), h(head.as_bytes(), h(k, 17))));
+        d ^ u ^ a ^ s ^ c ^ b ^ f ^ t
     }
 
     pub fn defined(&self, name: &[u8]) -> Tri {
