@@ -2528,6 +2528,10 @@ impl<'a> Lexer<'a> {
                     (None, b"ifndef") => named().not(),
                     _ => self.conditions.eval_in(&self.local, here, &s[e..span.1]),
                 };
+                // (Not a condition every compilation came to the same
+                // answer on, in a header they do not read the same way: what
+                // the settings say is not what each reads. Both branches.)
+                let holds = if holds != Tri::Unknown && told(start).is_none() && self.split_on(&s[e..span.1]) { Tri::Unknown } else { holds };
                 if holds == Tri::Unknown {
                     self.profile(&s[e..span.1], here);
                 }
@@ -2564,12 +2568,14 @@ impl<'a> Lexer<'a> {
                     // and (for `#elif`) its own condition holds.
                     if word != b"endif" {
                         let told = self.file.and_then(|f| self.conditions.source()?.verdict(f, start as u32));
+                        let split = word == b"elif" && self.file.is_some_and(|f| self.conditions.source().is_some_and(|src| src.split_on(f, &s[e..span.1])));
                         let own = match told {
                             Some(holds) if word != b"else" => if holds { Tri::True } else { Tri::False },
                             _ if word == b"elif" => self.conditions.eval_in(&self.local, here, &s[e..span.1]),
                             _ if word == b"else" => Tri::True,
                             _ => Tri::Unknown,
                         };
+                        let own = if word == b"elif" && own != Tri::Unknown && told.is_none() && split { Tri::Unknown } else { own };
                         if word == b"elif" && own == Tri::Unknown {
                             let (conditions, local) = (self.conditions, &self.local);
                             profile(conditions, local, &s[e..span.1], here);
@@ -2603,6 +2609,12 @@ impl<'a> Lexer<'a> {
         if skip {
             self.skip_branch();
         }
+    }
+
+    /// Whether this file is a header the compilations read differently,
+    /// and `expr` names something the build settles that a source changes.
+    fn split_on(&self, expr: &[u8]) -> bool {
+        self.file.is_some_and(|f| self.conditions.source().is_some_and(|s| s.split_on(f, expr)))
     }
 
     fn profile(&self, expr: &[u8], here: Option<(u32, u32)>) {
