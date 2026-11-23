@@ -460,6 +460,12 @@ pub fn readings_of(conditions: &cond::Conditions) -> std::sync::Arc<units::Readi
     conditions.source().map(|s| s.readings().clone()).unwrap_or_default()
 }
 
+/// The macros `conditions` define that code can use (`-D`), as the link
+/// takes them (`link::Options::given`).
+pub fn given_of(conditions: &cond::Conditions) -> std::sync::Arc<Vec<String>> {
+    std::sync::Arc::new(conditions.macro_texts())
+}
+
 /// The same, with what the build is known to define: `#define`s in branches
 /// it never compiles do not count, and extraction skips those branches.
 /// `conditions` come back with what the sources settle added.
@@ -467,11 +473,8 @@ pub fn prescan_under(root: &Path, files: &[PathBuf], conditions: &mut cond::Cond
     let defines = settle(root, files, conditions);
     let mut t = std::time::Instant::now();
     let paths: Vec<String> = files.iter().map(|p| rel_path(root, p)).collect();
-    let mut sets = MacroSets::of_defines(defines.iter().flatten());
+    let sets = MacroSets::of_files_under(&defines, &paths, conditions);
     step("sets", &mut t);
-    sets.scope(&defines, &paths, conditions.not_built());
-    let sets = sets.with_conditions(conditions.clone());
-    step("scope", &mut t);
     trim_memory();
     sets
 }

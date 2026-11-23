@@ -993,6 +993,20 @@ impl MacroSets {
         sets
     }
 
+    /// The same under `conditions`, the macros they define (`-D`, see
+    /// `Conditions::macro_texts`) read with the files' as what every
+    /// compilation begins with: seen everywhere.
+    pub fn of_files_under(per_file: &[Vec<Define>], paths: &[String], conditions: &Conditions) -> MacroSets {
+        let given = settings_defines(conditions);
+        let mut sets = MacroSets::of_defines(per_file.iter().flatten().chain(&given));
+        sets.scope(per_file, paths, conditions.not_built());
+        for d in &given {
+            sets.scoped.remove(&d.name);
+            sets.rival_defined.remove(&d.name);
+        }
+        sets.with_conditions(conditions.clone())
+    }
+
     /// Do two readings of a file's `#define`s come to the same sets, as
     /// `of_files` makes them, the other files' being the same? Only what
     /// those read is compared: not values or lines, nor the `#undef`s and
@@ -2531,7 +2545,7 @@ impl<'a> Lexer<'a> {
                 // (Not a condition every compilation came to the same
                 // answer on, in a header they do not read the same way: what
                 // the settings say is not what each reads. Both branches.)
-                let holds = if holds != Tri::Unknown && told(start).is_none() && self.split_on(&s[e..span.1]) { Tri::Unknown } else { holds };
+                let holds = if holds != Tri::Unknown && told(start).is_none() && self.split_on(&s[e..span.1], here) { Tri::Unknown } else { holds };
                 if holds == Tri::Unknown {
                     self.profile(&s[e..span.1], here);
                 }
@@ -2551,6 +2565,7 @@ impl<'a> Lexer<'a> {
                 skip = holds == Tri::False;
             }
             b"elif" | b"else" | b"elifdef" | b"elifndef" | b"endif" => {
+                let split = word == b"elif" && self.split_on(&s[e..span.1], here);
                 if let Some(c) = self.conds.last_mut() {
                     // The branch read so far ends here. (An include guard
                     // is no condition: what it holds is the file.)
@@ -2568,7 +2583,6 @@ impl<'a> Lexer<'a> {
                     // and (for `#elif`) its own condition holds.
                     if word != b"endif" {
                         let told = self.file.and_then(|f| self.conditions.source()?.verdict(f, start as u32));
-                        let split = word == b"elif" && self.file.is_some_and(|f| self.conditions.source().is_some_and(|src| src.split_on(f, &s[e..span.1])));
                         let own = match told {
                             Some(holds) if word != b"else" => if holds { Tri::True } else { Tri::False },
                             _ if word == b"elif" => self.conditions.eval_in(&self.local, here, &s[e..span.1]),
@@ -2612,9 +2626,18 @@ impl<'a> Lexer<'a> {
     }
 
     /// Whether this file is a header the compilations read differently,
-    /// and `expr` names something the build settles that a source changes.
-    fn split_on(&self, expr: &[u8]) -> bool {
-        self.file.is_some_and(|f| self.conditions.source().is_some_and(|s| s.split_on(f, expr)))
+    /// and `expr`, at `here`, names something the build settles that a
+    /// source changes, itself or through the values of the macros it names.
+    fn split_on(&self, expr: &[u8], here: Option<(u32, u32)>) -> bool {
+        let value = |name: &[u8]| match self.local.get(name) {
+            Some(Some(Some(v))) => Some(v.clone()),
+            Some(_) => None,
+            None => self.conditions.setting(name).map(<[u8]>::to_vec).or_else(|| {
+                let (f, l) = here?;
+                self.conditions.source()?.get(f, l, name).map(<[u8]>::to_vec)
+            }),
+        };
+        self.file.is_some_and(|f| self.conditions.source().is_some_and(|s| s.split_on(f, expr, value)))
     }
 
     fn profile(&self, expr: &[u8], here: Option<(u32, u32)>) {
@@ -2966,6 +2989,22 @@ pub fn defines(src: &[u8], conditions: &Conditions) -> Vec<Define> {
 
 /// The same for the file indexed as `path`, with notes of what it includes
 /// and which names its `#if`s test.
+/// The macros `conditions` define that code can use, as `#define`s.
+pub fn settings_defines(conditions: &Conditions) -> Vec<Define> {
+    let texts = conditions.macro_texts();
+    if texts.is_empty() {
+        return Vec::new();
+    }
+    let src: String = texts.iter().map(|t| format!("#define {t}\n")).collect();
+    // (No file has their text: what their bodies name only an expansion
+    // finds, as with a body that pastes.)
+    defines_of(src.as_bytes(), &Conditions::default(), None)
+        .into_iter()
+        .filter(|d| !d.test && !d.include && !d.undef)
+        .map(|d| Define { hides: true, ..d })
+        .collect()
+}
+
 pub fn defines_of(src: &[u8], conditions: &Conditions, path: Option<&str>) -> Vec<Define> {
     static NONE: std::sync::OnceLock<MacroSets> = std::sync::OnceLock::new();
     let mut l = lexer(src, NONE.get_or_init(MacroSets::default), conditions, false, path);
